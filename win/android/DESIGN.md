@@ -435,11 +435,13 @@ palette · low input latency.
 
 Two private repos, connected only by the protocol (not the filesystem):
 
-- **`yendor-engine`** — NetHack 5.0 core + the `win/android` seam (this repo's
-  mirror); the engine that emits the protocol.
-- **`yendor-client`** — the Godot 4.5 project; the controller-first protocol
-  client. Kept separate so its `.godot/`, import cache, and assets never clutter
-  the C source tree.
+- **`koalabuttz/NetHack`** (public fork) — NetHack 5.0 core + the `win/android`
+  seam, on the `android-window-port` branch; the engine that emits the protocol.
+  A fork rather than a private mirror, so the full history lives server-side with
+  no bulk upload — only the port's commits are ours.
+- **`yendor-client`** (private) — the Godot 4.5 project; the controller-first
+  protocol client. Kept separate so its `.godot/`, import cache, and assets never
+  clutter the C source tree.
 
 ---
 
