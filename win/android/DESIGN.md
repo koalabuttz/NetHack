@@ -263,23 +263,33 @@ wheels, context-A, and valid-verb menus all need *structured* state a scraped
 character grid can't supply. It is also the screen-parsing the `win/agent` work
 explicitly rejects. So: not this.
 
-### The boundary is a serialized protocol — and we already have one
+### The boundary is a serialized protocol (proven prior art — but not in this tree)
 
 Put the boundary in the wire format, not a C ABI. A C-struct ABI is brittle
 across versions (layouts, enums); a serialized protocol (JSON / flat text)
 absorbs version drift. State goes out structured; commands come in structured.
 
-`win/agent` is already exactly this: its `_live/` protocol (`view.json`,
-`frame.txt`, `cursor.txt`, `in.txt`) is a serialized structured-state-out /
-command-in contract — just pointed at an LLM instead of a human. So:
+There is **prior art for exactly this boundary**: the `win/agent` port's `_live/`
+protocol (`view.json`, `frame.txt`, `cursor.txt`, `in.txt`) is a serialized
+structured-state-out / command-in contract, pointed at an LLM. **Caveat — it is
+NOT in this fork.** `win/agent` lives on the separate `agent-window-port` branch
+(Windows-local, never pushed); `android-window-port` was forked from clean
+`NetHack-5.0` precisely to keep the two experiments decoupled. So it is a
+*reference to learn from*, not something present here to adopt — to use it, its
+schema must be brought over or re-derived.
 
-> The agent port and the android port are **two clients of one protocol.** The
-> LLM consumes structured state to *decide*; the controller app consumes the same
-> structured state to *render wheels and hints*. Port **one** seam into each
-> NetHack version and you get both agent-play and controller-play on it.
+The **aspiration** (not yet realized) is convergence:
 
-The per-version unit of work is therefore "the structured-state seam," shared
-with the agent work — not "a whole Android port."
+> the agent port and the android port as **two clients of one protocol** — the
+> LLM consuming structured state to *decide*, the controller app consuming the
+> same to *render wheels and hints*; then one seam per NetHack version yields both
+> agent-play and controller-play.
+
+Whether to pursue that (generalize win/agent's protocol into a shared spec) or to
+**design the android protocol fresh for the UI and converge later** is open — see
+Open Questions. Crucially, the version-blind machinery below ("declare, forward,
+degrade") derives from NetHack's *own* window interface and does **not depend on
+win/agent existing**, so protocol design can proceed now from first principles.
 
 ### How the app stays version-blind: "declare, forward, degrade"
 
@@ -449,9 +459,12 @@ Two private repos, connected only by the protocol (not the filesystem):
 
 **Protocol / engine boundary**
 
-- **Protocol lineage:** adopt `win/agent`'s `_live/` protocol verbatim,
-  generalize it into a shared spec both clients consume, or fork a UI-tuned
-  variant? Who owns the schema?
+- **Protocol lineage:** `win/agent`'s `_live/` protocol is prior art but is **not
+  in this fork** (it's on the Windows-local, unpushed `agent-window-port` branch).
+  Decide: design the android protocol *fresh* for the UI (deriving from NetHack's
+  window interface, converging with the agent later), or import/generalize
+  win/agent's schema into a shared spec — in which case that reference must be
+  made available here first. Recommended default: design fresh, converge later.
 - **Handshake schema:** what exactly the engine declares (version, capability
   flags, forwarded tables) and how the app negotiates against it.
 - **Transport on Android:** native library (`.so` via JNI) vs. bundled
