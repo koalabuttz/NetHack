@@ -234,30 +234,177 @@ No row needs the touchscreen.
 
 ---
 
-## Implementation seam (for later — not scaffolded yet)
+## Engine boundary & versioning
 
-This is a window port; wiring mirrors how `win/agent` plugs in — a new
-`win/android/` directory plus ~5 shared touchpoints:
+The app should outlive any single NetHack version. The architecture that buys
+that: a **serialized protocol** between the app (all UI) and the engine (the
+game), so engines slot in behind a stable contract. This section is the "why"
+and the "how"; it supersedes a naive single-port build.
+
+### What "slot in" can and can't mean
+
+Two readings, only one achievable:
+
+- **"Any version we've ported a thin seam into slots in."** Real. Each NetHack
+  edition is built with a small adapter that speaks the protocol; the app never
+  changes. This is the goal.
+- **"Any *unmodified* upstream NetHack slots in untouched."** A myth — unless you
+  abandon the structured UI (below). Core + window port compile into one binary;
+  `struct window_procs` is not stable across versions (procs get added/changed —
+  that's what the `WINDOWPORT` version macros are for), 5.0's grouped instance
+  globals (`gc.context`, `svm.mons`) don't exist in 3.6.x, and data/save formats
+  differ (5.0 Lua dat vs. 3.6 compiled levels). There is no edition where you
+  drop in new source and the port just links.
+
+The only way to wrap a truly unmodified engine is to run its TTY build as a
+subprocess and make the app a terminal emulator that scrapes the 80x24 screen.
+That is version-agnostic but **destroys the control scheme** — the item-first
+wheels, context-A, and valid-verb menus all need *structured* state a scraped
+character grid can't supply. It is also the screen-parsing the `win/agent` work
+explicitly rejects. So: not this.
+
+### The boundary is a serialized protocol — and we already have one
+
+Put the boundary in the wire format, not a C ABI. A C-struct ABI is brittle
+across versions (layouts, enums); a serialized protocol (JSON / flat text)
+absorbs version drift. State goes out structured; commands come in structured.
+
+`win/agent` is already exactly this: its `_live/` protocol (`view.json`,
+`frame.txt`, `cursor.txt`, `in.txt`) is a serialized structured-state-out /
+command-in contract — just pointed at an LLM instead of a human. So:
+
+> The agent port and the android port are **two clients of one protocol.** The
+> LLM consumes structured state to *decide*; the controller app consumes the same
+> structured state to *render wheels and hints*. Port **one** seam into each
+> NetHack version and you get both agent-play and controller-play on it.
+
+The per-version unit of work is therefore "the structured-state seam," shared
+with the agent work — not "a whole Android port."
+
+### How the app stays version-blind: "declare, forward, degrade"
+
+NetHack is already data-driven internally — it builds its own menus,
+character-creation screens, and status line from internal tables. The app's job
+is to render *those same tables* forwarded over the wire, never to hardcode one
+version's contents. The app branches on **what the engine declares**, never on a
+version number. Five moves cover almost everything:
+
+1. **Capability handshake** — on connect the engine declares what it supports
+   ("techniques: yes", "autoexplore: no", protocol version, the command set).
+2. **Forward the engine's own tables** — command list, glyph/tile set, object-
+   class symbols, role/race tables, spell list. The engine already has these
+   structs; the seam serializes them.
+3. **Engine-computed affordances** — the app asks "what can I do with this
+   object/tile?" and the *engine* answers (NetHack already knows). The app never
+   reimplements applicability logic.
+4. **Primitive-based prompts** — the windowprocs interface is *already* a tiny
+   fixed vocabulary: `yn_function`, `getlin` (text), `getdir` (direction),
+   `getpos` (target), the menu / `select_menu` API. Every prompt any version
+   raises is one of these. The protocol models that handful; the seam tags each
+   prompt with its primitive; the app renders primitives, not prompts.
+5. **Graceful unknowns** — an unrecognized glyph, status field, or command
+   renders generically (default tile, plain row, generic list entry) instead of
+   crashing. This is what lets a *newer* engine run against an *older* app.
+
+**The guardrail:** a `version ==` branch anywhere in the app is a bug, not a
+shortcut. The moment you are tempted, that is the signal to extend the protocol
+or the handshake instead. Violating it gives the worst case — a protocol layer
+*and* version-specific app code.
+
+### Where version differences actually land
+
+Across the editions people play, the differences resolve to "a table grew" or
+"the status field-list grew" — which the app renders blind:
+
+| Version / variant | UI-surface difference | Stays version-blind via |
+|---|---|---|
+| 3.4.3 → 3.6 | structured status fields, Unicode glyphs, menucolors, new `#` cmds (`#tip`, `#terrain`, `#overview`) | status field list; glyph table; command list |
+| 3.6 → 5.0 | instance-globals refactor, Lua dat, command tweaks | all internal → seam-only; app sees nothing |
+| SLASH'EM | new roles/races, techniques (`^T`), masses of monsters/objects, marketplace/forge | role/race tables; command list; glyph + class tables; existing prompt primitives |
+| EvilHack / SpliceHack / xNetHack / UnNetHack | new conditions, object materials/properties, new branches, rebalanced cmds | status fields; engine-computed verb list + detail text; just-more-map; command list |
+
+The genuinely hard case — a new interaction *modality* that isn't a choice list,
+a glyph grid, status fields, or one of the five prompt primitives (a crafting
+grid, a dialogue tree, a real-time minigame) — **does not exist anywhere in the
+mainstream NetHack family.** Supporting another favorite version means growing
+tables, not branching on versions.
+
+### Does this make updates easier, or just more complex?
+
+Both, split by the *kind* of change — and net easier, because the common kinds
+win big:
+
+- **API / compile drift** (winprocs signature, a moved global): confined to the
+  seam; app untouched. **Much easier** than the monolith, where the same drift
+  sits next to UI code.
+- **New content** (monsters / items / commands / glyphs): the handshake
+  advertises it; the data-driven app auto-renders. **Much easier.**
+- **New interaction primitive**: protocol v2 + app + seam — three layers.
+  **Harder** than the monolith's one place — but rare-to-nonexistent in the
+  NetHack family (previous section).
+
+Maintenance scales far better: without the boundary, N versions = **O(N) full
+ports** (the expensive UI duplicated N times); with it, N versions = **1 app + 1
+protocol + N small seams** — the costly UI is **O(1)**. And the boundary's upkeep
+is *split with the agent port*, so the Android port does not pay for it alone.
+
+Costs to budget honestly: (a) **slower v1** — you build app + protocol + seam
+instead of one port, with payback on version 2+; (b) **one expected protocol
+revision** — you usually cannot design the right protocol until you have seen the
+second concrete version (rule of three), so plan to revise once after 5.1 (or the
+3.6.x thought experiment) reveals what you over-fit to 5.0; (c) the discipline of
+the guardrail above.
+
+### The per-version seam (implementation, for later — not scaffolded yet)
+
+Each engine's seam is a NetHack window port that *emits the protocol* — wired the
+way `win/agent` plugs in: a new `win/<port>/` directory plus ~5 shared
+touchpoints, core untouched:
 
 - `include/winprocs.h` — interface (only if a new proc is needed).
 - `src/windows.c` — register the port's `struct window_procs`.
 - the platform makefiles — add the port's sources.
 - the platform sys glue (the `win/agent` analogue touched `sys/windows/windsys.c`).
+- build selection via the standard `WANT_WIN_*` mechanism, so the port coexists
+  with the others.
 
-The core (`src/`, `include/`) stays untouched. Build selection is the standard
-`WANT_WIN_*` mechanism, so this port coexists with the others.
+On Android the chosen engine ships as either a **native library** (`.so` via JNI;
+`sys/libnh` is the starting point) or a **bundled native executable** the app
+drives over a local socket (closer to the agent server, and the cleanest fit for
+the serialized protocol). The "5.1 releases and just slots in with no app update"
+ideal is *architecturally* real (ship the new engine as a separate artifact), but
+mind the platform constraint: Google Play policy and Android 14+ restrict loading
+executable / native code downloaded at runtime, so in practice engines ship
+bundled in the app or via normal updates — the decoupling still means rebuilding
+only the small engine module, not the UI.
 
 ---
 
 ## Open questions (to iron out before scaffolding)
 
+**Protocol / engine boundary**
+
+- **Protocol lineage:** adopt `win/agent`'s `_live/` protocol verbatim,
+  generalize it into a shared spec both clients consume, or fork a UI-tuned
+  variant? Who owns the schema?
+- **Handshake schema:** what exactly the engine declares (version, capability
+  flags, forwarded tables) and how the app negotiates against it.
+- **Transport on Android:** native library (`.so` via JNI) vs. bundled
+  executable over a local socket — and how the engine is delivered (bundled vs.
+  the policy-constrained downloadable artifact).
+- **Capability-gated features:** for an engine lacking a feature (e.g. no
+  autoexplore), does the seam *synthesize* it (travel-based exploration), or does
+  the app simply not offer it? Default per feature.
+
+**UI / interaction**
+
 - **Rendering substrate:** ASCII/tileset glyph grid vs. a richer tiled renderer?
-  Reuse an existing port's tile assets, or new ones?
+  Reuse an existing port's tile assets, or new ones? (Glyph→tile mapping is
+  forwarded data either way.)
 - **Wheel contents:** exact 8 spokes on each wheel; what's promoted vs. buried in
-  "More…". Are wheels fixed or user-editable?
+  "More…". Wheels fixed or user-editable? (Populated from the forwarded command
+  table, not hardcoded.)
 - **Default Assist state** on first launch, and where the toggle lives.
-- **Autoexplore:** does 5.0 core expose `#autoexplore`, or do we implement
-  travel-based exploration in the port?
 - **Map panning / camera** on a small screen: follow-@ vs. free-scroll; how the
   look cursor interacts with a viewport smaller than the level.
 - **Save/quit lifecycle** under Android (backgrounding, process death) — when to
