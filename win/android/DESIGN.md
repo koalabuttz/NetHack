@@ -380,6 +380,69 @@ only the small engine module, not the UI.
 
 ---
 
+## UI stack & aesthetic (decided)
+
+### Stack: Godot 4.5+, 2D, GDScript
+
+The client is a Godot 4.5+ 2D project written in GDScript. Godot wins on the
+things a modern controller-first game needs for free — native **gamepad focus
+navigation**, animation, shaders, 2D tile batching, audio, and a solid Android
+export — and it is MIT-licensed, so it sits cleanly beside the NGPL engine as a
+separate protocol client.
+
+Godot was *not* the obvious pick for an agent-in-terminal workflow (its culture
+is editor-centric), but the **MCP tooling closes that gap**: an agent drives the
+editor and runtime through tool calls instead of a GUI. Chosen over the pure-code
+alternatives (libGDX, Flutter) because that tooling now exists and the built-in
+game-feel is worth more than their slightly tighter raw loop.
+
+### Dev workflow: agent + Godot MCP, on Linux
+
+Primary loop is Claude Code ↔ **`satelliteoflove/godot-mcp`** ↔ Godot. That
+server is chosen for its **deterministic, controller-aware verify loop** — joypad
+button/stick/analog **input injection**, frozen-clock frame-stepping, live game
+state as JSON, and screenshots — ideal for proving controller UX reproducibly.
+`GoPeak` (GDScript LSP + DAP debugger) is the alternative if the agent wants
+code-intelligence / step-debugging. Fallback if the MCP misbehaves: plain
+`godot --headless --script`, which works on its own.
+
+Dev host is **Linux**, because the downstream Android pipeline (NDK cross-compile
+of the engine, Godot Android export), headless agent loops, and `xvfb` screenshot
+capture are all first-class there.
+
+### Aesthetic: hybrid map + designed chrome, glyph↔tile toggle
+
+The map renders as a modern pixel **tileset** by default, with a player toggle to
+gorgeous **ASCII glyphs** — mirroring the Assist toggle, and cheap because the
+protocol forwards glyph IDs (the renderer just maps glyph→sprite or glyph→char).
+Menus / HUD / wheels are **typographic designed chrome**, never OS widgets —
+building the UI out of system widgets is exactly the "dated Android app" failure
+mode this port exists to avoid. Identity comes from NetHack's CGA-ish palette and
+its object-class glyphs (`!`, `?`, `[`, `&`) reused as UI motifs.
+
+References that set the bar: **Cogmind** (ASCII, stunning UI), **Caves of Qud** /
+**Shattered Pixel Dungeon** (tiles + polish), **Jupiter Hell** (modern
+controller-first roguelike presentation).
+
+### Modern-feel ingredients (stack-agnostic)
+
+Animated, glowing focus (never a system cursor) · radial menus that animate open ·
+**haptics** (controller rumble on select) · smooth sub-tile camera pans and menu
+transitions · cohesive audio + rumble · one type family + icon set + the NetHack
+palette · low input latency.
+
+### Repo layout
+
+Two private repos, connected only by the protocol (not the filesystem):
+
+- **`yendor-engine`** — NetHack 5.0 core + the `win/android` seam (this repo's
+  mirror); the engine that emits the protocol.
+- **`yendor-client`** — the Godot 4.5 project; the controller-first protocol
+  client. Kept separate so its `.godot/`, import cache, and assets never clutter
+  the C source tree.
+
+---
+
 ## Open questions (to iron out before scaffolding)
 
 **Protocol / engine boundary**
@@ -398,9 +461,9 @@ only the small engine module, not the UI.
 
 **UI / interaction**
 
-- **Rendering substrate:** ASCII/tileset glyph grid vs. a richer tiled renderer?
-  Reuse an existing port's tile assets, or new ones? (Glyph→tile mapping is
-  forwarded data either way.)
+- **Tile assets:** reuse an existing NetHack tileset (classic 32×32, DawnLike,
+  etc.) or commission new pixel art? (Substrate itself is decided — Godot 2D with
+  a glyph↔tile toggle; glyph→tile mapping is forwarded data either way.)
 - **Wheel contents:** exact 8 spokes on each wheel; what's promoted vs. buried in
   "More…". Wheels fixed or user-editable? (Populated from the forwarded command
   table, not hardcoded.)
