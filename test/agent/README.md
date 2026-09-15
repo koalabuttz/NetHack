@@ -12,11 +12,16 @@ and include only `<stdint.h>`, `<stddef.h>`, `<stdbool.h>`, `<stdlib.h>`, and
 ## Commands
 
 ```sh
-make -C test/agent check       # build and run every fixture
+make -C test/agent check       # manifest + schema + every fixture
 make -C test/agent sanitize    # same, under AddressSanitizer + UBSan
 make -C test/agent depcheck    # prove no fixture reaches an engine header
 make -C test/agent clean
 ```
+
+`check` is the whole gate.  It first regenerates `doc/agent-profile-v1.tsv`
+from `include/optlist.h` and diffs it, so a drifted or hand-edited manifest
+fails; it then schema-validates real encoder output plus the built-in grammar
+vectors (`schema_check.py`); it then builds and runs every fixture.
 
 The plan's standalone smoke compile also works from the repository root:
 
@@ -46,7 +51,8 @@ prints only `win/agent/*.h` plus system headers.
 | `test_protocol.c` | strict `act` parsing (every tagged shape plus ~40 rejected shapes), escaping and UTF-8 validity, exact `hello` and the bare `closed` object, delivery/seq counter discipline, fragmented input and short writes, stale id consumes nothing, identical retry replays the retained response, conflicting id reuse closes, paging (`invalid(incomplete)` until every required page is delivered, `get_page` range errors), chunk planning at every boundary, and forced chunk emission with identical logical content |
 | `test_state.c` | the durable/audit reference model: a projectile that returns to the original durable map, palette isolation from animation, identical-frame suppression, nonblocking displays never advancing `seq`, chunk acknowledgement and identical retries, and resync replay that dedupes `(interval,k)` |
 | `test/agent/gen_profile.py` | regenerates `doc/agent-profile-v1.tsv` from `include/optlist.h`; refuses to emit a row for an option it has no classification for |
-| `test/agent/format_obs.py` | canonical client formatter: assembles chunk streams back into logical records and prints a human-readable projection, for debugging |
+| `test/agent/format_obs.py` | canonical client formatter: assembles chunk streams back into logical records (deriving `d` from `rid` and splicing `t` long-text slices) and prints a human-readable projection |
+| `test/agent/schema_check.py` | dependency-free JSON Schema subset validator plus 25 positive and 29 negative vectors; also validates real encoder output piped from `test_protocol --dump` |
 
 ## Formatter
 
@@ -58,6 +64,20 @@ python3 test/agent/format_obs.py --raw transcript.jsonl  # pass lines through
 
 It is a client-side debugging aid, not a production component.
 
+## Action acceptance is two-phase
+
+`agent_receive` frames and parses a line, applies every protocol-level check
+(schema, ranges, outstanding request id, kind, the pinned menu generation,
+the advertised position rectangle, page completeness), and returns the action
+*without* recording it.  The caller validates semantically (menu contents,
+yes/no semantics) and then calls `agent_accept`.  A semantically rejected
+action therefore leaves the request outstanding and may be resubmitted with
+the same request id.
+
+`agent_session.force_chunk` makes the encoder take the chunk path even when a
+record would fit one line, so the same logical record can be produced and
+compared both ways.
+
 ## Regenerating the profile manifest
 
 ```sh
@@ -65,8 +85,10 @@ python3 test/agent/gen_profile.py > doc/agent-profile-v1.tsv
 ```
 
 The manifest has one row per active `optlist.h` entry plus sections for the 16
-native color slots, the status conditions, the `WC_`/`WC2_` capability bits, and
-non-optlist symbol/binding state. Its columns are: option name, availability
+native color slots, the status conditions, the complete `WC_`/`WC2_` capability
+table, the standard binding inventory, and non-optlist symbol state.  Boolean
+options carry their compiled default; compound options carry their resolved
+startup value (never a placeholder). Its columns are: option name, availability
 guard, resolved startup value, classification, setter/handler entry point,
 saved-field binding, rationale. Rows behind a guard that is inactive in this
 build — and the two blocks that are compiled out entirely — are marked
@@ -79,8 +101,8 @@ build — and the two blocks that are compiled out entirely — are marked
   size the view/palette storage from the real contract; the protocol bounds
   themselves are the ones in `doc/agent-interface.md` section 6.
 * `get_page` returns an empty `rows` array in these fixtures. The paging rule
-  under test is the ordering rule (no selection until every required page is
-  delivered), not row content.
+  under test is the ordering rule (per-page delivery tracking, and no
+  selection until every required page is delivered), not row content.
 * The engine-facing bridge (`win/agent/winagent.c`), the native menu sidecars,
   the launcher, and the build wiring are later milestones (M1/M2/M3). This
   directory proves the frozen contract and the reference state machines, not

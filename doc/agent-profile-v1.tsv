@@ -5,22 +5,22 @@
 #
 # Columns: name <TAB> availability/build guard <TAB> resolved startup value <TAB> classification <TAB> setter/handler entry point <TAB> saved-field binding <TAB> rationale
 # classification: locked-presentation | locked-gameplay | unavailable-external | char-field
-# value: 'on'/'off'/'n/a (compound)' plus '(override)' when the profile overrides the compiled default
+# value: the resolved startup value: 'on'/'off' for booleans, the native default for compound options, or 'x (override)' when the profile overrides it
 # runtime mutation allowlist is EMPTY; every row is read-only at runtime
 #
 # == options (one row per active optlist.h entry) ==
 windowtype	always	agent (override)	locked-presentation	set_gameview	-	port locked to agent at bootstrap
 playmode	always	normal (override)	locked-gameplay	set_gameview	-	normal play only; debug/explore rejected
-name	always	n/a (compound)	char-field	set_gameview	-	character name via allowlisted startup data
-role	always	n/a (compound)	char-field	set_gameview	-	starting role via ordinary callbacks/startup data
-race	always	n/a (compound)	char-field	set_gameview	-	starting race via ordinary callbacks/startup data
-gender	always	n/a (compound)	char-field	set_gameview	-	starting gender via ordinary callbacks/startup data
-alignment	always	n/a (compound)	char-field	set_gameview	-	starting alignment via callbacks/startup data
+name	always	(adapter / allowlisted startup data)	char-field	set_gameview	-	character name via allowlisted startup data
+role	always	(adapter / allowlisted startup data)	char-field	set_gameview	-	starting role via ordinary callbacks/startup data
+race	always	(adapter / allowlisted startup data)	char-field	set_gameview	-	starting race via ordinary callbacks/startup data
+gender	always	(adapter / allowlisted startup data)	char-field	set_gameview	-	starting gender via ordinary callbacks/startup data
+alignment	always	(adapter / allowlisted startup data)	char-field	set_gameview	-	starting alignment via callbacks/startup data
 accessiblemsg	always	off	locked-presentation	set_in_game	&a11y.accessiblemsg	compiled default pinned
 acoustics	always	on	locked-gameplay	set_in_game	&flags.acoustics	compiled default pinned
-align_message	always	n/a (compound)	locked-presentation	set_gameview	-	window alignment not advertised
-align_status	always	n/a (compound)	locked-presentation	set_gameview	-	window alignment not advertised
-altkeyhandling	else_ifdef WIN32	n/a (compound)	unavailable-external	set_in_config	-	not applicable on this platform
+align_message	always	top (native default)	locked-presentation	set_gameview	-	window alignment not advertised
+align_status	always	bottom (native default)	locked-presentation	set_gameview	-	window alignment not advertised
+altkeyhandling	else_ifdef WIN32	-	unavailable-external	set_in_config	-	not applicable on this platform
 altmeta	ifdef ALTMETA	off (override)	locked-gameplay	set_in_game	&iflags.altmeta	alternate-meta ambiguity disabled
 armorstatus	always	off (override)	locked-presentation	set_in_game	&flags.armorstatus	optional status field off
 ascii_map	always	on (override)	locked-presentation	set_in_game	&iflags.wc_ascii_map	ASCII map is the only map
@@ -31,65 +31,65 @@ autoopen	always	on	locked-gameplay	set_in_game	&flags.autoopen	compiled default 
 autopickup	always	off	locked-gameplay	set_in_game	&flags.pickup	compiled default pinned
 autopickup exceptions	always	n/a (action)	unavailable-external	set_in_game	-	editor hook; no user editing
 autoquiver	always	off	locked-gameplay	set_in_game	&flags.autoquiver	compiled default pinned
-autounlock	always	n/a (compound)	locked-gameplay	set_in_game	-	compiled default pinned
+autounlock	always	apply-key (AUTOUNLOCK_APPLY_KEY)	locked-gameplay	set_in_game	-	compiled default pinned
 bgcolors	always	off (override)	locked-presentation	set_in_game	&iflags.bgcolors	background terrain layer disabled
 bind keys	always	n/a (action)	unavailable-external	set_in_game	-	runtime key rebinding denied
 BIOS	else_if defined(MICRO) && !defined(AMIGA)	off	unavailable-external	set_in_config	-	platform facility absent
 blind	always	off	locked-gameplay	set_in_config	&u.uroleplay.blind	role-play extra pinned at default
 bones	always	off (override)	locked-gameplay	set_in_config	&flags.bones	no cross-episode bones
-boulder	ifdef BACKWARD_COMPAT	n/a (compound)	locked-gameplay	set_in_game	-	deprecated alias; no effect
-catname	always	n/a (compound)	char-field	set_gameview	-	starting-pet name via startup data
+boulder	ifdef BACKWARD_COMPAT	(none; deprecated alias)	locked-gameplay	set_in_game	-	deprecated alias; no effect
+catname	always	(empty)	locked-gameplay	set_gameview	-	pet name is not an allowlisted startup field; pinned at its default
 checkpoint	ifdef INSURANCE	on	locked-gameplay	set_in_game	&flags.ins_chkpt	private crash recovery; not agent-visible
 cmdassist	always	on	locked-gameplay	set_in_game	&iflags.cmdassist	compiled default pinned
 color	always	on (override)	locked-presentation	set_in_game	&iflags.wc_color	color on
 confirm	always	on	locked-gameplay	set_in_game	&flags.confirm	compiled default pinned
-crash_email	ifdef CRASHREPORT	n/a (compound)	unavailable-external	set_in_game	-	external reporting facility
-crash_name	ifdef CRASHREPORT	n/a (compound)	unavailable-external	set_in_game	-	external reporting facility
-crash_urlmax	ifdef CRASHREPORT	n/a (compound)	unavailable-external	set_in_game	-	external reporting facility
-cursesgraphics	ifdef CURSES_GRAPHICS	n/a (compound)	unavailable-external	set_in_config	-	curses symset loading not compiled; guard inactive in this build
+crash_email	ifdef CRASHREPORT	-	unavailable-external	set_in_game	-	external reporting facility
+crash_name	ifdef CRASHREPORT	-	unavailable-external	set_in_game	-	external reporting facility
+crash_urlmax	ifdef CRASHREPORT	-	unavailable-external	set_in_game	-	external reporting facility
+cursesgraphics	ifdef CURSES_GRAPHICS	-	unavailable-external	set_in_config	-	curses symset loading not compiled; guard inactive in this build
 customcolors	always	off (override)	locked-presentation	set_in_game	&iflags.customcolors	no custom colors
 customsymbols	always	off (override)	locked-presentation	set_in_game	&iflags.customsymbols	no unicode symbol replacement
 dark_room	always	on	locked-presentation	set_in_game	&flags.dark_room	map display rule pinned
 deaf	always	off	locked-gameplay	set_in_config	&u.uroleplay.deaf	role-play extra pinned at default
-DECgraphics	ifdef BACKWARD_COMPAT	n/a (compound)	unavailable-external	set_in_config	-	symset loading disabled
+DECgraphics	ifdef BACKWARD_COMPAT	-	unavailable-external	set_in_config	-	symset loading disabled
 debug_hunger	always	off	unavailable-external	set_wiznofuz	&iflags.debug_hunger	wizard/fuzzer only
 debug_mongen	always	off	unavailable-external	set_wiznofuz	&iflags.debug_mongen	wizard/fuzzer only
 debug_overwrite_stairs	always	off	unavailable-external	set_wiznofuz	&iflags.debug_overwrite_stairs	wizard/fuzzer only
-disclose	always	n/a (compound)	locked-gameplay	set_in_game	-	compiled default pinned
-dogname	always	n/a (compound)	char-field	set_gameview	-	starting-pet name via startup data
+disclose	always	prompt, default no: inventory/attributes/vanquished/genocided/conduct/overview	locked-gameplay	set_in_game	-	compiled default pinned
+dogname	always	(empty)	locked-gameplay	set_gameview	-	pet name is not an allowlisted startup field; pinned at its default
 dropped_nopick	always	on	locked-gameplay	set_in_game	&flags.nopick_dropped	compiled default pinned
-dungeon	always	n/a (compound)	locked-presentation	set_in_config	-	dungeon symbol set pinned
-effects	always	n/a (compound)	locked-presentation	set_in_config	-	effect symbol set pinned
+dungeon	always	(built-in default symbol set)	locked-presentation	set_in_config	-	dungeon symbol set pinned
+effects	always	(built-in default symbol set)	locked-presentation	set_in_config	-	effect symbol set pinned
 eight_bit_tty	always	off	locked-presentation	set_in_game	&iflags.wc_eight_bit_input	WC_EIGHT_BIT_IN capability advertised
 extmenu	always	off	locked-presentation	set_in_game	&iflags.extmenu	compiled default pinned
 female	always	off	char-field	set_in_config	&flags.female	deprecated alias for gender
 fireassist	always	on	locked-gameplay	set_in_game	&iflags.fireassist	compiled default pinned
 fixinv	always	on	locked-gameplay	set_in_game	&flags.invlet_constant	compiled default pinned
-font_map	always	n/a (compound)	unavailable-external	set_gameview	-	no font facility
-font_menu	always	n/a (compound)	unavailable-external	set_gameview	-	no font facility
-font_message	always	n/a (compound)	unavailable-external	set_gameview	-	no font facility
-font_size_map	always	n/a (compound)	unavailable-external	set_gameview	-	no font facility
-font_size_menu	always	n/a (compound)	unavailable-external	set_gameview	-	no font facility
-font_size_message	always	n/a (compound)	unavailable-external	set_gameview	-	no font facility
-font_size_status	always	n/a (compound)	unavailable-external	set_gameview	-	no font facility
-font_size_text	always	n/a (compound)	unavailable-external	set_gameview	-	no font facility
-font_status	always	n/a (compound)	unavailable-external	set_gameview	-	no font facility
-font_text	always	n/a (compound)	unavailable-external	set_gameview	-	no font facility
+font_map	always	-	unavailable-external	set_gameview	-	no font facility
+font_menu	always	-	unavailable-external	set_gameview	-	no font facility
+font_message	always	-	unavailable-external	set_gameview	-	no font facility
+font_size_map	always	-	unavailable-external	set_gameview	-	no font facility
+font_size_menu	always	-	unavailable-external	set_gameview	-	no font facility
+font_size_message	always	-	unavailable-external	set_gameview	-	no font facility
+font_size_status	always	-	unavailable-external	set_gameview	-	no font facility
+font_size_text	always	-	unavailable-external	set_gameview	-	no font facility
+font_status	always	-	unavailable-external	set_gameview	-	no font facility
+font_text	always	-	unavailable-external	set_gameview	-	no font facility
 force_invmenu	always	off	locked-presentation	set_in_game	&iflags.force_invmenu	compiled default pinned
-fruit	always	n/a (compound)	locked-gameplay	set_in_game	-	compiled default pinned
+fruit	always	slime mold	locked-gameplay	set_in_game	-	compiled default pinned
 fullscreen	always	off	locked-presentation	set_in_config	&iflags.wc2_fullscreen	WC2_FULLSCREEN not advertised
-glyph	always	n/a (compound)	unavailable-external	set_in_game	-	unicode glyph handler disabled
+glyph	always	-	unavailable-external	set_in_game	-	unicode glyph handler disabled
 goldX	always	off	locked-gameplay	set_in_game	&flags.goldX	compiled default pinned
 guicolor	always	on	locked-presentation	set_in_game	&iflags.wc2_guicolor	UI color capability not advertised
 help	always	on	locked-gameplay	set_in_game	&flags.help	compiled default pinned
 herecmd_menu	always	off	locked-presentation	set_in_game	&iflags.herecmd_menu	compiled default pinned
-hicolor	if 0 & if defined(MAC68K)	n/a (compound)	unavailable-external	set_in_config	-	compiled out (obsolete platform); guard inactive in this build
+hicolor	if 0 & if defined(MAC68K)	-	unavailable-external	set_in_config	-	compiled out (obsolete platform); guard inactive in this build
 hilite_pet	always	on (override)	locked-presentation	set_in_game	&iflags.wc_hilite_pet	pet highlighting on
 hilite_pile	always	on (override)	locked-presentation	set_in_game	&iflags.hilite_pile	pile highlighting on
 hilite_status	ifdef STATUS_HILITES	off (override)	locked-presentation	set_in_game	-	configurable status highlighting off
 hitpointbar	always	off (override)	locked-presentation	set_in_game	&iflags.wc2_hitpointbar	hit-point bar off
-horsename	always	n/a (compound)	char-field	set_gameview	-	starting-pet name via startup data
-IBMgraphics	ifdef BACKWARD_COMPAT	n/a (compound)	unavailable-external	set_in_config	-	symset loading disabled
+horsename	always	(empty)	locked-gameplay	set_gameview	-	pet name is not an allowlisted startup field; pinned at its default
+IBMgraphics	ifdef BACKWARD_COMPAT	-	unavailable-external	set_in_config	-	symset loading disabled
 idlecheckpoint	always	off	locked-gameplay	set_in_game	&iflags.idlecheckpoint	compiled default pinned
 ignintr	ifndef MAC68K	off	locked-gameplay	set_in_game	&flags.ignintr	compiled default pinned
 implicit_uncursed	always	on	locked-gameplay	set_in_game	&flags.implicit_uncursed	compiled default pinned
@@ -98,58 +98,58 @@ legacy	always	on	locked-presentation	set_in_config	&flags.legacy	introductory me
 lit_corridor	always	off	locked-gameplay	set_in_game	&flags.lit_corridor	compiled default pinned
 lootabc	always	off	locked-gameplay	set_in_game	&flags.lootabc	compiled default pinned
 mail	always	off (override)	unavailable-external	set_in_game	&flags.biff	mail daemon disabled
-map_mode	always	n/a (compound)	unavailable-external	set_gameview	-	platform facility absent
+map_mode	always	-	unavailable-external	set_gameview	-	platform facility absent
 mention_decor	always	off	locked-gameplay	set_in_game	&flags.mention_decor	compiled default pinned
 mention_map	always	off	locked-presentation	set_in_game	&a11y.glyph_updates	accessibility message pinned
 mention_walls	always	off	locked-gameplay	set_in_game	&flags.mention_walls	compiled default pinned
-menu_deselect_all	always	n/a (compound)	locked-presentation	set_in_config	-	menu key binding pinned
-menu_deselect_page	always	n/a (compound)	locked-presentation	set_in_config	-	menu key binding pinned
-menu_first_page	always	n/a (compound)	locked-presentation	set_in_config	-	menu key binding pinned
-menu_headings	always	n/a (compound)	locked-presentation	set_in_game	-	menu heading style pinned
-menu_invert_all	always	n/a (compound)	locked-presentation	set_in_config	-	menu key binding pinned
-menu_invert_page	always	n/a (compound)	locked-presentation	set_in_config	-	menu key binding pinned
-menu_last_page	always	n/a (compound)	locked-presentation	set_in_config	-	menu key binding pinned
-menu_next_page	always	n/a (compound)	locked-presentation	set_in_config	-	menu key binding pinned
-menu_objsyms	always	n/a (compound)	locked-presentation	set_in_game	-	menu icon rule pinned
+menu_deselect_all	always	key '-' (MENU_UNSELECT_ALL)	locked-presentation	set_in_config	-	menu key binding pinned
+menu_deselect_page	always	key '\' (MENU_UNSELECT_PAGE)	locked-presentation	set_in_config	-	menu key binding pinned
+menu_first_page	always	key '^' (MENU_FIRST_PAGE)	locked-presentation	set_in_config	-	menu key binding pinned
+menu_headings	always	inverse (ATR_INVERSE, NO_COLOR)	locked-presentation	set_in_game	-	menu heading style pinned
+menu_invert_all	always	key '@' (MENU_INVERT_ALL)	locked-presentation	set_in_config	-	menu key binding pinned
+menu_invert_page	always	key '~' (MENU_INVERT_PAGE)	locked-presentation	set_in_config	-	menu key binding pinned
+menu_last_page	always	key '|' (MENU_LAST_PAGE)	locked-presentation	set_in_config	-	menu key binding pinned
+menu_next_page	always	key '>' (MENU_NEXT_PAGE)	locked-presentation	set_in_config	-	menu key binding pinned
+menu_objsyms	always	off	locked-presentation	set_in_game	-	menu icon rule pinned
 menu_overlay	ifdef TTY_GRAPHICS	on	locked-presentation	set_in_game	&iflags.menu_overlay	tty-only menu geometry; absent in agent-only
-menu_previous_page	always	n/a (compound)	locked-presentation	set_in_config	-	menu key binding pinned
-menu_search	always	n/a (compound)	locked-presentation	set_in_config	-	menu key binding pinned
-menu_select_all	always	n/a (compound)	locked-presentation	set_in_config	-	menu key binding pinned
-menu_select_page	always	n/a (compound)	locked-presentation	set_in_config	-	menu key binding pinned
-menu_shift_left	always	n/a (compound)	locked-presentation	set_in_config	-	menu key binding pinned
-menu_shift_right	always	n/a (compound)	locked-presentation	set_in_config	-	menu key binding pinned
+menu_previous_page	always	key '<' (MENU_PREVIOUS_PAGE)	locked-presentation	set_in_config	-	menu key binding pinned
+menu_search	always	key ':' (MENU_SEARCH)	locked-presentation	set_in_config	-	menu key binding pinned
+menu_select_all	always	key '.' (MENU_SELECT_ALL)	locked-presentation	set_in_config	-	menu key binding pinned
+menu_select_page	always	key ',' (MENU_SELECT_PAGE)	locked-presentation	set_in_config	-	menu key binding pinned
+menu_shift_left	always	key '{' (MENU_SHIFT_LEFT)	locked-presentation	set_in_config	-	menu key binding pinned
+menu_shift_right	always	key '}' (MENU_SHIFT_RIGHT)	locked-presentation	set_in_config	-	menu key binding pinned
 menu_tab_sep	always	off	unavailable-external	set_wizonly	&iflags.menu_tab_sep	wizard-only menu formatting
 menucolors	always	off (override)	locked-presentation	set_in_game	&iflags.use_menu_color	menu colors off
 menu colors	always	n/a (action)	unavailable-external	set_in_game	-	menu color editing denied
-menuinvertmode	always	n/a (compound)	locked-presentation	set_in_game	-	compiled default pinned
-menustyle	always	n/a (compound)	locked-presentation	set_in_game	-	compiled default pinned
+menuinvertmode	always	1 (native default)	locked-presentation	set_in_game	-	compiled default pinned
+menustyle	always	full (MENU_FULL)	locked-presentation	set_in_game	-	compiled default pinned
 message types	always	n/a (action)	unavailable-external	set_in_game	-	message handler configuration denied
 mon_movement	always	off	locked-presentation	set_in_game	&a11y.mon_movement	accessibility message pinned
 monpolycontrol	always	off	unavailable-external	set_wizonly	&iflags.mon_polycontrol	wizard-only
 montelecontrol	always	off	unavailable-external	set_wizonly	&iflags.mon_telecontrol	wizard-only
-monsters	always	n/a (compound)	locked-presentation	set_in_config	-	monster symbol set pinned
-mouse_support	always	n/a (compound)	unavailable-external	set_in_game	-	mouse input not advertised
-msg_window	else_if PREV_MSGS	n/a (compound)	unavailable-external	set_in_config	-	not applicable without tty history
-msghistory	always	n/a (compound)	locked-presentation	set_gameview	-	history depth pinned
+monsters	always	(built-in default symbol set)	locked-presentation	set_in_config	-	monster symbol set pinned
+mouse_support	always	-	unavailable-external	set_in_game	-	mouse input not advertised
+msg_window	else_if PREV_MSGS	single (iflags.prevmsg_window = 's')	unavailable-external	set_in_config	-	not applicable without tty history
+msghistory	always	20 (iflags.msg_history)	locked-presentation	set_gameview	-	history depth pinned
 news	ifdef NEWS	off	locked-presentation	set_in_config	&iflags.news	compiled default pinned
 nudist	always	off	locked-gameplay	set_in_config	&u.uroleplay.nudist	role-play extra pinned at default
 null	always	on	locked-presentation	set_in_game	&flags.null	compiled default pinned
 number_pad	always	off (override)	locked-presentation	set_in_game	-	standard native bindings; number_pad off
-objects	always	n/a (compound)	locked-presentation	set_in_config	-	object symbol set pinned
-packorder	always	n/a (compound)	locked-gameplay	set_in_game	-	compiled default pinned
-palette	ifdef CHANGE_COLOR & ifndef MAC68K	n/a (compound)	unavailable-external	set_gameview	-	color mutation denied
-paranoid_confirmation	always	n/a (compound)	locked-gameplay	set_in_game	-	compiled default pinned
+objects	always	(built-in default symbol set)	locked-presentation	set_in_config	-	object symbol set pinned
+packorder	always	$)"[%?+!=/(*`0_ (flags.inv_order = def_inv_order)	locked-gameplay	set_in_game	-	compiled default pinned
+palette	ifdef CHANGE_COLOR & ifndef MAC68K	-	unavailable-external	set_gameview	-	color mutation denied
+paranoid_confirmation	always	pray+swim+trap (PARANOID_PRAY|SWIM|TRAP)	locked-gameplay	set_in_game	-	compiled default pinned
 pauper	always	off	locked-gameplay	set_in_config	&u.uroleplay.pauper	role-play extra pinned at default
 perm_invent	always	off (override)	locked-presentation	set_in_game	&iflags.perm_invent	no permanent inventory
-perminv_mode	always	n/a (compound)	locked-presentation	set_in_game	-	no permanent inventory
-petattr	always	n/a (compound)	locked-presentation	set_in_game	-	pet attribute inverse
-pettype	always	n/a (compound)	char-field	set_gameview	-	preferred pet type via startup data
-pickup_burden	always	n/a (compound)	locked-gameplay	set_in_game	-	compiled default pinned
+perminv_mode	always	none (permanent inventory off)	locked-presentation	set_in_game	-	no permanent inventory
+petattr	always	inverse (ATR_INVERSE)	locked-presentation	set_in_game	-	pet attribute inverse
+pettype	always	random (no preference)	locked-gameplay	set_gameview	-	pet type is not an allowlisted startup field; pinned at its native default (random)
+pickup_burden	always	stressed (MOD_ENCUMBER)	locked-gameplay	set_in_game	-	compiled default pinned
 pickup_stolen	always	on	locked-gameplay	set_in_game	&flags.pickup_stolen	compiled default pinned
 pickup_thrown	always	on	locked-gameplay	set_in_game	&flags.pickup_thrown	compiled default pinned
-pickup_types	always	n/a (compound)	locked-gameplay	set_in_game	-	compiled default pinned
-pile_limit	always	n/a (compound)	locked-gameplay	set_in_game	-	compiled default pinned
-player_selection	always	n/a (compound)	locked-presentation	set_gameview	-	native presentation allowed
+pickup_types	always	all (empty list)	locked-gameplay	set_in_game	-	compiled default pinned
+pile_limit	always	5 (PILE_LIMIT_DFLT)	locked-gameplay	set_in_game	-	compiled default pinned
+player_selection	always	dialog (VIA_DIALOG)	locked-presentation	set_gameview	-	native presentation allowed
 popup_dialog	always	off	locked-presentation	set_in_game	&iflags.wc_popup_dialog	popup dialog capability not advertised
 preload_tiles	always	off (override)	unavailable-external	set_in_config	&iflags.wc_preload_tiles	tiles disabled
 price_quotes	always	off	locked-gameplay	set_in_game	&iflags.pricequotes	compiled default pinned
@@ -159,14 +159,14 @@ quick_farsight	always	off	locked-gameplay	set_in_game	&flags.quick_farsight	comp
 rawio	else_ifdef MICRO	off	unavailable-external	set_in_config	-	platform facility absent
 reroll	always	off	locked-gameplay	set_in_config	&u.uroleplay.reroll	role-play extra pinned at default
 rest_on_space	always	off	locked-gameplay	set_in_game	&flags.rest_on_space	compiled default pinned
-roguesymset	always	n/a (compound)	unavailable-external	set_in_game	-	symset loading disabled
-runmode	always	n/a (compound)	locked-presentation	set_in_game	-	display frequency pinned
+roguesymset	always	-	unavailable-external	set_in_game	-	symset loading disabled
+runmode	always	run (RUN_LEAP)	locked-presentation	set_in_game	-	display frequency pinned
 safe_pet	always	on	locked-gameplay	set_in_game	&flags.safe_dog	compiled default pinned
 safe_wait	always	on	locked-gameplay	set_in_game	&flags.safe_wait	compiled default pinned
 sanity_check	always	off	unavailable-external	set_wizonly	&iflags.sanity_check	wizard-only
-scores	always	n/a (compound)	locked-presentation	set_in_game	-	end-of-game disclosure pinned
-scroll_amount	always	n/a (compound)	locked-presentation	set_gameview	-	window geometry not advertised
-scroll_margin	always	n/a (compound)	locked-presentation	set_gameview	-	window geometry not advertised
+scores	always	3 top / 2 around / own off	locked-presentation	set_in_game	-	end-of-game disclosure pinned
+scroll_amount	always	1 (native default)	locked-presentation	set_gameview	-	window geometry not advertised
+scroll_margin	always	5 (native default)	locked-presentation	set_gameview	-	window geometry not advertised
 selectsaved	always	off (override)	locked-presentation	set_in_config	&iflags.wc2_selectsaved	no save-selection UI
 showdamage	always	off	locked-presentation	set_in_game	&iflags.showdamage	message content pinned
 showexp	always	off (override)	locked-presentation	set_in_game	&flags.showexp	optional status field off
@@ -175,11 +175,11 @@ showscore	else_ifdef SCORE_ON_BOTL	off	unavailable-external	set_in_config	-	SCOR
 showvers	always	off (override)	locked-presentation	set_in_game	&flags.showvers	optional status field off
 silent	always	on	locked-presentation	set_in_game	&flags.silent	no terminal bell
 softkeyboard	always	off	unavailable-external	set_in_config	&iflags.wc2_softkeyboard	platform facility absent
-sortdiscoveries	always	n/a (compound)	locked-presentation	set_in_game	-	compiled default pinned
-sortloot	always	n/a (compound)	locked-presentation	set_in_game	-	compiled default pinned
+sortdiscoveries	always	o (flags.discosort)	locked-presentation	set_in_game	-	compiled default pinned
+sortloot	always	loot (flags.sortloot = 'l')	locked-presentation	set_in_game	-	compiled default pinned
 sortpack	always	on	locked-presentation	set_in_game	&flags.sortpack	compiled default pinned
-sortvanquished	always	n/a (compound)	locked-presentation	set_in_game	-	compiled default pinned
-soundlib	always	n/a (compound)	unavailable-external	set_gameview	-	sound disabled
+sortvanquished	always	o (flags.vansort)	locked-presentation	set_in_game	-	compiled default pinned
+soundlib	always	-	unavailable-external	set_gameview	-	sound disabled
 sounds	else_ifdef SND_LIB_INTEGRATED	off	unavailable-external	set_in_game	&iflags.sounds	sound disabled
 sparkle	always	on	locked-presentation	set_in_game	&flags.sparkle	map effect pinned
 spot_monsters	always	off	locked-presentation	set_in_game	&a11y.mon_notices	accessibility message pinned
@@ -189,49 +189,49 @@ status_updates	always	on	locked-presentation	set_in_config	&iflags.status_update
 status condition fields	always	n/a (action)	unavailable-external	set_in_game	-	condition configuration denied
 statushilites	ifdef STATUS_HILITES	off (override)	locked-presentation	set_in_game	-	status highlighting off
 status highlight rules	ifdef STATUS_HILITES	n/a (action)	unavailable-external	set_in_game	-	status highlight editing denied
-statuslines	always	n/a (compound)	locked-presentation	set_in_game	-	compiled default pinned
-subkeyvalue	ifdef WIN32CON	n/a (compound)	unavailable-external	set_in_config	-	platform facility absent; guard inactive in this build
-suppress_alert	always	n/a (compound)	locked-presentation	set_in_game	-	compiled default pinned
-symset	always	n/a (compound)	unavailable-external	set_in_game	-	symset loading disabled
-term_cols	always	n/a (compound)	locked-presentation	set_in_config	-	map size is a build constant
-term_rows	always	n/a (compound)	locked-presentation	set_in_config	-	map size is a build constant
+statuslines	always	2 (iflags.wc2_statuslines)	locked-presentation	set_in_game	-	compiled default pinned
+subkeyvalue	ifdef WIN32CON	-	unavailable-external	set_in_config	-	platform facility absent; guard inactive in this build
+suppress_alert	always	0 (flags.suppress_alert)	locked-presentation	set_in_game	-	compiled default pinned
+symset	always	-	unavailable-external	set_in_game	-	symset loading disabled
+term_cols	always	80 (build constant COLNO)	locked-presentation	set_in_config	-	map size is a build constant
+term_rows	always	21 (build constant ROWNO)	locked-presentation	set_in_config	-	map size is a build constant
 terrainstatus	always	off (override)	locked-presentation	set_in_game	&flags.terrainstatus	optional status field off
-tile_file	always	n/a (compound)	unavailable-external	set_gameview	-	tiles disabled
-tile_height	always	n/a (compound)	unavailable-external	set_gameview	-	tiles disabled
-tile_width	always	n/a (compound)	unavailable-external	set_gameview	-	tiles disabled
+tile_file	always	-	unavailable-external	set_gameview	-	tiles disabled
+tile_height	always	-	unavailable-external	set_gameview	-	tiles disabled
+tile_width	always	-	unavailable-external	set_gameview	-	tiles disabled
 tiled_map	always	off (override)	unavailable-external	set_in_game	&iflags.wc_tiled_map	tiles disabled
 time	always	on (override)	locked-presentation	set_in_game	&flags.time	displayed game time on
 timed_delay	ifdef TIMED_DELAY	on	locked-presentation	set_in_game	&flags.nap	port never sleeps; value inert
 tips	always	on	locked-presentation	set_in_game	&flags.tips	compiled default pinned
 tombstone	always	on	locked-presentation	set_in_game	&flags.tombstone	compiled default pinned
 toptenwin	always	off	locked-presentation	set_in_game	&iflags.toptenwin	compiled default pinned
-traps	always	n/a (compound)	locked-presentation	set_in_config	-	trap symbol set pinned
+traps	always	(built-in default symbol set)	locked-presentation	set_in_config	-	trap symbol set pinned
 travel	always	on	locked-gameplay	set_in_game	&flags.travelcmd	compiled default pinned
 travel_debug	else_ifdef DEBUG	off	unavailable-external	set_wizonly	-	wizard/DEBUG only
 tutorial	always	on	locked-gameplay	set_in_config	&flags.tutorial	compiled default pinned
 use_darkgray	always	on	locked-presentation	set_in_config	&iflags.wc2_darkgray	WC2_DARKGRAY not advertised; inert
 use_inverse	always	on (override)	locked-presentation	set_in_game	&iflags.wc_inverse	inverse on
 use_truecolor	always	off (override)	locked-presentation	set_in_config	&iflags.use_truecolor	enhanced colors off
-vary_msgcount	always	n/a (compound)	locked-presentation	set_gameview	-	WC_VARY_MSGCOUNT not advertised
+vary_msgcount	always	0	locked-presentation	set_gameview	-	WC_VARY_MSGCOUNT not advertised
 verbose	always	on	locked-presentation	set_in_game	&flags.verbose	message verbosity pinned
-versinfo	always	n/a (compound)	locked-presentation	set_in_game	-	compiled default pinned
-video	if defined(MSDOS) && defined(NO_TERMS)	n/a (compound)	unavailable-external	set_in_config	-	platform facility absent; guard inactive in this build
-videocolors	ifdef VIDEOSHADES	n/a (compound)	unavailable-external	set_gameview	-	platform facility absent; guard inactive in this build
-videoshades	ifdef VIDEOSHADES	n/a (compound)	unavailable-external	set_gameview	-	platform facility absent; guard inactive in this build
-video_width	ifdef MSDOS	n/a (compound)	unavailable-external	set_gameview	-	platform facility absent; guard inactive in this build
-video_height	ifdef MSDOS	n/a (compound)	unavailable-external	set_gameview	-	platform facility absent; guard inactive in this build
+versinfo	always	4 (have_branch)	locked-presentation	set_in_game	-	compiled default pinned
+video	if defined(MSDOS) && defined(NO_TERMS)	-	unavailable-external	set_in_config	-	platform facility absent; guard inactive in this build
+videocolors	ifdef VIDEOSHADES	-	unavailable-external	set_gameview	-	platform facility absent; guard inactive in this build
+videoshades	ifdef VIDEOSHADES	-	unavailable-external	set_gameview	-	platform facility absent; guard inactive in this build
+video_width	ifdef MSDOS	-	unavailable-external	set_gameview	-	platform facility absent; guard inactive in this build
+video_height	ifdef MSDOS	-	unavailable-external	set_gameview	-	platform facility absent; guard inactive in this build
 voices	else_ifdef SND_SPEECH	off	unavailable-external	set_gameview	&iflags.voices	sound/speech disabled
 vt_tiledata	else_ifdef TTY_TILES_ESCCODES	off	unavailable-external	set_in_config	-	tty tile escape codes not compiled
 vt_sounddata	else_ifdef TTY_SOUND_ESCCODES	off	unavailable-external	set_in_config	-	tty sound escape codes not compiled
-warnings	always	n/a (compound)	locked-presentation	set_in_config	-	warning symbol set pinned
+warnings	always	(built-in default symbol set)	locked-presentation	set_in_config	-	warning symbol set pinned
 weaponstatus	always	off (override)	locked-presentation	set_in_game	&flags.weaponstatus	optional status field off
-whatis_coord	always	n/a (compound)	locked-presentation	set_in_game	-	compiled default pinned
-whatis_filter	always	n/a (compound)	locked-presentation	set_in_game	-	compiled default pinned
+whatis_coord	always	none (GPCOORDS_NONE)	locked-presentation	set_in_game	-	compiled default pinned
+whatis_filter	always	none (GFILTER_NONE)	locked-presentation	set_in_game	-	compiled default pinned
 whatis_menu	always	off	locked-presentation	set_in_game	&iflags.getloc_usemenu	compiled default pinned
 whatis_moveskip	always	off	locked-presentation	set_in_game	&iflags.getloc_moveskip	compiled default pinned
-windowborders	always	n/a (compound)	locked-presentation	set_in_game	-	compiled default pinned
-windowchain	ifdef WINCHAIN	n/a (compound)	unavailable-external	set_in_sysconf	-	window chaining not compiled; guard inactive in this build
-windowcolors	always	n/a (compound)	locked-presentation	set_gameview	-	window colors pinned
+windowborders	always	auto (iflags.wc2_windowborders = 2)	locked-presentation	set_in_game	-	compiled default pinned
+windowchain	ifdef WINCHAIN	-	unavailable-external	set_in_sysconf	-	window chaining not compiled; guard inactive in this build
+windowcolors	always	(none set)	locked-presentation	set_gameview	-	window colors pinned
 wizmgender	always	off	unavailable-external	set_wizonly	&iflags.wizmgender	wizard-only
 wizweight	always	off	unavailable-external	set_wizonly	&iflags.wizweight	wizard-only
 wraptext	always	off	locked-presentation	set_in_game	&iflags.wc2_wraptext	WC2_WRAPTEXT not advertised
@@ -334,6 +334,28 @@ cap.WC2_DARKGRAY	always	0x0020L off	locked-presentation	windowprocs.wincap	-	dar
 cap.WC2_HITPOINTBAR	always	0x0040L off	locked-presentation	windowprocs.wincap	-	hit-point bar off
 cap.WC2_FLUSH_STATUS	always	0x0080L on	locked-presentation	windowprocs.wincap	-	status batching (initial)
 cap.WC2_RESET_STATUS	always	0x0100L on	locked-presentation	windowprocs.wincap	-	status reset (initial)
+cap.WC2_TERM_SIZE	always	0x0200L off	locked-presentation	windowprocs.wincap	-	terminal size is a build constant
+cap.WC2_STATUSLINES	always	0x0400L off	locked-presentation	windowprocs.wincap	-	status line count frozen at 2
+cap.WC2_WINDOWBORDERS	always	0x0800L off	locked-presentation	windowprocs.wincap	-	no window borders advertised
+cap.WC2_PETATTR	always	0x1000L off	locked-presentation	windowprocs.wincap	-	pet attr fixed to inverse
+cap.WC2_GUICOLOR	always	0x2000L off	locked-presentation	windowprocs.wincap	-	no non-map colour facility
+cap.WC2_URGENT_MESG	always	0x4000L off	locked-presentation	windowprocs.wincap	-	no message urgency channel
+cap.WC2_SUPPRESS_HIST	always	0x8000L off	locked-presentation	windowprocs.wincap	-	no history suppression channel
+cap.WC2_MENU_SHIFT	always	0x010000L off	locked-presentation	windowprocs.wincap	-	no horizontal menu scrolling
+cap.WC2_U_UTF8STR	always	0x020000L off	locked-presentation	windowprocs.wincap	-	unicode disabled
+cap.WC2_EXTRACOLORS	always	0x040000L off	locked-presentation	windowprocs.wincap	-	enhanced colors disabled
+cap.WC2_EXTRASTATUS	always	0x080000L off	locked-presentation	windowprocs.wincap	-	optional status fields off
+
+# == standard binding inventory (non-optlist) ==
+# name <TAB> guard <TAB> resolved startup value <TAB> classification <TAB> setter <TAB> saved <TAB> rationale
+bind.command_keys	always	standard native bindings	locked-presentation	cmd.c / options.c	-	no runtime rebinding; bind keys denied
+bind.number_pad	always	off	locked-presentation	cmd.c / options.c	-	classic single-keystroke movement
+bind.numpad_meta_prefixes	always	not applicable (number_pad off)	locked-presentation	cmd.c / options.c	-	no alternate numpad interpretation
+bind.altmeta	always	off	locked-presentation	cmd.c / options.c	-	no ESC-prefix meta interpretation
+bind.menu_command_keys	always	built-in MENU_* defaults (wintype.h)	locked-presentation	cmd.c / options.c	-	menu_select_all '.', menu_deselect_all '-', menu_invert_all '@', menu_select_page ',', menu_deselect_page '\', menu_invert_page '~', menu_first_page '^', menu_last_page '|', menu_next_page '>', menu_previous_page '<', menu_shift_left '{', menu_shift_right '}', menu_search ':'
+bind.user_key_binding	always	denied	unavailable-external	cmd.c / options.c	-	bind_key(user=true) gated; only core reset_commands/user=false allowed
+bind.symbol_set_loading	always	denied	unavailable-external	cmd.c / options.c	-	load_symset/parsesymbols gated
+bind.mouse_input	always	denied	unavailable-external	cmd.c / options.c	-	WC_MOUSE_SUPPORT not advertised
 
 # == symbol / appearance state (non-optlist) ==
 # name <TAB> guard <TAB> resolved startup value <TAB> classification <TAB> setter <TAB> saved <TAB> rationale

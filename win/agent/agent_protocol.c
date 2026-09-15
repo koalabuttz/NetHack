@@ -9,10 +9,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* internal ceiling for one assembled logical record (production uses the
- * retained-state policy of doc/agent-interface.md section 6) */
-#define AG_MAX_LOGICAL_BYTES (4u * 1024u * 1024u)
-#define AG_CHUNK_OVERHEAD 160u
+/* The retained public state/content+unacked spool budget of
+ * doc/agent-interface.md section 6. */
+#define AG_MAX_LOGICAL_BYTES AG_MAX_RETAINED_BYTES
+/* conservative fixed overhead of one chunk record around its parts */
+#define AG_CHUNK_OVERHEAD 96u
+/* headroom inside one chunk for a long-text fragment's own envelope */
+#define AG_T_MARGIN 110u
+/* largest number of physical fragments one logical record may expand to */
+#define AG_MAX_FRAGS 8192
 
 /* ------------------------------------------------------------------ */
 /* growable byte buffer                                                */
@@ -75,7 +80,8 @@ ag_put(struct ag_buf *b, const char *s, size_t n)
 {
     if (!ag_reserve(b, n))
         return false;
-    memcpy(b->p + b->len, s, n);
+    if (n)
+        memcpy(b->p + b->len, s, n);
     b->len += n;
     return true;
 }
@@ -112,19 +118,21 @@ static bool
 ag_put_i64(struct ag_buf *b, long long v)
 {
     if (v < 0)
-        return ag_putc(b, '-') && ag_put_u64(b, (uint64_t) (-v));
+        return ag_putc(b, '-') && ag_put_u64(b, (uint64_t) (-(v + 1)) + 1u);
     return ag_put_u64(b, (uint64_t) v);
 }
 
+/* Write a JSON string literal for the n bytes at s. */
 static bool
-ag_put_jstr(struct ag_buf *b, const char *s)
+ag_put_jstr_n(struct ag_buf *b, const char *s, size_t n)
 {
     static const char hex[] = "0123456789abcdef";
+    size_t i;
 
     if (!ag_putc(b, '"'))
         return false;
-    for (; *s; ++s) {
-        unsigned char c = (unsigned char) *s;
+    for (i = 0; i < n; ++i) {
+        unsigned char c = (unsigned char) s[i];
 
         switch (c) {
         case '"':
@@ -178,6 +186,12 @@ ag_put_jstr(struct ag_buf *b, const char *s)
 }
 
 static bool
+ag_put_jstr(struct ag_buf *b, const char *s)
+{
+    return ag_put_jstr_n(b, s ? s : "", s ? strlen(s) : 0);
+}
+
+static bool
 ag_put_color(struct ag_buf *b, uint8_t slot)
 {
     const char *nm = agent_color_name(slot);
@@ -185,12 +199,6 @@ ag_put_color(struct ag_buf *b, uint8_t slot)
     if (!nm)
         nm = "none";
     return ag_put_jstr(b, nm);
-}
-
-static bool
-ag_put_style(struct ag_buf *b, uint8_t style)
-{
-    return ag_put_u64(b, style);
 }
 
 /* ------------------------------------------------------------------ */
@@ -201,7 +209,14 @@ struct ag_cur {
     const char *p;
     const char *end;
     int depth;
+    unsigned tokens;
 };
+
+static bool
+ag_tick(struct ag_cur *c)
+{
+    return ++c->tokens <= AG_MAX_TOKENS;
+}
 
 static void
 ag_ws(struct ag_cur *c)
@@ -298,7 +313,7 @@ ag_put_utf8(struct ag_buf *b, unsigned cp)
 static bool
 ag_string(struct ag_cur *c, struct ag_buf *out)
 {
-    if (c->p >= c->end || *c->p != '"')
+    if (c->p >= c->end || *c->p != '"' || !ag_tick(c))
         return false;
     ++c->p;
     for (;;) {
@@ -391,7 +406,11 @@ ag_string(struct ag_cur *c, struct ag_buf *out)
     }
 }
 
-/* Parse one integer.  Rejects fractions, exponents, '+', leading zeros. */
+/* Parse one integer.  Rejects fractions, exponents, '+', leading zeros.
+ * LLONG_MIN is handled explicitly so no negation of the minimum signed value
+ * is ever evaluated. */
+#define AG_I64_MIN (-9223372036854775807LL - 1LL)
+
 static bool
 ag_int(struct ag_cur *c, long long *out, bool *over)
 {
@@ -400,7 +419,7 @@ ag_int(struct ag_cur *c, long long *out, bool *over)
     const char *start;
 
     *over = false;
-    if (c->p >= c->end)
+    if (c->p >= c->end || !ag_tick(c))
         return false;
     if (*c->p == '-') {
         neg = true;
@@ -435,7 +454,11 @@ ag_int(struct ag_cur *c, long long *out, bool *over)
             *over = true;
             return false;
         }
-        *out = (long long) (-(long long) v);
+        if (v == 9223372036854775808ULL) {
+            *out = AG_I64_MIN; /* exact minimum; no negation overflow */
+        } else {
+            *out = -(long long) v;
+        }
     } else {
         if (v > 9223372036854775807ULL) {
             *over = true;
@@ -451,6 +474,8 @@ ag_lit(struct ag_cur *c, const char *word)
 {
     size_t n = strlen(word);
 
+    if (c->p >= c->end || !ag_tick(c))
+        return false;
     if ((size_t) (c->end - c->p) < n || memcmp(c->p, word, n) != 0)
         return false;
     c->p += n;
@@ -466,7 +491,7 @@ ag_skip_object(struct ag_cur *c)
 {
     unsigned keys = 0;
 
-    if (c->depth >= AG_MAX_NESTING)
+    if (c->depth >= AG_MAX_NESTING || !ag_tick(c))
         return false;
     ++c->depth;
     ++c->p; /* '{' */
@@ -506,7 +531,7 @@ ag_skip_object(struct ag_cur *c)
 static bool
 ag_skip_array(struct ag_cur *c)
 {
-    if (c->depth >= AG_MAX_NESTING)
+    if (c->depth >= AG_MAX_NESTING || !ag_tick(c))
         return false;
     ++c->depth;
     ++c->p; /* '[' */
@@ -563,15 +588,21 @@ ag_skip_value(struct ag_cur *c)
 }
 
 /* ------------------------------------------------------------------ */
-/* action parsing                                                      */
+/* small helpers                                                       */
 /* ------------------------------------------------------------------ */
 
-static enum agent_result
-ag_act_fail(struct agent_action *out, enum agent_invalid_code code)
+/* Read a NUL-terminated copy of a decoded key into k, reusing k's storage so
+ * that repeated calls inside a loop do not orphan earlier allocations. */
+static bool
+ag_key_text(struct ag_cur *c, struct ag_buf *k)
 {
-    out->kind = AG_ACT_NONE;
-    out->code = code;
-    return AG_BAD_INPUT;
+    if (!k->p)
+        ag_init(k);
+    k->len = 0;
+    if (!ag_string(c, k) || !ag_reserve(k, 1))
+        return false;
+    k->p[k->len] = '\0';
+    return true;
 }
 
 static bool
@@ -586,6 +617,24 @@ ag_menu_id_ok(const char *s)
         ++s;
     }
     return true;
+}
+
+static bool
+ag_is_counter(long long v, bool over)
+{
+    return !over && v >= 1 && (unsigned long long) v <= AG_COUNTER_MAX;
+}
+
+/* ------------------------------------------------------------------ */
+/* action parsing                                                      */
+/* ------------------------------------------------------------------ */
+
+static enum agent_result
+ag_act_fail(struct agent_action *out, enum agent_invalid_code code)
+{
+    out->kind = AG_ACT_NONE;
+    out->code = code;
+    return AG_BAD_INPUT;
 }
 
 /* Parse the "action" value.  Exactly one tagged shape is accepted. */
@@ -613,16 +662,14 @@ ag_parse_action_value(struct ag_cur *c, struct agent_action *out)
     ag_init(&key);
     for (;;) {
         ag_ws(c);
-        ag_init(&key);
-        if (!ag_string(c, &key)) {
+        if (!ag_key_text(c, &key)) {
             ag_free(&key);
             return ag_act_fail(out, AG_INV_SCHEMA);
         }
-        if (key.len >= AG_MAX_LINE_BYTES || !ag_reserve(&key, 1)) {
+        if (key.len >= AG_MAX_LINE_BYTES) {
             ag_free(&key);
             return ag_act_fail(out, AG_INV_SCHEMA);
         }
-        key.p[key.len] = '\0';
         ag_ws(c);
         if (c->p >= c->end || *c->p != ':') {
             ag_free(&key);
@@ -670,9 +717,8 @@ ag_parse_action_value(struct ag_cur *c, struct agent_action *out)
             seen_pos = true;
             ++shapes;
             ag_ws(c);
-            if (c->p >= c->end || *c->p != '[')
-                goto bad;
-            if (c->depth >= AG_MAX_NESTING)
+            if (c->p >= c->end || *c->p != '['
+                || c->depth >= AG_MAX_NESTING)
                 goto bad;
             ++c->depth;
             ++c->p;
@@ -691,7 +737,10 @@ ag_parse_action_value(struct ag_cur *c, struct agent_action *out)
                 goto bad;
             ++c->p;
             --c->depth;
-            if (x < 0 || x > 79 || y < 0 || y > 20)
+            /* column zero is the internal native sentinel only and is never
+             * accepted over the wire */
+            if (x < AG_MAP_MIN_X || x > AG_MAP_MAX_X || y < AG_MAP_MIN_Y
+                || y > AG_MAP_MAX_Y)
                 goto range;
             out->px = (int) x;
             out->py = (int) y;
@@ -702,9 +751,10 @@ ag_parse_action_value(struct ag_cur *c, struct agent_action *out)
             if (seen_mod || !ag_int(c, &v, &over))
                 goto bad;
             seen_mod = true;
-            if (over || v < 0 || v > 255)
+            /* mod is frozen to 0 in v1 */
+            if (over || v != 0)
                 goto range;
-            out->pmod = (int) v;
+            out->pmod = 0;
         } else if (strcmp(key.p, "yn") == 0) {
             long long v;
             bool over;
@@ -743,17 +793,16 @@ ag_parse_action_value(struct ag_cur *c, struct agent_action *out)
                 ag_free(&t);
                 goto badfree;
             }
-            if (t.len > 32) {
+            if (t.len + 1 > AG_ID_STR_MAX) {
                 ag_free(&t);
                 goto toobig;
             }
-            memcpy(out->text, t.p ? t.p : "", t.len);
-            out->text[t.len] = '\0';
-            if (!ag_menu_id_ok(out->text)) {
+            memcpy(out->menu, t.p ? t.p : "", t.len);
+            out->menu[t.len] = '\0';
+            if (!ag_menu_id_ok(out->menu)) {
                 ag_free(&t);
                 goto badfree;
             }
-            out->menu = out->text;
             ag_free(&t);
         } else if (strcmp(key.p, "commit") == 0) {
             size_t n = 0;
@@ -762,9 +811,8 @@ ag_parse_action_value(struct ag_cur *c, struct agent_action *out)
                 goto bad;
             seen_commit = true;
             ag_ws(c);
-            if (c->p >= c->end || *c->p != '[')
-                goto bad;
-            if (c->depth >= AG_MAX_NESTING)
+            if (c->p >= c->end || *c->p != '['
+                || c->depth >= AG_MAX_NESTING)
                 goto bad;
             ++c->depth;
             ++c->p;
@@ -778,7 +826,8 @@ ag_parse_action_value(struct ag_cur *c, struct agent_action *out)
                     bool over;
 
                     ag_ws(c);
-                    if (c->p >= c->end || *c->p != '[')
+                    if (c->p >= c->end || *c->p != '['
+                        || c->depth >= AG_MAX_NESTING)
                         goto bad;
                     ++c->depth;
                     ++c->p;
@@ -799,13 +848,10 @@ ag_parse_action_value(struct ag_cur *c, struct agent_action *out)
                     --c->depth;
                     if (r < 1 || r > AG_MAX_MENU_ROWS)
                         goto range;
-                    if (cnt < -1 || cnt == 0)
+                    if (cnt < -1 || cnt == 0 || cnt > AG_COUNT_MAX)
                         goto range;
-                    if (cnt > AG_COUNT_MAX)
-                        goto range;
-                    if (n >= AG_MAX_MENU_ROWS || n >= out->commit_cap)
-                        goto toobig;
-                    if (!out->commit)
+                    if (n >= AG_MAX_MENU_ROWS || n >= out->commit_cap
+                        || !out->commit)
                         goto toobig;
                     out->commit[n].r = (long) r;
                     out->commit[n].count = (long) cnt;
@@ -853,7 +899,6 @@ ag_parse_action_value(struct ag_cur *c, struct agent_action *out)
         return ag_act_fail(out, AG_INV_SCHEMA);
     }
 
-    /* exactly one tagged shape, with its optional companions only */
     if (shapes != 1)
         return ag_act_fail(out, AG_INV_SCHEMA);
     if (seen_key)
@@ -871,15 +916,12 @@ ag_parse_action_value(struct ag_cur *c, struct agent_action *out)
     else if (seen_ack)
         out->kind = AG_ACT_ACK;
 
-    /* companion fields are only legal with their shape */
     if (seen_mod && !seen_pos)
         return ag_act_fail(out, AG_INV_SCHEMA);
     if (seen_count && !seen_yn)
         return ag_act_fail(out, AG_INV_SCHEMA);
-    if (seen_pos && !seen_mod) {
-        out->pmod = 0; /* mod is explicit; its absence is invalid */
+    if (seen_pos && !seen_mod)
         return ag_act_fail(out, AG_INV_SCHEMA);
-    }
     if (seen_menu && !seen_commit)
         return ag_act_fail(out, AG_INV_SCHEMA);
     return AG_OK;
@@ -928,9 +970,10 @@ agent_parse_action(const char *buf, size_t len, struct agent_action *out)
     c.p = buf;
     c.end = buf + len;
     c.depth = 0;
+    c.tokens = 0;
 
     ag_ws(&c);
-    if (c.p >= c.end || *c.p != '{')
+    if (c.p >= c.end || *c.p != '{' || !ag_tick(&c))
         return ag_act_fail(out, AG_INV_SCHEMA);
     ++c.depth;
     ++c.p;
@@ -941,16 +984,14 @@ agent_parse_action(const char *buf, size_t len, struct agent_action *out)
     ag_init(&key);
     for (;;) {
         ag_ws(&c);
-        ag_init(&key);
-        if (!ag_string(&c, &key)) {
+        if (!ag_key_text(&c, &key)) {
             ag_free(&key);
             return ag_act_fail(out, AG_INV_SCHEMA);
         }
-        if (key.len >= AG_MAX_LINE_BYTES || !ag_reserve(&key, 1)) {
+        if (key.len >= AG_MAX_LINE_BYTES) {
             ag_free(&key);
             return ag_act_fail(out, AG_INV_SCHEMA);
         }
-        key.p[key.len] = '\0';
         ag_ws(&c);
         if (c.p >= c.end || *c.p != ':') {
             ag_free(&key);
@@ -991,9 +1032,7 @@ agent_parse_action(const char *buf, size_t len, struct agent_action *out)
             if (have_seq || !ag_int(&c, &v, &over))
                 goto schema;
             have_seq = true;
-            if (over || v < 1)
-                goto range;
-            if ((unsigned long long) v > AG_COUNTER_MAX)
+            if (!ag_is_counter(v, over))
                 goto range;
             out->seq = (uint64_t) v;
             out->has_seq = true;
@@ -1004,9 +1043,7 @@ agent_parse_action(const char *buf, size_t len, struct agent_action *out)
             if (have_id || !ag_int(&c, &v, &over))
                 goto schema;
             have_id = true;
-            if (over || v < 1)
-                goto range;
-            if ((unsigned long long) v > AG_COUNTER_MAX)
+            if (!ag_is_counter(v, over))
                 goto range;
             out->id = (uint64_t) v;
         } else if (strcmp(key.p, "action") == 0) {
@@ -1057,6 +1094,362 @@ schemafree:
 }
 
 /* ------------------------------------------------------------------ */
+/* strict transport auxiliary parsing                                  */
+/* ------------------------------------------------------------------ */
+
+/* One strict object parser for ack_seq / ack_chunk / get_page.  It enforces
+ * the exact key set, rejects duplicate keys, requires v==1, bounds every
+ * integer, and rejects trailing content. */
+enum agent_result
+agent_parse_aux(const char *buf, size_t len, struct agent_aux *out)
+{
+    static const char *const ack_seq_keys[] = { "v", "type", "seq" };
+    static const char *const ack_chunk_keys[] = { "v", "type", "rid", "i" };
+    static const char *const get_page_keys[] = { "v", "type", "id", "content",
+                                                 "page" };
+    const char *const *allowed = ack_seq_keys;
+    unsigned nallowed = 3;
+    struct ag_cur c;
+    struct ag_buf key, val;
+    char type[16];
+    bool have_v = false, have_type = false;
+    bool have_seq = false, have_rid = false, have_i = false;
+    bool have_id = false, have_content = false, have_page = false;
+    unsigned seen_any = 0;
+
+    if (!buf || !out)
+        return AG_INTERNAL;
+    memset(out, 0, sizeof *out);
+    out->kind = AG_AUX_NONE;
+    out->code = AG_INV_NONE;
+    if (len == 0 || len > AG_MAX_LINE_BYTES)
+        goto schema;
+    if (memchr(buf, 0, len) != (const void *) 0)
+        goto schema;
+
+    /* first pass: the exact key set requires knowing the type */
+    {
+        struct ag_cur t;
+        struct ag_buf tk;
+        char prev[AG_MAX_KEYS_PER_OBJECT][32];
+        unsigned nprev = 0, i;
+        bool found = false;
+
+        t.p = buf;
+        t.end = buf + len;
+        t.depth = 0;
+        t.tokens = 0;
+        ag_ws(&t);
+        if (t.p >= t.end || *t.p != '{' || !ag_tick(&t))
+            goto schema;
+        ++t.depth;
+        ++t.p;
+        ag_init(&tk);
+        for (;;) {
+            ag_ws(&t);
+            if (!ag_key_text(&t, &tk)) {
+                ag_free(&tk);
+                goto schema;
+            }
+            if (tk.len >= sizeof prev[0]) {
+                ag_free(&tk);
+                goto schema;
+            }
+            for (i = 0; i < nprev; ++i)
+                if (strcmp(prev[i], tk.p) == 0) {
+                    ag_free(&tk);
+                    goto schema; /* duplicate key */
+                }
+            if (nprev >= AG_MAX_KEYS_PER_OBJECT) {
+                ag_free(&tk);
+                goto schema;
+            }
+            strcpy(prev[nprev++], tk.p);
+            ag_ws(&t);
+            if (t.p >= t.end || *t.p != ':') {
+                ag_free(&tk);
+                goto schema;
+            }
+            ++t.p;
+            ag_ws(&t);
+            if (strcmp(tk.p, "type") == 0) {
+                struct ag_buf tv;
+
+                ag_init(&tv);
+                if (!ag_string(&t, &tv) || tv.len + 1 > sizeof type) {
+                    ag_free(&tv);
+                    ag_free(&tk);
+                    goto schema;
+                }
+                memcpy(type, tv.p ? tv.p : "", tv.len);
+                type[tv.len] = '\0';
+                ag_free(&tv);
+                found = true;
+            } else if (!ag_skip_value(&t)) {
+                ag_free(&tk);
+                goto schema;
+            }
+            ag_ws(&t);
+            if (t.p < t.end && *t.p == ',') {
+                ++t.p;
+                continue;
+            }
+            if (t.p < t.end && *t.p == '}') {
+                ++t.p;
+                break;
+            }
+            ag_free(&tk);
+            goto schema;
+        }
+        ag_free(&tk);
+        ag_ws(&t);
+        if (t.p != t.end || !found)
+            goto schema;
+    }
+
+    if (strcmp(type, "ack_seq") == 0) {
+        out->kind = AG_AUX_ACK_SEQ;
+        allowed = ack_seq_keys;
+        nallowed = 3;
+    } else if (strcmp(type, "ack_chunk") == 0) {
+        out->kind = AG_AUX_ACK_CHUNK;
+        allowed = ack_chunk_keys;
+        nallowed = 4;
+    } else if (strcmp(type, "get_page") == 0) {
+        out->kind = AG_AUX_GET_PAGE;
+        allowed = get_page_keys;
+        nallowed = 5;
+    } else {
+        goto schema;
+    }
+
+    c.p = buf;
+    c.end = buf + len;
+    c.depth = 0;
+    c.tokens = 0;
+    ag_ws(&c);
+    if (c.p >= c.end || *c.p != '{' || !ag_tick(&c))
+        goto schema;
+    ++c.depth;
+    ++c.p;
+    ag_ws(&c);
+    if (c.p < c.end && *c.p == '}')
+        goto schema;
+
+    ag_init(&key);
+    ag_init(&val);
+    for (;;) {
+        unsigned i;
+        bool matched = false;
+
+        ag_ws(&c);
+        if (!ag_key_text(&c, &key)) {
+            ag_free(&key);
+            ag_free(&val);
+            goto schema;
+        }
+        ag_ws(&c);
+        if (c.p >= c.end || *c.p != ':') {
+            ag_free(&key);
+            ag_free(&val);
+            goto schema;
+        }
+        for (i = 0; i < nallowed; ++i) {
+            if (strcmp(key.p, allowed[i]) == 0) {
+                if (seen_any & (1u << i)) {
+                    ag_free(&key);
+                    ag_free(&val);
+                    goto schema; /* duplicate key */
+                }
+                seen_any |= (1u << i);
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            ag_free(&key);
+            ag_free(&val);
+            goto schema; /* additional property */
+        }
+        ++c.p;
+        ag_ws(&c);
+
+        if (strcmp(key.p, "v") == 0) {
+            long long v;
+            bool over;
+
+            if (!ag_int(&c, &v, &over)) {
+                ag_free(&key);
+                ag_free(&val);
+                goto schema;
+            }
+            have_v = true;
+            if (over || v != AG_VERSION) {
+                ag_free(&key);
+                ag_free(&val);
+                goto range;
+            }
+        } else if (strcmp(key.p, "type") == 0) {
+            struct ag_buf t;
+
+            ag_init(&t);
+            if (!ag_string(&c, &t)) {
+                ag_free(&t);
+                ag_free(&key);
+                ag_free(&val);
+                goto schema;
+            }
+            have_type = true;
+            ag_free(&t);
+        } else if (strcmp(key.p, "seq") == 0) {
+            long long v;
+            bool over;
+
+            if (!ag_int(&c, &v, &over)) {
+                ag_free(&key);
+                ag_free(&val);
+                goto schema;
+            }
+            have_seq = true;
+            if (!ag_is_counter(v, over)) {
+                ag_free(&key);
+                ag_free(&val);
+                goto range;
+            }
+            out->seq = (uint64_t) v;
+        } else if (strcmp(key.p, "rid") == 0) {
+            long long v;
+            bool over;
+
+            if (!ag_int(&c, &v, &over)) {
+                ag_free(&key);
+                ag_free(&val);
+                goto schema;
+            }
+            have_rid = true;
+            if (!ag_is_counter(v, over)) {
+                ag_free(&key);
+                ag_free(&val);
+                goto range;
+            }
+            out->rid = (uint64_t) v;
+        } else if (strcmp(key.p, "i") == 0) {
+            long long v;
+            bool over;
+
+            if (!ag_int(&c, &v, &over)) {
+                ag_free(&key);
+                ag_free(&val);
+                goto schema;
+            }
+            have_i = true;
+            if (over || v < 0) {
+                ag_free(&key);
+                ag_free(&val);
+                goto range;
+            }
+            out->i = (long) v;
+        } else if (strcmp(key.p, "id") == 0) {
+            long long v;
+            bool over;
+
+            if (!ag_int(&c, &v, &over)) {
+                ag_free(&key);
+                ag_free(&val);
+                goto schema;
+            }
+            have_id = true;
+            if (!ag_is_counter(v, over)) {
+                ag_free(&key);
+                ag_free(&val);
+                goto range;
+            }
+            out->id = (uint64_t) v;
+        } else if (strcmp(key.p, "content") == 0) {
+            struct ag_buf t;
+
+            ag_init(&t);
+            if (!ag_string(&c, &t)) {
+                ag_free(&t);
+                ag_free(&key);
+                ag_free(&val);
+                goto schema;
+            }
+            if (t.len + 1 > sizeof out->content) {
+                ag_free(&t);
+                ag_free(&key);
+                ag_free(&val);
+                goto range;
+            }
+            memcpy(out->content, t.p ? t.p : "", t.len);
+            out->content[t.len] = '\0';
+            if (t.len < 2 || out->content[0] != 'c'
+                || out->content[1] < '1' || out->content[1] > '9') {
+                ag_free(&t);
+                ag_free(&key);
+                ag_free(&val);
+                goto schema;
+            }
+            have_content = true;
+            ag_free(&t);
+        } else { /* page */
+            long long v;
+            bool over;
+
+            if (!ag_int(&c, &v, &over)) {
+                ag_free(&key);
+                ag_free(&val);
+                goto schema;
+            }
+            have_page = true;
+            if (over || v < 0 || v >= AG_MAX_PAGES) {
+                ag_free(&key);
+                ag_free(&val);
+                goto range;
+            }
+            out->page = (long) v;
+        }
+
+        ag_free(&key);
+        ag_free(&val);
+        ag_ws(&c);
+        if (c.p < c.end && *c.p == ',') {
+            ++c.p;
+            continue;
+        }
+        if (c.p < c.end && *c.p == '}') {
+            ++c.p;
+            --c.depth;
+            break;
+        }
+        goto schema;
+    }
+
+    ag_ws(&c);
+    if (c.p != c.end)
+        goto schema;
+    if (!have_v || !have_type)
+        goto schema;
+    if (out->kind == AG_AUX_ACK_SEQ && !have_seq)
+        goto schema;
+    if (out->kind == AG_AUX_ACK_CHUNK && (!have_rid || !have_i))
+        goto schema;
+    if (out->kind == AG_AUX_GET_PAGE
+        && (!have_id || !have_content || !have_page))
+        goto schema;
+    return AG_OK;
+
+schema:
+    out->kind = AG_AUX_NONE;
+    out->code = AG_INV_SCHEMA;
+    return AG_BAD_INPUT;
+range:
+    out->kind = AG_AUX_NONE;
+    out->code = AG_INV_RANGE;
+    return AG_BAD_INPUT;
+}
+
+/* ------------------------------------------------------------------ */
 /* parts: one enumeration drives both the plain object and the chunks  */
 /* ------------------------------------------------------------------ */
 
@@ -1073,11 +1466,18 @@ enum ag_part_kind {
     AG_P_NEED
 };
 
+/* long-text field identity */
+enum { AG_TF_NONE = 0, AG_TF_TEXT = 1, AG_TF_TITLE = 2 };
+
 struct ag_part {
     int kind;
-    const char *key; /* header key or status member name, else NULL */
-    size_t off;
-    size_t len;
+    const char *key;   /* header key or status member name */
+    size_t off, len;   /* value JSON (full text) */
+    size_t head_off, head_len; /* element JSON with an empty text field */
+    long ref;          /* event id for msg/hist */
+    int field;         /* AG_TF_* */
+    const char *raw;   /* raw text bytes (not JSON-escaped) */
+    size_t raw_len;
 };
 
 struct ag_parts {
@@ -1104,11 +1504,14 @@ ag_parts_free(struct ag_parts *ps)
     ag_free(&ps->arena);
 }
 
-static bool
+/* Append the len bytes at val (which may be NULL when len is 0) as the value
+ * of one part, returning -1 on failure. */
+static long
 ag_parts_add(struct ag_parts *ps, int kind, const char *key, const char *val,
              size_t vlen)
 {
     struct ag_part *p;
+    size_t off;
 
     if (ps->n == ps->cap) {
         size_t ncap = ps->cap ? ps->cap * 2 : 64;
@@ -1116,179 +1519,195 @@ ag_parts_add(struct ag_parts *ps, int kind, const char *key, const char *val,
                                                         ncap * sizeof *nv);
 
         if (!nv)
-            return false;
+            return -1;
         ps->v = nv;
         ps->cap = ncap;
     }
-    p = &ps->v[ps->n++];
+    p = &ps->v[ps->n];
+    memset(p, 0, sizeof *p);
     p->kind = kind;
     p->key = key;
     p->off = ps->arena.len;
     p->len = vlen;
-    if (vlen && val && !ag_put(&ps->arena, val, vlen)) {
-        --ps->n;
-        return false;
-    }
-    return true;
+    off = p->off;
+    if (vlen && val && !ag_put(&ps->arena, val, vlen))
+        return -1;
+    ++ps->n;
+    return (long) off;
+}
+
+static void
+ag_part_set_head(struct ag_part *p, size_t off, size_t len)
+{
+    p->head_off = off;
+    p->head_len = len;
 }
 
 static const char *
-ag_part_val(const struct ag_parts *ps, const struct ag_part *p)
+ag_arena_at(const struct ag_parts *ps, size_t off)
 {
-    return ps->arena.p + p->off;
+    return ps->arena.p + off;
 }
 
-static const char *
-ag_array_key(int kind)
-{
-    switch (kind) {
-    case AG_P_COND:
-        return "cond";
-    case AG_P_PAL:
-        return "pal";
-    case AG_P_MAP:
-        return "map";
-    case AG_P_MSG:
-        return "msg";
-    case AG_P_HIST:
-        return "hist";
-    case AG_P_WIN:
-        return "windows";
-    default:
-        break;
-    }
-    return (const char *) 0;
-}
+/* ------------------------------------------------------------------ */
+/* plain (unlined) observation rendering                                */
+/* ------------------------------------------------------------------ */
 
-/* Render the logical obs record from the parts, in fixed field order. */
 static bool
-ag_render_obs(const struct ag_parts *ps, struct ag_buf *o)
+ag_emit_obj_members(struct ag_buf *o, const struct ag_parts *ps, int kind,
+                    const char *objkey, bool members)
 {
     size_t i;
-    int open = 0; /* 0 none, 1 "s" object, 2 "cond", 3 "pal", 4 "map",
-                     5 "msg", 6 "hist", 7 "windows" */
-    bool first_top = true;
-    bool first_in = true;
+    bool first = true;
 
-    if (!ag_putc(o, '{'))
+    if (!ag_putc(o, '"') || !ag_puts(o, objkey)
+        || !ag_puts(o, members ? "\":{" : "\":["))
+        return false;
+    for (i = 0; i < ps->n; ++i) {
+        const struct ag_part *p = &ps->v[i];
+
+        if (p->kind != kind)
+            continue;
+        if (!first && !ag_putc(o, ','))
+            return false;
+        first = false;
+        if (members) {
+            if (!ag_put_jstr(o, p->key) || !ag_putc(o, ':'))
+                return false;
+        }
+        if (!ag_put(o, ag_arena_at(ps, p->off), p->len))
+            return false;
+    }
+    return ag_putc(o, members ? '}' : ']');
+}
+
+static bool
+ag_emit_fields(struct ag_buf *o, const struct ag_parts *ps, uint64_t d,
+               uint64_t seq)
+{
+    size_t i;
+
+    if (!ag_puts(o, "{\"v\":") || !ag_put_u64(o, AG_VERSION)
+        || !ag_puts(o, ",\"ch\":\"player\",\"type\":\"obs\",\"d\":")
+        || !ag_put_u64(o, d) || !ag_puts(o, ",\"seq\":")
+        || !ag_put_u64(o, seq) || !ag_puts(o, ",\"base\":null,"))
+        return false;
+
+    /* every full observation carries the complete fixed field set, including
+     * empty collections for empty ones */
+    if (!ag_emit_obj_members(o, ps, AG_P_STATUS, "s", true)
+        || !ag_putc(o, ',')
+        || !ag_emit_obj_members(o, ps, AG_P_COND, "cond", false)
+        || !ag_putc(o, ',')
+        || !ag_emit_obj_members(o, ps, AG_P_PAL, "pal", false)
+        || !ag_putc(o, ',')
+        || !ag_emit_obj_members(o, ps, AG_P_MAP, "map", false)
+        || !ag_putc(o, ','))
         return false;
 
     for (i = 0; i < ps->n; ++i) {
         const struct ag_part *p = &ps->v[i];
-        const char *v = ag_part_val(ps, p);
 
-        if (p->kind == AG_P_HEADER || p->kind == AG_P_CUR
-            || p->kind == AG_P_NEED) {
-            if (open) {
-                if (!ag_putc(o, open == 1 ? '}' : ']'))
-                    return false;
-                open = 0;
-            }
-            if (!first_top && !ag_putc(o, ','))
+        if (p->kind == AG_P_CUR) {
+            if (!ag_puts(o, "\"cur\":")
+                || !ag_put(o, ag_arena_at(ps, p->off), p->len))
                 return false;
-            first_top = false;
-            if (p->kind == AG_P_HEADER) {
-                if (!ag_put_jstr(o, p->key) || !ag_putc(o, ':')
-                    || !ag_put(o, v, p->len))
-                    return false;
-            } else {
-                if (!ag_put_jstr(o, p->kind == AG_P_CUR ? "cur" : "need")
-                    || !ag_putc(o, ':') || !ag_put(o, v, p->len))
-                    return false;
-            }
-            continue;
-        }
-        if (p->kind == AG_P_STATUS) {
-            if (open != 1) {
-                if (open && !ag_putc(o, open == 1 ? '}' : ']'))
-                    return false;
-                if (!first_top && !ag_putc(o, ','))
-                    return false;
-                first_top = false;
-                if (!ag_putc(o, '"') || !ag_puts(o, "s")
-                    || !ag_puts(o, "\":{"))
-                    return false;
-                open = 1;
-                first_in = true;
-            }
-            if (!first_in && !ag_putc(o, ','))
-                return false;
-            first_in = false;
-            if (!ag_put_jstr(o, p->key) || !ag_putc(o, ':')
-                || !ag_put(o, v, p->len))
-                return false;
-            continue;
-        }
-        /* array element */
-        {
-            int want = 2;
-            const char *akey = ag_array_key(p->kind);
-
-            if (p->kind == AG_P_PAL)
-                want = 3;
-            else if (p->kind == AG_P_MAP)
-                want = 4;
-            else if (p->kind == AG_P_MSG)
-                want = 5;
-            else if (p->kind == AG_P_HIST)
-                want = 6;
-            else if (p->kind == AG_P_WIN)
-                want = 7;
-            if (open != want) {
-                if (open && !ag_putc(o, open == 1 ? '}' : ']'))
-                    return false;
-                if (!first_top && !ag_putc(o, ','))
-                    return false;
-                first_top = false;
-                if (!ag_putc(o, '"') || !ag_puts(o, akey)
-                    || !ag_puts(o, "\":["))
-                    return false;
-                open = want;
-                first_in = true;
-            }
-            if (!first_in && !ag_putc(o, ','))
-                return false;
-            first_in = false;
-            if (!ag_put(o, v, p->len))
-                return false;
+            break;
         }
     }
-    if (open && !ag_putc(o, open == 1 ? '}' : ']'))
+    if (i == ps->n)
+        return false;
+    if (!ag_putc(o, ','))
+        return false;
+
+    if (!ag_emit_obj_members(o, ps, AG_P_MSG, "msg", false)
+        || !ag_putc(o, ',')
+        || !ag_emit_obj_members(o, ps, AG_P_HIST, "hist", false)
+        || !ag_putc(o, ',')
+        || !ag_emit_obj_members(o, ps, AG_P_WIN, "windows", false)
+        || !ag_putc(o, ','))
+        return false;
+
+    for (i = 0; i < ps->n; ++i) {
+        const struct ag_part *p = &ps->v[i];
+
+        if (p->kind == AG_P_NEED) {
+            if (!ag_puts(o, "\"need\":")
+                || !ag_put(o, ag_arena_at(ps, p->off), p->len))
+                return false;
+            break;
+        }
+    }
+    if (i == ps->n)
         return false;
     return ag_putc(o, '}');
 }
 
-/* Build the ordered part list for one durable commit. */
+/* ------------------------------------------------------------------ */
+/* part construction                                                   */
+/* ------------------------------------------------------------------ */
+
+/* Build the msg/hist/win element JSON twice: once with the real text and once
+ * with an empty text field, so the chunk path can splice long text out. */
+static bool
+ag_add_text_element(struct ag_parts *ps, int kind, long ref, int field,
+                    const char *raw, size_t raw_len,
+                    const struct ag_buf *full, const struct ag_buf *head)
+{
+    long o = ag_parts_add(ps, kind, (const char *) 0,
+                          full->p ? full->p : "", full->len);
+    struct ag_part *p;
+
+    if (o < 0)
+        return false;
+    p = &ps->v[ps->n - 1];
+    p->ref = ref;
+    p->field = field;
+    p->raw = raw;
+    p->raw_len = raw_len;
+    if (raw_len) {
+        size_t off = ps->arena.len;
+
+        if (!ag_put(&ps->arena, head->p ? head->p : "", head->len))
+            return false;
+        ag_part_set_head(p, off, head->len);
+    }
+    return true;
+}
+
+#define AG_EMIT_SIMPLE(kind, key)                                            \
+    do {                                                                     \
+        if (ok)                                                              \
+            ok = (ag_parts_add(ps, (kind), (key), b.p ? b.p : "", b.len)     \
+                  >= 0);                                                     \
+        b.len = 0;                                                           \
+    } while (0)
+
 static bool
 ag_build_parts(struct ag_parts *ps, const struct agent_view *v,
-               const struct agent_need *need, uint64_t d, uint64_t seq)
+               const struct agent_need *need, uint64_t seq)
 {
-    struct ag_buf b;
+    struct ag_buf b, head;
     size_t i, j;
     bool ok = true;
     const char *mname;
 
     ag_init(&b);
-#define EMIT(kind, key)                                                     \
-    do {                                                                    \
-        if (ok)                                                             \
-            ok = ag_parts_add(ps, (kind), (key), b.p ? b.p : "", b.len);     \
-        b.len = 0;                                                          \
-    } while (0)
+    ag_init(&head);
 
-    /* header scalars */
+    /* header scalars: exactly v, ch, type, seq, base.  The logical record's
+     * own delivery counter is carried by the record (or by rid when chunked),
+     * never as a header part. */
     ag_put_u64(&b, AG_VERSION);
-    EMIT(AG_P_HEADER, "v");
+    AG_EMIT_SIMPLE(AG_P_HEADER, "v");
     ag_put_jstr(&b, "player");
-    EMIT(AG_P_HEADER, "ch");
+    AG_EMIT_SIMPLE(AG_P_HEADER, "ch");
     ag_put_jstr(&b, "obs");
-    EMIT(AG_P_HEADER, "type");
-    ag_put_u64(&b, d);
-    EMIT(AG_P_HEADER, "d");
+    AG_EMIT_SIMPLE(AG_P_HEADER, "type");
     ag_put_u64(&b, seq);
-    EMIT(AG_P_HEADER, "seq");
+    AG_EMIT_SIMPLE(AG_P_HEADER, "seq");
     ag_puts(&b, "null");
-    EMIT(AG_P_HEADER, "base");
+    AG_EMIT_SIMPLE(AG_P_HEADER, "base");
 
     /* status members */
     for (i = 0; i < v->nstatus && ok; ++i) {
@@ -1301,9 +1720,9 @@ ag_build_parts(struct ag_parts *ps, const struct agent_view *v,
         ag_puts(&b, ",\"color\":");
         ag_put_color(&b, s->color);
         ag_puts(&b, ",\"style\":");
-        ag_put_style(&b, s->style);
+        ag_put_u64(&b, s->style);
         ag_putc(&b, '}');
-        EMIT(AG_P_STATUS, s->name);
+        AG_EMIT_SIMPLE(AG_P_STATUS, s->name);
     }
     for (i = 0; i < v->ncond && ok; ++i) {
         const struct agent_cond *cd = &v->cond[i];
@@ -1313,9 +1732,9 @@ ag_build_parts(struct ag_parts *ps, const struct agent_view *v,
         ag_puts(&b, ",\"color\":");
         ag_put_color(&b, cd->color);
         ag_puts(&b, ",\"style\":");
-        ag_put_style(&b, cd->style);
+        ag_put_u64(&b, cd->style);
         ag_putc(&b, '}');
-        EMIT(AG_P_COND, (const char *) 0);
+        AG_EMIT_SIMPLE(AG_P_COND, (const char *) 0);
     }
     for (i = 0; i < v->npal && ok; ++i) {
         ag_putc(&b, '[');
@@ -1325,18 +1744,20 @@ ag_build_parts(struct ag_parts *ps, const struct agent_view *v,
         ag_puts(&b, "\",");
         ag_put_color(&b, v->pal[i].fg);
         ag_putc(&b, ',');
-        ag_put_style(&b, v->pal[i].style);
+        ag_put_u64(&b, v->pal[i].style);
         ag_putc(&b, ',');
         ag_put_color(&b, v->pal[i].frame);
         ag_putc(&b, ']');
-        EMIT(AG_P_PAL, (const char *) 0);
+        AG_EMIT_SIMPLE(AG_P_PAL, (const char *) 0);
     }
+    /* sparse blank omission: an unpainted cell is the declared blank
+     * appearance, so palette id 0 cells are not enumerated */
     for (j = 0; j < AG_MAP_ROWS && ok; ++j) {
         for (i = 0; i < AG_MAP_COLS && ok; ++i) {
             uint16_t id = v->map[j][i];
 
             if (id == 0)
-                continue; /* blank cells are the declared default */
+                continue;
             ag_putc(&b, '[');
             ag_put_u64(&b, i + AG_MAP_MIN_X);
             ag_putc(&b, ',');
@@ -1344,7 +1765,7 @@ ag_build_parts(struct ag_parts *ps, const struct agent_view *v,
             ag_putc(&b, ',');
             ag_put_u64(&b, id);
             ag_putc(&b, ']');
-            EMIT(AG_P_MAP, (const char *) 0);
+            AG_EMIT_SIMPLE(AG_P_MAP, (const char *) 0);
         }
     }
     if (v->has_cursor) {
@@ -1356,37 +1777,71 @@ ag_build_parts(struct ag_parts *ps, const struct agent_view *v,
     } else {
         ag_puts(&b, "null");
     }
-    EMIT(AG_P_CUR, (const char *) 0);
+    AG_EMIT_SIMPLE(AG_P_CUR, (const char *) 0);
 
     for (i = 0; i < v->nmsg && ok; ++i) {
+        if (!ag_is_counter((long long) v->msg[i].e, false)) {
+            ok = false;
+            break;
+        }
         ag_puts(&b, "{\"e\":");
         ag_put_u64(&b, v->msg[i].e);
         ag_puts(&b, ",\"text\":");
         ag_put_jstr(&b, v->msg[i].text ? v->msg[i].text : "");
         ag_puts(&b, ",\"style\":");
-        ag_put_style(&b, v->msg[i].style);
+        ag_put_u64(&b, v->msg[i].style);
         ag_putc(&b, '}');
-        EMIT(AG_P_MSG, (const char *) 0);
+        ag_puts(&head, "{\"e\":");
+        ag_put_u64(&head, v->msg[i].e);
+        ag_puts(&head, ",\"text\":\"\",\"style\":");
+        ag_put_u64(&head, v->msg[i].style);
+        ag_putc(&head, '}');
+        ok = ag_add_text_element(ps, AG_P_MSG, (long) v->msg[i].e, AG_TF_TEXT,
+                                 v->msg[i].text,
+                                 v->msg[i].text ? strlen(v->msg[i].text) : 0,
+                                 &b, &head);
+        b.len = 0;
+        head.len = 0;
     }
     for (i = 0; i < v->nhist && ok; ++i) {
+        if (!ag_is_counter((long long) v->hist[i].e, false)) {
+            ok = false;
+            break;
+        }
         ag_puts(&b, "{\"e\":");
         ag_put_u64(&b, v->hist[i].e);
         ag_puts(&b, ",\"text\":");
         ag_put_jstr(&b, v->hist[i].text ? v->hist[i].text : "");
         ag_puts(&b, ",\"style\":");
-        ag_put_style(&b, v->hist[i].style);
+        ag_put_u64(&b, v->hist[i].style);
         ag_putc(&b, '}');
-        EMIT(AG_P_HIST, (const char *) 0);
+        ag_puts(&head, "{\"e\":");
+        ag_put_u64(&head, v->hist[i].e);
+        ag_puts(&head, ",\"text\":\"\",\"style\":");
+        ag_put_u64(&head, v->hist[i].style);
+        ag_putc(&head, '}');
+        ok = ag_add_text_element(ps, AG_P_HIST, (long) v->hist[i].e,
+                                 AG_TF_TEXT, v->hist[i].text,
+                                 v->hist[i].text
+                                     ? strlen(v->hist[i].text) : 0,
+                                 &b, &head);
+        b.len = 0;
+        head.len = 0;
     }
     for (i = 0; i < v->nwindows && ok; ++i) {
         const struct agent_window *w = &v->windows[i];
+        const char *wid = w->w ? w->w : "w1";
 
+        if (!w->title)
+            ok = false;
+        if (!ok)
+            break;
         ag_puts(&b, "{\"w\":");
-        ag_put_jstr(&b, w->w ? w->w : "w1");
+        ag_put_jstr(&b, wid);
         ag_puts(&b, ",\"kind\":");
         ag_put_jstr(&b, w->kind ? "menu" : "text");
         ag_puts(&b, ",\"title\":");
-        ag_put_jstr(&b, w->title ? w->title : "");
+        ag_put_jstr(&b, w->title);
         if (w->kind) {
             ag_puts(&b, ",\"mode\":");
             mname = agent_menu_mode_name((enum agent_menu_mode) w->mode);
@@ -1397,13 +1852,41 @@ ag_build_parts(struct ag_parts *ps, const struct agent_view *v,
         ag_puts(&b, ",\"pages\":");
         ag_put_u64(&b, (uint64_t) (w->pages < 0 ? 0 : w->pages));
         ag_putc(&b, '}');
-        EMIT(AG_P_WIN, (const char *) 0);
+        ag_puts(&head, "{\"w\":");
+        ag_put_jstr(&head, wid);
+        ag_puts(&head, ",\"kind\":");
+        ag_put_jstr(&head, w->kind ? "menu" : "text");
+        ag_puts(&head, ",\"title\":\"\"");
+        if (w->kind) {
+            ag_puts(&head, ",\"mode\":");
+            mname = agent_menu_mode_name((enum agent_menu_mode) w->mode);
+            ag_put_jstr(&head, mname ? mname : "none");
+        }
+        ag_puts(&head, ",\"content\":");
+        ag_put_jstr(&head, w->content ? w->content : "c1");
+        ag_puts(&head, ",\"pages\":");
+        ag_put_u64(&head, (uint64_t) (w->pages < 0 ? 0 : w->pages));
+        ag_putc(&head, '}');
+        ok = ag_add_text_element(ps, AG_P_WIN, 0, AG_TF_TITLE, w->title,
+                                 strlen(w->title), &b, &head);
+        b.len = 0;
+        head.len = 0;
+        /* the window element needs its id string for the t-part path */
+        if (ok) {
+            struct ag_part *p = &ps->v[ps->n - 1];
+
+            p->key = wid;
+        }
     }
 
     /* need */
     if (!need || need->kind == AG_NEED_NONE) {
         ag_puts(&b, "null");
     } else {
+        if (!ag_is_counter((long long) need->id, false)) {
+            ok = false;
+            goto out;
+        }
         ag_puts(&b, "{\"id\":");
         ag_put_u64(&b, need->id);
         ag_puts(&b, ",\"kind\":");
@@ -1432,11 +1915,8 @@ ag_build_parts(struct ag_parts *ps, const struct agent_view *v,
         case AG_NEED_MENU:
             ag_put_jstr(&b, "menu");
             break;
-        case AG_NEED_ACK:
-            ag_put_jstr(&b, "ack");
-            break;
         default:
-            ag_put_jstr(&b, "command");
+            ag_put_jstr(&b, "ack");
             break;
         }
         if (need->prompt) {
@@ -1490,21 +1970,44 @@ ag_build_parts(struct ag_parts *ps, const struct agent_view *v,
         }
         ag_putc(&b, '}');
     }
-    EMIT(AG_P_NEED, (const char *) 0);
+    AG_EMIT_SIMPLE(AG_P_NEED, (const char *) 0);
 
-#undef EMIT
-
+out:
     ag_free(&b);
+    ag_free(&head);
     return ok && !ps->arena.ovf;
 }
 
-/* Render one part as its chunk-grammar fragment. */
+#undef AG_EMIT_SIMPLE
+
+/* ------------------------------------------------------------------ */
+/* chunk fragments                                                     */
+/* ------------------------------------------------------------------ */
+
+struct ag_frag {
+    size_t off;   /* offset into the caller's scratch buffer */
+    size_t len;
+};
+
+/* Trim n so that the slice never ends inside a UTF-8 sequence. */
+static size_t
+ag_utf8_floor(const char *s, size_t n)
+{
+    while (n > 0 && ((unsigned char) s[n] & 0xc0) == 0x80)
+        --n;
+    return n;
+}
+
+/* Render one part's chunk fragment(s) into out, appending to the fragment
+ * list.  Returns false on failure. */
 static bool
-ag_part_fragment(const struct ag_parts *ps, const struct ag_part *p,
-                 struct ag_buf *o)
+ag_render_part_frags(const struct ag_parts *ps, const struct ag_part *p,
+                     size_t budget, struct ag_buf *scratch,
+                     struct ag_frag *frags, size_t *nfrags, size_t maxfrags)
 {
     const char *tag = "h";
-    size_t vlen = p->len;
+    struct ag_buf one;
+    struct ag_buf t;
 
     switch (p->kind) {
     case AG_P_HEADER:
@@ -1534,22 +2037,129 @@ ag_part_fragment(const struct ag_parts *ps, const struct ag_part *p,
     case AG_P_CUR:
         tag = "cur";
         break;
-    case AG_P_NEED:
+    default:
         tag = "need";
         break;
-    default:
-        break;
     }
-    if (!ag_puts(o, "{\"p\":") || !ag_put_jstr(o, tag))
+
+    ag_init(&one);
+    if (!ag_puts(&one, "{\"p\":") || !ag_put_jstr(&one, tag))
+        goto fail;
+    if (p->key && (p->kind == AG_P_HEADER || p->kind == AG_P_STATUS)) {
+        if (!ag_puts(&one, ",\"k\":") || !ag_put_jstr(&one, p->key))
+            goto fail;
+    }
+    if (!ag_puts(&one, ",\"val\":")
+        || !ag_put(&one, ag_arena_at(ps, p->off), p->len)
+        || !ag_putc(&one, '}'))
+        goto fail;
+
+    if (one.len <= budget) {
+        size_t off = scratch->len;
+
+        if (*nfrags >= maxfrags || !ag_put(scratch, one.p, one.len))
+            goto fail;
+        frags[*nfrags].off = off;
+        frags[*nfrags].len = one.len;
+        ++*nfrags;
+        ag_free(&one);
+        return true;
+    }
+    ag_free(&one);
+
+    /* a long text value is spliced into t parts */
+    if (!p->raw || p->field == AG_TF_NONE)
         return false;
-    if (p->key) {
-        if (!ag_puts(o, ",\"k\":") || !ag_put_jstr(o, p->key))
+    if (p->raw_len > AG_MAX_TEXT_BYTES)
+        return false;
+
+    {
+        size_t off = scratch->len;
+
+        if (*nfrags >= maxfrags
+            || !ag_put(scratch, ag_arena_at(ps, p->head_off), p->head_len))
             return false;
+        frags[*nfrags].off = off;
+        frags[*nfrags].len = p->head_len;
+        ++*nfrags;
     }
-    if (!ag_puts(o, ",\"val\":")
-        || !ag_put(o, ag_part_val(ps, p), vlen))
-        return false;
-    return ag_putc(o, '}');
+
+    {
+        size_t pos = 0;
+        size_t room = budget > AG_T_MARGIN ? budget - AG_T_MARGIN : 0;
+
+        if (room == 0)
+            return false;
+        while (pos < p->raw_len) {
+            size_t take = p->raw_len - pos;
+            size_t off = scratch->len;
+            bool fit = false;
+
+            if (take > room)
+                take = room;
+            take = ag_utf8_floor(p->raw + pos, take);
+            if (take == 0)
+                return false;
+            ag_init(&t);
+            for (;;) {
+                t.len = 0;
+                if (!ag_puts(&t, "{\"p\":\"t\",\"k\":")
+                    || !ag_put_jstr(&t, tag))
+                    goto tfail;
+                if (p->kind == AG_P_WIN) {
+                    if (!ag_puts(&t, ",\"w\":")
+                        || !ag_put_jstr(&t, p->key ? p->key : "w1"))
+                        goto tfail;
+                } else {
+                    if (!ag_puts(&t, ",\"e\":") || !ag_put_i64(&t, p->ref))
+                        goto tfail;
+                }
+                if (!ag_puts(&t, ",\"f\":")
+                    || !ag_put_jstr(&t, p->field == AG_TF_TITLE ? "title"
+                                                                : "text"))
+                    goto tfail;
+                if (!ag_puts(&t, ",\"offset\":") || !ag_put_u64(&t, pos))
+                    goto tfail;
+                if (!ag_puts(&t, ",\"text\":")
+                    || !ag_put_jstr_n(&t, p->raw + pos, take))
+                    goto tfail;
+                if (!ag_puts(&t, ",\"last\":")
+                    || !ag_puts(&t, (pos + take == p->raw_len) ? "true"
+                                                               : "false")
+                    || !ag_putc(&t, '}'))
+                    goto tfail;
+                if (t.len <= budget) {
+                    fit = true;
+                    break;
+                }
+                if (take <= 1)
+                    goto tfail;
+                take = ag_utf8_floor(p->raw + pos, take / 2);
+                if (take == 0)
+                    goto tfail;
+            }
+            if (!fit)
+                goto tfail;
+            if (*nfrags >= maxfrags
+                || !ag_put(scratch, t.p, t.len)) {
+                ag_free(&t);
+                return false;
+            }
+            frags[*nfrags].off = off;
+            frags[*nfrags].len = t.len;
+            ++*nfrags;
+            ag_free(&t);
+            pos += take;
+        }
+    }
+    return true;
+
+tfail:
+    ag_free(&t);
+    return false;
+fail:
+    ag_free(&one);
+    return false;
 }
 
 size_t
@@ -1606,13 +2216,43 @@ ag_write_all(struct agent_session *s, const char *buf, size_t len)
     return AG_OK;
 }
 
-/* Write one physical record: bytes plus LF, retaining it for retry. */
+static bool
+ag_reply_append(struct agent_session *s, const char *buf, size_t len)
+{
+    if (s->reply_len + len > AG_MAX_RETAINED_BYTES)
+        return false;
+    if (s->reply_len + len > s->reply_cap) {
+        size_t ncap = s->reply_cap ? s->reply_cap : 4096;
+        char *np;
+
+        while (ncap < s->reply_len + len)
+            ncap *= 2;
+        if (ncap > AG_MAX_RETAINED_BYTES)
+            ncap = AG_MAX_RETAINED_BYTES;
+        np = (char *) realloc(s->reply, ncap);
+        if (!np)
+            return false;
+        s->reply = np;
+        s->reply_cap = ncap;
+    }
+    memcpy(s->reply + s->reply_len, buf, len);
+    s->reply_len += len;
+    return true;
+}
+
+/* Write one physical record: bytes plus LF, retaining it for retry and, when
+ * collecting, appending it to the retained logical response stream. */
 static enum agent_result
-ag_emit(struct agent_session *s, const char *buf, size_t len, uint64_t d)
+ag_emit(struct agent_session *s, const char *buf, size_t len, uint64_t d,
+        bool collect)
 {
     enum agent_result r;
 
     if (len + 1 > sizeof s->last_line)
+        return AG_LIMIT;
+    if (collect && !ag_reply_append(s, buf, len))
+        return AG_LIMIT;
+    if (collect && !ag_reply_append(s, "\n", 1))
         return AG_LIMIT;
     r = ag_write_all(s, buf, len);
     if (r != AG_OK)
@@ -1640,6 +2280,17 @@ ag_hash(const char *buf, size_t len)
     return h;
 }
 
+/* Advance one output counter, refusing to wrap. */
+static bool
+ag_bump(struct agent_session *s, uint64_t *v)
+{
+    (void) s;
+    if (*v >= AG_COUNTER_MAX)
+        return false;
+    ++*v;
+    return true;
+}
+
 void
 agent_session_init(struct agent_session *s, agent_read_fn rd,
                    agent_write_fn wr, void *io)
@@ -1651,12 +2302,53 @@ agent_session_init(struct agent_session *s, agent_read_fn rd,
     s->limit_line = AG_MAX_LINE_BYTES;
 }
 
+void
+agent_session_free(struct agent_session *s)
+{
+    if (!s)
+        return;
+    if (s->reply)
+        free(s->reply);
+    if (s->action_text)
+        free(s->action_text);
+    s->reply = (char *) 0;
+    s->reply_len = s->reply_cap = 0;
+    s->action_text = (char *) 0;
+    s->action_len = s->action_cap = 0;
+}
+
+static bool
+ag_action_store(struct agent_session *s, const char *buf, size_t len)
+{
+    if (len > AG_MAX_ACTION_BYTES)
+        return false;
+    if (len > s->action_cap) {
+        char *np = (char *) realloc(s->action_text, len ? len : 1);
+
+        if (!np)
+            return false;
+        s->action_text = np;
+        s->action_cap = len;
+    }
+    memcpy(s->action_text, buf, len);
+    s->action_len = len;
+    return true;
+}
+
 enum agent_result
 agent_write_hello(struct agent_session *s)
 {
     struct ag_buf o;
     enum agent_result r;
-    uint64_t d = ++s->next_delivery;
+    uint64_t d;
+
+    if (!s)
+        return AG_INTERNAL;
+    if (s->hello_sent || s->closed)
+        return AG_BAD_INPUT; /* hello is emitted at most once */
+    if (!ag_bump(s, &s->next_delivery))
+        return AG_LIMIT;
+    d = s->next_delivery;
 
     ag_init(&o);
     ag_puts(&o, "{\"v\":1,\"ch\":\"control\",\"type\":\"hello\",\"d\":");
@@ -1672,8 +2364,10 @@ agent_write_hello(struct agent_session *s)
         ag_free(&o);
         return AG_LIMIT;
     }
-    r = ag_emit(s, o.p, o.len, d);
+    r = ag_emit(s, o.p, o.len, d, false);
     ag_free(&o);
+    if (r == AG_OK)
+        s->hello_sent = true;
     return r;
 }
 
@@ -1684,12 +2378,18 @@ agent_write_closed(struct agent_session *s)
                                  "\"type\":\"closed\"}";
     enum agent_result r;
 
+    if (!s)
+        return AG_INTERNAL;
+    if (s->closed_sent)
+        return AG_BAD_INPUT; /* terminal closure is emitted at most once */
     /* exactly the bare closure: no delivery counter, no reason, no id */
     r = ag_write_all(s, closed, sizeof closed - 1);
     if (r == AG_OK)
         r = ag_write_all(s, "\n", 1);
-    if (r == AG_OK)
+    if (r == AG_OK) {
+        s->closed_sent = true;
         s->closed = true;
+    }
     return r;
 }
 
@@ -1700,11 +2400,16 @@ agent_write_invalid(struct agent_session *s, enum agent_invalid_code code)
                                          "incomplete" };
     struct ag_buf o;
     enum agent_result r;
-    uint64_t d = ++s->next_delivery;
+    uint64_t d;
     const char *nm = "schema";
 
+    if (!s)
+        return AG_INTERNAL;
     if (code >= AG_INV_SCHEMA && code <= AG_INV_INCOMPLETE)
         nm = names[code - 1];
+    if (!ag_bump(s, &s->next_delivery))
+        return AG_LIMIT;
+    d = s->next_delivery;
     ag_init(&o);
     ag_puts(&o, "{\"v\":1,\"ch\":\"control\",\"type\":\"invalid\",\"d\":");
     ag_put_u64(&o, d);
@@ -1715,7 +2420,7 @@ agent_write_invalid(struct agent_session *s, enum agent_invalid_code code)
         ag_free(&o);
         return AG_LIMIT;
     }
-    r = ag_emit(s, o.p, o.len, d);
+    r = ag_emit(s, o.p, o.len, d, false);
     ag_free(&o);
     if (r == AG_OK) {
         ++s->invalids;
@@ -1727,56 +2432,56 @@ agent_write_invalid(struct agent_session *s, enum agent_invalid_code code)
 enum agent_result
 agent_retry_last(struct agent_session *s)
 {
-    if (s->last_line_len == 0)
+    if (!s || s->last_line_len == 0)
         return AG_INTERNAL;
     /* identical bytes and the original delivery counter */
     return ag_write_all(s, s->last_line, s->last_line_len);
 }
 
-/* Emit an oversized logical record as an ordered chunk stream. */
 static enum agent_result
 ag_emit_chunked(struct agent_session *s, const struct ag_parts *ps)
 {
-    enum agent_result r;
-    size_t i, nchunks, budget;
-    size_t *lens;
-    size_t *chunk_of;
-    struct ag_buf o;
+    enum agent_result r = AG_OK;
+    size_t budget, i, nfrags = 0, nchunks;
+    struct ag_frag *frags;
+    size_t *lens, *chunk_of;
+    struct ag_buf scratch, o;
     uint64_t rid = 0;
 
-    r = AG_OK;
-
-    if (ps->n > (size_t) 65535)
+    if (ps->n > AG_MAX_FRAGS)
         return AG_LIMIT;
-    lens = (size_t *) calloc(ps->n ? ps->n : 1, sizeof *lens);
-    chunk_of = (size_t *) calloc(ps->n ? ps->n : 1, sizeof *chunk_of);
-    if (!lens || !chunk_of) {
+    frags = (struct ag_frag *) calloc(AG_MAX_FRAGS, sizeof *frags);
+    lens = (size_t *) calloc(AG_MAX_FRAGS, sizeof *lens);
+    chunk_of = (size_t *) calloc(AG_MAX_FRAGS, sizeof *chunk_of);
+    if (!frags || !lens || !chunk_of) {
+        free(frags);
         free(lens);
         free(chunk_of);
         return AG_INTERNAL;
     }
-    /* measure each fragment */
-    for (i = 0; i < ps->n; ++i) {
-        struct ag_buf f;
+    ag_init(&scratch);
+    ag_init(&o);
 
-        ag_init(&f);
-        if (!ag_part_fragment(ps, &ps->v[i], &f)) {
-            ag_free(&f);
-            free(lens);
-            free(chunk_of);
-            return AG_LIMIT;
-        }
-        lens[i] = f.len;
-        ag_free(&f);
-    }
     budget = s->limit_line > AG_CHUNK_OVERHEAD + 1
                  ? s->limit_line - AG_CHUNK_OVERHEAD - 1
                  : 0;
-    nchunks = agent_chunk_plan(lens, ps->n, budget, chunk_of, 65535);
+    if (budget == 0) {
+        r = AG_LIMIT;
+        goto out;
+    }
+    for (i = 0; i < ps->n; ++i) {
+        if (!ag_render_part_frags(ps, &ps->v[i], budget, &scratch, frags,
+                                  &nfrags, AG_MAX_FRAGS)) {
+            r = AG_LIMIT;
+            goto out;
+        }
+    }
+    for (i = 0; i < nfrags; ++i)
+        lens[i] = frags[i].len;
+    nchunks = agent_chunk_plan(lens, nfrags, budget, chunk_of, 65535);
     if (nchunks == 0) {
-        free(lens);
-        free(chunk_of);
-        return AG_LIMIT;
+        r = AG_LIMIT;
+        goto out;
     }
 
     for (i = 0; i < nchunks; ++i) {
@@ -1784,53 +2489,62 @@ ag_emit_chunked(struct agent_session *s, const struct ag_parts *ps)
         uint64_t d;
         bool last = (i + 1 == nchunks);
 
-        ag_init(&o);
-        d = ++s->next_delivery;
+        if (!ag_bump(s, &s->next_delivery)) {
+            r = AG_LIMIT;
+            goto out;
+        }
+        d = s->next_delivery;
         if (rid == 0)
             rid = d;
-        ag_puts(&o, "{\"v\":1,\"ch\":\"control\",\"type\":\"chunk\",\"d\":");
-        ag_put_u64(&o, d);
-        ag_puts(&o, ",\"rid\":");
-        ag_put_u64(&o, rid);
-        ag_puts(&o, ",\"i\":");
-        ag_put_u64(&o, (uint64_t) i);
-        ag_puts(&o, ",\"last\":");
-        ag_puts(&o, last ? "true" : "false");
-        ag_puts(&o, ",\"parts\":[");
+        o.len = 0;
+        if (!ag_puts(&o, "{\"v\":1,\"ch\":\"control\","
+                         "\"type\":\"chunk\",\"d\":")
+            || !ag_put_u64(&o, d) || !ag_puts(&o, ",\"rid\":")
+            || !ag_put_u64(&o, rid) || !ag_puts(&o, ",\"i\":")
+            || !ag_put_u64(&o, (uint64_t) i) || !ag_puts(&o, ",\"last\":")
+            || !ag_puts(&o, last ? "true" : "false")
+            || !ag_puts(&o, ",\"parts\":[")) {
+            r = AG_LIMIT;
+            goto out;
+        }
         {
             bool first = true;
 
-            for (j = 0; j < ps->n; ++j) {
+            for (j = 0; j < nfrags; ++j) {
                 if (chunk_of[j] != i)
                     continue;
                 if (!first && !ag_putc(&o, ',')) {
                     r = AG_LIMIT;
-                    goto done;
+                    goto out;
                 }
                 first = false;
-                if (!ag_part_fragment(ps, &ps->v[j], &o)) {
+                if (!ag_put(&o, scratch.p + frags[j].off,
+                            frags[j].len)) {
                     r = AG_LIMIT;
-                    goto done;
+                    goto out;
                 }
             }
         }
-        ag_puts(&o, "]}");
+        if (!ag_puts(&o, "]}")) {
+            r = AG_LIMIT;
+            goto out;
+        }
         if (o.ovf) {
             r = AG_LIMIT;
-            goto done;
+            goto out;
         }
-        r = ag_emit(s, o.p, o.len, d);
-        ag_free(&o);
+        r = ag_emit(s, o.p, o.len, d, true);
         if (r != AG_OK)
             goto out;
     }
     s->last_rid = rid;
+    s->last_chunk_count = (long) nchunks;
     r = AG_OK;
-    goto out;
 
-done:
-    ag_free(&o);
 out:
+    ag_free(&scratch);
+    ag_free(&o);
+    free(frags);
     free(lens);
     free(chunk_of);
     return r;
@@ -1847,27 +2561,39 @@ agent_commit(struct agent_session *s, const struct agent_view *v,
 
     if (!s || !v)
         return AG_INTERNAL;
+    if (need && need->kind != AG_NEED_NONE && need->pages > AG_MAX_PAGES)
+        return AG_LIMIT;
 
-    d = ++s->next_delivery;
-    seq = ++s->next_seq;
+    s->reply_len = 0;
+    s->have_reply = false;
+
+    if (!ag_bump(s, &s->next_delivery))
+        return AG_LIMIT;
+    d = s->next_delivery;
+    if (!ag_bump(s, &s->next_seq))
+        return AG_LIMIT;
+    seq = s->next_seq;
 
     ag_parts_init(&ps);
-    if (!ag_build_parts(&ps, v, need, d, seq)) {
+    ag_init(&o);
+    if (!ag_build_parts(&ps, v, need, seq)) {
+        ag_free(&o);
         ag_parts_free(&ps);
         return AG_LIMIT;
     }
-    ag_init(&o);
-    if (!ag_render_obs(&ps, &o) || o.ovf) {
+    if (!ag_emit_fields(&o, &ps, d, seq) || o.ovf) {
         ag_free(&o);
         ag_parts_free(&ps);
         return AG_LIMIT;
     }
 
-    if (o.len + 1 <= s->limit_line) {
-        r = ag_emit(s, o.p, o.len, d);
+    if (!s->force_chunk && o.len + 1 <= s->limit_line) {
+        r = ag_emit(s, o.p, o.len, d, true);
     } else {
         /* the delivery counter for chunk 0 is the one just allocated */
         --s->next_delivery;
+        s->last_rid = 0;
+        s->last_chunk_count = 0;
         r = ag_emit_chunked(s, &ps);
     }
     ag_free(&o);
@@ -1875,29 +2601,44 @@ agent_commit(struct agent_session *s, const struct agent_view *v,
     if (r != AG_OK)
         return r;
 
-    /* publish the outstanding request */
+    /* publish every outstanding-request constraint */
     if (need && need->kind != AG_NEED_NONE) {
         s->outstanding_id = need->id;
         s->outstanding_kind = need->kind;
+        if (need->content) {
+            strncpy(s->need_content, need->content,
+                    sizeof s->need_content - 1);
+            s->need_content[sizeof s->need_content - 1] = '\0';
+        } else {
+            s->need_content[0] = '\0';
+        }
+        if (need->menu) {
+            strncpy(s->need_menu, need->menu, sizeof s->need_menu - 1);
+            s->need_menu[sizeof s->need_menu - 1] = '\0';
+        } else {
+            s->need_menu[0] = '\0';
+        }
+        s->need_x0 = need->x0;
+        s->need_y0 = need->y0;
+        s->need_x1 = need->x1;
+        s->need_y1 = need->y1;
         s->need_pages = need->pages > 0 ? need->pages : 0;
-        s->pages_sent = 0;
-        s->need_content = need->content;
+        memset(s->pages_done, 0, sizeof s->pages_done);
+        s->pages_delivered = 0;
     } else {
         s->outstanding_id = 0;
         s->outstanding_kind = AG_NEED_NONE;
+        s->need_content[0] = '\0';
+        s->need_menu[0] = '\0';
+        s->need_x0 = s->need_y0 = s->need_x1 = s->need_y1 = 0;
         s->need_pages = 0;
-        s->pages_sent = 0;
-        s->need_content = (const char *) 0;
+        memset(s->pages_done, 0, sizeof s->pages_done);
+        s->pages_delivered = 0;
     }
 
-    /* retain this response for the last accepted action */
-    if (s->have_action) {
-        if (s->last_line_len <= sizeof s->last_reply) {
-            memcpy(s->last_reply, s->last_line, s->last_line_len);
-            s->last_reply_len = s->last_line_len;
-            s->have_reply = true;
-        }
-    }
+    /* retain the complete logical response for the last accepted action */
+    if (s->have_action)
+        s->have_reply = true;
     return AG_OK;
 }
 
@@ -1936,229 +2677,37 @@ ag_read_exact_line(struct agent_session *s, char *line, size_t *linelen)
     }
 }
 
-/* Read a small string field of the form "key":<string>. */
 static bool
-ag_get_string_field(const char *line, size_t len, const char *key, char *out,
-                    size_t cap)
+ag_page_delivered(const struct agent_session *s, long page)
 {
-    struct ag_cur c;
-    bool found = false;
-
-    c.p = line;
-    c.end = line + len;
-    c.depth = 0;
-    ag_ws(&c);
-    if (c.p >= c.end || *c.p != '{')
+    if (page < 0 || page >= AG_MAX_PAGES)
         return false;
-    ++c.depth;
-    ++c.p;
-    ag_ws(&c);
-    if (c.p < c.end && *c.p == '}')
-        return false;
-    for (;;) {
-        struct ag_buf k, v;
-
-        ag_ws(&c);
-        ag_init(&k);
-        ag_init(&v);
-        if (!ag_string(&c, &k) || !ag_reserve(&k, 1)) {
-            ag_free(&k);
-            ag_free(&v);
-            return false;
-        }
-        k.p[k.len] = '\0';
-        ag_ws(&c);
-        if (c.p >= c.end || *c.p != ':') {
-            ag_free(&k);
-            ag_free(&v);
-            return false;
-        }
-        ++c.p;
-        ag_ws(&c);
-        if (k.p && strcmp(k.p, key) == 0) {
-            if (!ag_string(&c, &v)) {
-                ag_free(&k);
-                ag_free(&v);
-                return false;
-            }
-            if (v.len + 1 > cap) {
-                ag_free(&k);
-                ag_free(&v);
-                return false;
-            }
-            memcpy(out, v.p ? v.p : "", v.len);
-            out[v.len] = '\0';
-            found = true;
-        } else if (!ag_skip_value(&c)) {
-            ag_free(&k);
-            ag_free(&v);
-            return false;
-        }
-        ag_free(&k);
-        ag_free(&v);
-        ag_ws(&c);
-        if (c.p < c.end && *c.p == ',') {
-            ++c.p;
-            continue;
-        }
-        if (c.p < c.end && *c.p == '}') {
-            ++c.p;
-            break;
-        }
-        return false;
-    }
-    ag_ws(&c);
-    if (c.p != c.end)
-        return false;
-    return found;
+    return (s->pages_done[page / 8] & (1u << (page % 8))) != 0;
 }
 
-/* Strict top-level key set check for a transport auxiliary record: every key
- * must be in the allowed list, each allowed key must appear exactly once, and
- * no other key may appear.  This enforces "no additional properties". */
-static bool
-ag_keys_exact(const char *line, size_t len, const char *const *keys,
-              unsigned n)
+static void
+ag_mark_page(struct agent_session *s, long page)
 {
-    struct ag_cur c;
-    unsigned seen = 0;
-    unsigned i;
-
-    c.p = line;
-    c.end = line + len;
-    c.depth = 0;
-    ag_ws(&c);
-    if (c.p >= c.end || *c.p != '{')
-        return false;
-    ++c.depth;
-    ++c.p;
-    ag_ws(&c);
-    if (c.p < c.end && *c.p == '}')
-        return n == 0;
-    for (;;) {
-        struct ag_buf k;
-        bool matched = false;
-
-        ag_ws(&c);
-        ag_init(&k);
-        if (!ag_string(&c, &k) || !ag_reserve(&k, 1)) {
-            ag_free(&k);
-            return false;
-        }
-        k.p[k.len] = '\0';
-        ag_ws(&c);
-        if (c.p >= c.end || *c.p != ':') {
-            ag_free(&k);
-            return false;
-        }
-        ++c.p;
-        ag_ws(&c);
-        if (!ag_skip_value(&c)) {
-            ag_free(&k);
-            return false;
-        }
-        for (i = 0; i < n; ++i) {
-            if (strcmp(k.p, keys[i]) == 0) {
-                seen |= (1u << i);
-                matched = true;
-                break;
-            }
-        }
-        ag_free(&k);
-        if (!matched)
-            return false;
-        ag_ws(&c);
-        if (c.p < c.end && *c.p == ',') {
-            ++c.p;
-            continue;
-        }
-        if (c.p < c.end && *c.p == '}') {
-            ++c.p;
-            break;
-        }
-        return false;
+    if (page < 0 || page >= AG_MAX_PAGES)
+        return;
+    if (!ag_page_delivered(s, page)) {
+        s->pages_done[page / 8] |= (unsigned char) (1u << (page % 8));
+        ++s->pages_delivered;
     }
-    ag_ws(&c);
-    if (c.p != c.end)
-        return false;
-    return seen == ((n >= 32) ? 0xffffffffu : ((1u << n) - 1u));
-}
-
-static bool
-ag_field_present(const char *line, size_t len, const char *key,
-                 long long *ival, bool *is_int)
-{
-    struct ag_cur c;
-    bool found = false;
-
-    if (is_int)
-        *is_int = false;
-    c.p = line;
-    c.end = line + len;
-    c.depth = 0;
-    ag_ws(&c);
-    if (c.p >= c.end || *c.p != '{')
-        return false;
-    ++c.depth;
-    ++c.p;
-    for (;;) {
-        struct ag_buf k;
-
-        ag_ws(&c);
-        ag_init(&k);
-        if (!ag_string(&c, &k) || !ag_reserve(&k, 1)) {
-            ag_free(&k);
-            return false;
-        }
-        k.p[k.len] = '\0';
-        ag_ws(&c);
-        if (c.p >= c.end || *c.p != ':') {
-            ag_free(&k);
-            return false;
-        }
-        ++c.p;
-        ag_ws(&c);
-        if (k.p && strcmp(k.p, key) == 0) {
-            long long v;
-            bool over;
-
-            if (!ag_int(&c, &v, &over) || over) {
-                ag_free(&k);
-                return false;
-            }
-            if (ival)
-                *ival = v;
-            if (is_int)
-                *is_int = true;
-            found = true;
-        } else if (!ag_skip_value(&c)) {
-            ag_free(&k);
-            return false;
-        }
-        ag_free(&k);
-        ag_ws(&c);
-        if (c.p < c.end && *c.p == ',') {
-            ++c.p;
-            continue;
-        }
-        if (c.p < c.end && *c.p == '}') {
-            ++c.p;
-            break;
-        }
-        return false;
-    }
-    return found;
 }
 
 /* Emit a single page of the outstanding content. */
 static enum agent_result
-ag_emit_page(struct agent_session *s, const char *content, int page,
+ag_emit_page(struct agent_session *s, const char *content, long page,
              int pages)
 {
     struct ag_buf o;
     enum agent_result r;
-    uint64_t d = ++s->next_delivery;
+    uint64_t d;
 
+    if (!ag_bump(s, &s->next_delivery))
+        return AG_LIMIT;
+    d = s->next_delivery;
     ag_init(&o);
     ag_puts(&o, "{\"v\":1,\"ch\":\"control\",\"type\":\"page\",\"d\":");
     ag_put_u64(&o, d);
@@ -2173,9 +2722,158 @@ ag_emit_page(struct agent_session *s, const char *content, int page,
         ag_free(&o);
         return AG_LIMIT;
     }
-    r = ag_emit(s, o.p, o.len, d);
+    r = ag_emit(s, o.p, o.len, d, false);
     ag_free(&o);
     return r;
+}
+
+/* Handle one parsed transport auxiliary.  Returns AG_OK to continue reading,
+ * AG_IO on a transport failure, or AG_BAD_INPUT after emitting invalid. */
+static enum agent_result
+ag_handle_aux(struct agent_session *s, struct agent_aux *aux)
+{
+    switch (aux->kind) {
+    case AG_AUX_ACK_SEQ:
+        if (aux->seq > s->next_seq) {
+            if (agent_write_invalid(s, AG_INV_STALE) != AG_OK)
+                return AG_IO;
+            return AG_BAD_INPUT;
+        }
+        s->acked_seq = aux->seq;
+        return AG_OK;
+
+    case AG_AUX_ACK_CHUNK:
+        if (s->last_rid == 0 || aux->rid != s->last_rid
+            || s->last_chunk_count <= 0) {
+            if (agent_write_invalid(s, AG_INV_STALE) != AG_OK)
+                return AG_IO;
+            return AG_BAD_INPUT;
+        }
+        if (aux->i >= s->last_chunk_count) {
+            if (agent_write_invalid(s, AG_INV_RANGE) != AG_OK)
+                return AG_IO;
+            return AG_BAD_INPUT;
+        }
+        /* cumulative, contiguous: a repeat of an already acknowledged index
+         * is idempotent, the next index advances, anything beyond is a gap */
+        if ((uint64_t) aux->i > s->acked_chunk + 1) {
+            if (agent_write_invalid(s, AG_INV_INCOMPLETE) != AG_OK)
+                return AG_IO;
+            return AG_BAD_INPUT;
+        }
+        if ((uint64_t) aux->i > s->acked_chunk)
+            s->acked_chunk = (uint64_t) aux->i;
+        return AG_OK;
+
+    case AG_AUX_GET_PAGE:
+        if (s->outstanding_id == 0 || aux->id != s->outstanding_id) {
+            if (agent_write_invalid(s, AG_INV_KIND) != AG_OK)
+                return AG_IO;
+            return AG_BAD_INPUT;
+        }
+        if (s->need_content[0] == '\0'
+            || strcmp(aux->content, s->need_content) != 0
+            || aux->page >= s->need_pages) {
+            if (agent_write_invalid(s, AG_INV_RANGE) != AG_OK)
+                return AG_IO;
+            return AG_BAD_INPUT;
+        }
+        /* the request-driven response is the acknowledgement; a repeat is a
+         * retry and is re-sent without changing the delivered set */
+        ag_mark_page(s, aux->page);
+        if (ag_emit_page(s, aux->content, aux->page, s->need_pages) != AG_OK)
+            return AG_IO;
+        return AG_OK;
+
+    default:
+        break;
+    }
+    if (agent_write_invalid(s, AG_INV_SCHEMA) != AG_OK)
+        return AG_IO;
+    return AG_BAD_INPUT;
+}
+
+/* Peek the "type" of a record, strictly validating the object as we go. */
+static bool
+ag_peek_type(const char *line, size_t len, char *type, size_t cap)
+{
+    struct ag_cur c;
+    struct ag_buf key;
+    char prev[AG_MAX_KEYS_PER_OBJECT][32];
+    unsigned nprev = 0;
+    bool found = false;
+
+    if (len == 0 || memchr(line, 0, len) != (const void *) 0)
+        return false;
+    c.p = line;
+    c.end = line + len;
+    c.depth = 0;
+    c.tokens = 0;
+    ag_ws(&c);
+    if (c.p >= c.end || *c.p != '{' || !ag_tick(&c))
+        return false;
+    ++c.depth;
+    ++c.p;
+    ag_ws(&c);
+    if (c.p < c.end && *c.p == '}')
+        return false;
+    ag_init(&key);
+    for (;;) {
+        unsigned i;
+
+        ag_ws(&c);
+        if (!ag_key_text(&c, &key)) {
+            ag_free(&key);
+            return false;
+        }
+        if (key.len >= sizeof prev[0] || nprev >= AG_MAX_KEYS_PER_OBJECT) {
+            ag_free(&key);
+            return false;
+        }
+        for (i = 0; i < nprev; ++i)
+            if (strcmp(prev[i], key.p) == 0) {
+                ag_free(&key);
+                return false; /* duplicate key */
+            }
+        strcpy(prev[nprev++], key.p);
+        ag_ws(&c);
+        if (c.p >= c.end || *c.p != ':') {
+            ag_free(&key);
+            return false;
+        }
+        ++c.p;
+        ag_ws(&c);
+        if (strcmp(key.p, "type") == 0) {
+            struct ag_buf t;
+
+            ag_init(&t);
+            if (!ag_string(&c, &t) || t.len + 1 > cap) {
+                ag_free(&t);
+                ag_free(&key);
+                return false;
+            }
+            memcpy(type, t.p ? t.p : "", t.len);
+            type[t.len] = '\0';
+            ag_free(&t);
+            found = true;
+        } else if (!ag_skip_value(&c)) {
+            ag_free(&key);
+            return false;
+        }
+        ag_free(&key);
+        ag_ws(&c);
+        if (c.p < c.end && *c.p == ',') {
+            ++c.p;
+            continue;
+        }
+        if (c.p < c.end && *c.p == '}') {
+            ++c.p;
+            break;
+        }
+        return false;
+    }
+    ag_ws(&c);
+    return found && c.p == c.end;
 }
 
 enum agent_result
@@ -2187,9 +2885,11 @@ agent_receive(struct agent_session *s, struct agent_action *out)
     if (!s || !out)
         return AG_INTERNAL;
     out->replay = false;
+    s->pending_len = 0;
 
     for (;;) {
         enum agent_result lr;
+        char type[24];
 
         if (s->closed)
             return AG_IO;
@@ -2198,110 +2898,38 @@ agent_receive(struct agent_session *s, struct agent_action *out)
             return lr;
         if (len == 0)
             continue; /* tolerate a bare newline */
-        if (memchr(line, '\r', len) != (const void *) 0
-            || memchr(line, 0, len) != (const void *) 0) {
+        if (memchr(line, '\r', len) != (const void *) 0) {
             if (agent_write_invalid(s, AG_INV_SCHEMA) != AG_OK)
                 return AG_IO;
             continue;
         }
-        {
-            char type[16];
+        if (!ag_peek_type(line, len, type, sizeof type)) {
+            if (agent_write_invalid(s, AG_INV_SCHEMA) != AG_OK)
+                return AG_IO;
+            continue;
+        }
 
-            if (!ag_get_string_field(line, len, "type", type, sizeof type)) {
-                if (agent_write_invalid(s, AG_INV_SCHEMA) != AG_OK)
-                    return AG_IO;
-                continue;
-            }
-            if (strcmp(type, "ack_seq") == 0) {
-                static const char *const keys[] = { "v", "type", "seq" };
-                long long v;
-                bool is_int;
+        if (strcmp(type, "ack_seq") == 0 || strcmp(type, "ack_chunk") == 0
+            || strcmp(type, "get_page") == 0) {
+            struct agent_aux aux;
+            enum agent_result ar = agent_parse_aux(line, len, &aux);
 
-                if (!ag_keys_exact(line, len, keys, 3)) {
-                    if (agent_write_invalid(s, AG_INV_SCHEMA) != AG_OK)
-                        return AG_IO;
-                    continue;
-                }
-                if (!ag_field_present(line, len, "seq", &v, &is_int)
-                    || !is_int || v < 1
-                    || (unsigned long long) v > AG_COUNTER_MAX) {
-                    if (agent_write_invalid(s, AG_INV_SCHEMA) != AG_OK)
-                        return AG_IO;
-                    continue;
-                }
-                if ((uint64_t) v > s->next_seq) {
-                    if (agent_write_invalid(s, AG_INV_STALE) != AG_OK)
-                        return AG_IO;
-                    continue;
-                }
-                s->acked_seq = (uint64_t) v;
-                continue;
-            }
-            if (strcmp(type, "ack_chunk") == 0) {
-                static const char *const keys[] = { "v", "type", "rid", "i" };
-                long long rid, idx;
-                bool io1, io2;
-
-                if (!ag_keys_exact(line, len, keys, 4)) {
-                    if (agent_write_invalid(s, AG_INV_SCHEMA) != AG_OK)
-                        return AG_IO;
-                    continue;
-                }
-                if (!ag_field_present(line, len, "rid", &rid, &io1)
-                    || !ag_field_present(line, len, "i", &idx, &io2)
-                    || !io1 || !io2 || rid < 1 || idx < 0) {
-                    if (agent_write_invalid(s, AG_INV_SCHEMA) != AG_OK)
-                        return AG_IO;
-                    continue;
-                }
-                if ((uint64_t) rid != s->last_rid) {
-                    if (agent_write_invalid(s, AG_INV_STALE) != AG_OK)
-                        return AG_IO;
-                    continue;
-                }
-                if ((uint64_t) idx > s->acked_chunk)
-                    s->acked_chunk = (uint64_t) idx;
-                continue;
-            }
-            if (strcmp(type, "get_page") == 0) {
-                static const char *const keys[] = { "v", "type", "id",
-                                                    "content", "page" };
-                char content[32];
-                long long page;
-                bool is_int;
-
-                if (!ag_keys_exact(line, len, keys, 5)) {
-                    if (agent_write_invalid(s, AG_INV_SCHEMA) != AG_OK)
-                        return AG_IO;
-                    continue;
-                }
-                if (!ag_get_string_field(line, len, "content", content,
-                                         sizeof content)
-                    || !ag_field_present(line, len, "page", &page, &is_int)
-                    || !is_int) {
-                    if (agent_write_invalid(s, AG_INV_SCHEMA) != AG_OK)
-                        return AG_IO;
-                    continue;
-                }
-                if (!s->need_content
-                    || strcmp(content, s->need_content) != 0
-                    || page < 0 || page >= s->need_pages) {
-                    if (agent_write_invalid(s, AG_INV_RANGE) != AG_OK)
-                        return AG_IO;
-                    continue;
-                }
-                if (ag_emit_page(s, content, (int) page, s->need_pages)
+            if (ar != AG_OK) {
+                if (agent_write_invalid(s, aux.code ? aux.code
+                                                    : AG_INV_SCHEMA)
                     != AG_OK)
                     return AG_IO;
-                if (s->pages_sent < s->need_pages)
-                    ++s->pages_sent;
                 continue;
             }
-            if (strcmp(type, "act") != 0) {
-                if (agent_write_invalid(s, AG_INV_SCHEMA) != AG_OK)
-                    return AG_IO;
-                continue;
-            }
+            lr = ag_handle_aux(s, &aux);
+            if (lr == AG_IO)
+                return AG_IO;
+            continue;
+        }
+        if (strcmp(type, "act") != 0) {
+            if (agent_write_invalid(s, AG_INV_SCHEMA) != AG_OK)
+                return AG_IO;
+            continue;
         }
 
         /* an act record */
@@ -2317,15 +2945,20 @@ agent_receive(struct agent_session *s, struct agent_action *out)
                     return AG_IO;
                 return AG_BAD_INPUT;
             }
-            /* accepted-action identity: identical retry replays; conflicting
-             * reuse of an accepted id closes; a stale id consumes nothing */
+
+            /* accepted-action identity: exact bytes decide; the hash is
+             * only a fast pre-filter.  An identical retry replays the
+             * retained response; conflicting reuse of an accepted id
+             * closes. */
             if (s->have_action && out->id == s->action_id) {
-                if (h != s->action_hash)
+                if (s->action_hash != h)
+                    return AG_INTERNAL;
+                if (s->action_len != len || !s->action_text
+                    || memcmp(s->action_text, line, len) != 0)
                     return AG_INTERNAL;
                 if (!s->have_reply)
                     return AG_INTERNAL;
-                if (ag_write_all(s, s->last_reply, s->last_reply_len)
-                    != AG_OK)
+                if (ag_write_all(s, s->reply, s->reply_len) != AG_OK)
                     return AG_IO;
                 ++s->replays;
                 continue;
@@ -2347,7 +2980,7 @@ agent_receive(struct agent_session *s, struct agent_action *out)
                     return AG_IO;
                 return AG_BAD_INPUT;
             }
-            /* kind must match the outstanding request */
+            /* kind must be compatible with the outstanding request */
             {
                 enum agent_need_kind k = s->outstanding_kind;
                 bool ok = true;
@@ -2367,7 +3000,9 @@ agent_receive(struct agent_session *s, struct agent_action *out)
                     break;
                 case AG_NEED_LINE:
                 case AG_NEED_EXTCMD:
-                    ok = (out->kind == AG_ACT_TEXT);
+                    /* native Escape / -1 maps to an explicit cancel */
+                    ok = (out->kind == AG_ACT_TEXT
+                          || out->kind == AG_ACT_CANCEL);
                     break;
                 case AG_NEED_MENU:
                     ok = (out->kind == AG_ACT_MENU
@@ -2375,7 +3010,8 @@ agent_receive(struct agent_session *s, struct agent_action *out)
                           || out->kind == AG_ACT_ACK);
                     break;
                 case AG_NEED_ACK:
-                    ok = (out->kind == AG_ACT_ACK);
+                    ok = (out->kind == AG_ACT_ACK
+                          || out->kind == AG_ACT_CANCEL);
                     break;
                 default:
                     break;
@@ -2387,10 +3023,30 @@ agent_receive(struct agent_session *s, struct agent_action *out)
                     return AG_BAD_INPUT;
                 }
             }
-            /* required content must be fully delivered before a selection */
+            /* a menu answer must name the generation the request pinned */
+            if (s->outstanding_kind == AG_NEED_MENU
+                && out->kind == AG_ACT_MENU
+                && strcmp(out->menu, s->need_menu) != 0) {
+                out->code = AG_INV_STALE;
+                if (agent_write_invalid(s, AG_INV_STALE) != AG_OK)
+                    return AG_IO;
+                return AG_BAD_INPUT;
+            }
+            /* a position must lie inside the advertised rectangle */
+            if (out->kind == AG_ACT_POSITION
+                && (out->px < s->need_x0 || out->px > s->need_x1
+                    || out->py < s->need_y0 || out->py > s->need_y1)) {
+                out->code = AG_INV_RANGE;
+                if (agent_write_invalid(s, AG_INV_RANGE) != AG_OK)
+                    return AG_IO;
+                return AG_BAD_INPUT;
+            }
+            /* every required page must be delivered before a selection */
             if ((s->outstanding_kind == AG_NEED_MENU
                  || s->outstanding_kind == AG_NEED_ACK)
-                && s->need_pages > 0 && s->pages_sent < s->need_pages) {
+                && (out->kind == AG_ACT_MENU || out->kind == AG_ACT_ACK)
+                && s->need_pages > 0
+                && s->pages_delivered < s->need_pages) {
                 out->code = AG_INV_INCOMPLETE;
                 if (agent_write_invalid(s, AG_INV_INCOMPLETE) != AG_OK)
                     return AG_IO;
@@ -2406,13 +3062,31 @@ agent_receive(struct agent_session *s, struct agent_action *out)
                 }
                 s->acked_seq = out->seq;
             }
-            /* accept: remember identity; the reply is retained on commit */
-            s->have_action = true;
-            s->action_id = out->id;
-            s->action_hash = h;
-            s->have_reply = false;
+            /* not accepted yet: record only the raw line for agent_accept */
+            memcpy(s->pending_line, line, len);
+            s->pending_len = len;
+            s->pending_hash = h;
             out->replay = false;
             return AG_OK;
         }
     }
+}
+
+enum agent_result
+agent_accept(struct agent_session *s, const struct agent_action *a)
+{
+    if (!s || !a)
+        return AG_INTERNAL;
+    if (s->pending_len == 0)
+        return AG_INTERNAL; /* nothing was received for this action */
+    if (a->id != 0 && s->outstanding_id != 0 && a->id != s->outstanding_id)
+        return AG_INTERNAL;
+    if (!ag_action_store(s, s->pending_line, s->pending_len))
+        return AG_LIMIT;
+    s->action_hash = s->pending_hash;
+    s->action_id = a->id;
+    s->have_action = true;
+    s->have_reply = false;
+    s->pending_len = 0;
+    return AG_OK;
 }

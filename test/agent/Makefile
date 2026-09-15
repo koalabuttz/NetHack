@@ -1,6 +1,7 @@
 # test/agent/Makefile -- engine-free P1 fixtures for the NetHack agent port.
 #
-#   make check       build and run every fixture
+#   make check       regenerate/verify the profile manifest, build and run
+#                    every fixture
 #   make sanitize    rebuild with AddressSanitizer + UndefinedBehaviorSanitizer
 #   make depcheck    prove no fixture reaches an engine header
 #   make clean
@@ -9,13 +10,21 @@
 
 CC ?= cc
 AGENT = ../../win/agent
+DOC = ../../doc
 CFLAGS = -std=c99 -Wall -Wextra -Werror -I$(AGENT) -I.
 SAN = -fsanitize=address,undefined -fno-omit-frame-pointer -g
 
+AGENT_SRC = $(AGENT)/agent_view.c $(AGENT)/agent_menu.c \
+            $(AGENT)/agent_protocol.c
 AGENT_OBJS = agent_view.o agent_menu.o agent_protocol.o
 REF_OBJS = reference_state.o
+TEST_SRC = test_view.c test_menu.c test_protocol.c test_state.c
+REF_SRC = reference_state.c
 
 TESTS = test_view test_menu test_protocol test_state
+
+# every C translation unit this milestone builds
+ALL_TU = $(AGENT_SRC) $(REF_SRC) $(TEST_SRC)
 
 all: $(TESTS)
 
@@ -44,12 +53,32 @@ test_protocol: test_protocol.c $(AGENT_OBJS)
 test_state: test_state.c $(REF_OBJS) $(AGENT_OBJS)
 	$(CC) $(CFLAGS) -o $@ test_state.c $(REF_OBJS) $(AGENT_OBJS)
 
-check: $(TESTS)
+# The frozen profile manifest is generated from include/optlist.h.  Regenerating
+# it here means a drifted or hand-edited manifest fails the gate.
+manifest-check:
+	@python3 gen_profile.py > .profile.tmp
+	@if diff -q .profile.tmp $(DOC)/agent-profile-v1.tsv > /dev/null; then \
+	    echo "profile manifest: up to date"; \
+	    rm -f .profile.tmp; \
+	else \
+	    echo "PROFILE MANIFEST DRIFTED:"; \
+	    diff .profile.tmp $(DOC)/agent-profile-v1.tsv | head -40; \
+	    rm -f .profile.tmp; \
+	    exit 1; \
+	fi
+
+check: manifest-check schema-check $(TESTS)
 	@fail=0; for t in $(TESTS); do \
 	    printf '%s: ' "$$t"; ./$$t || fail=1; \
 	done; \
 	if [ $$fail -ne 0 ]; then echo "CHECK FAILED"; exit 1; fi; \
 	echo "all P1 fixtures pass"
+
+# Validate real encoder output and the built-in grammar vectors against
+# doc/agent-v1.schema.json.
+schema-check: test_protocol
+	@./test_protocol --dump | python3 schema_check.py --stdin
+	@python3 schema_check.py
 
 # ASan/UBSan build, if the compiler supports the flags.
 sanitize: clean
@@ -67,18 +96,18 @@ sanitize: clean
 	if [ $$fail -ne 0 ]; then echo "SANITIZE FAILED"; exit 1; fi; \
 	echo "all P1 fixtures pass under ASan/UBSan"
 
-# Use the compiler's dependency output, not grep, to prove that no unit
-# reaches include/ or src/.
+# Use the compiler's dependency output, not grep, to prove that no unit of this
+# milestone reaches include/ or src/.  Every translation unit built by P1 is
+# covered, including the fixtures themselves.
 depcheck:
-	@fail=0; for f in $(AGENT)/agent_view.c $(AGENT)/agent_menu.c \
-	                   $(AGENT)/agent_protocol.c reference_state.c; do \
-	    $(CC) $(CFLAGS) -MD -MF .dep.$$(basename $$f).d -c $$f -o /dev/null \
-	        || exit 1; \
+	@fail=0; for f in $(ALL_TU); do \
+	    base=$$(basename $$f); \
+	    $(CC) $(CFLAGS) -MD -MF .dep.$$base.d -c $$f -o /dev/null || exit 1; \
 	    if grep -E '(^|[[:space:]])(\.\./)*(include|src)/[A-Za-z_]+\.h([[:space:]]|$$)' \
-	           .dep.$$(basename $$f).d >/dev/null; then \
+	           .dep.$$base.d > /dev/null; then \
 	        echo "ENGINE HEADER reached by $$f:"; \
 	        grep -E '(^|[[:space:]])(\.\./)*(include|src)/[A-Za-z_]+\.h' \
-	             .dep.$$(basename $$f).d; \
+	             .dep.$$base.d; \
 	        fail=1; \
 	    fi; \
 	done; \
@@ -87,6 +116,6 @@ depcheck:
 	echo "no engine headers in any fixture translation unit"
 
 clean:
-	rm -f $(TESTS) $(AGENT_OBJS) $(REF_OBJS) .dep.*.d
+	rm -f $(TESTS) $(AGENT_OBJS) $(REF_OBJS) .dep.*.d .profile.tmp
 
-.PHONY: all check sanitize depcheck clean
+.PHONY: all check manifest-check schema-check sanitize depcheck clean

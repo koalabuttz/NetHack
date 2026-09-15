@@ -61,7 +61,8 @@ SCHED = {
     "blind": ("locked-gameplay", "role-play extra pinned at default", None),
     "bones": ("locked-gameplay", "no cross-episode bones", "off"),
     "boulder": ("locked-gameplay", "deprecated alias; no effect", None),
-    "catname": ("char-field", "starting-pet name via startup data", None),
+    "catname": ("locked-gameplay", "pet name is not an allowlisted startup "
+                "field; pinned at its default", None),
     "checkpoint": ("locked-gameplay", "private crash recovery; not agent-visible", None),
     "cmdassist": ("locked-gameplay", "compiled default pinned", None),
     "color": ("locked-presentation", "color on", "on"),
@@ -79,7 +80,8 @@ SCHED = {
     "debug_mongen": ("unavailable-external", "wizard/fuzzer only", None),
     "debug_overwrite_stairs": ("unavailable-external", "wizard/fuzzer only", None),
     "disclose": ("locked-gameplay", "compiled default pinned", None),
-    "dogname": ("char-field", "starting-pet name via startup data", None),
+    "dogname": ("locked-gameplay", "pet name is not an allowlisted startup "
+                "field; pinned at its default", None),
     "dropped_nopick": ("locked-gameplay", "compiled default pinned", None),
     "dungeon": ("locked-presentation", "dungeon symbol set pinned", None),
     "effects": ("locked-presentation", "effect symbol set pinned", None),
@@ -111,7 +113,8 @@ SCHED = {
     "hilite_pile": ("locked-presentation", "pile highlighting on", "on"),
     "hilite_status": ("locked-presentation", "configurable status highlighting off", "off"),
     "hitpointbar": ("locked-presentation", "hit-point bar off", "off"),
-    "horsename": ("char-field", "starting-pet name via startup data", None),
+    "horsename": ("locked-gameplay", "pet name is not an allowlisted "
+                  "startup field; pinned at its default", None),
     "IBMgraphics": ("unavailable-external", "symset loading disabled", None),
     "idlecheckpoint": ("locked-gameplay", "compiled default pinned", None),
     "ignintr": ("locked-gameplay", "compiled default pinned", None),
@@ -166,7 +169,8 @@ SCHED = {
     "perm_invent": ("locked-presentation", "no permanent inventory", "off"),
     "perminv_mode": ("locked-presentation", "no permanent inventory", None),
     "petattr": ("locked-presentation", "pet attribute inverse", None),
-    "pettype": ("char-field", "preferred pet type via startup data", None),
+    "pettype": ("locked-gameplay", "pet type is not an allowlisted startup "
+                "field; pinned at its native default (random)", None),
     "pickup_burden": ("locked-gameplay", "compiled default pinned", None),
     "pickup_stolen": ("locked-gameplay", "compiled default pinned", None),
     "pickup_thrown": ("locked-gameplay", "compiled default pinned", None),
@@ -333,6 +337,41 @@ CAPS = [
     ("WC2_HITPOINTBAR", "0x0040L", "off", "hit-point bar off"),
     ("WC2_FLUSH_STATUS", "0x0080L", "on", "status batching (initial)"),
     ("WC2_RESET_STATUS", "0x0100L", "on", "status reset (initial)"),
+    ("WC2_TERM_SIZE", "0x0200L", "off", "terminal size is a build constant"),
+    ("WC2_STATUSLINES", "0x0400L", "off", "status line count frozen at 2"),
+    ("WC2_WINDOWBORDERS", "0x0800L", "off", "no window borders advertised"),
+    ("WC2_PETATTR", "0x1000L", "off", "pet attr fixed to inverse"),
+    ("WC2_GUICOLOR", "0x2000L", "off", "no non-map colour facility"),
+    ("WC2_URGENT_MESG", "0x4000L", "off", "no message urgency channel"),
+    ("WC2_SUPPRESS_HIST", "0x8000L", "off", "no history suppression channel"),
+    ("WC2_MENU_SHIFT", "0x010000L", "off", "no horizontal menu scrolling"),
+    ("WC2_U_UTF8STR", "0x020000L", "off", "unicode disabled"),
+    ("WC2_EXTRACOLORS", "0x040000L", "off", "enhanced colors disabled"),
+    ("WC2_EXTRASTATUS", "0x080000L", "off", "optional status fields off"),
+]
+
+BINDINGS = [
+    ("command keys", "standard native bindings", "locked-presentation",
+     "no runtime rebinding; bind keys denied"),
+    ("number_pad", "off", "locked-presentation",
+     "classic single-keystroke movement"),
+    ("numpad meta prefixes", "not applicable (number_pad off)",
+     "locked-presentation", "no alternate numpad interpretation"),
+    ("altmeta", "off", "locked-presentation",
+     "no ESC-prefix meta interpretation"),
+    ("menu command keys", "built-in MENU_* defaults (wintype.h)",
+     "locked-presentation",
+     "menu_select_all '.', menu_deselect_all '-', menu_invert_all '@', "
+     "menu_select_page ',', menu_deselect_page '\\', menu_invert_page '~', "
+     "menu_first_page '^', menu_last_page '|', menu_next_page '>', "
+     "menu_previous_page '<', menu_shift_left '{', menu_shift_right '}', "
+     "menu_search ':'"),
+    ("user key binding", "denied", "unavailable-external",
+     "bind_key(user=true) gated; only core reset_commands/user=false allowed"),
+    ("symbol set loading", "denied", "unavailable-external",
+     "load_symset/parsesymbols gated"),
+    ("mouse input", "denied", "unavailable-external",
+     "WC_MOUSE_SUPPORT not advertised"),
 ]
 
 SYMBOLS = [
@@ -347,6 +386,96 @@ SYMBOLS = [
     ("initial blank appearance", "palette id 0 = blank", "locked-presentation",
      "unpainted cells share one blank tuple"),
 ]
+
+
+# Resolved startup value of every ACTIVE compound option, taken from the
+# option's own do_init/default assignment or its native default table.  The
+# generator refuses to emit a row for a compound option that is missing here.
+COMPOUND = {
+    "align_message": "top (native default)",
+    "align_status": "bottom (native default)",
+    "autounlock": "apply-key (AUTOUNLOCK_APPLY_KEY)",
+    "boulder": "(none; deprecated alias)",
+    "catname": "(empty)",
+    "disclose": "prompt, default no: inventory/attributes/vanquished/"
+                "genocided/conduct/overview",
+    "dogname": "(empty)",
+    "dungeon": "(built-in default symbol set)",
+    "effects": "(built-in default symbol set)",
+    "fruit": "slime mold",
+    "horsename": "(empty)",
+    "hilite_status": "(empty rule set; status highlighting off)",
+    "menu_deselect_all": "key '-' (MENU_UNSELECT_ALL)",
+    "menu_deselect_page": "key '\\' (MENU_UNSELECT_PAGE)",
+    "menu_first_page": "key '^' (MENU_FIRST_PAGE)",
+    "menu_headings": "inverse (ATR_INVERSE, NO_COLOR)",
+    "menu_invert_all": "key '@' (MENU_INVERT_ALL)",
+    "menu_invert_page": "key '~' (MENU_INVERT_PAGE)",
+    "menu_last_page": "key '|' (MENU_LAST_PAGE)",
+    "menu_next_page": "key '>' (MENU_NEXT_PAGE)",
+    "menu_objsyms": "off",
+    "menu_previous_page": "key '<' (MENU_PREVIOUS_PAGE)",
+    "menu_search": "key ':' (MENU_SEARCH)",
+    "menu_select_all": "key '.' (MENU_SELECT_ALL)",
+    "menu_select_page": "key ',' (MENU_SELECT_PAGE)",
+    "menu_shift_left": "key '{' (MENU_SHIFT_LEFT)",
+    "menu_shift_right": "key '}' (MENU_SHIFT_RIGHT)",
+    "menuinvertmode": "1 (native default)",
+    "menustyle": "full (MENU_FULL)",
+    "monsters": "(built-in default symbol set)",
+    "msg_window": "single (iflags.prevmsg_window = 's')",
+    "msghistory": "20 (iflags.msg_history)",
+    "objects": "(built-in default symbol set)",
+    "packorder": "$)\"[%?+!=/(*`0_ (flags.inv_order = def_inv_order)",
+    "paranoid_confirmation": "pray+swim+trap (PARANOID_PRAY|SWIM|TRAP)",
+    "perminv_mode": "none (permanent inventory off)",
+    "petattr": "inverse (ATR_INVERSE)",
+    "pettype": "random (no preference)",
+    "pickup_burden": "stressed (MOD_ENCUMBER)",
+    "pickup_types": "all (empty list)",
+    "pile_limit": "5 (PILE_LIMIT_DFLT)",
+    "player_selection": "dialog (VIA_DIALOG)",
+    "runmode": "run (RUN_LEAP)",
+    "scores": "3 top / 2 around / own off",
+    "scroll_amount": "1 (native default)",
+    "scroll_margin": "5 (native default)",
+    "sortdiscoveries": "o (flags.discosort)",
+    "sortloot": "loot (flags.sortloot = 'l')",
+    "sortvanquished": "o (flags.vansort)",
+    "statushilites": "0 (status highlighting off)",
+    "statuslines": "2 (iflags.wc2_statuslines)",
+    "suppress_alert": "0 (flags.suppress_alert)",
+    "term_cols": "80 (build constant COLNO)",
+    "term_rows": "21 (build constant ROWNO)",
+    "traps": "(built-in default symbol set)",
+    "vary_msgcount": "0",
+    "versinfo": "4 (have_branch)",
+    "warnings": "(built-in default symbol set)",
+    "whatis_coord": "none (GPCOORDS_NONE)",
+    "whatis_filter": "none (GFILTER_NONE)",
+    "windowborders": "auto (iflags.wc2_windowborders = 2)",
+    "windowcolors": "(none set)",
+    "name": "(adapter / allowlisted startup data)",
+    "role": "(adapter / allowlisted startup data)",
+    "race": "(adapter / allowlisted startup data)",
+    "gender": "(adapter / allowlisted startup data)",
+    "alignment": "(adapter / allowlisted startup data)",
+}
+
+# Options that are inactive in this build, compiled out, or external
+# facilities: they have no resolved startup value to state.
+COMPOUND_NA = (
+    "DECgraphics", "IBMgraphics", "altkeyhandling", "crash_email", "crash_name",
+    "crash_urlmax", "cursesgraphics", "font_map", "font_menu", "font_message",
+    "font_size_map", "font_size_menu", "font_size_message", "font_size_status",
+    "font_size_text", "font_status", "font_text", "glyph", "hicolor",
+    "map_mode", "mouse_support", "palette", "roguesymset", "soundlib",
+    "subkeyvalue", "symset", "tile_file", "tile_height", "tile_width",
+    "video", "video_height", "video_width", "videocolors", "videoshades",
+    "windowchain", "windowtype", "playmode", "number_pad",
+)
+for _n in COMPOUND_NA:
+    COMPOUND.setdefault(_n, "-")
 
 
 def split_args(s):
@@ -502,7 +631,11 @@ def main():
             saved = addr if addr.startswith("&") else "-"
             value = "on" if init == "On" else "off"
         elif typ == "C":
-            setter, saved, value = a[4], "-", "n/a (compound)"
+            setter, saved = a[4], "-"
+            if name not in COMPOUND:
+                sys.exit("ERROR: no resolved value for compound option %r"
+                         % name)
+            value = COMPOUND[name]
         elif typ == "O":
             setter, saved, value = a[5], "-", "n/a (action)"
         else:
@@ -534,8 +667,9 @@ def main():
       " saved-field binding <TAB> rationale")
     w("# classification: locked-presentation | locked-gameplay |"
       " unavailable-external | char-field")
-    w("# value: 'on'/'off'/'n/a (compound)' plus '(override)' when the profile"
-      " overrides the compiled default")
+    w("# value: the resolved startup value: 'on'/'off' for booleans, the native"
+      " default for compound options, or 'x (override)' when the profile"
+      " overrides it")
     w("# runtime mutation allowlist is EMPTY; every row is read-only at runtime")
     w("#")
     w("# == options (one row per active optlist.h entry) ==")
@@ -564,6 +698,13 @@ def main():
     for name, val, onoff, why in CAPS:
         w("\t".join((("cap.%s" % name), "always", "%s %s" % (val, onoff),
                      "locked-presentation", "windowprocs.wincap", "-", why)))
+    w("")
+    w("# == standard binding inventory (non-optlist) ==")
+    w("# name <TAB> guard <TAB> resolved startup value <TAB> classification"
+      " <TAB> setter <TAB> saved <TAB> rationale")
+    for name, val, cls, why in BINDINGS:
+        w("\t".join(("bind.%s" % name.replace(" ", "_"), "always", val, cls,
+                     "cmd.c / options.c", "-", why)))
     w("")
     w("# == symbol / appearance state (non-optlist) ==")
     w("# name <TAB> guard <TAB> resolved startup value <TAB> classification"

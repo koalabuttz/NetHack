@@ -79,6 +79,13 @@ enum agent_result agent_menu_validate(const struct agent_menu *m,
                                       const struct agent_menu_answer *a,
                                       struct agent_selection *out);
 
+/* Validate the structural invariants of a constructed menu itself: sequential
+ * 1-based row ids, in-range advisory accelerators, and an initial value
+ * null, -1, or strictly positive.  A row whose initial value is 0 is invalid
+ * because 0 is neither "unselected" (null) nor a legal native count.
+ */
+enum agent_result agent_menu_check(const struct agent_menu *m);
+
 /* Mode name helpers used by the encoder. */
 const char *agent_menu_mode_name(enum agent_menu_mode mode);
 bool agent_menu_mode_parse(const char *s, enum agent_menu_mode *out);

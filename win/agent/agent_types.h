@@ -35,6 +35,14 @@
 #define AG_COUNT_MAX 2147483647L       /* additionally <= LONG_MAX */
 #define AG_COUNTER_MAX 9007199254740991ULL /* 2^53-1 */
 
+/* presentation identifiers are "mN" / "cN" / "wN" strings; this is the
+ * widest one the encoder ever emits ("c" + 14 digits + NUL) */
+#define AG_ID_STR_MAX 16
+
+/* content pages per menu/text window */
+#define AG_MAX_PAGES 65536
+#define AG_PAGES_BITMAP_BYTES (AG_MAX_PAGES / 8)
+
 /* fixture bounds: a single public view/action value is a fixed-size value */
 #define AG_VIEW_MAX_PALETTE 256
 #define AG_VIEW_MAX_STATUS 32
@@ -190,11 +198,11 @@ struct agent_action {
     bool has_seq;
     uint64_t seq;            /* durable version acknowledged */
     uint8_t key;             /* AG_ACT_KEY / AG_ACT_YN byte */
-    char text[AG_LINE_INPUT_MAX + 1];
-    int px, py, pmod;        /* AG_ACT_POSITION */
+    char text[AG_LINE_INPUT_MAX + 1]; /* AG_ACT_TEXT */
+    int px, py, pmod;        /* AG_ACT_POSITION; mod is frozen to 0 */
     long yn_count;
     bool has_count;
-    const char *menu;        /* AG_ACT_MENU "mN" */
+    char menu[AG_ID_STR_MAX]; /* AG_ACT_MENU generation id "mN" */
     struct agent_commit_row *commit; /* caller-provided storage */
     size_t commit_cap;
     size_t ncommit;

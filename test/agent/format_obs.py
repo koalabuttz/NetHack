@@ -31,7 +31,8 @@ def assemble(lines):
             yield rec
             continue
         rid = rec["rid"]
-        slot = pending.setdefault(rid, {"n": 0, "parts": {}, "last": False})
+        slot = pending.setdefault(rid, {"rid": rid, "parts": {}, "text": {},
+                                        "last": False})
         for part in rec["parts"]:
             p = part["p"]
             if p == "h":
@@ -40,22 +41,30 @@ def assemble(lines):
                 slot["parts"].setdefault("s", {})[part["k"]] = part["val"]
             elif p in ("cond", "pal", "map", "msg", "hist", "win"):
                 slot["parts"].setdefault(p, []).append(part["val"])
+            elif p == "t":
+                key = (part["k"], part.get("e"), part.get("w"), part["f"])
+                slot["text"].setdefault(key, []).append(
+                    (part["offset"], part["text"], part["last"]))
             else:
                 slot["parts"][p] = part["val"]
-        slot["n"] += 1
+            slot["last"] = slot["last"] or bool(rec.get("last"))
         if rec.get("last"):
-            slot["last"] = True
             yield rebuild(slot)
 
 
 def rebuild(slot):
-    """Turn assembled parts back into a logical obs record."""
+    """Turn assembled parts back into a logical obs record.
+
+    The chunk stream carries no header d: the logical record's delivery counter
+    is rid, the delivery counter of its first chunk.  Long text arrives as
+    ordered t slices addressed by (kind, event-or-window, field).
+    """
     parts = slot["parts"]
     rec = {
         "v": parts.get(("h", "v")),
         "ch": parts.get(("h", "ch")),
         "type": "obs",
-        "d": parts.get(("h", "d")),
+        "d": slot["rid"],
         "seq": parts.get(("h", "seq")),
         "base": parts.get(("h", "base")),
         "s": parts.get("s", {}),
@@ -68,6 +77,25 @@ def rebuild(slot):
         "windows": parts.get("win", []),
         "need": parts.get("need"),
     }
+
+    for (kind, ev, wid, field), slices in slot["text"].items():
+        slices.sort(key=lambda s: s[0])
+        text = "".join(s[1] for s in slices)
+        target = None
+        if kind in ("msg", "hist"):
+            for entry in rec[kind]:
+                if entry.get("e") == ev:
+                    target = entry
+                    break
+            key = "text"
+        else:
+            for entry in rec["windows"]:
+                if entry.get("w") == wid:
+                    target = entry
+                    break
+            key = "title"
+        if target is not None:
+            target[key] = text
     return rec
 
 

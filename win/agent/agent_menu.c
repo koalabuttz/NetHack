@@ -67,6 +67,44 @@ sel_sort(struct agent_selection *out)
 }
 
 enum agent_result
+agent_menu_check(const struct agent_menu *m)
+{
+    size_t i;
+
+    if (!m || (!m->rows && m->nrows))
+        return AG_INTERNAL;
+    if (m->nrows > AG_MAX_MENU_ROWS)
+        return AG_LIMIT;
+    if (m->id && !(m->id[0] == 'm' && m->id[1] >= '1' && m->id[1] <= '9'))
+        return AG_BAD_INPUT;
+
+    for (i = 0; i < m->nrows; ++i) {
+        const struct agent_menu_row *row = &m->rows[i];
+
+        /* row ids are sequential in insertion order, including headings */
+        if (row->r != (long) i + 1)
+            return AG_BAD_INPUT;
+        if (row->key < 0 || row->key > 255 || row->group < 0
+            || row->group > 255)
+            return AG_BAD_INPUT;
+        if (row->has_initial && row->initial != -1 && row->initial < 1)
+            return AG_BAD_INPUT; /* 0 is neither null nor a legal count */
+        if (row->style
+            & ~(AG_STYLE_BOLD | AG_STYLE_DIM | AG_STYLE_ITALIC
+                | AG_STYLE_UNDERLINE | AG_STYLE_BLINK | AG_STYLE_INVERSE))
+            return AG_BAD_INPUT;
+        if (row->color >= AG_COL_MAX)
+            return AG_BAD_INPUT;
+        if (row->has_icon
+            && (row->icon.ch < 0x20 || row->icon.ch > 0x7e
+                || row->icon.fg >= AG_COL_MAX
+                || row->icon.frame >= AG_COL_MAX))
+            return AG_BAD_INPUT;
+    }
+    return AG_OK;
+}
+
+enum agent_result
 agent_menu_validate(const struct agent_menu *m,
                     const struct agent_menu_answer *a,
                     struct agent_selection *out)

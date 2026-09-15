@@ -264,6 +264,78 @@ main(void)
         CHECK(agent_menu_validate(&m, &a, &small) == AG_LIMIT);
     }
 
+    /* ---- reverse-order submission normalizes to insertion order ---- */
+    m = make_menu(AG_MENU_ANY, 4);
+    memset(&a, 0, sizeof a);
+    commit[0].r = 4;
+    commit[0].count = 1;
+    commit[1].r = 3;
+    commit[1].count = 2;
+    commit[2].r = 2;
+    commit[2].count = -1;
+    a.rows = commit;
+    a.nrows = 3;
+    CHECK(agent_menu_validate(&m, &a, &sel) == AG_OK);
+    CHECK(sel.nrows == 3);
+    CHECK(sel.rows[0].r == 2 && sel.rows[0].count == -1);
+    CHECK(sel.rows[1].r == 3 && sel.rows[1].count == 2);
+    CHECK(sel.rows[2].r == 4 && sel.rows[2].count == 1);
+
+    /* ---- structural row invariants ---- */
+    {
+        struct agent_menu_row r2[3];
+
+        /* a well-formed menu passes the structural check */
+        memset(r2, 0, sizeof r2);
+        r2[0].r = 1;
+        snprintf(r2[0].text, sizeof r2[0].text, "heading");
+        r2[1].r = 2;
+        snprintf(r2[1].text, sizeof r2[1].text, "a");
+        r2[1].selectable = true;
+        r2[1].has_initial = true;
+        r2[1].initial = 5; /* a positive initial count is preserved */
+        r2[2].r = 3;
+        snprintf(r2[2].text, sizeof r2[2].text, "b");
+        r2[2].selectable = true;
+        r2[2].has_initial = true;
+        r2[2].initial = -1; /* native all/default */
+        r2[2].color = AG_COL_GRAY;
+        m = make_menu(AG_MENU_ANY, 3);
+        m.rows = r2;
+        CHECK(agent_menu_check(&m) == AG_OK);
+
+        /* an initial value of zero is neither null nor a legal count */
+        r2[1].initial = 0;
+        CHECK(agent_menu_check(&m) == AG_BAD_INPUT);
+        r2[1].initial = 5;
+
+        /* "no initial" is expressed by has_initial == false */
+        r2[1].has_initial = false;
+        r2[1].initial = 0;
+        CHECK(agent_menu_check(&m) == AG_OK);
+        r2[1].has_initial = true;
+        r2[1].initial = 5;
+
+        /* row ids must be sequential in insertion order */
+        r2[2].r = 4;
+        CHECK(agent_menu_check(&m) == AG_BAD_INPUT);
+        r2[2].r = 3;
+
+        /* an out-of-range advisory accelerator is rejected */
+        r2[1].key = 300;
+        CHECK(agent_menu_check(&m) == AG_BAD_INPUT);
+        r2[1].key = 0;
+
+        /* a published icon must itself be publishable */
+        r2[1].has_icon = true;
+        r2[1].icon.ch = 0x80;
+        CHECK(agent_menu_check(&m) == AG_BAD_INPUT);
+        r2[1].icon.ch = ')';
+        r2[1].icon.fg = AG_COL_GRAY;
+        r2[1].icon.frame = AG_COL_NONE;
+        CHECK(agent_menu_check(&m) == AG_OK);
+    }
+
     if (failures) {
         printf("test_menu: %d failure(s)\n", failures);
         return 1;

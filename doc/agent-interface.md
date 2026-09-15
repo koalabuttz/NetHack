@@ -361,8 +361,11 @@ Fields: `v, ch, type, d, seq, base, s, cond, pal, map, cur, msg, hist, windows, 
   scalar field value.
 * `pal` is an array of `[id,char,color,style,frame]` palette definitions.
   Palette id 0 is always `[0," ","none",0,"none"]`.
-* `map` is an array of `[x,y,palette_id]` triples, row-major, covering all legal
-  cells in a full snapshot. Cells initially unpainted are palette id 0.
+* `map` is an array of `[x,y,palette_id]` triples, row-major. **Blank cells are
+  omitted (sparse).** An unpainted cell is the declared blank appearance, so a
+  full snapshot enumerates only cells whose palette id is not 0; a cell absent
+  from `map` is palette id 0, the blank tuple. Sparse omission, not a complete
+  grid, is the normative blank-cell representation.
 * `cur` is `[x,y]` or `null`. Cursor removal is explicit.
 * `msg` is an ordered array of message/presentation events `{e,text,style}`.
   `e` is a presentation-derived event id, never an engine identifier.
@@ -370,6 +373,12 @@ Fields: `v, ch, type, d, seq, base, s, cond, pal, map, cur, msg, hist, windows, 
   discipline, tagged separately from new events.
 * `windows` is an ordered array of content descriptors (section 12.4).
 * `need` is `null` at a final boundary or a tagged request (section 11.1).
+
+Every full observation carries the complete fixed field set
+`s, cond, pal, map, cur, msg, hist, windows, need`, in that order. An empty
+collection is present and empty (`"s":{}`, `"map":[]`), never omitted; a
+chunked full snapshot that enumerates no element of an array means that array
+is empty. `need:null` is legal in both the plain and the chunked form.
 
 Message/request/window ids are presentation-derived counters, never native
 `winid`s or file paths.
@@ -452,12 +461,34 @@ Enumerated part paths for v1 (no arbitrary JSON-pointer patch language):
 | `win` | `{"p":"win","val":{...}}` | one window descriptor | array element |
 | `cur` | `{"p":"cur","val":[x,y]\|null}` | cursor | scalar |
 | `need` | `{"p":"need","val":{...}\|null}` | request | scalar |
-| `t` | `{"p":"t","path":P,"offset":O,"text":S,"last":B}` | long text `P` | offsets are UTF-8 byte counts at scalar boundaries |
+| `t` | `{"p":"t","k":K,"e":E\|"w":W,"f":F,"offset":O,"text":S,"last":B}` | long text | `K` ∈ {msg,hist,win}; see below |
 
-Header scalars appear in part 0. `map`, `pal`, `msg`, `hist`, `s`, and `win`
-arrays are split only *between* elements. Long text uses the `t` part with
-`offset` in UTF-8 byte counts. Splits never cut a UTF-8 sequence or a scalar
-value ambiguously.
+Header parts carry **only** `v`, `ch`, `type`, `seq`, and `base`. The logical
+record's own delivery counter is not a header part: it is `rid`, the delivery
+counter of the first chunk. Each physical chunk has its own `d`.
+
+Header scalars appear in part 0. `map`, `pal`, `msg`, `hist`, `cond`, `s`, and
+`win` arrays are split only *between* elements. Splits never cut a UTF-8
+sequence or a scalar value ambiguously.
+
+### 7.1 Long-text parts
+
+A field value longer than the physical budget is addressed unambiguously by
+element and field identity, so several long strings can be in flight at once:
+
+* `k` names the element kind: `msg`, `hist`, or `win`.
+* `e` is the presentation event id for `msg`/`hist`; `w` is the window id
+  (`"wN"`) for `win`. Exactly one of the two is present.
+* `f` is the field being spliced: `text` for `msg`/`hist`, `title` for `win`.
+* `offset` is the UTF-8 byte offset of this slice within the whole field value.
+* `text` is the slice itself; `last` is true only on the final slice.
+
+The element part that introduces a spliced field carries that field as an empty
+string (`"text":""` / `"title":""`). A client concatenates the `t` slices for a
+given `(k, e|w, f)` in ascending `offset` order and installs the result in that
+element's field. Slices are cut only at UTF-8 scalar boundaries, so every slice
+is independently valid UTF-8; `offset` values are contiguous and the final
+slice is marked `last:true`.
 
 The client assembles and validates the entire logical record before atomic
 application. Identical retry chunks are deduplicated by `(rid,i)`; changing
@@ -487,6 +518,37 @@ in Phase 2. Unknown top-level schemas produce `invalid(schema)` or a generic
 close for framing exhaustion. Conflicting accepted-action id reuse closes; an
 accepted action is never executed twice.
 
+Every auxiliary record is parsed by one strict object parser: the key set must
+be exactly the one listed above for that record type, duplicate keys are
+rejected, `v` must be exactly 1, every integer is bounded, and no trailing
+content is permitted.
+
+### 8.1 Page delivery and acknowledgement
+
+`get_page` is **its own acknowledgement**. A page counts as delivered when its
+`page` response has been sent in answer to a `get_page` request; there is no
+separate page-ack record. Consequences:
+
+* Delivery is tracked per page index in a bounded per-request bitmap. Only the
+  *first* delivery of a given index counts; a repeated `get_page` for an
+  already-delivered page is an idempotent retry that re-sends the page without
+  changing the delivered set.
+* Two requests for page 0 of a two-page menu therefore deliver one page, not
+  two. A selection remains `invalid(incomplete)` until every required page index
+  has been delivered.
+* `get_page` must name the outstanding request id and that request's content
+  id, and its page index must lie within the declared page count; otherwise it
+  is rejected without changing any delivery state.
+
+### 8.2 Chunk acknowledgement
+
+`ack_chunk` is cumulative and contiguous. A repeat of an already acknowledged
+index is idempotent, the next index advances the acknowledgement, and an index
+beyond `acknowledged + 1` is a gap and is rejected as `invalid(incomplete)`.
+The rid must be the most recent chunk stream and the index must lie inside it.
+Chunk acknowledgement is transport bookkeeping: it is not input, not a durable
+commit acknowledgement, and not permission to advance a prompt.
+
 ## 9. Durable state machine
 
 Three distinct concepts are maintained:
@@ -512,7 +574,8 @@ again.
 
 A full snapshot uses `base:null`. Initially unpainted cells equal the declared
 blank appearance; hidden stone and unexplored are not distinguished when both
-are blank.
+are blank. Blank cells are omitted from `map` (section 5.2): a cell absent from
+the snapshot is palette id 0.
 
 New durable palette ids are assigned at commit, from newly used durable tuples
 in deterministic public presentation order: row-major over the durable map,
@@ -583,26 +646,53 @@ Request common fields: `{id, kind}`. Types:
 |---|---|
 | `{"key":B}` | one key byte `B` in 1..255 |
 | `{"text":S}` | bounded UTF-8 text |
-| `{"position":[x,y],"mod":M}` | explicit position with modifier `M` |
+| `{"position":[x,y],"mod":M}` | explicit position; `M` is frozen to 0 |
 | `{"yn":B,"count":C}` | yes/no byte, optional count |
 | `{"menu":"mN","commit":[[r,count],...]}` | final menu selection set |
 | `{"cancel":true}` | cancellation |
 | `{"ack":true}` | acknowledgement of display-only content |
 
+An explicit position must satisfy `x` in `1..79` and `y` in `0..20` on the wire.
+Column zero is the internal native sentinel and is never accepted; the
+accumulated native modifier must be `0`. In addition, a position answer must
+lie inside the rectangle the outstanding request advertised (`x0,y0,x1,y1`),
+and a menu answer must name the generation id (`"mN"`) that request pinned;
+both bounds sets are persisted with the request and checked at the protocol
+layer before the action is offered to the caller.
+
 No `then`, `group`, `selectall`, `invert`, `bulk`, or raw-menu-key fields
-exist in v1. Escape/cancel mappings vary by native callback; line/extcmd cancel
-returns the native Escape/`-1` result; menu cancel is `-1`/no result. Key bytes
-include control/meta codes without terminal escape-sequence interpretation; 0
-is rejected except where a native position sentinel is returned after a valid
-position answer.
+exist in v1. Escape/cancel mappings vary by native callback; `{"cancel":true}`
+is accepted for `line` and `extcmd` requests and returns the native Escape/`-1`
+result, and for a menu it returns native cancellation; menu cancel is `-1`/no
+result. Key bytes include control/meta codes without terminal escape-sequence
+interpretation; 0 is rejected except where a native position sentinel is
+returned after a valid position answer.
 
 ### 11.3 Accepted-action identity
 
-The session retains the last accepted action's identity and content. An
-identical retry replays the retained response. A conflicting reuse of an
-accepted id closes the transport. An accepted request is never executed twice.
-If the retained response is unavailable, the session closes generically rather
-than re-executing.
+Accepting an action is explicitly two-phase:
+
+1. `agent_receive` frames a line, parses it, and applies every protocol-level
+   check that needs no engine knowledge — schema, ranges, the outstanding
+   request id, kind compatibility, the pinned menu generation, the advertised
+   position rectangle, page completeness, and the implied durable
+   acknowledgement. It does **not** record the action as accepted.
+2. The caller then runs its own semantic validation (menu contents via the menu
+   model, native yes/no semantics, position legality). If that succeeds the
+   caller calls `agent_accept`, which is what records acceptance.
+
+A semantically rejected action therefore leaves the request outstanding and may
+be resubmitted with the same request id; only a *recorded* accepted id can
+conflict.
+
+Acceptance records the exact request bytes, with a 32-bit hash used only as a
+fast pre-filter. An identical retry replays the retained response, which is the
+complete immutable logical response stream (every physical chunk), byte for
+byte. Two distinct actions that happen to share a hash are still distinguished,
+because the bytes decide. A conflicting reuse of an accepted id closes the
+transport. An accepted request is never executed twice. If the retained
+response is unavailable, the session closes generically rather than
+re-executing.
 
 ## 12. Menu contract
 
@@ -708,14 +798,30 @@ explicitly select desired visible row ids in the final set.
 * Message, request, window, and content ids are assigned from public
   presentation only. Protocol counters are public bookkeeping, never PIDs,
   seeds, or hidden-state hashes.
-* Chunks can be acknowledged cumulatively through the last contiguous chunk.
-  Chunk acknowledgement releases sender buffer pressure; it is not input, not a
+* Chunk acknowledgement is cumulative and contiguous (section 8.2). Chunk
+  acknowledgement releases sender buffer pressure; it is not input, not a
   durable commit acknowledgement, and not permission to advance a prompt.
 * A durable acknowledgement names the applied `seq`. A following valid action
   may acknowledge that version implicitly. No gameplay action is accepted while
   a required commit is only partly delivered.
 * Retries are deduplicated by public id. Changing content under an existing id
   is a protocol failure.
+
+**Counter bounds.** Every output counter is bounded by `1..2^53-1`. Before any
+counter advances, and before any encoder emits a caller-supplied event, request,
+window, or content id, the value is checked; a counter that would wrap, or a
+supplied id outside the bound, causes a generic close (`AG_LIMIT`) rather than
+an unchecked increment. The same applies to every parsed integer counter.
+
+**Single-emission records.** `hello` and `closed` are each emitted at most once
+per connection. A second call is rejected and emits nothing, so a transcript
+contains exactly one `hello` and exactly one `closed`.
+
+**Parsing bounds.** Beyond the physical line length, the reader enforces the
+declared nesting depth, per-object key count, and a per-line token budget of
+32768 tokens; exceeding the token budget rejects the line rather than parsing
+it. Byte length is validated as a separate layer from character length: the
+declared text budgets are byte budgets, and invalid UTF-8 is rejected outright.
 
 **Closed-counter exception.** Architecture §6.5 mandates that the terminal
 closure be exactly `{"v":1,"ch":"control","type":"closed"}` with no other field.

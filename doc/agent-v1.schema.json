@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://nethack.org/agent/v1.schema.json",
   "title": "NetHack agent interface v1",
-  "description": "Exact wire grammar for protocol v=1. One JSON object per physical line, UTF-8, compact, no BOM, no comments, no trailing content. Every object rejects additional properties. Framing (not expressible here) also limits a physical line to 65536 bytes including LF, nesting to 8, object keys to 32, and tokens to 32768. Integers are exact; fractions, exponents, NaN and Infinity are rejected. See doc/agent-interface.md.",
+  "description": "Exact wire grammar for protocol v=1. One JSON object per physical line, UTF-8, compact, no BOM, no comments, no trailing content. Every object rejects additional properties. Framing (not expressible here) also limits a physical line to 65536 bytes including LF, nesting to 8, object keys to 32, and tokens to 32768. Integers are exact; fractions, exponents, NaN and Infinity are rejected. UTF-8 VALIDITY AND BYTE LENGTH ARE A MANDATORY SEPARATE VALIDATION LAYER: JSON Schema maxLength counts characters, not bytes, so a validator must additionally reject invalid UTF-8 (including surrogates) and enforce the byte budgets of the text-bearing fields. See doc/agent-interface.md.",
   "oneOf": [
     { "$ref": "#/$defs/hello" },
     { "$ref": "#/$defs/obs" },
@@ -161,9 +161,13 @@
         {
           "if": { "properties": { "kind": { "const": "menu" } }, "required": ["kind"] },
           "then": { "required": ["mode"] }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "text" } }, "required": ["kind"] },
+          "then": { "not": { "required": ["mode"] } }
         }
       ],
-      "description": "mode appears only for menus; w and content ids are presentation-derived"
+      "description": "mode appears only for menus and is forbidden for text windows; w and content ids are presentation-derived"
     },
 
     "page_row": {
@@ -182,7 +186,8 @@
               "type": ["integer", "null"],
               "minimum": -1,
               "maximum": 2147483647,
-              "description": "null = initially unselected; -1 = selected at native all/default count; positive = explicit native count"
+              "not": { "const": 0 },
+              "description": "null = initially unselected; -1 = selected at native all/default count; positive = explicit native count. 0 is invalid: it is neither null nor a legal count."
             },
             "style": { "$ref": "#/$defs/style" },
             "color": { "$ref": "#/$defs/color" },
@@ -292,7 +297,10 @@
         { "type": "integer", "minimum": 1, "maximum": 65535 },
         {
           "type": "integer",
-          "description": "-1 (native all/default) or a positive count within the protocol bound and native long range"
+          "minimum": -1,
+          "maximum": 2147483647,
+          "not": { "const": 0 },
+          "description": "-1 (native all/default) or a positive count within the protocol bound and native long range; 0 and values below -1 are rejected"
         }
       ],
       "items": false
@@ -322,12 +330,20 @@
               "minItems": 2,
               "maxItems": 2,
               "prefixItems": [
-                { "type": "integer", "minimum": 0, "maximum": 79 },
+                {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 79,
+                  "description": "column zero is the internal native sentinel and is never accepted over the wire"
+                },
                 { "type": "integer", "minimum": 0, "maximum": 20 }
               ],
               "items": false
             },
-            "mod": { "type": "integer", "minimum": 0, "maximum": 255 }
+            "mod": {
+              "const": 0,
+              "description": "frozen to 0 in v1"
+            }
           }
         },
         {
@@ -475,8 +491,12 @@
         "msg": { "type": "array", "maxItems": 65535, "items": { "$ref": "#/$defs/msg_event" } },
         "hist": { "type": "array", "maxItems": 65535, "items": { "$ref": "#/$defs/msg_event" } },
         "windows": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/window_descriptor" } },
-        "need": { "$ref": "#/$defs/need" }
-      }
+        "need": {
+          "oneOf": [{ "$ref": "#/$defs/need" }, { "type": "null" }],
+          "description": "null at a final boundary; a tagged request otherwise"
+        }
+      },
+      "description": "A full observation always carries the complete fixed field set s, cond, pal, map, cur, msg, hist, windows, need; an empty collection is present and empty. Unpainted map cells are omitted (sparse): a cell absent from map is the declared blank appearance, palette id 0."
     },
 
     "act": {
@@ -644,20 +664,54 @@
           "type": "object",
           "required": ["p", "val"],
           "additionalProperties": false,
-          "properties": { "p": { "const": "need" }, "val": { "$ref": "#/$defs/need" } }
+          "properties": {
+            "p": { "const": "need" },
+            "val": {
+              "oneOf": [{ "$ref": "#/$defs/need" }, { "type": "null" }]
+            }
+          }
         },
         {
           "type": "object",
-          "required": ["p", "path", "offset", "text", "last"],
+          "required": ["p", "k", "f", "offset", "text", "last"],
           "additionalProperties": false,
           "properties": {
             "p": { "const": "t" },
-            "path": { "enum": ["msg", "hist", "title", "windows"] },
-            "offset": { "type": "integer", "minimum": 0, "maximum": 1048575 },
-            "text": { "type": "string", "maxLength": 1048576 },
-            "last": { "type": "boolean" }
+            "k": {
+              "enum": ["msg", "hist", "win"],
+              "description": "which long-text-bearing element this slice belongs to"
+            },
+            "e": { "$ref": "#/$defs/counter", "description": "event id for msg/hist" },
+            "w": { "type": "string", "pattern": "^w[1-9][0-9]*$", "description": "window id for win" },
+            "f": { "enum": ["text", "title"] },
+            "offset": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1048575,
+              "description": "UTF-8 byte offset of this slice within the whole field value"
+            },
+            "text": {
+              "type": "string",
+              "maxLength": 1048576,
+              "description": "this slice; slices concatenate in ascending offset order at UTF-8 scalar boundaries"
+            },
+            "last": { "type": "boolean", "description": "true only on the final slice of the field" }
           },
-          "description": "long text; offsets are UTF-8 byte counts at scalar boundaries, never cutting a UTF-8 sequence"
+          "allOf": [
+            {
+              "if": { "properties": { "k": { "const": "win" } }, "required": ["k"] },
+              "then": { "required": ["w"], "not": { "required": ["e"] } }
+            },
+            {
+              "if": { "properties": { "k": { "enum": ["msg", "hist"] } }, "required": ["k"] },
+              "then": { "required": ["e"], "not": { "required": ["w"] } }
+            },
+            {
+              "if": { "properties": { "k": { "const": "win" } }, "required": ["k"] },
+              "then": { "properties": { "f": { "const": "title" } } }
+            }
+          ],
+          "description": "A long text value is addressed unambiguously by (k, e or w, f): each element's field is split into ordered UTF-8-boundary slices. The element part that introduces it carries an empty field value."
         }
       ],
       "description": "enumerated chunk part grammar; there is no arbitrary JSON-pointer patch language"
@@ -677,7 +731,7 @@
         "last": { "type": "boolean" },
         "parts": { "type": "array", "minItems": 0, "maxItems": 8192, "items": { "$ref": "#/$defs/chunk_part" } }
       },
-      "description": "a large logical record is an ordered chunk stream, never partial independently applicable observations. Retries preserve d and the exact bytes; identical retry chunks are deduplicated by (rid,i)."
+      "description": "a large logical record is an ordered chunk stream, never partial independently applicable observations. Header parts carry only v, ch, type, seq and base; the logical record's own delivery counter is not a header part, it is rid (the delivery counter of the first chunk). Each physical chunk has its own monotonically assigned d. Retries preserve d and the exact bytes; identical retry chunks are deduplicated by (rid,i). A full observation's array fields still always exist logically: a chunked full snapshot that enumerates no element of an array means that array is empty."
     },
 
     "invalid": {
