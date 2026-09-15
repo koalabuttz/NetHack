@@ -98,7 +98,7 @@
         { "$ref": "#/$defs/palette_id" }
       ],
       "items": false,
-      "description": "[x, y, palette_id], row-major"
+      "description": "[x, y, palette_id]. The adapter stores the native map array by native coordinate and emits the stored coordinate unchanged, so a published x is always 1..79 and a published y always 0..20; native column zero is never emitted. Blank cells (palette id 0) are omitted."
     },
 
     "status_field_name": {

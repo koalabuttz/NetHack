@@ -66,6 +66,7 @@ struct agent_session {
     uint64_t next_menu;     /* "mN" */
     uint64_t acked_seq;
     uint64_t acked_chunk;   /* highest contiguous chunk index acknowledged */
+    bool have_chunk_ack;    /* false = "none": no index acknowledged yet */
     uint64_t last_rid;    /* rid of the most recent chunk stream, 0 none */
     long last_chunk_count;  /* physical chunks emitted for last_rid */
 
@@ -80,6 +81,7 @@ struct agent_session {
     char need_menu[AG_ID_STR_MAX];   /* menu generation the request pins */
     int need_x0, need_y0, need_x1, need_y1; /* legal position rectangle */
     int need_pages;
+    int need_max;           /* advertised line/extcmd byte budget, 0..255 */
     unsigned char pages_done[AG_PAGES_BITMAP_BYTES];
     int pages_delivered;    /* count of distinct delivered page indices */
 
@@ -102,9 +104,12 @@ struct agent_session {
     size_t last_line_len;
     uint64_t last_line_d;
 
-    /* the raw line behind the action returned by the last agent_receive */
+    /* the raw line behind the action returned by the last agent_receive, and
+     * its session-owned identity; agent_accept() consumes only these */
     char pending_line[AG_MAX_LINE_BYTES];
     size_t pending_len;
+    uint64_t pending_id;
+    enum agent_action_kind pending_kind;
     uint32_t pending_hash;
 
     unsigned replays;
@@ -112,6 +117,12 @@ struct agent_session {
     enum agent_invalid_code last_code;
 };
 
+/* Allocate and initialize a session.
+ *
+ * The session OWNS heap allocations (the retained response stream and the
+ * accepted-action bytes).  Every session MUST be released with
+ * agent_session_free() on shutdown and BEFORE it is reinitialized; calling
+ * agent_session_init() on a live session leaks those buffers. */
 void agent_session_init(struct agent_session *s, agent_read_fn rd,
                         agent_write_fn wr, void *io);
 void agent_session_free(struct agent_session *s);
@@ -132,10 +143,16 @@ enum agent_result agent_commit(struct agent_session *s,
 enum agent_result agent_receive(struct agent_session *s,
                                 struct agent_action *out);
 
-/* Record acceptance of an action previously returned by agent_receive, after
- * the caller's semantic validation has succeeded. */
-enum agent_result agent_accept(struct agent_session *s,
-                               const struct agent_action *a);
+/* Record acceptance of the action previously returned by agent_receive, after
+ * the caller's semantic validation has succeeded.
+ *
+ * Acceptance operates SOLELY on the session-owned pending identity that
+ * agent_receive captured: there is no action argument, so an unrelated
+ * object cannot be bound to the pending bytes, and a zero request id can
+ * never be accepted (the parser never produces one).  The pending identity
+ * is consumed exactly once; a second call without an intervening
+ * agent_receive fails. */
+enum agent_result agent_accept(struct agent_session *s);
 
 /* Emit the exact bare terminal closure.  A second call is rejected. */
 enum agent_result agent_write_closed(struct agent_session *s);

@@ -625,6 +625,114 @@ ag_is_counter(long long v, bool over)
     return !over && v >= 1 && (unsigned long long) v <= AG_COUNTER_MAX;
 }
 
+/* Validate one byte range as well-formed UTF-8 (rejecting lone continuation
+ * bytes, truncated leads, overlong encodings, surrogates, and code points
+ * above U+10FFFF). */
+static bool
+ag_utf8_valid(const char *s, size_t n)
+{
+    size_t i = 0;
+
+    while (i < n) {
+        size_t len;
+
+        if (!ag_utf8_len((const unsigned char *) s + i, n - i, &len))
+            return false;
+        i += len;
+    }
+    return true;
+}
+
+/* Validate one public text value: well-formed UTF-8 within its byte budget.
+ * An absent (NULL) value is allowed; the caller decides where absence is
+ * meaningful. */
+static bool
+ag_text_ok(const char *s)
+{
+    size_t n;
+
+    if (!s)
+        return true;
+    n = strlen(s);
+    if (n > AG_MAX_TEXT_BYTES)
+        return false;
+    return ag_utf8_valid(s, n);
+}
+
+#define AG_STYLE_MASK                                                  \
+    (AG_STYLE_BOLD | AG_STYLE_DIM | AG_STYLE_ITALIC | AG_STYLE_UNDERLINE \
+     | AG_STYLE_BLINK | AG_STYLE_INVERSE)
+
+/* Validate every public value of a commit BEFORE any representation is built,
+ * so a malformed view fails closed with no output at all. */
+static bool
+ag_validate_view(const struct agent_view *v, const struct agent_need *need)
+{
+    size_t i;
+    int j, k;
+
+    if (!v || v->npal > AG_VIEW_MAX_PALETTE || v->nstatus > AG_VIEW_MAX_STATUS
+        || v->ncond > AG_VIEW_MAX_COND || v->nmsg > AG_VIEW_MAX_MSG
+        || v->nhist > AG_VIEW_MAX_MSG || v->nwindows > AG_VIEW_MAX_WINDOWS)
+        return false;
+
+    for (i = 0; i < v->npal; ++i) {
+        unsigned char ch = v->pal[i].ch;
+
+        /* a published cell character is one printable ASCII character */
+        if (ch < 0x20 || ch > 0x7e)
+            return false;
+        if (v->pal[i].fg >= AG_COL_MAX || v->pal[i].frame >= AG_COL_MAX)
+            return false;
+        if (v->pal[i].style & ~AG_STYLE_MASK)
+            return false;
+    }
+    for (j = 0; j < AG_MAP_ROWS; ++j)
+        for (k = 0; k < AG_MAP_COLS; ++k)
+            if (v->map[j][k] >= v->npal)
+                return false;
+    if (v->has_cursor
+        && (v->cur_x < AG_MAP_MIN_X || v->cur_x > AG_MAP_MAX_X
+            || v->cur_y < AG_MAP_MIN_Y || v->cur_y > AG_MAP_MAX_Y))
+        return false;
+    for (i = 0; i < v->nstatus; ++i) {
+        if ((v->status[i].name && !ag_text_ok(v->status[i].name))
+            || !ag_text_ok(v->status[i].text))
+            return false;
+        if (v->status[i].color >= AG_COL_MAX
+            || (v->status[i].style & ~AG_STYLE_MASK))
+            return false;
+    }
+    for (i = 0; i < v->ncond; ++i) {
+        if ((v->cond[i].text && !ag_text_ok(v->cond[i].text))
+            || v->cond[i].color >= AG_COL_MAX)
+            return false;
+    }
+    for (i = 0; i < v->nmsg; ++i)
+        if (!ag_text_ok(v->msg[i].text))
+            return false;
+    for (i = 0; i < v->nhist; ++i)
+        if (!ag_text_ok(v->hist[i].text))
+            return false;
+    for (i = 0; i < v->nwindows; ++i) {
+        if (!v->windows[i].title || !ag_text_ok(v->windows[i].title)
+            || !ag_text_ok(v->windows[i].w)
+            || !ag_text_ok(v->windows[i].content))
+            return false;
+    }
+    if (need && need->kind != AG_NEED_NONE) {
+        if (!ag_text_ok(need->prompt) || !ag_text_ok(need->choices)
+            || !ag_text_ok(need->menu) || !ag_text_ok(need->content))
+            return false;
+        if (need->pages < 0 || need->pages > AG_MAX_PAGES)
+            return false;
+        if ((need->kind == AG_NEED_LINE || need->kind == AG_NEED_EXTCMD)
+            && (need->max < 0 || need->max > AG_LINE_INPUT_MAX))
+            return false;
+    }
+    return true;
+}
+
 /* ------------------------------------------------------------------ */
 /* action parsing                                                      */
 /* ------------------------------------------------------------------ */
@@ -1402,7 +1510,7 @@ agent_parse_aux(const char *buf, size_t len, struct agent_aux *out)
                 goto schema;
             }
             have_page = true;
-            if (over || v < 0 || v >= AG_MAX_PAGES) {
+            if (over || v < 0 || v > AG_MAX_PAGE_INDEX) {
                 ag_free(&key);
                 ag_free(&val);
                 goto range;
@@ -1750,18 +1858,20 @@ ag_build_parts(struct ag_parts *ps, const struct agent_view *v,
         ag_putc(&b, ']');
         AG_EMIT_SIMPLE(AG_P_PAL, (const char *) 0);
     }
-    /* sparse blank omission: an unpainted cell is the declared blank
-     * appearance, so palette id 0 cells are not enumerated */
-    for (j = 0; j < AG_MAP_ROWS && ok; ++j) {
-        for (i = 0; i < AG_MAP_COLS && ok; ++i) {
+    /* Sparse blank omission: an unpainted cell is the declared blank
+     * appearance, so palette id 0 cells are not enumerated.  The loop walks
+     * the native array by native x and skips native column zero, which is
+     * unused; the stored coordinate is emitted unchanged. */
+    for (j = AG_MAP_MIN_Y; j <= AG_MAP_MAX_Y && ok; ++j) {
+        for (i = AG_MAP_MIN_X; i <= AG_MAP_MAX_X && ok; ++i) {
             uint16_t id = v->map[j][i];
 
             if (id == 0)
                 continue;
             ag_putc(&b, '[');
-            ag_put_u64(&b, i + AG_MAP_MIN_X);
+            ag_put_u64(&b, i);
             ag_putc(&b, ',');
-            ag_put_u64(&b, j + AG_MAP_MIN_Y);
+            ag_put_u64(&b, j);
             ag_putc(&b, ',');
             ag_put_u64(&b, id);
             ag_putc(&b, ']');
@@ -1769,10 +1879,11 @@ ag_build_parts(struct ag_parts *ps, const struct agent_view *v,
         }
     }
     if (v->has_cursor) {
+        /* the cursor follows the same convention: no offset is applied */
         ag_putc(&b, '[');
-        ag_put_u64(&b, (uint64_t) v->cur_x + AG_MAP_MIN_X);
+        ag_put_u64(&b, (uint64_t) v->cur_x);
         ag_putc(&b, ',');
-        ag_put_u64(&b, (uint64_t) v->cur_y + AG_MAP_MIN_Y);
+        ag_put_u64(&b, (uint64_t) v->cur_y);
         ag_putc(&b, ']');
     } else {
         ag_puts(&b, "null");
@@ -2438,6 +2549,17 @@ agent_retry_last(struct agent_session *s)
     return ag_write_all(s, s->last_line, s->last_line_len);
 }
 
+/* Start (or clear) a chunk delivery stream: the acknowledgement high-water
+ * belongs to one stream, so it is reset whenever last_rid changes. */
+static void
+ag_new_stream(struct agent_session *s, uint64_t rid, long count)
+{
+    s->last_rid = rid;
+    s->last_chunk_count = count;
+    s->acked_chunk = 0;
+    s->have_chunk_ack = false; /* "none": no index acknowledged yet */
+}
+
 static enum agent_result
 ag_emit_chunked(struct agent_session *s, const struct ag_parts *ps)
 {
@@ -2537,8 +2659,7 @@ ag_emit_chunked(struct agent_session *s, const struct ag_parts *ps)
         if (r != AG_OK)
             goto out;
     }
-    s->last_rid = rid;
-    s->last_chunk_count = (long) nchunks;
+    ag_new_stream(s, rid, (long) nchunks);
     r = AG_OK;
 
 out:
@@ -2561,7 +2682,9 @@ agent_commit(struct agent_session *s, const struct agent_view *v,
 
     if (!s || !v)
         return AG_INTERNAL;
-    if (need && need->kind != AG_NEED_NONE && need->pages > AG_MAX_PAGES)
+    /* validate every public value before anything is built or counted, so a
+     * malformed view fails closed with no output and no counter movement */
+    if (!ag_validate_view(v, need))
         return AG_LIMIT;
 
     s->reply_len = 0;
@@ -2592,8 +2715,7 @@ agent_commit(struct agent_session *s, const struct agent_view *v,
     } else {
         /* the delivery counter for chunk 0 is the one just allocated */
         --s->next_delivery;
-        s->last_rid = 0;
-        s->last_chunk_count = 0;
+        ag_new_stream(s, 0, 0);
         r = ag_emit_chunked(s, &ps);
     }
     ag_free(&o);
@@ -2623,6 +2745,10 @@ agent_commit(struct agent_session *s, const struct agent_view *v,
         s->need_x1 = need->x1;
         s->need_y1 = need->y1;
         s->need_pages = need->pages > 0 ? need->pages : 0;
+        s->need_max = (need->kind == AG_NEED_LINE
+                       || need->kind == AG_NEED_EXTCMD)
+                          ? need->max
+                          : 0;
         memset(s->pages_done, 0, sizeof s->pages_done);
         s->pages_delivered = 0;
     } else {
@@ -2632,6 +2758,7 @@ agent_commit(struct agent_session *s, const struct agent_view *v,
         s->need_menu[0] = '\0';
         s->need_x0 = s->need_y0 = s->need_x1 = s->need_y1 = 0;
         s->need_pages = 0;
+        s->need_max = 0;
         memset(s->pages_done, 0, sizeof s->pages_done);
         s->pages_delivered = 0;
     }
@@ -2754,8 +2881,20 @@ ag_handle_aux(struct agent_session *s, struct agent_aux *aux)
                 return AG_IO;
             return AG_BAD_INPUT;
         }
-        /* cumulative, contiguous: a repeat of an already acknowledged index
-         * is idempotent, the next index advances, anything beyond is a gap */
+        /* Cumulative and contiguous, with an explicit "none" state: the first
+         * acknowledgement of a stream must be index 0, a repeat of an
+         * acknowledged index is idempotent, the next index advances, and
+         * anything beyond is a gap. */
+        if (!s->have_chunk_ack) {
+            if (aux->i != 0) {
+                if (agent_write_invalid(s, AG_INV_INCOMPLETE) != AG_OK)
+                    return AG_IO;
+                return AG_BAD_INPUT;
+            }
+            s->have_chunk_ack = true;
+            s->acked_chunk = 0;
+            return AG_OK;
+        }
         if ((uint64_t) aux->i > s->acked_chunk + 1) {
             if (agent_write_invalid(s, AG_INV_INCOMPLETE) != AG_OK)
                 return AG_IO;
@@ -2779,10 +2918,11 @@ ag_handle_aux(struct agent_session *s, struct agent_aux *aux)
             return AG_BAD_INPUT;
         }
         /* the request-driven response is the acknowledgement; a repeat is a
-         * retry and is re-sent without changing the delivered set */
-        ag_mark_page(s, aux->page);
+         * retry and is re-sent without changing the delivered set.  The
+         * delivered bit is set only once the page response has been sent. */
         if (ag_emit_page(s, aux->content, aux->page, s->need_pages) != AG_OK)
             return AG_IO;
+        ag_mark_page(s, aux->page);
         return AG_OK;
 
     default:
@@ -3041,6 +3181,17 @@ agent_receive(struct agent_session *s, struct agent_action *out)
                     return AG_IO;
                 return AG_BAD_INPUT;
             }
+            /* a line/extcmd answer must fit the byte budget the request
+             * advertised, counted over the decoded UTF-8 bytes */
+            if (out->kind == AG_ACT_TEXT
+                && (s->outstanding_kind == AG_NEED_LINE
+                    || s->outstanding_kind == AG_NEED_EXTCMD)
+                && strlen(out->text) > (size_t) s->need_max) {
+                out->code = AG_INV_RANGE;
+                if (agent_write_invalid(s, AG_INV_RANGE) != AG_OK)
+                    return AG_IO;
+                return AG_BAD_INPUT;
+            }
             /* every required page must be delivered before a selection */
             if ((s->outstanding_kind == AG_NEED_MENU
                  || s->outstanding_kind == AG_NEED_ACK)
@@ -3062,10 +3213,13 @@ agent_receive(struct agent_session *s, struct agent_action *out)
                 }
                 s->acked_seq = out->seq;
             }
-            /* not accepted yet: record only the raw line for agent_accept */
+            /* not accepted yet: record the raw line and the session-owned
+             * identity for agent_accept() */
             memcpy(s->pending_line, line, len);
             s->pending_len = len;
             s->pending_hash = h;
+            s->pending_id = out->id;
+            s->pending_kind = out->kind;
             out->replay = false;
             return AG_OK;
         }
@@ -3073,20 +3227,25 @@ agent_receive(struct agent_session *s, struct agent_action *out)
 }
 
 enum agent_result
-agent_accept(struct agent_session *s, const struct agent_action *a)
+agent_accept(struct agent_session *s)
 {
-    if (!s || !a)
+    if (!s)
         return AG_INTERNAL;
     if (s->pending_len == 0)
         return AG_INTERNAL; /* nothing was received for this action */
-    if (a->id != 0 && s->outstanding_id != 0 && a->id != s->outstanding_id)
+    /* acceptance is bound to the session-owned pending identity only; a zero
+     * id is never a valid wire action and can never be accepted */
+    if (s->pending_id == 0 || s->pending_kind == AG_ACT_NONE)
         return AG_INTERNAL;
     if (!ag_action_store(s, s->pending_line, s->pending_len))
         return AG_LIMIT;
     s->action_hash = s->pending_hash;
-    s->action_id = a->id;
+    s->action_id = s->pending_id;
     s->have_action = true;
     s->have_reply = false;
+    /* the pending identity is consumed exactly once */
     s->pending_len = 0;
+    s->pending_id = 0;
+    s->pending_kind = AG_ACT_NONE;
     return AG_OK;
 }

@@ -67,7 +67,7 @@ manifest-check:
 	    exit 1; \
 	fi
 
-check: manifest-check schema-check $(TESTS)
+check: manifest-check schema-check formatter-check $(TESTS)
 	@fail=0; for t in $(TESTS); do \
 	    printf '%s: ' "$$t"; ./$$t || fail=1; \
 	done; \
@@ -79,6 +79,12 @@ check: manifest-check schema-check $(TESTS)
 schema-check: test_protocol
 	@./test_protocol --dump | python3 schema_check.py --stdin
 	@python3 schema_check.py
+
+# The canonical formatter must accept real encoder output and must reject a
+# hostile chunk stream; its own vectors cover retries, gaps and bad slices.
+formatter-check: test_protocol
+	@./test_protocol --dump | python3 format_obs.py --json > /dev/null
+	@python3 format_obs.py --selftest
 
 # ASan/UBSan build, if the compiler supports the flags.
 sanitize: clean

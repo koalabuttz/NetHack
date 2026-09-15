@@ -60,19 +60,30 @@ prints only `win/agent/*.h` plus system headers.
 python3 test/agent/format_obs.py transcript.jsonl        # human projection
 python3 test/agent/format_obs.py --json transcript.jsonl # assembled records
 python3 test/agent/format_obs.py --raw transcript.jsonl  # pass lines through
+python3 test/agent/format_obs.py --selftest              # chunk-assembly vectors
 ```
 
-It is a client-side debugging aid, not a production component.
+It is a client-side debugging aid, not a production component. Its chunk
+assembler is strict and doubles as the reference for what a client must reject:
+chunks stored by `(rid, i)` with contiguous indices from zero, exact repeats
+deduplicated, changed repeats and gaps rejected, header parts allowed only in
+chunk 0, and long-text slices required to name an existing element with
+contiguous offsets before the record is rebuilt atomically.
+
+Sessions own heap allocations. Release every session with `agent_session_free`
+on shutdown and before reinitializing it, or the retained response stream and
+the accepted-action bytes leak.
 
 ## Action acceptance is two-phase
 
 `agent_receive` frames and parses a line, applies every protocol-level check
-(schema, ranges, outstanding request id, kind, the pinned menu generation,
-the advertised position rectangle, page completeness), and returns the action
-*without* recording it.  The caller validates semantically (menu contents,
-yes/no semantics) and then calls `agent_accept`.  A semantically rejected
-action therefore leaves the request outstanding and may be resubmitted with
-the same request id.
+(schema, ranges, outstanding request id, kind, the pinned menu generation, the
+advertised position rectangle, the advertised line/extcmd byte budget, page
+completeness), and returns the action *without* recording it. The caller
+validates semantically (menu contents, yes/no semantics) and then calls
+`agent_accept`, which takes **no action argument** and records the
+session-owned pending identity only. A semantically rejected action therefore
+leaves the request outstanding and may be resubmitted with the same request id.
 
 `agent_session.force_chunk` makes the encoder take the chunk path even when a
 record would fit one line, so the same logical record can be produced and

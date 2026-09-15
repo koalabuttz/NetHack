@@ -66,6 +66,7 @@ wizard3.lua   wizhelp
 
 doc:
 (files for all versions)
+agent-interface.md  agent-profile-v1.tsv  agent-v1.schema.json
 Gbk-1pg-pfx.mn     Gbk-1pg-sfx.mn     Guidebook.mn       Guidebook.tex
 Guidebook.txt      config.nh          dlb.6              dlb.txt
 fixes1-0.txt       fixes1-4-f.txt     fixes2-2.txt       fixes2-3-e.txt
@@ -581,6 +582,12 @@ test:
 README.md     test_cnf.lua  test_des.lua  test_lev.lua  test_obj.lua
 test_sel.lua  test_shk.lua  test_src.lua  testmove.lua  testwish.lua
 
+test/agent:
+(files for the engine-free agent port fixtures)
+Makefile            README.md           format_obs.py       gen_profile.py
+reference_state.c   reference_state.h   schema_check.py     test_menu.c
+test_protocol.c     test_state.c        test_view.c
+
 util:
 (files for all versions)
 dlb_main.c  makedefs.c  mdgrep.h    mdgrep.pl   panic.c     recover.c
@@ -609,6 +616,11 @@ pet_mark.xbm    pilemark.xbm    rip.xpm         tile2x11.c
 winX.c          winlabel.c      winmap.c        winmenu.c
 winmesg.c       winmisc.c       winstat.c       wintext.c
 winval.c
+
+win/agent:
+(files for the agent window port - no terminal required)
+agent_menu.c        agent_menu.h        agent_protocol.c    agent_protocol.h
+agent_types.h       agent_view.c        agent_view.h
 
 win/chain:
 (files for stacking window systems)

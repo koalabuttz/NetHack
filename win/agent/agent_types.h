@@ -39,9 +39,11 @@
  * widest one the encoder ever emits ("c" + 14 digits + NUL) */
 #define AG_ID_STR_MAX 16
 
-/* content pages per menu/text window */
-#define AG_MAX_PAGES 65536
-#define AG_PAGES_BITMAP_BYTES (AG_MAX_PAGES / 8)
+/* content pages per menu/text window: at most AG_MAX_PAGES pages, whose
+ * zero-based indices run 0..AG_MAX_PAGE_INDEX */
+#define AG_MAX_PAGES 65535
+#define AG_MAX_PAGE_INDEX 65534
+#define AG_PAGES_BITMAP_BYTES ((AG_MAX_PAGES + 7) / 8)
 
 /* fixture bounds: a single public view/action value is a fixed-size value */
 #define AG_VIEW_MAX_PALETTE 256
@@ -51,7 +53,16 @@
 #define AG_VIEW_MAX_WINDOWS 32
 #define AG_VIEW_MAX_COMMIT 256
 
-/* ---- map geometry (include/global.h COLNO/ROWNO) ---- */
+/* ---- map geometry (include/global.h COLNO/ROWNO) ----
+ *
+ * The view stores the native 80-column map array indexed by native x:
+ * map[native_y][native_x].  Native column zero is unused and is never
+ * published, so the legal public coordinates are exactly
+ * x = AG_MAP_MIN_X .. AG_MAP_MAX_X and y = AG_MAP_MIN_Y .. AG_MAP_MAX_Y.
+ * The encoder emits the stored coordinates unchanged; it never adds an
+ * offset and never emits x = 0 or x = 80.  A cursor follows the same
+ * convention.
+ */
 #define AG_MAP_COLS 80
 #define AG_MAP_ROWS 21
 #define AG_MAP_MIN_X 1

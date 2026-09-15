@@ -366,6 +366,12 @@ Fields: `v, ch, type, d, seq, base, s, cond, pal, map, cur, msg, hist, windows, 
   full snapshot enumerates only cells whose palette id is not 0; a cell absent
   from `map` is palette id 0, the blank tuple. Sparse omission, not a complete
   grid, is the normative blank-cell representation.
+
+  The adapter stores the native 80-column map array indexed by native
+  coordinate and **emits the stored coordinate unchanged**: it never applies an
+  offset. Native column zero is unused and is never emitted, so a published
+  `x` is always in `1..79` and a published `y` always in `0..20`. The cursor
+  follows the same convention; a cursor outside those ranges is refused.
 * `cur` is `[x,y]` or `null`. Cursor removal is explicit.
 * `msg` is an ordered array of message/presentation events `{e,text,style}`.
   `e` is a presentation-derived event id, never an engine identifier.
@@ -429,6 +435,8 @@ no `d`.
 | outstanding gameplay request | 1 | |
 | counters | 1..2^53-1 | uint64_t internally; close before wrap |
 | menu counts | -1 or 1..2147483647 | additionally `<= LONG_MAX` |
+| content pages | at most 65535 | zero-based indices `0..65534` |
+| line/extcmd answer | the advertised `max` | tested over decoded UTF-8 bytes |
 
 These are local engineering bounds, not measured production budgets. Input
 errors do not consume input; internal or resource failures close generically.
@@ -539,15 +547,23 @@ separate page-ack record. Consequences:
 * `get_page` must name the outstanding request id and that request's content
   id, and its page index must lie within the declared page count; otherwise it
   is rejected without changing any delivery state.
+* A page index is 0-based and at most `65534`; a request may declare at most
+  `65535` pages.
+* The delivered bit is set only **after** the `page` response has been written,
+  so a failed emission cannot mark a page as delivered.
 
 ### 8.2 Chunk acknowledgement
 
-`ack_chunk` is cumulative and contiguous. A repeat of an already acknowledged
-index is idempotent, the next index advances the acknowledgement, and an index
-beyond `acknowledged + 1` is a gap and is rejected as `invalid(incomplete)`.
-The rid must be the most recent chunk stream and the index must lie inside it.
-Chunk acknowledgement is transport bookkeeping: it is not input, not a durable
-commit acknowledgement, and not permission to advance a prompt.
+`ack_chunk` is cumulative and contiguous, with an explicit **none** state. The
+first acknowledgement of a stream must name index 0; a repeat of an
+acknowledged index is idempotent, the next index advances the acknowledgement,
+and an index beyond `acknowledged + 1` is a gap and is rejected as
+`invalid(incomplete)`. The acknowledgement high-water belongs to one stream:
+it is reset whenever the logical record id changes, so a fresh stream cannot
+inherit a previous stream's high-water and its first acknowledgement is index 0
+again. The rid must be the most recent chunk stream and the index must lie
+inside it. Chunk acknowledgement is transport bookkeeping: it is not input, not
+a durable commit acknowledgement, and not permission to advance a prompt.
 
 ## 9. Durable state machine
 
@@ -633,7 +649,11 @@ Request common fields: `{id, kind}`. Types:
   unrestricted), default (byte or `null`); numeric true only if displayed
   choices include a numeric affordance.
 * `line`, `extcmd` — displayed prompt and max byte count; extcmd answers are
-  text resolved privately with the native exact matcher.
+  text resolved privately with the native exact matcher. The advertised `max`
+  is persisted with the request and enforced at the protocol layer over the
+  **decoded UTF-8 byte length** of the answer, so an answer longer than `max`
+  bytes is rejected (leaving the request outstanding) even when it contains
+  fewer code points.
 * `menu` — `{id,kind:"menu",menu:"mN",mode:"none|one|any",content:"cN",pages:N}`.
 * `ack` — `{id,kind:"ack",content:"cN",pages:N}`; all required content must be
   published before acknowledgement is accepted.
@@ -680,6 +700,13 @@ Accepting an action is explicitly two-phase:
 2. The caller then runs its own semantic validation (menu contents via the menu
    model, native yes/no semantics, position legality). If that succeeds the
    caller calls `agent_accept`, which is what records acceptance.
+
+`agent_accept` takes **no action argument**. Acceptance operates solely on the
+session-owned pending identity captured by `agent_receive`, so an unrelated
+object cannot be bound to the pending bytes, and a zero request id — which the
+parser never produces — can never be accepted. The pending identity is
+consumed exactly once; a second call without an intervening receive fails and
+changes nothing.
 
 A semantically rejected action therefore leaves the request outstanding and may
 be resubmitted with the same request id; only a *recorded* accepted id can
@@ -822,6 +849,14 @@ declared nesting depth, per-object key count, and a per-line token budget of
 32768 tokens; exceeding the token budget rejects the line rather than parsing
 it. Byte length is validated as a separate layer from character length: the
 declared text budgets are byte budgets, and invalid UTF-8 is rejected outright.
+
+**Encoder validation and fail-closed commits.** Every public text value is
+validated as well-formed UTF-8 (rejecting lone continuation bytes, truncated
+leads, overlong encodings, surrogates, and code points above U+10FFFF) and
+against its byte budget **before either representation is built**. A malformed
+value makes the commit fail closed: no record, page, or chunk is written and no
+counter moves. Long-text slices are cut only at UTF-8 scalar boundaries, so
+every slice and every physical line is independently valid UTF-8.
 
 **Closed-counter exception.** Architecture §6.5 mandates that the terminal
 closure be exactly `{"v":1,"ch":"control","type":"closed"}` with no other field.

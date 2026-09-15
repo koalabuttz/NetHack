@@ -316,16 +316,16 @@ build_view(int ncells)
     view.pal[2].fg = AG_COL_WHITE;
     view.npal = 3;
     for (i = 0; i < ncells; ++i) {
-        int y = i / AG_MAP_COLS;
-        int x = i % AG_MAP_COLS;
+        int y = AG_MAP_MIN_Y + i / AG_MAP_MAX_X;
+        int x = AG_MAP_MIN_X + i % AG_MAP_MAX_X;
 
-        if (y >= AG_MAP_ROWS)
+        if (y > AG_MAP_MAX_Y)
             break;
         view.map[y][x] = (i == 0) ? 2 : 1;
     }
     view.has_cursor = true;
-    view.cur_x = 0;
-    view.cur_y = 0;
+    view.cur_x = AG_MAP_MIN_X;
+    view.cur_y = AG_MAP_MIN_Y;
     view.status[0].name = "time";
     view.status[0].text = "42";
     view.status[0].color = AG_COL_NONE;
@@ -765,7 +765,7 @@ test_two_phase_acceptance(void)
 
     feed(right);
     CHECK(recv(&a) == AG_OK);
-    CHECK(agent_accept(&sess, &a) == AG_OK);
+    CHECK(agent_accept(&sess) == AG_OK);
     CHECK(sess.have_action == true);
     CHECK(sess.action_id == 9);
 }
@@ -789,7 +789,7 @@ test_action_grammar(void)
     CHECK(agent_commit(&sess, &view, &need) == AG_OK);
     feed("{\"v\":1,\"type\":\"act\",\"id\":4,\"action\":{\"text\":\"x\"}}\n");
     CHECK(recv(&a) == AG_OK && a.kind == AG_ACT_TEXT);
-    CHECK(agent_accept(&sess, &a) == AG_OK);
+    CHECK(agent_accept(&sess) == AG_OK);
     reset_io();
     CHECK(agent_commit(&sess, &view, &need) == AG_OK);
     feed("{\"v\":1,\"type\":\"act\",\"id\":4,"
@@ -1017,7 +1017,7 @@ test_stale_and_duplicate_actions(void)
 
     feed(act5);
     CHECK(recv(&a) == AG_OK);
-    CHECK(agent_accept(&sess, &a) == AG_OK);
+    CHECK(agent_accept(&sess) == AG_OK);
     CHECK(sess.have_action && sess.action_id == 5);
 
     need_cmd(&need, 6);
@@ -1033,7 +1033,7 @@ test_stale_and_duplicate_actions(void)
         CHECK(a.id == 6);
         CHECK(sess.replays == 1);
         CHECK(io.outlen > before); /* the reply was re-written */
-        CHECK(agent_accept(&sess, &a) == AG_OK);
+        CHECK(agent_accept(&sess) == AG_OK);
     }
     /* conflicting reuse of an accepted id closes the transport */
     feed("{\"v\":1,\"type\":\"act\",\"id\":6,\"action\":{\"key\":107}}\n");
@@ -1067,7 +1067,7 @@ test_multichunk_retry_replay(void)
 
     feed(act);
     CHECK(recv(&a) == AG_OK);
-    CHECK(agent_accept(&sess, &a) == AG_OK);
+    CHECK(agent_accept(&sess) == AG_OK);
 
     /* the next commit retains the complete multi-chunk response */
     need_cmd(&need, 2);
@@ -1114,7 +1114,7 @@ test_hash_collision_distinguished(void)
 
     feed(A);
     CHECK(recv(&a) == AG_OK);
-    CHECK(agent_accept(&sess, &a) == AG_OK);
+    CHECK(agent_accept(&sess) == AG_OK);
     need.id = 2;
     CHECK(agent_commit(&sess, &view, &need) == AG_OK);
     CHECK(sess.action_hash == 3834817770u);
@@ -1481,6 +1481,436 @@ dump_vectors(void)
     fwrite(io.out, 1, io.outlen, stdout);
 }
 
+
+/* an independent UTF-8 validator for the test side */
+static bool
+utf8_ok(const char *s, size_t n)
+{
+    size_t i = 0;
+
+    while (i < n) {
+        unsigned char c = (unsigned char) s[i];
+        size_t need;
+
+        if (c < 0x80) {
+            need = 1;
+        } else if (c >= 0xc2 && c <= 0xdf) {
+            need = 2;
+        } else if (c >= 0xe0 && c <= 0xef) {
+            need = 3;
+        } else if (c >= 0xf0 && c <= 0xf4) {
+            need = 4;
+        } else {
+            return false;
+        }
+        if (i + need > n)
+            return false;
+        if (need > 1) {
+            size_t k;
+
+            for (k = 1; k < need; ++k)
+                if (((unsigned char) s[i + k] & 0xc0) != 0x80)
+                    return false;
+            if (need == 3 && c == 0xe0 && (unsigned char) s[i + 1] < 0xa0)
+                return false;
+            if (need == 3 && c == 0xed && (unsigned char) s[i + 1] >= 0xa0)
+                return false;
+            if (need == 4 && c == 0xf0 && (unsigned char) s[i + 1] < 0x90)
+                return false;
+            if (need == 4 && c == 0xf4 && (unsigned char) s[i + 1] >= 0x90)
+                return false;
+        }
+        i += need;
+    }
+    return true;
+}
+
+/* every physical line of the current output must decode as UTF-8 */
+static void
+check_lines_utf8(const char *what)
+{
+    const char *p = outstr();
+    const char *nl;
+
+    while ((nl = strchr(p, '\n')) != NULL) {
+        if (!utf8_ok(p, (size_t) (nl - p))) {
+            printf("FAIL %s: a physical line is not valid UTF-8\n", what);
+            ++failures;
+        }
+        p = nl + 1;
+    }
+}
+
+/* ---- finding 1: map coordinates are native and never 0 or 80 ---- */
+static void
+test_map_coordinates(void)
+{
+    struct agent_view v;
+    struct agent_need need;
+    static char arr[512];
+    const char *c;
+
+    memset(&v, 0, sizeof v);
+    v.full = true;
+    v.pal[0].ch = AG_BLANK_CHAR;
+    v.pal[0].fg = AG_COL_NONE;
+    v.pal[1].ch = '.';
+    v.pal[1].fg = AG_COL_GRAY;
+    v.npal = 2;
+    /* only native (1,0) and (79,20); native column zero is set but unused */
+    v.map[0][0] = 1;
+    v.map[0][1] = 1;
+    v.map[20][79] = 1;
+    v.has_cursor = true;
+    v.cur_x = 1;
+    v.cur_y = 0;
+
+    reset_io();
+    need_cmd(&need, 1);
+    CHECK(agent_commit(&sess, &v, &need) == AG_OK);
+    CHECK(array_content(outstr(), "map", arr, sizeof arr));
+    CHECK(strcmp(arr, "[1,0,1],[79,20,1]") == 0);
+    c = find_key(outstr(), "cur");
+    CHECK(c && strncmp(c, "[1,0]", 5) == 0);
+
+    /* the same record forced through the chunk path */
+    reset_io();
+    agent_session_init(&sess, rd, wr, &io);
+    sess.force_chunk = true;
+    CHECK(agent_commit(&sess, &v, &need) == AG_OK);
+    CHECK(collect_parts(outstr(), "map", arr, sizeof arr));
+    CHECK(strcmp(arr, "[1,0,1],[79,20,1]") == 0);
+    CHECK(collect_parts(outstr(), "cur", arr, sizeof arr));
+    CHECK(strcmp(arr, "[1,0]") == 0);
+
+    /* an out-of-range cursor fails closed */
+    v.cur_x = 0;
+    reset_io();
+    CHECK(agent_commit(&sess, &v, &need) == AG_LIMIT);
+    CHECK(io.outlen == 0);
+    v.cur_x = 80;
+    CHECK(agent_commit(&sess, &v, &need) == AG_LIMIT);
+    CHECK(io.outlen == 0);
+}
+
+/* ---- finding 2: chunk acknowledgement has an explicit none state ---- */
+static void
+test_chunk_ack_state(void)
+{
+    struct agent_action a;
+    struct agent_need need;
+    char ack[128];
+    long rid;
+
+    prep(&a);
+    build_view(60);
+    reset_io();
+    agent_session_init(&sess, rd, wr, &io);
+    sess.force_chunk = true;
+    sess.limit_line = 300;
+    need_cmd(&need, 1);
+    CHECK(agent_commit(&sess, &view, &need) == AG_OK);
+    CHECK(sess.last_chunk_count > 1);
+    CHECK(sess.have_chunk_ack == false);
+    rid = (long) sess.last_rid;
+
+    /* a fresh stream cannot start above index 0 */
+    snprintf(ack, sizeof ack,
+             "{\"v\":1,\"type\":\"ack_chunk\",\"rid\":%ld,\"i\":1}\n", rid);
+    feed(ack);
+    CHECK(agent_receive(&sess, &a) == AG_IO);
+    CHECK(count_sub(outstr(), "\"code\":\"incomplete\"") == 1);
+    CHECK(sess.have_chunk_ack == false);
+
+    /* index 0 starts the stream */
+    snprintf(ack, sizeof ack,
+             "{\"v\":1,\"type\":\"ack_chunk\",\"rid\":%ld,\"i\":0}\n", rid);
+    feed(ack);
+    CHECK(agent_receive(&sess, &a) == AG_IO);
+    CHECK(sess.have_chunk_ack == true);
+    CHECK(sess.acked_chunk == 0);
+
+    /* a repeat of 0 is idempotent */
+    feed(ack);
+    CHECK(agent_receive(&sess, &a) == AG_IO);
+    CHECK(sess.acked_chunk == 0);
+
+    /* then 1 advances */
+    snprintf(ack, sizeof ack,
+             "{\"v\":1,\"type\":\"ack_chunk\",\"rid\":%ld,\"i\":1}\n", rid);
+    feed(ack);
+    CHECK(agent_receive(&sess, &a) == AG_IO);
+    CHECK(sess.acked_chunk == 1);
+
+    /* a second stream resets the high-water: i:1 is incomplete again */
+    reset_io();
+    agent_session_init(&sess, rd, wr, &io);
+    sess.force_chunk = true;
+    sess.limit_line = 300;
+    CHECK(agent_commit(&sess, &view, &need) == AG_OK);
+    CHECK(sess.have_chunk_ack == false);
+    CHECK(sess.acked_chunk == 0);
+    rid = (long) sess.last_rid;
+    snprintf(ack, sizeof ack,
+             "{\"v\":1,\"type\":\"ack_chunk\",\"rid\":%ld,\"i\":1}\n", rid);
+    feed(ack);
+    CHECK(agent_receive(&sess, &a) == AG_IO);
+    CHECK(count_sub(outstr(), "\"code\":\"incomplete\"") == 1);
+    CHECK(sess.have_chunk_ack == false);
+    CHECK(sess.acked_chunk == 0);
+}
+
+/* ---- finding 3: the advertised line/extcmd budget is enforced ---- */
+static void
+test_line_max(void)
+{
+    struct agent_action a;
+    struct agent_need need;
+
+    prep(&a);
+    build_view(2);
+    reset_io();
+    memset(&need, 0, sizeof need);
+    need.kind = AG_NEED_LINE;
+    need.id = 3;
+    need.max = 5;
+    CHECK(agent_commit(&sess, &view, &need) == AG_OK);
+    CHECK(sess.need_max == 5);
+
+    /* max-1 bytes is accepted */
+    feed("{\"v\":1,\"type\":\"act\",\"id\":3,"
+         "\"action\":{\"text\":\"abcd\"}}\n");
+    CHECK(recv(&a) == AG_OK);
+    CHECK(strlen(a.text) == 4);
+    CHECK(agent_accept(&sess) == AG_OK);
+
+    /* exactly max is accepted */
+    reset_io();
+    CHECK(agent_commit(&sess, &view, &need) == AG_OK);
+    feed("{\"v\":1,\"type\":\"act\",\"id\":3,"
+         "\"action\":{\"text\":\"abcde\"}}\n");
+    CHECK(recv(&a) == AG_OK);
+    CHECK(strlen(a.text) == 5);
+
+    /* max+1 is rejected, and the request stays resubmittable */
+    reset_io();
+    CHECK(agent_commit(&sess, &view, &need) == AG_OK);
+    feed("{\"v\":1,\"type\":\"act\",\"id\":3,"
+         "\"action\":{\"text\":\"abcdef\"}}\n");
+    CHECK(recv(&a) == AG_BAD_INPUT);
+    CHECK(a.code == AG_INV_RANGE);
+    CHECK(sess.outstanding_id == 3);
+    CHECK(sess.pending_len == 0);
+    feed("{\"v\":1,\"type\":\"act\",\"id\":3,"
+         "\"action\":{\"text\":\"abcde\"}}\n");
+    CHECK(recv(&a) == AG_OK);
+
+    /* the budget counts bytes, not code points: two 2-byte scalars fit five
+     * bytes, three of them do not */
+    reset_io();
+    CHECK(agent_commit(&sess, &view, &need) == AG_OK);
+    {
+        static const char two[] = "\xc3\xa9" "\xc3\xa9";
+        char line[128];
+        size_t n;
+
+        n = (size_t) snprintf(line, sizeof line,
+                              "%s%s%s",
+                              "{\"v\":1,\"type\":\"act\",\"id\":3,"
+                              "\"action\":{\"text\":\"", two, "\"}}\n");
+        memcpy(line + n - 5, two, 4);
+        /* rebuild cleanly rather than fighting the format string */
+        n = 0;
+        n += (size_t) snprintf(line + n, sizeof line - n, "%s",
+                               "{\"v\":1,\"type\":\"act\",\"id\":3,"
+                               "\"action\":{\"text\":\"");
+        memcpy(line + n, two, 4);
+        n += 4;
+        n += (size_t) snprintf(line + n, sizeof line - n, "%s", "\"}}\n");
+        feed(line);
+        CHECK(recv(&a) == AG_OK);
+        CHECK(strlen(a.text) == 4);
+    }
+    reset_io();
+    CHECK(agent_commit(&sess, &view, &need) == AG_OK);
+    {
+        static const char three[] = "\xc3\xa9" "\xc3\xa9" "\xc3\xa9";
+        char line[128];
+        size_t n = 0;
+
+        n += (size_t) snprintf(line + n, sizeof line - n, "%s",
+                               "{\"v\":1,\"type\":\"act\",\"id\":3,"
+                               "\"action\":{\"text\":\"");
+        memcpy(line + n, three, 6);
+        n += 6;
+        n += (size_t) snprintf(line + n, sizeof line - n, "%s", "\"}}\n");
+        feed(line);
+        CHECK(recv(&a) == AG_BAD_INPUT);
+        CHECK(a.code == AG_INV_RANGE);
+        CHECK(sess.outstanding_id == 3);
+    }
+
+    /* an out-of-range advertised budget is refused at commit */
+    reset_io();
+    need.max = AG_LINE_INPUT_MAX + 1;
+    CHECK(agent_commit(&sess, &view, &need) == AG_LIMIT);
+    CHECK(io.outlen == 0);
+}
+
+/* ---- finding 4: the encoder validates UTF-8 before building ---- */
+static void
+test_encoder_utf8(void)
+{
+    struct agent_view v;
+    static char text[4096];
+    static char recon[4096 + 64];
+    static const char mixed[] = "\xc3\xa9" "\xe2\x82\xac" "\xf0\x9f\x98\x80";
+    size_t i, budget;
+
+    memset(&v, 0, sizeof v);
+    v.full = true;
+    v.pal[0].ch = AG_BLANK_CHAR;
+    v.pal[0].fg = AG_COL_NONE;
+    v.npal = 1;
+    v.nmsg = 1;
+    v.msg[0].e = 5;
+    v.msg[0].style = 0;
+
+    /* repeat the 2/3/4-byte scalars so a small budget forces many slices */
+    for (i = 0; i + sizeof mixed - 1 <= sizeof text - 1;
+         i += sizeof mixed - 1)
+        memcpy(text + i, mixed, sizeof mixed - 1);
+    text[i] = '\0';
+    v.msg[0].text = text;
+
+    /* split at every legal budget boundary: the reconstruction must be exact
+     * and every physical line must still decode as UTF-8 */
+    for (budget = 260; budget <= 1400; budget += 37) {
+        reset_io();
+        agent_session_init(&sess, rd, wr, &io);
+        sess.force_chunk = true;
+        sess.limit_line = budget;
+        CHECK(agent_commit(&sess, &v, NULL) == AG_OK);
+        memset(recon, 0, sizeof recon);
+        CHECK(collect_text_parts(outstr(), "msg", 5, "text", recon,
+                                 sizeof recon));
+        CHECK(strcmp(recon, text) == 0);
+        check_lines_utf8("utf8 slice");
+    }
+
+    /* malformed, truncated, overlong and surrogate sequences fail closed */
+    {
+        static const char *const badtexts[] = {
+            "\x80",             /* lone continuation byte */
+            "\xc3\x28",         /* truncated 2-byte sequence */
+            "\xe2\x82",         /* truncated 3-byte sequence */
+            "\xf0\x9f\x98",     /* truncated 4-byte sequence */
+            "\xc0\xaf",         /* overlong 2-byte encoding */
+            "\xe0\x80\xaf",     /* overlong 3-byte encoding */
+            "\xed\xa0\x80",     /* UTF-16 surrogate */
+            "\xf5\x80\x80\x80", /* above U+10FFFF */
+            "\xff",             /* invalid lead byte */
+            "ok\xc3"            /* valid prefix, then truncated */
+        };
+        size_t k;
+
+        for (k = 0; k < sizeof badtexts / sizeof badtexts[0]; ++k) {
+            v.msg[0].text = badtexts[k];
+            reset_io();
+            CHECK(agent_commit(&sess, &v, NULL) == AG_LIMIT);
+            CHECK(io.outlen == 0); /* fail closed: nothing is written */
+        }
+        /* a well-formed value is still accepted after the malformed ones */
+        v.msg[0].text = "fine";
+        reset_io();
+        CHECK(agent_commit(&sess, &v, NULL) == AG_OK);
+    }
+}
+
+/* ---- finding 5: acceptance binds only the pending identity ---- */
+static void
+test_accept_identity(void)
+{
+    struct agent_action a;
+    struct agent_need need;
+
+    prep(&a);
+    build_view(2);
+    reset_io();
+    need_cmd(&need, 9);
+    CHECK(agent_commit(&sess, &view, &need) == AG_OK);
+
+    /* nothing pending: acceptance fails and changes nothing */
+    CHECK(agent_accept(&sess) == AG_INTERNAL);
+    CHECK(sess.have_action == false);
+    CHECK(sess.action_id == 0);
+
+    /* an unrelated id (8) is rejected by receive: never pending */
+    feed("{\"v\":1,\"type\":\"act\",\"id\":8,\"action\":{\"key\":104}}\n");
+    CHECK(recv(&a) == AG_BAD_INPUT);
+    CHECK(sess.pending_len == 0);
+    CHECK(agent_accept(&sess) == AG_INTERNAL);
+    CHECK(sess.action_id == 0);
+
+    /* a zero request id is never a valid wire action */
+    feed("{\"v\":1,\"type\":\"act\",\"id\":0,\"action\":{\"key\":104}}\n");
+    CHECK(recv(&a) == AG_BAD_INPUT);
+    CHECK(sess.pending_id == 0);
+    CHECK(agent_accept(&sess) == AG_INTERNAL);
+    CHECK(sess.action_id == 0);
+
+    /* normal acceptance binds the session-owned id exactly once */
+    feed("{\"v\":1,\"type\":\"act\",\"id\":9,\"action\":{\"key\":104}}\n");
+    CHECK(recv(&a) == AG_OK);
+    CHECK(sess.pending_id == 9);
+    CHECK(agent_accept(&sess) == AG_OK);
+    CHECK(sess.action_id == 9);
+    CHECK(sess.have_action == true);
+    /* the pending identity is consumed exactly once */
+    CHECK(agent_accept(&sess) == AG_INTERNAL);
+    CHECK(sess.action_id == 9);
+}
+
+/* ---- finding 7: page count and index boundaries ---- */
+static void
+test_page_bounds(void)
+{
+    struct agent_action a;
+    struct agent_need need;
+
+    prep(&a);
+    build_view(2);
+    reset_io();
+    memset(&need, 0, sizeof need);
+    need.kind = AG_NEED_MENU;
+    need.id = 1;
+    need.menu = "m1";
+    need.mode = AG_MENU_ANY;
+    need.content = "c1";
+    need.pages = AG_MAX_PAGES; /* exactly the maximum */
+    CHECK(agent_commit(&sess, &view, &need) == AG_OK);
+    CHECK(sess.need_pages == 65535);
+
+    /* exactly the last legal index is delivered */
+    feed("{\"v\":1,\"type\":\"get_page\",\"id\":1,\"content\":\"c1\","
+         "\"page\":65534}\n");
+    CHECK(agent_receive(&sess, &a) == AG_IO);
+    CHECK(sess.pages_delivered == 1);
+
+    /* one index past the allowed maximum is rejected by the parser */
+    feed("{\"v\":1,\"type\":\"get_page\",\"id\":1,\"content\":\"c1\","
+         "\"page\":65535}\n");
+    CHECK(agent_receive(&sess, &a) == AG_IO);
+    CHECK(sess.pages_delivered == 1);
+    CHECK(count_sub(outstr(), "\"code\":\"range\"") == 1);
+
+    /* one page past the declared maximum is refused at commit */
+    reset_io();
+    need.pages = AG_MAX_PAGES + 1;
+    CHECK(agent_commit(&sess, &view, &need) == AG_LIMIT);
+    CHECK(io.outlen == 0);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1507,6 +1937,12 @@ main(int argc, char **argv)
     test_long_text();
     test_chunk_plan_boundaries();
     test_chunk_emission_details();
+    test_map_coordinates();
+    test_chunk_ack_state();
+    test_line_max();
+    test_encoder_utf8();
+    test_accept_identity();
+    test_page_bounds();
 
     if (failures) {
         printf("test_protocol: %d failure(s)\n", failures);
