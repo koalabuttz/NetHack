@@ -4,6 +4,9 @@
 /* NetHack may be freely redistributed.  See license for details. */
 
 #include "hack.h"
+#ifdef AGENT_GRAPHICS
+#include "winagent.h"
+#endif
 
 #define BIGBUFSZ (5 * BUFSZ) /* big enough to format a 4*BUFSZ string (from
                               * config file parsing) with modest decoration;
@@ -586,6 +589,18 @@ impossible(const char *s, ...)
     va_list the_args;
     char pbuf[BIGBUFSZ]; /* will be chopped down to BUFSZ-1 if longer */
     char pbuf2[BUFSZ];
+
+#ifdef AGENT_GRAPHICS
+    /* Producer-level diagnostic isolation: in agent mode the diagnostic text
+     * goes to a bounded PRIVATE sink and the worker terminates low-level,
+     * before any recursive panic handling or public pline()/raw_print() path.
+     * Human behavior is unchanged when the latch is not set. */
+    if (agent_mode()) {
+        va_start(the_args, s);
+        agent_impossible_fatal(s, the_args);
+        /*NOTREACHED*/
+    }
+#endif
 
     va_start(the_args, s);
     if (program_state.in_impossible)

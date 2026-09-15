@@ -1,0 +1,20 @@
+# test/agent/sysconf -- the reviewed minimal immutable configuration read by
+# agent workers.  It is the ONLY configuration an agent episode reads: personal
+# rc files, NETHACKOPTIONS and HACKOPTIONS are bypassed by the trusted latch.
+#
+# No developer or user hooks: no pager/editor/shell, no wizard or explorer
+# accounts, no external crash submission, no panic tracer.  All writable paths
+# come from the launcher's private per-episode root, not from this file.
+
+# No privileged accounts: an agent worker is never a wizard or explorer.
+WIZARDS=
+EXPLORERS=
+
+# The worker's account name.  It grants nothing beyond ordinary play.
+GENERICUSERS=agent
+
+# One player per worker process.
+MAXPLAYERS=1
+
+# No rerolling of starting inventories.
+MAX_REROLL_RATE=0

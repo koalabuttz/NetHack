@@ -86,6 +86,7 @@ sound.txt          tmac.n             tmac.nh            window.txt
 
 include:
 (files for X versions)
+winagent.h
 tile2x11.h  winX.h      xwindow.h   xwindowp.h
 
 (files for all versions)
@@ -381,8 +382,8 @@ Install.unx     Makefile.check  Makefile.dat    Makefile.doc
 Makefile.src    Makefile.top    Makefile.utl    NewInstall.unx
 README.hints    README.xcode    XCode.xcconfig  depend.awk
 gitinfo.sh      macuuid.m       mkmkfile.sh     nethack.sh
-setup.sh        sysconf         unixmain.c      unixres.c
-unixunix.c
+agent_runner.c  setup.sh        sysconf         unixmain.c
+unixres.c       unixunix.c
 
 sys/unix/NetHack.xcodeproj:
 (file for macOS Xcode)
@@ -408,7 +409,8 @@ solaris-playground  unix
 
 sys/unix/hints/include:
 (files for configuring UNIX NetHack versions)
-compiler.500       cross-post.500     cross-pre1.500     cross-pre2.500
+agent.500          compiler.500       cross-post.500     cross-pre1.500
+cross-pre2.500
 dirs-perms.500     gbdates-post.500   gbdates-pre.500    linuxdistro.500
 misc.500           multisnd-post.500  multisnd1-pre.500  multisnd2-pre.500
 multiw-1.500       multiw-2.500       response.500       whichbsd.500
@@ -584,9 +586,10 @@ test_sel.lua  test_shk.lua  test_src.lua  testmove.lua  testwish.lua
 
 test/agent:
 (files for the engine-free agent port fixtures)
-Makefile            README.md           format_obs.py       gen_profile.py
-reference_state.c   reference_state.h   schema_check.py     test_menu.c
-test_protocol.c     test_state.c        test_view.c
+.gitignore          Makefile            README.md           driver.py
+format_obs.py       gen_profile.py      reference_state.c   reference_state.h
+schema_check.py     sysconf             test_menu.c         test_protocol.c
+test_state.c        test_view.c
 
 util:
 (files for all versions)
@@ -619,8 +622,9 @@ winval.c
 
 win/agent:
 (files for the agent window port - no terminal required)
-agent_menu.c        agent_menu.h        agent_protocol.c    agent_protocol.h
-agent_types.h       agent_view.c        agent_view.h
+agent_bootstrap.c   agent_handshake.h   agent_menu.c        agent_menu.h
+agent_protocol.c    agent_protocol.h    agent_types.h       agent_view.c
+agent_view.h        winagent.c
 
 win/chain:
 (files for stacking window systems)

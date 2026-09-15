@@ -5,6 +5,15 @@
 
 #ifndef OPTION_LISTS_ONLY
 #include "hack.h"
+/* The sysconf file actually used at startup.  In agent mode this is the
+ * launcher-approved immutable path from the handshake; in a human build it is
+ * the compiled-in path, so human behavior is byte-for-byte unchanged. */
+#ifdef AGENT_GRAPHICS
+#include "winagent.h"
+#define AGENT_SYSCF_FILE (agent_mode() ? agent_trusted_sysconf() : SYSCF_FILE)
+#else
+#define AGENT_SYSCF_FILE SYSCF_FILE
+#endif
 #include "tcap.h"
 #else /* OPTION_LISTS_ONLY: (AMIGA) external program for opt lists */
 #include "config.h"
@@ -7105,11 +7114,11 @@ initoptions(void)
 #ifdef SYSCF_FILE
     /* If SYSCF_FILE is specified, it _must_ exist... */
     assure_syscf_file();
-    config_error_init(TRUE, SYSCF_FILE, FALSE);
+    config_error_init(TRUE, AGENT_SYSCF_FILE, FALSE);
 
     /* ... and _must_ parse correctly. */
     go.opt_phase = syscf_opt;
-    if (!read_config_file(SYSCF_FILE, set_in_sysconf)) {
+    if (!read_config_file(AGENT_SYSCF_FILE, set_in_sysconf)) {
         if (config_error_done() && !iflags.initoptions_noterminate)
             nh_terminate(EXIT_FAILURE);
     }
@@ -7302,11 +7311,11 @@ initoptions_init(void)
 #ifdef SYSCF_FILE
     /* If SYSCF_FILE is specified, it _must_ exist... */
     assure_syscf_file();
-    config_error_init(TRUE, SYSCF_FILE, FALSE);
+    config_error_init(TRUE, AGENT_SYSCF_FILE, FALSE);
 
     /* ... and _must_ parse correctly. */
     go.opt_phase = syscf_opt;
-    if (!read_config_file(SYSCF_FILE, set_in_sysconf)) {
+    if (!read_config_file(AGENT_SYSCF_FILE, set_in_sysconf)) {
         if (config_error_done() && !iflags.initoptions_noterminate)
             nh_terminate(EXIT_FAILURE);
     }

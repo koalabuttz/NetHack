@@ -159,6 +159,37 @@ There are other hints file options that are meant to impact your NetHack build
 in various other ways too. A reference list can be found in
 sys/unix/README.hints. 
 
+
+Agent (headless) builds
+------------------------
+A headless agent build needs no terminal at all:
+
+    make WANT_WIN_AGENT=1 WANT_DEFAULT=agent all
+
+It links neither curses nor ncurses nor terminfo, and it builds the trusted
+launcher src/nethack-agent alongside src/nethack.  Agent-only is selected by
+the absence of WANT_WIN_TTY/WANT_WIN_CURSES; do not pass WANT_WIN_TTY=0.
+
+    make spotless
+    ( cd sys/unix && sh setup.sh hints/linux.500 )
+    make WANT_WIN_AGENT=1 WANT_DEFAULT=agent WANT_AGENT_STRICT=1 all
+
+WANT_AGENT_STRICT=1 adds only verified compile-time exclusions (NOSHELL and
+NOSUSPEND).  Do not run 'make install' to test an agent build: the launcher
+stages its own immutable data and creates private per-episode directories.
+
+    root=$(mktemp -d)
+    make WANT_WIN_AGENT=1 WANT_DEFAULT=agent WANT_AGENT_STRICT=1 \
+        AGENT_TEST_DATA="$root/data" agent-test-data
+    python3 test/agent/driver.py episode \
+        --runner "$PWD/src/nethack-agent" --worker "$PWD/src/nethack" \
+        --data "$root/data" --sysconf "$root/data/sysconf" \
+        --private-root "$root/episodes"
+
+See sys/unix/README.hints for the build variables and doc/agent-interface.md
+for the frozen wire contract.
+
+
 # NetHack 5.0  NewInstall.unx       $NHDT-Date: 1652276817 2022/05/11 13:46:57 $  $NHDT-Branch: NetHack-5.0 $:$NHDT-Revision: 1.11 $
 # Copyright (c) 2009 by Kenneth Lorber, Kensington, Maryland
 # NetHack may be freely redistributed.  See license for details.

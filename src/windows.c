@@ -4,8 +4,14 @@
 
 #include "hack.h"
 #include "dlb.h"
+#ifdef AGENT_GRAPHICS
+#include "winagent.h"
+#endif
 #ifdef TTY_GRAPHICS
 #include "wintty.h"
+#endif
+#ifdef AGENT_GRAPHICS
+extern struct window_procs agent_procs;
 #endif
 #ifdef CURSES_GRAPHICS
 extern struct window_procs curses_procs;
@@ -131,6 +137,11 @@ static struct win_choices {
 #endif
 #ifdef SHIM_GRAPHICS
     { &shim_procs, 0 CHAINR(0) },
+#endif
+#ifdef AGENT_GRAPHICS
+    /* Agent initializes itself through init_nhwindows; the trusted bootstrap
+     * owns port selection, so there is no registry init routine. */
+    { &agent_procs, 0 CHAINR(0) },
 #endif
 #ifdef WINCHAIN
     { &chainin_procs, chainin_procs_init, chainin_procs_chain },
@@ -268,6 +279,14 @@ choose_windows(const char *s)
 {
     int i;
     char *tmps = 0;
+
+#ifdef AGENT_GRAPHICS
+    /* Trusted-bootstrap latch policy, enforced before the selection loop: a
+     * latched worker is forced onto the agent port and a non-latched process
+     * may not select it.  The latch is private static storage, so neither
+     * configuration nor a save file can influence this decision. */
+    s = agent_enforce_window_choice(s);
+#endif
 
     for (i = 0; winchoices[i].procs; i++) {
         if ('+' == winchoices[i].procs->name[0])

@@ -98,3 +98,6 @@ util/*.lib
 util/*.exp
 submodules/CHKSUMS.tmp
 sys/amiga/regex/
+
+# the trusted agent launcher, built alongside src/nethack
+src/nethack-agent

@@ -7,6 +7,9 @@
 
 #include "hack.h"
 #include "dlb.h"
+#ifdef AGENT_GRAPHICS
+#include "winagent.h"
+#endif
 
 #include <sys/stat.h>
 #include <signal.h>
@@ -63,7 +66,27 @@ main(int argc, char *argv[])
     boolean resuming = FALSE; /* assume new game */
     boolean plsel_once = FALSE;
 
+#ifdef AGENT_GRAPHICS
+    /* Trusted bootstrap, step 1-2 of the documented hook order: this runs
+     * before early_init() so the latch is established before any engine
+     * global, configuration file, or player-facing output can exist.  It is
+     * OS-only and stores its authority in private static storage. */
+    agent_bootstrap_probe(&argc, &argv);
+    agent_bootstrap_argv_policy(argc, argv);
+#endif
+
     early_init(argc, argv);
+
+#ifdef AGENT_GRAPHICS
+    /* Hook order step 2: the engine globals are now initialized, so the
+     * private prefixes and diagnostic routing can be established. */
+    agent_bootstrap_after_globals();
+    /* An agent-only build is a headless worker: without a valid trusted
+     * bootstrap it must fail privately rather than fall back to a terminal
+     * port or to personal configuration. */
+    if (!agent_mode() && strcmp(DEFAULT_WINDOW_SYS, "agent") == 0)
+        agent_private_fatal("agent-only build started without a bootstrap");
+#endif
 
 #if defined(__APPLE__)
     {
@@ -128,6 +151,12 @@ main(int argc, char *argv[])
     dir = nh_getenv("NETHACKDIR");
     if (!dir)
         dir = nh_getenv("HACKDIR");
+#ifdef AGENT_GRAPHICS
+    /* Hook order step 4: an agent worker takes its playground from the trusted
+     * handshake, never from the inherited environment. */
+    if (agent_mode())
+        dir = (char *) agent_trusted_writable_root();
+#endif
 #endif /* CHDIR */
     program_state.early_options = 1;
     /* handle -dalthackdir, -s <score stuff>, --version, --showpaths */

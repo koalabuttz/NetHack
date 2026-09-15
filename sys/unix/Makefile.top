@@ -132,7 +132,16 @@ LUATOPLIB ?= lib/lua/$(LUABASELIB)
 LUAHPREFIX ?= ../
 LUALIBBUILT ?= $(LUATOP)/liblua.a
 
-ALLDEP = $(PRECHECK) $(GAME) recover Guidebook $(VARDAT) spec_levs check-dlb
+ALLDEP = $(PRECHECK) $(GAME) recover Guidebook $(VARDAT) spec_levs check-dlb \
+	$(AGENT_ALLDEP)
+ifdef WANT_WIN_AGENT
+AGENT_ALLDEP = agent-runner
+endif
+
+# The trusted launcher is built inside src/, where its sources and the shared
+# handshake header live.  It is standalone: no game objects, no Lua, no tty.
+agent-runner:
+	( cd src ; $(MAKE) WANT_WIN_AGENT=1 agent-runner )
 
 # first target is also the default target for 'make' without any arguments
 all:    $(ALLDEP)
@@ -279,6 +288,32 @@ check-dlb: options
 dlb:
 	( cd util ; $(MAKE) dlb )
 	( cd dat ; $(MAKE) DATDLB="$(DATDLB)" nhdat )
+
+# Stage the immutable agent test data into a caller-owned directory.
+#
+# This is deliberately NOT an install target and never touches the playground:
+# it creates AGENT_TEST_DATA if needed, marks it as owned, copies the immutable
+# data (nhdat plus the non-DLB files) and the reviewed test sysconf, and
+# refuses to write into a non-empty directory it does not own.  The caller's
+# writable per-episode state is created separately by the launcher.
+agent-test-data: $(GAME) $(VARDAT) spec_levs
+	@if test -z "$(AGENT_TEST_DATA)" ; then \
+	    echo "agent-test-data: set AGENT_TEST_DATA to a fresh directory" ; \
+	    exit 1 ; \
+	fi
+	@if test -e "$(AGENT_TEST_DATA)" \
+	    && test -n "`ls -A $(AGENT_TEST_DATA) 2>/dev/null`" \
+	    && test ! -f "$(AGENT_TEST_DATA)/.agent-test-data" ; then \
+	    echo "agent-test-data: refusing non-empty directory (not created by this target)" ; \
+	    exit 1 ; \
+	fi
+	@mkdir -p "$(AGENT_TEST_DATA)"
+	@touch "$(AGENT_TEST_DATA)/.agent-test-data"
+	( cd dat ; for f in nhdat $(DATNODLB) ; do \
+	      if test -f "$$f" ; then cp -p "$$f" "$(AGENT_TEST_DATA)" ; fi ; \
+	  done )
+	cp -p test/agent/sysconf "$(AGENT_TEST_DATA)/sysconf"
+	@echo "agent test data staged in $(AGENT_TEST_DATA)" 
 
 wasm:
 	( cd src ; $(MAKE) CROSS_TO_WASM=1 ../targets/wasm/nethack.js )

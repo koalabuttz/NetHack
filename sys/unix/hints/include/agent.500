@@ -1,0 +1,28 @@
+#------------------------------------------------------------------------------
+# NetHack 5.0  agent.500
+
+# The agent window port is a headless, trusted-bootstrap port.  This include is
+# pulled in conditionally from linux.500 and changes nothing unless
+# WANT_WIN_AGENT is set, so human-only and combined builds are unaffected.
+#
+# Build it with:
+#   make WANT_WIN_AGENT=1 WANT_DEFAULT=agent all
+
+ifdef WANT_WIN_AGENT
+
+# WANT_AGENT_STRICT=1 is a proposed, opt-in strict profile for evaluation
+# workers.  It adds ONLY compile-time feature exclusions whose guards are
+# verified in include/unixconf.h:
+#   NOSHELL    (unixconf.h, "do not compile in the shell escape")
+#   NOSUSPEND  (unixconf.h, "do not compile in ^Z suspension")
+# Nothing else is guessed here: an exclusion without a verified guard would be
+# a claim this tree cannot support.
+ifdef WANT_AGENT_STRICT
+NHCFLAGS += -DNOSHELL
+NHCFLAGS += -DNOSUSPEND
+endif
+
+endif # WANT_WIN_AGENT
+
+#end of agent.500
+#------------------------------------------------------------------------------

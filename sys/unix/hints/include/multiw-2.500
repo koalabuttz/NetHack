@@ -35,12 +35,15 @@ WANT_WIN_CURSES=1
 WANT_WIN_X11=1
 WANT_WIN_QT=1
 else
-# Make sure that at least one interface is enabled.
+# Make sure that at least one interface is enabled.  The agent port counts as
+# an interface, so an agent-only build does not silently fall back to tty.
 ifndef WANT_WIN_TTY
 ifndef  WANT_WIN_CURSES
 ifndef   WANT_WIN_X11
 ifndef    WANT_WIN_QT
+ifndef     WANT_WIN_AGENT
 WANT_WIN_TTY=1
+endif
 endif
 endif
 endif
@@ -68,7 +71,11 @@ else
 ifdef    WANT_WIN_QT
 WANT_DEFAULT=Qt
 else
+ifdef     WANT_WIN_AGENT
+WANT_DEFAULT=agent
+else
 # ? shouldn't be able to get here...
+endif
 endif
 endif
 endif
@@ -85,6 +92,17 @@ WINSRC += $(WINTTYSRC)
 WINOBJ0 += $(WINTTYOBJ)
 else
 WINCFLAGS += -DNOTTYGRAPHICS
+endif
+
+# The agent port is a headless window system: no terminal, curses, tiles or
+# terminal input.  It is deliberately NOT part of WANT_WIN_ALL.  WINLIB is
+# always assigned here (even when empty) so that the tty/ncurses fallback in
+# Makefile.src is never used for an agent-only build.
+ifdef WANT_WIN_AGENT
+WINCFLAGS += -DAGENT_GRAPHICS
+WINSRC += $(WINAGENTSRC)
+WINOBJ0 += $(WINAGENTOBJ)
+WINLIB += $(WINAGENTLIB)
 endif
 
 ifdef WANT_WIN_CURSES

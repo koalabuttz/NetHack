@@ -27,7 +27,7 @@ HINTSINCLNAMES := dirs-perms \
 		compiler cross-pre1 cross-pre2 cross-post \
 		gbdates-pre gbdates-post \
 		linuxdistro \
-		multiw-1 multiw-2 misc \
+		multiw-1 multiw-2 agent misc \
 		multisnd1-pre multisnd2-pre multisnd-post \
 		response
 HINTSINCLFILES := $(addsuffix .$(HINTSVERSION), $(HINTSINCLNAMES))
@@ -40,6 +40,10 @@ endif
 # note: '#-INCLUDE' is not just a comment
 #        multiw-1.500 contains sections 1 to 2
 #-INCLUDE multiw-1.500
+
+# note: '#-INCLUDE' is not just a comment
+#        agent.500 adds the opt-in WANT_AGENT_STRICT profile only
+#-INCLUDE agent.500
 
 # note: '#-INCLUDE' is not just a comment
 #        it pulls in the contents of dirs-perms.500
@@ -351,8 +355,13 @@ VARDATND0 =
 #endif # WANT_WIN_CHAIN
 
 ifdef MAKEFILE_SRC
+# Link the curses/termcap libraries only when a terminal port is actually part
+# of this binary.  An agent-only build has no terminal and must not inherit a
+# tty dependency through CURSESLIB.
 ifdef CURSESLIB
+ifneq "$(WANT_WIN_TTY)$(WANT_WIN_CURSES)" ""
 WINLIB += $(CURSESLIB)
+endif
 endif   #CURSESLIB
 
 ifneq "$(NO_NHUUID)" "1"

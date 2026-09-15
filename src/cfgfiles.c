@@ -6,6 +6,15 @@
 #define NEED_VARARGS
 
 #include "hack.h"
+/* The sysconf file actually used at startup.  In agent mode this is the
+ * launcher-approved immutable path from the handshake; in a human build it is
+ * the compiled-in path, so human behavior is byte-for-byte unchanged. */
+#ifdef AGENT_GRAPHICS
+#include "winagent.h"
+#define AGENT_SYSCF_FILE (agent_mode() ? agent_trusted_sysconf() : SYSCF_FILE)
+#else
+#define AGENT_SYSCF_FILE SYSCF_FILE
+#endif
 #include "dlb.h"
 #include <errno.h>
 
@@ -2203,12 +2212,14 @@ assure_syscf_file(void)
      */
 #ifndef VMS
 #if defined(NOCWD_ASSUMPTIONS) && defined(WIN32)
-    fd = open(fqname(SYSCF_FILE, SYSCONFPREFIX, 0), O_RDONLY);
+    fd = open(fqname(AGENT_SYSCF_FILE, SYSCONFPREFIX, 0), O_RDONLY);
 #else
-    fd = open(SYSCF_FILE, O_RDONLY);
+    /* In agent mode this is the launcher-approved immutable sysconf; in a
+     * human build it is the compiled-in path, unchanged. */
+    fd = open(AGENT_SYSCF_FILE, O_RDONLY);
 #endif
 #else   /* VMS */
-    fd = open(SYSCF_FILE, O_RDONLY, 0);
+    fd = open(AGENT_SYSCF_FILE, O_RDONLY, 0);
 #endif  /* VMS */
     if (fd >= 0) {
         /* readable */

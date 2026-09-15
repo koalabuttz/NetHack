@@ -20,6 +20,7 @@ enum wp_ids { wp_tty = 1, wp_X11, wp_Qt, wp_mswin, wp_curses,
               wp_mac, wp_Gem, wp_Gnome,
 #endif
               wp_trace  // XXX do we need this?  should chainin/out get an id? TBD
+              , wp_agent /* the agent window port (appended, never inserted) */
 };
 
 /* NB: this MUST match chain_procs below */

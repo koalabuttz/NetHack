@@ -1,0 +1,10 @@
+# Binaries and objects built by test/agent/Makefile, plus the sanitizer and
+# dependency scratch files.  Nothing here is a shipped file.
+test_view
+test_menu
+test_protocol
+test_state
+*.o
+.dep.*.d
+.profile.tmp
+__pycache__/

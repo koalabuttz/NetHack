@@ -244,6 +244,20 @@ WINTTYSRC ?= ../win/tty/getline.c ../win/tty/termcap.c ../win/tty/topl.c \
 WINTTYOBJ ?= $(TARGETPFX)getline.o $(TARGETPFX)termcap.o $(TARGETPFX)topl.o \
 	$(TARGETPFX)wintty.o
 #
+# Files for the agent window port (headless, trusted bootstrap).  This port has
+# no terminal dependency, so WINAGENTLIB is intentionally empty; it still has
+# to be *defined* for an agent-only build so that the tty/ncurses fallback
+# below is never used.
+WINAGENTSRC ?= ../win/agent/winagent.c ../win/agent/agent_bootstrap.c \
+	../win/agent/agent_types.h ../win/agent/agent_view.h \
+	../win/agent/agent_view.c ../win/agent/agent_menu.h \
+	../win/agent/agent_menu.c ../win/agent/agent_protocol.h \
+	../win/agent/agent_protocol.c ../win/agent/agent_handshake.h
+WINAGENTOBJ ?= $(TARGETPFX)winagent.o $(TARGETPFX)agent_bootstrap.o \
+	$(TARGETPFX)agent_view.o $(TARGETPFX)agent_menu.o \
+	$(TARGETPFX)agent_protocol.o
+WINAGENTLIB ?=
+#
 # Files for curses interface
 WINCURSESSRC ?= ../win/curses/cursmain.c ../win/curses/curswins.c \
 	../win/curses/cursmisc.c ../win/curses/cursdial.c \
@@ -546,7 +560,8 @@ SYSCSRC ?= ../sys/share/pcmain.c ../sys/share/pcsys.c \
 SYSCXXSRC ?= ../sys/share/cppregex.cpp
 
 # all windowing-system-dependent .c (for dependencies and such)
-WINCSRC ?= $(WINTTYSRC) $(WINCURSESSRC) $(WINX11SRC) $(WINSHIMSRC)
+WINCSRC ?= $(WINTTYSRC) $(WINCURSESSRC) $(WINX11SRC) $(WINSHIMSRC) \
+	$(WINAGENTSRC)
 # all windowing-system-dependent .cpp (for dependencies and such)
 WINCXXSRC ?= $(WINQTSRC) $(WINQT3SRC) $(WINBESRC)
 
@@ -640,10 +655,23 @@ HOBJ ?= $(TARGETPFX)allmain.o $(TARGETPFX)alloc.o \
 
 DATE_O = $(TARGETPFX)date.o
 
+# The trusted launcher is a STANDALONE executable: it is built from its own
+# source only and is never linked with the game objects, Lua, or any window
+# object.  It is built only when the agent port is selected.
+AGENTRUNNER ?= nethack-agent
+ifdef WANT_WIN_AGENT
+RUNNER_TARGET ?= $(AGENTRUNNER)
+endif
+
+agent-runner: ../sys/unix/agent_runner.c ../win/agent/agent_handshake.h
+	$(CC) -std=c99 -Wall -Wextra -O2 \
+		-D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L -I../win/agent \
+		-o $(AGENTRUNNER) ../sys/unix/agent_runner.c
+
 # the .o files from the HACKCSRC, SYSSRC, and WINSRC lists
 
 # first target is also the default target for 'make' without any arguments
-all:	$(GAME)
+all:	$(GAME) $(RUNNER_TARGET)
 	@echo ""
 
 ../src/nethack_cc.rsp:
@@ -826,6 +854,7 @@ tags: $(CSOURCES)
 
 clean:
 	-rm -f *.o $(HACK_H) $(CONFIG_H)
+	-rm -f $(AGENTRUNNER)
 	-rm -f monstr.c vis_tab.c ../include/vis_tab.h #obsolete generated files
 	-true; $(CLEANMORE)
 	true; $(CLEAN_CC_RESPONSEFILE) $(CLEAN_CXX_RESPONSEFILE)
@@ -1162,6 +1191,32 @@ $(TARGETPFX)termcap.o: ../win/tty/termcap.c $(HACK_H) ../include/tcap.h \
 $(TARGETPFX)topl.o: ../win/tty/topl.c $(HACK_H) ../include/tcap.h \
 		../include/wintty.h
 	$(TARGET_CC) $(TARGET_CFLAGS) -c -o $@ ../win/tty/topl.c
+$(TARGETPFX)winagent.o: ../win/agent/winagent.c $(HACK_H) \
+		../win/agent/agent_types.h ../win/agent/agent_protocol.h \
+		../win/agent/agent_menu.h ../include/winagent.h
+	$(TARGET_CC) $(TARGET_CFLAGS) -I../win/agent -c -o $@ ../win/agent/winagent.c
+
+$(TARGETPFX)agent_bootstrap.o: ../win/agent/agent_bootstrap.c \
+		../win/agent/agent_handshake.h ../include/winagent.h
+	$(TARGET_CC) $(TARGET_CFLAGS) -I../win/agent -c -o $@ \
+		../win/agent/agent_bootstrap.c
+
+$(TARGETPFX)agent_view.o: ../win/agent/agent_view.c ../win/agent/agent_view.h \
+		../win/agent/agent_types.h
+	$(TARGET_CC) $(TARGET_CFLAGS) -I../win/agent -c -o $@ \
+		../win/agent/agent_view.c
+
+$(TARGETPFX)agent_menu.o: ../win/agent/agent_menu.c ../win/agent/agent_menu.h \
+		../win/agent/agent_types.h
+	$(TARGET_CC) $(TARGET_CFLAGS) -I../win/agent -c -o $@ \
+		../win/agent/agent_menu.c
+
+$(TARGETPFX)agent_protocol.o: ../win/agent/agent_protocol.c \
+		../win/agent/agent_protocol.h ../win/agent/agent_menu.h \
+		../win/agent/agent_types.h
+	$(TARGET_CC) $(TARGET_CFLAGS) -I../win/agent -c -o $@ \
+		../win/agent/agent_protocol.c
+
 $(TARGETPFX)wintty.o: ../win/tty/wintty.c $(HACK_H) ../include/dlb.h \
 		../include/tcap.h ../include/wintty.h
 	$(TARGET_CC) $(TARGET_CFLAGS) -c -o $@ ../win/tty/wintty.c
