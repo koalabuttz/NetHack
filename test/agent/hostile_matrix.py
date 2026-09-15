@@ -686,32 +686,40 @@ def main(argv):
                      "probe bindkeys=1", "probe symset=1",
                      "probe symsetload=1", "probe parsemutate=1",
                      "probe wizardcmd=1", "probe ordinary=0",
-                     "probe handlers=1"):
+                     "probe handlers=1",
+                     "probe glypheq-map=1", "probe glypheq-frame=1",
+                     "probe glypheq-menu=1", "probe glypheq-female=1"):
             if want not in res.diag:
                 failures.append("impossible: private diag missing %r" % want)
         rows.append(("impossible", "reject", "empty", str(res.exit_code),
                      "ok" if not any("impossible:" in f for f in failures)
                      else "FAIL"))
 
-        # One unimplemented decision callback per worker process: each must
-        # terminate privately with zero public bytes.
-        for kind, diag in (
-                ("test-display", "blocking display is not implemented yet"),
-                ("test-select", "menu selection is not implemented yet"),
-                ("test-msgmenu", "message menu is not implemented yet")):
-            label = "decision-" + kind.split("-", 1)[1]
+        # One M2 decision boundary per worker process: each publishes exactly
+        # one durable snapshot carrying its outstanding request and then
+        # terminates privately on the silent transport rather than fabricating
+        # a decision the agent never made.
+        for kind, label in (
+                ("test-display", "display"),
+                ("test-select", "select"),
+                ("test-msgmenu", "msgmenu")):
+            label = "decision-" + label
             res = run_worker(args, label, worker=args.impossible_worker,
                              handshake_kind=kind, timeout=args.timeout)
-            parse_records(res, schema, label, failures)
-            if res.public:
-                failures.append("%s: expected zero public bytes, saw %r"
-                                % (label, res.public[:80]))
+            records = parse_records(res, schema, label, failures)
+            kinds = [r.get("type") for r in records]
+            if kinds != ["hello", "obs"]:
+                failures.append("%s: expected exactly [hello, obs], saw %s"
+                                % (label, kinds))
             if res.exit_code != 70:
                 failures.append("%s: exit %d, expected private 70"
                                 % (label, res.exit_code))
-            if diag not in res.diag:
-                failures.append("%s: private diag missing %r; got %r"
-                                % (label, diag, res.diag[:160]))
+            if "native character selection" not in res.diag:
+                failures.append("%s: private diag missing the selection "
+                                "context; got %r" % (label, res.diag[:160]))
+            if "wrecon ok" not in res.diag:
+                failures.append("%s: the presentation reconstruction self-check "
+                                "did not run; got %r" % (label, res.diag[:160]))
             rows.append((label, "reject",
                          "empty" if not res.public
                          else "%d lines" % len(res.lines()),

@@ -134,6 +134,28 @@ matrix-full:
 	    $(if $(PRIVATE_ROOT),--private-root "$(PRIVATE_ROOT)") \
 	    --impossible-worker "$(IMPOSSIBLE_WORKER)"
 
+# The native episode tests need a built agent worker and launcher, so they are
+# opt-in like `matrix`.  `episode` proves the startup boundary still holds;
+# `play` creates a game, selects a character through the native role menus,
+# moves the hero, and quits through the native command path.
+episode:
+	@test -n "$(WORKER)" -a -n "$(RUNNER)" -a -n "$(DATA)" || \
+	    { echo "set WORKER, RUNNER, DATA (and optionally SYSCONF,"; \
+	      echo "PRIVATE_ROOT) for the native episode test"; exit 2; }
+	python3 driver.py episode --runner "$(RUNNER)" --worker "$(WORKER)" \
+	    --data "$(DATA)" $(if $(SYSCONF),--sysconf "$(SYSCONF)") \
+	    --private-root "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-episode)"
+
+play:
+	@test -n "$(WORKER)" -a -n "$(RUNNER)" -a -n "$(DATA)" || \
+	    { echo "set WORKER, RUNNER, DATA (and optionally SYSCONF,"; \
+	      echo "PRIVATE_ROOT) for the scripted gameplay test"; exit 2; }
+	rm -rf "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-play)"
+	mkdir -p "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-play)"
+	python3 driver.py play --runner "$(RUNNER)" --worker "$(WORKER)" \
+	    --data "$(DATA)" $(if $(SYSCONF),--sysconf "$(SYSCONF)") \
+	    --private-root "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-play)"
+
 # ASan/UBSan build, if the compiler supports the flags.
 sanitize: clean
 	@$(CC) $(CFLAGS) $(SAN) -o test_view test_view.c $(AGENT)/agent_view.c \
@@ -173,4 +195,4 @@ clean:
 	rm -f $(TESTS) $(AGENT_OBJS) $(REF_OBJS) .dep.*.d .profile.tmp .profile.h.tmp
 
 .PHONY: all check manifest-check header-check schema-check matrix \
-	matrix-full sanitize depcheck clean
+	episode play matrix-full sanitize depcheck clean
