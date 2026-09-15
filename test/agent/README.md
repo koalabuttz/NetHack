@@ -29,7 +29,7 @@ The hostile-startup matrix (the M1 exit gate) needs a built agent-only worker
 and the trusted launcher, so it is not part of the engine-free `check`:
 
 ```sh
-make agent-test-data AGENT_TEST_DATA=/tmp/agent-data   # from the top level
+make agent-test-data AGENT_TEST_DATA=/tmp/agent-data   # stages data only; never relinks the game
 make -C test/agent matrix \
     WORKER="$PWD/src/nethack" RUNNER="$PWD/src/nethack-agent" \
     DATA=/tmp/agent-data SYSCONF=/tmp/agent-data/sysconf

@@ -296,7 +296,17 @@ dlb:
 # data (nhdat plus the non-DLB files) and the reviewed test sysconf, and
 # refuses to write into a non-empty directory it does not own.  The caller's
 # writable per-episode state is created separately by the launcher.
-agent-test-data: $(GAME) $(VARDAT) spec_levs
+# Stage immutable game data for agent testing.  Deliberately has NO
+# prerequisites: upstream wires $(VARDAT) through $(GAME), so depending on it
+# would re-link the whole game under the invoking make's window variables and
+# silently break a configured agent-only or tty-only build.  This is a copy
+# step; run the data-producing build (make all) first.  The nhdat guard fails
+# loudly instead of staging an incomplete tree.
+agent-test-data:
+	@if test ! -f dat/nhdat ; then \
+	    echo "agent-test-data: dat/nhdat missing -- build the data first" ; \
+	    exit 1 ; \
+	fi
 	@if test -z "$(AGENT_TEST_DATA)" ; then \
 	    echo "agent-test-data: set AGENT_TEST_DATA to a fresh directory" ; \
 	    exit 1 ; \
