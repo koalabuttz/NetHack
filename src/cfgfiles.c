@@ -1435,15 +1435,16 @@ parse_config_line(char *origbuf)
     mungspaces(buf);
 
 #ifdef AGENT_GRAPHICS
-    /* Directive-level classification: the trusted sysconf may only carry
-     * directives the agent profile recognises.  An unknown statement is an
-     * error rather than a silently ignored line, so a new directive cannot
-     * take effect simply by being unknown. */
+    /* Directive-level policy: the trusted sysconf may carry only the frozen
+     * statements the profile pins.  A forbidden directive (path-bearing,
+     * execution, reporting, tracing, sound, mail, hook, or logging) is
+     * refused HERE, before its config-statement function can mutate sysopt,
+     * and the worker terminates privately: no public byte is produced and no
+     * external facility is activated.  See agent_policy.c for the closed
+     * list and the exact expected values. */
     if (agent_mode() && iflags.parse_config_file_src == set_in_sysconf
-        && !agent_policy_sysconf_directive(buf)) {
-        config_error_add("Unrecognized sysconf directive in agent mode");
-        return FALSE;
-    }
+        && !agent_policy_sysconf_directive(buf))
+        agent_private_fatal("forbidden sysconf directive in agent mode");
 #endif
 
     /* find the '=' or ':' */

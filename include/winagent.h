@@ -35,6 +35,12 @@ int agent_mode(void);
  * runtime policy phase.  Called after early_init() has reset the globals. */
 void agent_bootstrap_after_globals(void);
 
+/* Make the launcher's roots authoritative for the engine's path prefixes.
+ * Called at the END of the trusted option phase, after agent mode's only
+ * configuration source (the approved sysconf) has been parsed, so a
+ * configuration statement cannot repoint the prefixes afterwards. */
+void agent_bind_prefixes(void);
+
 /* The inherited transport descriptor, or -1 when not latched.  The port uses
  * it for all player-facing I/O. */
 int agent_bootstrap_fd(void);
@@ -96,8 +102,9 @@ void agent_policy_end_trusted_init(void);
 boolean agent_policy_command(int (*fn)(void));
 boolean agent_policy_command_flags(unsigned long cmdflags);
 
-/* Sysconf directive classification: an unrecognised directive is rejected
- * rather than silently ignored. */
+/* Sysconf directive policy: TRUE only for one of the frozen statements the
+ * shipped agent sysconf pins (directive name and exact value).  Any other
+ * directive -- and an altered value on an accepted name -- is a rejection. */
 boolean agent_policy_sysconf_directive(const char *stmt);
 
 #ifdef AGENT_TEST_IMPOSSIBLE
@@ -106,6 +113,10 @@ boolean agent_policy_sysconf_directive(const char *stmt);
  * file defines AGENT_TEST_IMPOSSIBLE, so the symbol never exists in a shipped
  * binary. */
 boolean agent_test_runtime_set_denied(const char *name);
+
+/* Test-only: the test launch mode the trusted handshake selected.  Also
+ * absent from every shipped binary. */
+unsigned agent_bootstrap_test_mode(void);
 #endif
 
 /* Record that the frozen profile has been applied and verified.  This is the

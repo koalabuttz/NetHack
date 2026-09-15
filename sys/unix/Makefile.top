@@ -303,10 +303,6 @@ dlb:
 # step; run the data-producing build (make all) first.  The nhdat guard fails
 # loudly instead of staging an incomplete tree.
 agent-test-data:
-	@if test ! -f dat/nhdat ; then \
-	    echo "agent-test-data: dat/nhdat missing -- build the data first" ; \
-	    exit 1 ; \
-	fi
 	@if test -z "$(AGENT_TEST_DATA)" ; then \
 	    echo "agent-test-data: set AGENT_TEST_DATA to a fresh directory" ; \
 	    exit 1 ; \
@@ -317,13 +313,20 @@ agent-test-data:
 	    echo "agent-test-data: refusing non-empty directory (not created by this target)" ; \
 	    exit 1 ; \
 	fi
+	@for f in nhdat $(DATNODLB) ; do \
+	    if test ! -f "dat/$$f" || test ! -r "dat/$$f" ; then \
+	        echo "agent-test-data: required data file dat/$$f is missing or" \
+	             "unreadable -- build the data first" ; \
+	        exit 1 ; \
+	    fi ; \
+	done
 	@mkdir -p "$(AGENT_TEST_DATA)"
 	@touch "$(AGENT_TEST_DATA)/.agent-test-data"
 	( cd dat ; for f in nhdat $(DATNODLB) ; do \
-	      if test -f "$$f" ; then cp -p "$$f" "$(AGENT_TEST_DATA)" ; fi ; \
+	      cp -p "$$f" "$(AGENT_TEST_DATA)" || exit 1 ; \
 	  done )
 	cp -p test/agent/sysconf "$(AGENT_TEST_DATA)/sysconf"
-	@echo "agent test data staged in $(AGENT_TEST_DATA)" 
+	@echo "agent test data staged in $(AGENT_TEST_DATA)"
 
 wasm:
 	( cd src ; $(MAKE) CROSS_TO_WASM=1 ../targets/wasm/nethack.js )

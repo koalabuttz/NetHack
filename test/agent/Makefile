@@ -107,6 +107,12 @@ header-check:
 # engine-free).  Stage data with `make agent-test-data`, then:
 #   make -C test/agent matrix WORKER=../../src/nethack \
 #       RUNNER=../../src/nethack-agent DATA=/tmp/data SYSCONF=/tmp/data/sysconf
+#
+# `matrix` is the SMOKE run: the impossible-worker cases are reported as
+# SKIPPED (and the exit status is still 0).  `matrix-full` is the gate: it
+# REQUIRES the impossible worker (a build with AGENT_TEST_IMPOSSIBLE) and
+# fails if it is missing, so it cannot pass while the runtime-policy or
+# decision-callback contracts go unexercised.
 matrix:
 	@test -n "$(WORKER)" -a -n "$(RUNNER)" -a -n "$(DATA)" || \
 	    { echo "set WORKER, RUNNER, DATA (and optionally SYSCONF,"; \
@@ -115,6 +121,18 @@ matrix:
 	    --data "$(DATA)" $(if $(SYSCONF),--sysconf "$(SYSCONF)") \
 	    $(if $(PRIVATE_ROOT),--private-root "$(PRIVATE_ROOT)") \
 	    $(if $(IMPOSSIBLE_WORKER),--impossible-worker "$(IMPOSSIBLE_WORKER)")
+
+matrix-full:
+	@test -n "$(WORKER)" -a -n "$(RUNNER)" -a -n "$(DATA)" \
+	    -a -n "$(IMPOSSIBLE_WORKER)" || \
+	    { echo "matrix-full requires WORKER, RUNNER, DATA and"; \
+	      echo "IMPOSSIBLE_WORKER (a build with AGENT_TEST_IMPOSSIBLE)"; \
+	      exit 2; }
+	python3 hostile_matrix.py --worker "$(WORKER)" --runner "$(RUNNER)" \
+	    --data "$(DATA)" --require-impossible \
+	    $(if $(SYSCONF),--sysconf "$(SYSCONF)") \
+	    $(if $(PRIVATE_ROOT),--private-root "$(PRIVATE_ROOT)") \
+	    --impossible-worker "$(IMPOSSIBLE_WORKER)"
 
 # ASan/UBSan build, if the compiler supports the flags.
 sanitize: clean
@@ -154,5 +172,5 @@ depcheck:
 clean:
 	rm -f $(TESTS) $(AGENT_OBJS) $(REF_OBJS) .dep.*.d .profile.tmp .profile.h.tmp
 
-.PHONY: all check manifest-check header-check schema-check matrix sanitize \
-	depcheck clean
+.PHONY: all check manifest-check header-check schema-check matrix \
+	matrix-full sanitize depcheck clean

@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -121,6 +122,23 @@ r_write_all(int fd, const char *buf, size_t len)
     return 0;
 }
 
+/* Terminate a worker and every process it started.
+ *
+ * The worker calls setsid(), so its process group is its own pid.  Killing
+ * the NEGATIVE pid reaches the whole group, so a descendant (save
+ * compression, panic tracer) is cleaned up with the leader instead of being
+ * orphaned.  If the group does not exist yet (the setsid() race) or setsid()
+ * failed, the negative-pid kill reports ESRCH and the leader alone is
+ * signalled. */
+static void
+r_kill_tree(pid_t pid, int sig)
+{
+    if (pid <= 0)
+        return;
+    if (kill(-pid, sig) != 0)
+        (void) kill(pid, sig);
+}
+
 /* Close every descriptor above 2 except the ones we own. */
 static void
 r_close_all(int keep1, int keep2)
@@ -154,14 +172,6 @@ r_copy_bounded(char *dst, size_t cap, const char *src)
     dst[n] = '\0';
 }
 
-static int
-r_symlink_exists(const char *path)
-{
-    struct stat st;
-
-    return lstat(path, &st) == 0;
-}
-
 static char *
 r_dir_join(char *buf, size_t cap, const char *a, const char *b)
 {
@@ -185,6 +195,12 @@ main(int argc, char **argv)
     time_t started;
     int child_status = 0;
     int stdin_open = 1;
+
+    /* Suppress SIGPIPE for the whole run.  A worker that exits mid-write, or
+     * a consumer that closes our stdout, must surface as an ordinary write
+     * error (EPIPE) rather than a signal that kills this process before the
+     * cleanup path can reap the worker and remove the episode tree. */
+    (void) signal(SIGPIPE, SIG_IGN);
 
     memset(&cfg, 0, sizeof cfg);
     cfg.profile = "normal-ascii-color-v1";
@@ -277,10 +293,24 @@ main(int argc, char **argv)
             char src[RUNNER_PATH_MAX], dst[RUNNER_PATH_MAX];
 
             if (!r_dir_join(src, sizeof src, cfg.data_root, shared[k])
-                || !r_dir_join(dst, sizeof dst, workdir, shared[k]))
-                continue;
-            if (access(src, R_OK) == 0 && !r_symlink_exists(dst))
-                (void) symlink(src, dst);
+                || !r_dir_join(dst, sizeof dst, workdir, shared[k])) {
+                r_diag("private path too long");
+                r_remove_tree(workdir);
+                return 4;
+            }
+            /* Sharing immutable game data is required, not best effort: a
+             * missing or unshareable file would silently start an incomplete
+             * episode tree, so it fails closed instead. */
+            if (access(src, R_OK) != 0) {
+                r_diag("required immutable data file is unreadable: %s", src);
+                r_remove_tree(workdir);
+                return 7;
+            }
+            if (symlink(src, dst) != 0 && errno != EEXIST) {
+                r_diag("cannot share immutable data file: %s", dst);
+                r_remove_tree(workdir);
+                return 7;
+            }
         }
     }
     {
@@ -341,9 +371,28 @@ main(int argc, char **argv)
         (void) close(sv[0]);
         /* everything except the transport descriptor is closed */
         r_close_all(sv[1], -1);
+        /* The handshake must cross execve, so FD_CLOEXEC is cleared here.
+         * The worker sets it again (agent_bootstrap.c) once the handshake has
+         * been consumed, so no later descendant inherits the channel.  Both
+         * fcntl calls are checked: an unverifiable descriptor state is not a
+         * launch. */
         flags = fcntl(sv[1], F_GETFD);
-        if (flags >= 0)
-            (void) fcntl(sv[1], F_SETFD, flags & ~FD_CLOEXEC);
+        if (flags < 0)
+            _exit(63);
+        if (fcntl(sv[1], F_SETFD, flags & ~FD_CLOEXEC) < 0)
+            _exit(63);
+
+        /* Hard bound the private diagnostic sink.  RLIMIT_FSIZE is enforced
+         * by the kernel on the very next write, so the worker cannot
+         * overshoot the cap between the supervisor's polls; the supervisor's
+         * polling check below remains only as a backstop. */
+        {
+            struct rlimit rl;
+
+            rl.rlim_cur = (rlim_t) RUNNER_DIAG_CAP;
+            rl.rlim_max = (rlim_t) RUNNER_DIAG_CAP;
+            (void) setrlimit(RLIMIT_FSIZE, &rl);
+        }
 
         (void) snprintf(sockpath_arg, sizeof sockpath_arg, "--agent-fd=%d",
                         sv[1]);
@@ -385,11 +434,8 @@ main(int argc, char **argv)
     r_copy_bounded(hs.sysconf_path, sizeof hs.sysconf_path, cfg.sysconf);
     if (r_write_all(sv[0], (const char *) &hs, sizeof hs) != 0) {
         r_diag("could not send the bootstrap handshake");
-        (void) close(sv[0]);
-        (void) kill(child, SIGKILL);
-        (void) waitpid(child, &child_status, 0);
-        r_remove_tree(workdir);
-        return 6;
+        status = 6;
+        goto cleanup;
     }
 
     started = time((time_t *) 0);
@@ -452,9 +498,15 @@ main(int argc, char **argv)
             break;
         }
     }
+    /* ---- ONE cleanup path for every post-fork outcome ----
+     * Reached by falling out of the loop (transport end, write failure
+     * including EPIPE, diagnostic bound, or deadline) and by a handshake
+     * failure.  It closes the transport, terminates the worker's whole
+     * process group, reaps the worker, and removes only the tree this runner
+     * created. */
+cleanup:
     (void) close(sv[0]);
-
-    /* terminate, then kill after a short private deadline, then reap */
+    r_kill_tree(child, SIGTERM);
     for (i = 0; i < 40; ++i) {
         pid_t w = waitpid(child, &child_status, WNOHANG);
 
@@ -462,10 +514,8 @@ main(int argc, char **argv)
             break;
         if (w < 0 && errno != EINTR)
             break;
-        if (i == 10)
-            (void) kill(child, SIGTERM);
         if (i == 25)
-            (void) kill(child, SIGKILL);
+            r_kill_tree(child, SIGKILL);
         {
             struct timespec ts;
 
@@ -482,13 +532,15 @@ main(int argc, char **argv)
         } while (w < 0 && errno == EINTR);
     }
 
-    /* The launcher alone reports terminal closure to the public channel. */
+    /* Terminal closure is best effort: if the consumer already closed our
+     * stdout this write fails with EPIPE and the episode simply ends without
+     * it, but the cleanup above still ran.  The launcher alone reports
+     * terminal closure to the public channel. */
     if (r_write_all(STDOUT_FILENO, closed_record,
                     sizeof closed_record - 1) == 0)
         (void) r_write_all(STDOUT_FILENO, "\n", 1);
 
-    /* reap before cleanup, then remove only the tree we created */
+    /* remove only the tree we created */
     r_remove_tree(workdir);
-    (void) status;
-    return 0;
+    return status;
 }

@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -125,6 +126,16 @@ agent_trusted_sysconf(void)
     return (const char *) 0;
 }
 
+#ifdef AGENT_TEST_IMPOSSIBLE
+/* Test-only: the launch mode the matrix selected, or AG_HS_MODE_NEW when the
+ * process is not latched.  Never exists in a production binary. */
+unsigned
+agent_bootstrap_test_mode(void)
+{
+    return agent_latched ? agent_hs.mode : AG_HS_MODE_NEW;
+}
+#endif /* AGENT_TEST_IMPOSSIBLE */
+
 /* Parse "--agent-fd=N" out of one argument, returning N or -1. */
 static int
 ag_parse_locator(const char *arg)
@@ -169,6 +180,44 @@ ag_read_exact(int fd, void *buf, size_t len)
     return 0;
 }
 
+/* A connected STREAM socket is what the launcher installs.  This proves the
+ * inherited descriptor's shape; it is deliberately NOT an authentication
+ * claim -- the handshake record above is the trust boundary. */
+static int
+ag_is_connected_socket(int fd)
+{
+    int sotype;
+    socklen_t slen = (socklen_t) sizeof sotype;
+    struct sockaddr_storage ss;
+    socklen_t alen = (socklen_t) sizeof ss;
+
+    if (fd < 0)
+        return 0;
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &sotype, &slen) != 0)
+        return 0;
+    if (sotype != SOCK_STREAM)
+        return 0;
+    if (getpeername(fd, (struct sockaddr *) &ss, &alen) != 0)
+        return 0;
+    return 1;
+}
+
+/* Copy a directory root with exactly one trailing slash, the form fqname()
+ * expects when it concatenates a basename. */
+static char *
+ag_prefix_dir(const char *dir)
+{
+    size_t n = strlen(dir);
+    char *p = (char *) alloc(n + 2);
+
+    Strcpy(p, dir);
+    if (n == 0 || p[n - 1] != '/') {
+        p[n] = '/';
+        p[n + 1] = '\0';
+    }
+    return p;
+}
+
 void
 agent_bootstrap_probe(int *argc, char ***argvp)
 {
@@ -200,7 +249,14 @@ agent_bootstrap_probe(int *argc, char ***argvp)
         agent_private_fatal("unsupported handshake version");
     if (hs.reserved != 0u)
         agent_private_fatal("handshake reserved field not zero");
-    if (hs.mode != AG_HS_MODE_NEW)
+    if (hs.mode != AG_HS_MODE_NEW
+#ifdef AGENT_TEST_IMPOSSIBLE
+        /* Test-only launch modes (see agent_handshake.h): the matrix drives
+         * one unimplemented decision callback per worker process. */
+        && (hs.mode < AG_HS_MODE_TEST_FIRST
+            || hs.mode > AG_HS_MODE_TEST_LAST)
+#endif
+        )
         agent_private_fatal("unsupported launch mode");
     hs.profile[AG_HS_PROFILE_MAX - 1] = '\0';
     if (strcmp(hs.profile, AG_AGENT_PROFILE) != 0)
@@ -211,11 +267,30 @@ agent_bootstrap_probe(int *argc, char ***argvp)
     hs.sysconf_path[AG_HS_ROOT_MAX - 1] = '\0';
     if (hs.writable_root[0] != '/')
         agent_private_fatal("private writable root must be absolute");
+    /* Every launch path the handshake names must be absolute as well: a
+     * relative root would resolve against the worker's cwd and could be
+     * steered by anything that changed it. */
+    if (hs.data_root[0] && hs.data_root[0] != '/')
+        agent_private_fatal("trusted data root must be absolute");
+    if (hs.config_root[0] && hs.config_root[0] != '/')
+        agent_private_fatal("trusted config root must be absolute");
+    if (hs.sysconf_path[0] && hs.sysconf_path[0] != '/')
+        agent_private_fatal("trusted sysconf path must be absolute");
 
-    /* the descriptor stays owned by this process for the whole run */
+    /* The descriptor must be a connected stream socket. */
+    if (!ag_is_connected_socket(fd))
+        agent_private_fatal("agent transport is not a connected socket");
+
+    /* The descriptor is used for the whole run, so it stays open -- but it
+     * must never leak into a descendant.  The launcher cleared FD_CLOEXEC so
+     * the handshake could cross execve; from here on it is SET, so a later
+     * exec (save compression, panic tracer) cannot inherit the player-JSON
+     * channel.  A failed flag read or write is fatal, never assumed. */
     fdflags = fcntl(fd, F_GETFD);
-    if (fdflags >= 0)
-        (void) fcntl(fd, F_SETFD, fdflags & ~FD_CLOEXEC);
+    if (fdflags < 0)
+        agent_private_fatal("cannot read transport descriptor flags");
+    if (fcntl(fd, F_SETFD, fdflags | FD_CLOEXEC) < 0)
+        agent_private_fatal("cannot set close-on-exec on transport");
 
     agent_hs = hs;
     agent_latched_fd = fd;
@@ -239,6 +314,53 @@ agent_bootstrap_after_globals(void)
      * the record alone. */
     if (stat(agent_hs.writable_root, &st) != 0 || !S_ISDIR(st.st_mode))
         agent_private_fatal("private writable root is missing");
+    /* The immutable roots the handshake names must exist and be readable: a
+     * run whose data, configuration, or sysconf is absent cannot be the
+     * reviewed launch, so it fails closed rather than falling back. */
+    if (agent_hs.data_root[0]
+        && (stat(agent_hs.data_root, &st) != 0 || !S_ISDIR(st.st_mode)
+            || access(agent_hs.data_root, R_OK) != 0))
+        agent_private_fatal("trusted data root is missing or unreadable");
+    if (agent_hs.config_root[0]
+        && (stat(agent_hs.config_root, &st) != 0 || !S_ISDIR(st.st_mode)
+            || access(agent_hs.config_root, R_OK) != 0))
+        agent_private_fatal("trusted config root is missing or unreadable");
+    if (agent_hs.sysconf_path[0]
+        && (stat(agent_hs.sysconf_path, &st) != 0 || !S_ISREG(st.st_mode)
+            || access(agent_hs.sysconf_path, R_OK) != 0))
+        agent_private_fatal("trusted sysconf is missing or unreadable");
+}
+
+/* Make the launcher's roots authoritative for the engine's path prefixes.
+ *
+ * This runs at the END of the trusted option phase -- after agent mode's only
+ * configuration source, the approved sysconf, has been parsed -- and it
+ * OVERWRITES rather than defers, so the launcher's immutable data and
+ * configuration roots stay bound and every writable prefix stays inside the
+ * private episode root.  A configuration statement that names a prefix is
+ * already refused outright (see agent_policy_sysconf_directive); this is the
+ * defense in depth that keeps the binding true even if one were admitted.
+ *
+ * Where the engine does not use path prefixes at all, fqname() ignores these
+ * and the episode root is simply the worker's private cwd. */
+void
+agent_bind_prefixes(void)
+{
+    if (!agent_latched)
+        return;
+    if (agent_hs.data_root[0])
+        gf.fqn_prefix[DATAPREFIX] = ag_prefix_dir(agent_hs.data_root);
+    if (agent_hs.config_root[0])
+        gf.fqn_prefix[CONFIGPREFIX] = ag_prefix_dir(agent_hs.config_root);
+    /* Every writable location is the private per-episode root: a path-bearing
+     * default can therefore never reach a shared playground. */
+    gf.fqn_prefix[HACKPREFIX] = ag_prefix_dir(agent_hs.writable_root);
+    gf.fqn_prefix[LEVELPREFIX] = ag_prefix_dir(agent_hs.writable_root);
+    gf.fqn_prefix[SAVEPREFIX] = ag_prefix_dir(agent_hs.writable_root);
+    gf.fqn_prefix[BONESPREFIX] = ag_prefix_dir(agent_hs.writable_root);
+    gf.fqn_prefix[LOCKPREFIX] = ag_prefix_dir(agent_hs.writable_root);
+    gf.fqn_prefix[TROUBLEPREFIX] = ag_prefix_dir(agent_hs.writable_root);
+    gf.fqn_prefix[SCOREPREFIX] = ag_prefix_dir(agent_hs.writable_root);
 }
 
 /* Classify a rejected argument for the PRIVATE diagnostic only.  The policy

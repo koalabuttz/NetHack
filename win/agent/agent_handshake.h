@@ -25,6 +25,21 @@
 #define AG_HS_MODE_NEW 0u
 #define AG_HS_MODE_RESTORE 1u
 
+#ifdef AGENT_TEST_IMPOSSIBLE
+/* Test-only launch modes.  The hostile matrix uses them to drive exactly one
+ * unimplemented decision callback per worker process, so the "private exit,
+ * zero public bytes" contract can be asserted for each one.  They are visible
+ * only to a matrix build: no hints file defines AGENT_TEST_IMPOSSIBLE, so a
+ * shipped worker never accepts them and they are not an extra steering
+ * channel -- the trusted handshake selects them, like every other field. */
+#define AG_HS_MODE_TEST_FIRST 60u
+#define AG_HS_MODE_TEST_DISPLAY 60u
+#define AG_HS_MODE_TEST_SELECT 61u
+#define AG_HS_MODE_TEST_MSGMENU 62u
+#define AG_HS_MODE_TEST_EXEC 63u
+#define AG_HS_MODE_TEST_LAST 63u
+#endif /* AGENT_TEST_IMPOSSIBLE */
+
 #define AG_HS_PROFILE_MAX 64
 #define AG_HS_ROOT_MAX 512
 

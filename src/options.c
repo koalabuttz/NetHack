@@ -237,9 +237,16 @@ agent_apply_profile(void)
 {
     size_t k;
     boolean validated = TRUE;
+    int saved_phase;
 
     if (!agent_mode())
         return;
+    /* The profile is applied under builtin_opt, the phase it ran under when
+     * this call preceded the sysconf parse.  The call has since moved AFTER
+     * that parse (so the validation covers the sysconf's effects), so pin the
+     * phase explicitly instead of inheriting syscf_opt. */
+    saved_phase = (int) go.opt_phase;
+    go.opt_phase = builtin_opt;
     agent_policy_begin_trusted_init();
     for (k = 0; k < AGENT_PIN_COUNT; ++k) {
         int slot = agent_pin_slot(agent_pins[k].name);
@@ -268,6 +275,11 @@ agent_apply_profile(void)
         }
     }
     agent_policy_end_trusted_init();
+    go.opt_phase = saved_phase;
+
+    /* The configuration phase is over, so the launcher's roots become the
+     * authoritative prefixes; see agent_bind_prefixes(). */
+    agent_bind_prefixes();
 
     /* Validate the effective values of the boolean pins. */
     for (k = 0; k < AGENT_PIN_COUNT && validated; ++k) {
@@ -7522,13 +7534,6 @@ initoptions_init(void)
      */
     iflags.menuinvertmode = 1;
 
-#ifdef AGENT_GRAPHICS
-    /* Trusted option initialization is complete: apply the frozen profile
-     * now, before any untrusted source (rc file, environment, config file)
-     * could run, and validate that it took. */
-    agent_apply_profile();
-#endif
-
     /* since this is done before init_objects(), do partial init here */
     objects[SLIME_MOLD].oc_name_idx = SLIME_MOLD;
     nmcpy(svp.pl_fruit, OBJ_NAME(objects[SLIME_MOLD]), PL_FSIZ);
@@ -7553,6 +7558,17 @@ initoptions_init(void)
      */
 #endif
 #endif /* SYSCF */
+
+#ifdef AGENT_GRAPHICS
+    /* Trusted option initialization AND the trusted sysconf parse are both
+     * complete, so the frozen profile can now be applied and verified -- and
+     * only now is it marked validated for the publication gate.  Marking it
+     * before the sysconf was read would not cover the sysconf's effects, so
+     * the validation is deliberately after that parse.  No untrusted source
+     * (personal rc file, environment, config file) runs in agent mode at all:
+     * initoptions_finish() replaces rcfile() with agent_profile_finish(). */
+    agent_apply_profile();
+#endif
 }
 
 /*

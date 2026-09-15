@@ -54,6 +54,17 @@ extern void check_linux_console(void);
 extern void init_linux_cons(void);
 #endif
 
+#ifdef AGENT_GRAPHICS
+/* Latch-guarded host integration.  An agent worker must not activate a
+ * terminal, pager, mail, panic tracer, or sound facility: those are the
+ * external host integrations the agent profile excludes (plan section 4
+ * step 6).  In a human or non-agent build the guard is the constant TRUE, so
+ * the code below is exactly the code that ran before. */
+#define AGENT_HOST_INTEGRATION() (!agent_mode())
+#else
+#define AGENT_HOST_INTEGRATION() TRUE
+#endif
+
 static void wd_message(void);
 static struct passwd *get_unix_pw(void);
 
@@ -135,8 +146,10 @@ main(int argc, char *argv[])
      * hint if qt_init_nhwindow() is invoked.
      */
 #if defined(SND_LIB_MACSOUND)
-    soundlibchoice = soundlib_macsound;
-    assign_soundlib(soundlibchoice);
+    if (AGENT_HOST_INTEGRATION()) {
+        soundlibchoice = soundlib_macsound;
+        assign_soundlib(soundlibchoice);
+    }
 #endif
 #endif
 
@@ -169,10 +182,12 @@ main(int argc, char *argv[])
     chdirx(dir, TRUE);
 #endif
 #ifdef _M_UNIX
-    check_sco_console();
+    if (AGENT_HOST_INTEGRATION())
+        check_sco_console();
 #endif
 #ifdef __linux__
-    check_linux_console();
+    if (AGENT_HOST_INTEGRATION())
+        check_linux_console();
 #endif
     program_state.early_options = 0;
 
@@ -180,7 +195,10 @@ main(int argc, char *argv[])
 #ifdef PANICTRACE
     ARGV0 = gh.hname; /* save for possible stack trace */
 #ifndef NO_SIGNAL
-    panictrace_setsignals(TRUE);
+    /* The panic tracer execs an external debugger; an agent worker never
+     * installs it. */
+    if (AGENT_HOST_INTEGRATION())
+        panictrace_setsignals(TRUE);
 #endif
 #endif
     exact_username = whoami();
@@ -202,20 +220,28 @@ main(int argc, char *argv[])
 #endif
     init_nhwindows(&argc, argv); /* now we can set up window system */
 #ifdef _M_UNIX
-    init_sco_cons();
+    if (AGENT_HOST_INTEGRATION())
+        init_sco_cons();
 #endif
 #ifdef __linux__
-    init_linux_cons();
+    if (AGENT_HOST_INTEGRATION())
+        init_linux_cons();
 #endif
 
 #ifdef DEF_PAGER
-    if (!(gc.catmore = nh_getenv("NETHACKPAGER"))
+    /* No pager in agent mode: it would exec an external viewer.  gc.catmore
+     * stays NULL, which every consumer already treats as "no pager". */
+    if (AGENT_HOST_INTEGRATION()
+        && !(gc.catmore = nh_getenv("NETHACKPAGER"))
         && !(gc.catmore = nh_getenv("HACKPAGER"))
         && !(gc.catmore = nh_getenv("PAGER")))
         gc.catmore = DEF_PAGER;
 #endif
 #ifdef MAIL
-    getmailstatus();
+    /* Reading the mail spool is a host integration an agent worker never
+     * performs; the profile also pins mail=off. */
+    if (AGENT_HOST_INTEGRATION())
+        getmailstatus();
 #endif
 
     /* wizard mode access is deferred until here */

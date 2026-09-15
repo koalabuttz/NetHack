@@ -16,28 +16,46 @@
 
 /* ---- sysconf directive classification ---- */
 
-/* The trusted sysconf may only carry directives the agent profile classifies.
- * An unrecognised statement is rejected rather than silently ignored: the
- * profile is frozen, so a new directive has to be classified deliberately
- * instead of taking effect by being unknown.
+/* The trusted sysconf may carry ONLY the statements the shipped agent
+ * configuration actually needs, each pinned to the exact value the frozen
+ * profile expects.  This is a positive allowlist of frozen statements, not a
+ * classification of directive names: a directive that is merely "known" is
+ * still refused.
  *
- * Path-bearing directives are listed because the launcher supplies the
- * writable locations; a sysconf is never allowed to point play at a shared
- * playground. */
-static const char *const agent_sysconf_directives[] = {
-    "wizards", "explorers", "genericusers", "maxplayers", "max_reroll_rate",
-    "support", "check_save_uid", "shell", "pager", "editor", "mail",
-    "crashreporturl", "panicreport", "panictrace_gdb", "panictrace_libc",
-    "gdbpath", "greppath", "recordfile", "logfile", "xlogfile", "sysconf",
-    "hackdir", "nethackdir", "portable_device_paths", "bones", "sounds",
-    "livelog", "wizkit", "max_score_age", "max_score_age_when"
+ * Name classification cannot make the excluded directives safe.  They are
+ * direct config-statement functions that mutate sysopt (src/cfgfiles.c), so
+ * the option gate never sees them; a path-bearing statement would let the
+ * sysconf point play at a shared playground, and an execution, tracing,
+ * reporting, sound, mail, hook, or logging statement would activate an
+ * external facility the profile forbids (plan section 4 step 6: reject
+ * unknown/external directives).  Only the five frozen statements below are
+ * accepted; anything else -- and any altered value on an accepted name --
+ * is a rejection the caller turns into a private termination. */
+#define AGENT_SYSCONF_NAME_MAX 64
+#define AGENT_SYSCONF_VALUE_MAX 64
+
+struct agent_sysconf_stmt {
+    const char *name;  /* directive name, lower case */
+    const char *value; /* exact accepted value; "" means "no value" */
 };
 
+static const struct agent_sysconf_stmt agent_sysconf_allowed[] = {
+    { "wizards", "" },
+    { "explorers", "" },
+    { "genericusers", "agent" },
+    { "maxplayers", "1" },
+    { "max_reroll_rate", "0" },
+};
+
+/* Split a mungspaced config statement into its directive name and value and
+ * report whether it is exactly one of the frozen statements.  The engine --
+ * not this function -- decides what a rejection does. */
 boolean
 agent_policy_sysconf_directive(const char *stmt)
 {
-    char buf[64];
-    size_t i, n;
+    char name[AGENT_SYSCONF_NAME_MAX], value[AGENT_SYSCONF_VALUE_MAX];
+    const char *s;
+    size_t i, d, vlen;
 
     if (!agent_mode() || !stmt)
         return TRUE; /* the human path is unchanged */
@@ -45,17 +63,36 @@ agent_policy_sysconf_directive(const char *stmt)
         ++stmt;
     if (*stmt == '#' || *stmt == '\0')
         return TRUE; /* comment or blank line */
-    for (n = 0; stmt[n] && stmt[n] != '=' && stmt[n] != ' ' && stmt[n] != '\t'
-                && n < sizeof buf - 1; ++n)
-        buf[n] = stmt[n];
-    buf[n] = '\0';
-    if (n == 0)
-        return TRUE;
-    for (i = 0; i < n; ++i)
-        buf[i] = (char) lowc((uchar) buf[i]);
-    for (i = 0; i < SIZE(agent_sysconf_directives); ++i)
-        if (strcmp(buf, agent_sysconf_directives[i]) == 0)
-            return TRUE;
+
+    /* the directive name ends at the first delimiter or space */
+    for (d = 0; stmt[d] && stmt[d] != '=' && stmt[d] != ':' && stmt[d] != ' '
+                && stmt[d] != '\t'; ++d)
+        ;
+    if (d == 0 || d >= sizeof name)
+        return FALSE;
+    for (i = 0; i < d; ++i)
+        name[i] = (char) lowc((uchar) stmt[i]);
+    name[d] = '\0';
+
+    /* skip the delimiter and any whitespace around it */
+    s = stmt + d;
+    while (*s == ' ' || *s == '\t')
+        ++s;
+    if (*s == '=' || *s == ':')
+        ++s;
+    while (*s == ' ' || *s == '\t')
+        ++s;
+    vlen = strlen(s);
+    if (vlen >= sizeof value)
+        return FALSE; /* an accepted statement has a short frozen value */
+    for (i = 0; i < vlen; ++i)
+        value[i] = s[i];
+    value[vlen] = '\0';
+
+    for (i = 0; i < SIZE(agent_sysconf_allowed); ++i)
+        if (strcmp(name, agent_sysconf_allowed[i].name) == 0)
+            return (boolean) (strcmp(value, agent_sysconf_allowed[i].value)
+                              == 0);
     return FALSE;
 }
 

@@ -22,6 +22,15 @@ NHCFLAGS += -DNOSHELL
 NHCFLAGS += -DNOSUSPEND
 endif
 
+# WANT_AGENT_TEST_IMPOSSIBLE=1 builds the hostile-matrix worker.  It compiles
+# in the test-only diagnostic injection (AGENT_TEST_IMPOSSIBLE) that proves
+# the runtime-policy probes and the decision-callback fatals, and it is the
+# only build that accepts the test-only handshake launch modes.  It must
+# NEVER be used for a shipped or evaluation worker.
+ifdef WANT_AGENT_TEST_IMPOSSIBLE
+NHCFLAGS += -DAGENT_TEST_IMPOSSIBLE
+endif
+
 endif # WANT_WIN_AGENT
 
 #end of agent.500

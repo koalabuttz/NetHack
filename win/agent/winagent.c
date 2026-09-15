@@ -24,6 +24,8 @@
 
 #ifdef AGENT_TEST_IMPOSSIBLE
 #include "func_tab.h" /* WIZMODECMD / CMD_NOT_AVAILABLE */
+#include "agent_handshake.h" /* AG_HS_MODE_TEST_* (test-only launch modes) */
+#include <fcntl.h> /* F_GETFD / FD_CLOEXEC for the transport probe */
 #endif
 
 #include <errno.h>
@@ -184,6 +186,17 @@ agent_test_diagnostics(void)
     r = load_symset("DECGraphics", PRIMARYSET);
     program_state.in_parseoptions -= 1;
     agent_test_probe("symsetload", r == 0);
+    /* An actual parse-time mutation through the engine's OWN option parser:
+     * it must be refused AND leave the affected field untouched, so the
+     * denial is proven on the data, not only on the return value. */
+    {
+        char before[BUFSZ];
+
+        Strcpy(before, svp.plname);
+        r = parseoptions((char *) "name:Hostile", FALSE, FALSE);
+        agent_test_probe("parsemutate",
+                         r == FALSE && strcmp(before, svp.plname) == 0);
+    }
     /* wizard/fuzzer/unavailable commands vs an ordinary command */
     agent_test_probe("wizardcmd",
                      agent_policy_command_flags(WIZMODECMD) == FALSE);
@@ -199,6 +212,10 @@ agent_test_diagnostics(void)
 }
 #endif /* AGENT_TEST_IMPOSSIBLE */
 
+#ifdef AGENT_TEST_IMPOSSIBLE
+static void agent_test_mode_dispatch(void);
+#endif
+
 static void
 agent_player_selection(void)
 {
@@ -213,7 +230,10 @@ agent_player_selection(void)
         agent_private_fatal("player selection before publication readiness");
 
 #ifdef AGENT_TEST_IMPOSSIBLE
-    /* Test-only diagnostic injection for the hostile matrix (see below). */
+    /* Test-only injection for the hostile matrix (see below).  The mode
+     * dispatcher runs FIRST: a selected decision callback must terminate
+     * privately here, before any public byte is produced. */
+    agent_test_mode_dispatch();
     agent_test_diagnostics();
 #endif
 
@@ -347,9 +367,12 @@ static void
 agent_display_nhwindow(winid window, boolean blocking)
 {
     (void) window;
-    (void) blocking;
-    /* M1: discarded, publishes nothing (M2 renders it). */
-    (void) ("display_nhwindow");
+    /* A NONBLOCKING display is plumbing that publishes nothing and waits for
+     * nothing, so it stays a no-op.  A BLOCKING display requires an
+     * acknowledgement the agent has not been asked for yet; silently
+     * returning would fabricate that decision, so it fails closed. */
+    if (blocking)
+        agent_private_fatal("blocking display is not implemented yet");
 }
 
 static void
@@ -440,10 +463,10 @@ agent_select_menu(winid window, int how, MENU_ITEM_P **menu_list)
 {
     (void) window;
     (void) how;
-    if (menu_list)
-        *menu_list = (MENU_ITEM_P *) 0;
-    /* M1 publishes nothing here; returning "no selection" is the native
-     * cancellation result, not a fabricated decision. */
+    (void) menu_list;
+    /* A menu selection IS a decision.  Returning an empty selection would
+     * fabricate one, so an unimplemented selection fails closed instead. */
+    agent_private_fatal("menu selection is not implemented yet");
     return 0;
 }
 
@@ -453,10 +476,73 @@ agent_message_menu(char let, int how, const char *mesg)
     (void) let;
     (void) how;
     (void) mesg;
-    /* M1: discarded, publishes nothing (M2 renders it). */
-    (void) ("message_menu");
+    /* A message-menu answer IS a decision.  Returning Escape would fabricate
+     * one, so an unimplemented message menu fails closed instead. */
+    agent_private_fatal("message menu is not implemented yet");
     return '\033';
 }
+
+#ifdef AGENT_TEST_IMPOSSIBLE
+/* Test-only: report the transport descriptor's close-on-exec state and then
+ * exec a descriptor-inventory helper.  The transport was already proven
+ * usable pre-exec by the handshake the bootstrap consumed; after the exec the
+ * helper must NOT find the descriptor, because a later exec descendant (save
+ * compression, panic tracer) must not inherit the player-JSON channel.  The
+ * helper is /bin/sh, so no extra binary is needed and its stderr is the same
+ * private sink. */
+static void
+agent_test_exec_inventory(void)
+{
+    char script[256], fdstr[16], probe[80];
+    char *av[4], *ev[2];
+    int fd = agent_bootstrap_fd();
+    int fdflags = (fd >= 0) ? fcntl(fd, F_GETFD) : -1;
+
+    (void) snprintf(probe, sizeof probe, "probe cloexec=%d",
+                    (fdflags >= 0 && (fdflags & FD_CLOEXEC)) ? 1 : 0);
+    agent_private_diag(probe);
+
+    (void) snprintf(fdstr, sizeof fdstr, "%d", fd);
+    (void) snprintf(script, sizeof script,
+                    "if [ -e /proc/self/fd/%s ]; then "
+                    "echo helper:transport-present; else "
+                    "echo helper:transport-absent; fi", fdstr);
+    av[0] = (char *) "/bin/sh";
+    av[1] = (char *) "-c";
+    av[2] = script;
+    av[3] = (char *) 0;
+    ev[0] = (char *) "PATH=/usr/bin:/bin";
+    ev[1] = (char *) 0;
+    (void) execve("/bin/sh", av, ev);
+    agent_private_fatal("descriptor-inventory helper could not be executed");
+}
+
+/* Test-only: drive ONE test path per worker process, selected by the
+ * test-only handshake launch mode the matrix sends (see agent_handshake.h).
+ * The three decision cases must terminate the worker privately with zero
+ * public bytes.  AG_HS_MODE_NEW selects none, which leaves the ordinary
+ * impossible-matrix run below unchanged. */
+static void
+agent_test_mode_dispatch(void)
+{
+    switch (agent_bootstrap_test_mode()) {
+    case AG_HS_MODE_TEST_DISPLAY:
+        agent_display_nhwindow((winid) 1, TRUE);
+        break;
+    case AG_HS_MODE_TEST_SELECT:
+        (void) agent_select_menu((winid) 1, 0, (MENU_ITEM_P **) 0);
+        break;
+    case AG_HS_MODE_TEST_MSGMENU:
+        (void) agent_message_menu(' ', 0, "test");
+        break;
+    case AG_HS_MODE_TEST_EXEC:
+        agent_test_exec_inventory();
+        break;
+    default:
+        break;
+    }
+}
+#endif /* AGENT_TEST_IMPOSSIBLE */
 
 static void
 agent_mark_synch(void)
