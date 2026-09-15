@@ -10,9 +10,9 @@
  * Returns false when the candidate cannot be published: a non-ASCII
  * character or an out-of-range color slot.  Otherwise writes the public
  * 4-tuple, applying the fixed profile's displayed precedence:
- *   frame color wins over pet highlighting; pet/pile/detection/black-and-white
- *   inverse set the public inverse style bit in the map context; map-only
- *   reasons are ignored in the menu context; wizard-only reasons are dropped.
+ *   frame color wins over pet highlighting; pet, pile, detection and BW
+ *   inverse set the public inverse style bit in the map context; the menu
+ *   context ignores map-only reasons; wizard-only reasons never apply.
  */
 bool agent_normalize_appearance(const struct agent_render_input *in,
                                 enum agent_render_context ctx,
@@ -20,8 +20,8 @@ bool agent_normalize_appearance(const struct agent_render_input *in,
 
 /* Project a native yes/no choices string to its displayed prefix.
  *
- * The native string may carry an undisplayed accepted suffix after an embedded
- * Escape.  Only bytes before the first Escape (or NUL) are copied.  Bytes
+ * The native string may carry an undisplayed accepted suffix after an
+ * embedded Escape.  Only bytes before the first Escape (or NUL) are copied.
  * outside printable ASCII are rejected, and overflow of out->cap fails.
  * len may be 0; out->len is set to the number of copied bytes.
  */

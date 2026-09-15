@@ -36,7 +36,7 @@ struct agent_session {
     uint64_t next_menu;     /* "mN" */
     uint64_t acked_seq;
     uint64_t acked_chunk;   /* highest contiguous chunk index acknowledged */
-    uint64_t last_rid;      /* rid of the most recent chunk stream, 0 = none */
+    uint64_t last_rid;    /* rid of the most recent chunk stream, 0 none */
 
     /* outstanding gameplay request */
     uint64_t outstanding_id;
@@ -72,13 +72,15 @@ enum agent_result agent_write_hello(struct agent_session *s);
 
 /* Freeze and deliver the durable presentation, retaining the response for the
  * last accepted action.  need may be NULL for a final boundary. */
-enum agent_result agent_commit(struct agent_session *s, const struct agent_view *v,
+enum agent_result agent_commit(struct agent_session *s,
+                               const struct agent_view *v,
                                const struct agent_need *need);
 
 /* Read until a fresh executable action is available.  Transport auxiliaries
  * and identical retries are consumed internally.  On a rejected input returns
  * AG_BAD_INPUT without consuming the outstanding request. */
-enum agent_result agent_receive(struct agent_session *s, struct agent_action *out);
+enum agent_result agent_receive(struct agent_session *s,
+                                struct agent_action *out);
 
 /* Emit the exact bare terminal closure and mark the session closed. */
 enum agent_result agent_write_closed(struct agent_session *s);
@@ -90,8 +92,8 @@ enum agent_result agent_write_invalid(struct agent_session *s,
 /* Re-send the retained last physical record with its original d and bytes. */
 enum agent_result agent_retry_last(struct agent_session *s);
 
-/* Strict parse of one act record.  out->commit/commit_cap must be preset by the
- * caller to receive menu commit rows. */
+/* Strict parse of one act record.  The caller presets
+ * out->commit/commit_cap to receive menu commit rows. */
 enum agent_result agent_parse_action(const char *buf, size_t len,
                                      struct agent_action *out);
 

@@ -20,7 +20,7 @@ enum agent_menu_mode {
 #define AG_MENU_TEXT_MAX 256
 
 struct agent_menu_row {
-    long r;                    /* 1-based, insertion order, includes headings */
+    long r;                 /* 1-based insertion order, includes headings */
     char text[AG_MENU_TEXT_MAX];
     bool selectable;
     int key;                   /* advisory accelerator byte, or 0 for null */
@@ -72,7 +72,7 @@ struct agent_selection {
  *
  * On success returns AG_OK and fills out with rows normalized to menu
  * insertion order.  On a validation failure returns AG_BAD_INPUT (or AG_LIMIT
- * for a bound overflow) and leaves the caller's outstanding request untouched;
+ * for a bound overflow) and leaves the outstanding request untouched;
  * out->code carries the public code.  Cancellation yields no rows.
  */
 enum agent_result agent_menu_validate(const struct agent_menu *m,

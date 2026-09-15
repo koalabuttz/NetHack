@@ -52,7 +52,7 @@ agent_model_reset(struct agent_model *m)
     m->last_k = -1;
 }
 
-/* Allocate durable palette ids from the frozen durable map in row-major order.
+/* Allocate durable palette ids from the frozen map in row-major order.
  * Only the durable map is scanned: a tuple seen only in an animation is never
  * allocated here. */
 static void
@@ -236,8 +236,9 @@ agent_model_step(struct agent_model *m, const struct agent_model_event *ev)
             int i;
 
             for (i = 0; i < m->last_nchunks; ++i)
-                m->last_chunk_len[i] = chunk_bytes(m, i, m->last_chunk_bytes[i],
-                                                   sizeof m->last_chunk_bytes[i]);
+                m->last_chunk_len[i] =
+                    chunk_bytes(m, i, m->last_chunk_bytes[i],
+                                sizeof m->last_chunk_bytes[i]);
         }
         return AG_OK;
     }
@@ -273,7 +274,7 @@ agent_model_step(struct agent_model *m, const struct agent_model_event *ev)
         return AG_OK;
 
     case AG_EV_RESYNC: {
-        /* Replay the retained interval prefix.  Its ledger dedupes (interval,k),
+        /* Replay the retained interval prefix; its ledger dedupes
          * so already delivered frames are never counted twice. */
         size_t i, j;
         unsigned distinct = 0;

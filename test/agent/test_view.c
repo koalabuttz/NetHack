@@ -1,6 +1,6 @@
 /* test_view.c -- appearance normalization and hidden-choice projection.
  *
- * Golden vectors for doc/agent-interface.md sections 2.3 and 4.2.  Engine-free.
+ * Golden vectors for doc/agent-interface.md sections 2.3 and 4.2.
  */
 
 #include <stdio.h>
@@ -108,7 +108,7 @@ main(void)
     /* ---- visible choices stop before the hidden suffix ---- */
     t.buf = buf;
     t.cap = sizeof buf;
-    /* the native string carries an undisplayed accepted suffix after Escape */
+    /* the native string carries an undisplayed suffix after Escape */
     CHECK(agent_visible_choices("ynq\x1b" "ABC", 7, &t));
     CHECK(t.len == 3);
     CHECK(memcmp(buf, "ynq", 3) == 0);

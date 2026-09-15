@@ -22,7 +22,8 @@ agent_color_name(uint8_t slot)
 
 bool
 agent_normalize_appearance(const struct agent_render_input *in,
-                           enum agent_render_context ctx, struct agent_cell *out)
+                           enum agent_render_context ctx,
+                           struct agent_cell *out)
 {
     if (!in || !out)
         return false;
@@ -64,7 +65,7 @@ agent_visible_choices(const char *choices, size_t len, struct agent_text *out)
     for (i = 0; i < len; ++i) {
         unsigned char c = (unsigned char) choices[i];
 
-        /* an embedded Escape (or NUL) starts the undisplayed accepted suffix */
+        /* an embedded Escape (or NUL) starts the hidden accepted suffix */
         if (c == 0x1b || c == 0x00)
             break;
         /* only displayed, printable ASCII may be published */

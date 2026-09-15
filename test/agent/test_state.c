@@ -1,6 +1,6 @@
 /* test_state.c -- durable/audit reference vectors.
  *
- * Vectors named by the P1 gate: a projectile that returns to its original map,
+ * P1 gate vectors: a projectile that returns to its original map,
  * palette isolation from animation, chunk splits at every boundary, retries,
  * and resync replay.  Engine-free.
  */
@@ -120,7 +120,8 @@ main(void)
          * palette id, and the durable palette did not grow */
         CHECK(model.ndpal == npal_before);
         for (i = 0; i < model.ndpal; ++i)
-            CHECK(!(model.dpal[i].ch == '*' && model.dpal[i].fg == AG_COL_ORANGE));
+            CHECK(!(model.dpal[i].ch == '*'
+                    && model.dpal[i].fg == AG_COL_ORANGE));
     }
 
     /* ================================================================
@@ -267,7 +268,7 @@ main(void)
         ev.kind = AG_EV_RESYNC;
         CHECK(agent_model_step(&model, &ev) == AG_OK);
         CHECK(model.resync_replays == 1);
-        CHECK(model.frames_displayed == displayed); /* deduped by (interval,k) */
+        CHECK(model.frames_displayed == displayed); /* dedup (interval,k) */
         CHECK(model.nledger == ledger);
 
         CHECK(agent_model_step(&model, &ev) == AG_OK);

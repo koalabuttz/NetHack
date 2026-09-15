@@ -24,7 +24,7 @@
 #define AG_MAX_ACTION_BYTES 65535
 #define AG_KEY_MIN 1
 #define AG_KEY_MAX 255
-#define AG_LINE_INPUT_MAX 255          /* min(255, native destination cap-1) */
+#define AG_LINE_INPUT_MAX 255     /* min(255, native dest capacity-1) */
 #define AG_MAX_WINDOWS 32
 #define AG_MAX_MENU_ROWS 65535
 #define AG_MAX_TEXT_LINES 65535

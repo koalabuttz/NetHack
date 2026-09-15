@@ -205,7 +205,8 @@ test_parse_accepts(void)
     }
     {
         static const char pos[] = "{\"v\":1,\"type\":\"act\",\"id\":9,"
-                                  "\"action\":{\"position\":[12,8],\"mod\":0}}";
+                                  "\"action\":{\"position\":[12,8],"
+                                  "\"mod\":0}}";
         CHECK(agent_parse_action(pos, sizeof pos - 1, &a) == AG_OK);
         CHECK(a.kind == AG_ACT_POSITION && a.px == 12 && a.py == 8
               && a.pmod == 0);
@@ -254,7 +255,8 @@ test_parse_rejects(void)
         "{\"v\":1,\"type\":\"act\",\"id\":1,\"action\":{\"key\":1},\"x\":1}",
         "{\"v\":1,\"type\":\"act\",\"id\":1,\"ch\":\"player\","
         "\"action\":{\"key\":1}}",
-        "{\"v\":1,\"type\":\"act\",\"id\":1,\"action\":{\"key\":1,\"then\":[]}}",
+        "{\"v\":1,\"type\":\"act\",\"id\":1,"
+        "\"action\":{\"key\":1,\"then\":[]}}",
         "{\"v\":1,\"type\":\"act\",\"id\":1,\"action\":{\"selectall\":true}}",
         "{\"v\":1,\"type\":\"act\",\"id\":1,\"action\":{\"invert\":true}}",
         "{\"v\":1,\"type\":\"act\",\"id\":1,\"action\":{\"bulk\":true}}",
@@ -263,7 +265,8 @@ test_parse_rejects(void)
         "{\"v\":1,\"type\":\"act\",\"id\":1,\"action\":{\"raw\":true}}",
         /* duplicate keys */
         "{\"v\":1,\"v\":1,\"type\":\"act\",\"id\":1,\"action\":{\"key\":1}}",
-        "{\"v\":1,\"type\":\"act\",\"id\":1,\"action\":{\"key\":1,\"key\":2}}",
+        "{\"v\":1,\"type\":\"act\",\"id\":1,"
+        "\"action\":{\"key\":1,\"key\":2}}",
         /* missing required */
         "{\"v\":1,\"type\":\"act\",\"action\":{\"key\":1}}",
         "{\"v\":1,\"type\":\"act\",\"id\":1}",
@@ -295,9 +298,12 @@ test_parse_rejects(void)
         "{\"v\":1,\"type\":\"act\",\"id\":1,\"action\":{\"key\":1}}x",
         "{\"v\":1,\"type\":\"act\",\"id\":1,\"action\":{\"key\":1}",
         /* bad escapes / encoding */
-        "{\"v\":1,\"type\":\"act\",\"id\":1,\"action\":{\"text\":\"a\\u0000b\"}}",
-        "{\"v\":1,\"type\":\"act\",\"id\":1,\"action\":{\"text\":\"\\ud800\"}}",
-        "{\"v\":1,\"type\":\"act\",\"id\":1,\"action\":{\"text\":\"a\x01\" \"b\"}}",
+        "{\"v\":1,\"type\":\"act\",\"id\":1,"
+        "\"action\":{\"text\":\"a\\u0000b\"}}",
+        "{\"v\":1,\"type\":\"act\",\"id\":1,"
+        "\"action\":{\"text\":\"\\ud800\"}}",
+        "{\"v\":1,\"type\":\"act\",\"id\":1,"
+        "\"action\":{\"text\":\"a\x01\" \"b\"}}",
         "{\"v\":1,\"type\":\"act\",\"id\":1,\"action\":{\"key\":1}\x80}"
     };
     size_t i;
@@ -332,7 +338,8 @@ test_parse_rejects(void)
     /* commit with zero or out-of-range counts */
     {
         static const char z[] = "{\"v\":1,\"type\":\"act\",\"id\":1,"
-                                "\"action\":{\"menu\":\"m1\",\"commit\":[[1,0]]}}";
+                                "\"action\":{\"menu\":\"m1\","
+                                "\"commit\":[[1,0]]}}";
         static const char r[] = "{\"v\":1,\"type\":\"act\",\"id\":1,"
                                 "\"action\":{\"menu\":\"m1\","
                                 "\"commit\":[[65536,1]]}}";
@@ -377,7 +384,8 @@ test_hello_and_closed(void)
     static const char expect_hello[] =
         "{\"v\":1,\"ch\":\"control\",\"type\":\"hello\",\"d\":1,"
         "\"profile\":\"normal-ascii-color-v1\",\"policy\":\"llm-final-v1\","
-        "\"caps\":[\"snapshot\",\"menu\",\"paging\"],\"coord\":\"engine-map\","
+        "\"caps\":[\"snapshot\",\"menu\",\"paging\"],"
+        "\"coord\":\"engine-map\","
         "\"size\":[80,21],\"x0\":1,\"y0\":0,\"limits\":{\"line\":65536,"
         "\"page_bytes\":16384,\"page_rows\":128,\"count\":2147483647}}\n";
     static const char expect_closed[] =
@@ -419,7 +427,8 @@ test_commit_and_counters(void)
     CHECK(sess.outstanding_id == 1);
     CHECK(strstr(outstr(), "\"seq\":1") != NULL);
     CHECK(strstr(outstr(), "\"base\":null") != NULL);
-    CHECK(strstr(outstr(), "\"need\":{\"id\":1,\"kind\":\"command\"}") != NULL);
+    CHECK(strstr(outstr(), "\"need\":{\"id\":1,\"kind\":\"command\"}")
+          != NULL);
 
     /* a final-boundary commit clears the outstanding request and advances
      * seq exactly once; a nonblocking display would not advance it at all */
@@ -516,7 +525,8 @@ test_stale_and_duplicate_actions(void)
 
         /* an identical retry replays the retained response and is consumed */
         feed(act5);
-        feed("{\"v\":1,\"type\":\"act\",\"id\":6,\"action\":{\"key\":106}}\n");
+        feed("{\"v\":1,\"type\":\"act\",\"id\":6,"
+             "\"action\":{\"key\":106}}\n");
         CHECK(agent_receive(&sess, &a) == AG_OK);
         CHECK(a.id == 6);
         CHECK(sess.replays == 1);
@@ -643,7 +653,7 @@ test_chunk_plan_boundaries(void)
             }
         }
     }
-    /* everything in one chunk when the budget covers the whole packed record */
+    /* everything in one chunk when the budget covers the whole record */
     CHECK(agent_chunk_plan(parts, 6, 100, chunk_of, 16) == 1);
     /* caller storage too small fails closed */
     CHECK(agent_chunk_plan(parts, 6, 30, chunk_of, 2) == 0);
@@ -703,7 +713,8 @@ test_chunk_emission(void)
 
         CHECK(agent_retry_last(&sess) == AG_OK);
         CHECK(io.outlen == before + sess.last_line_len);
-        CHECK(memcmp(io.out + before, sess.last_line, sess.last_line_len) == 0);
+        CHECK(memcmp(io.out + before, sess.last_line,
+                     sess.last_line_len) == 0);
     }
 }
 

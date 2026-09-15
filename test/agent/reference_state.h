@@ -1,4 +1,4 @@
-/* reference_state.h -- engine-free durable/audit reference model (P1 fixtures).
+/* reference_state.h -- engine-free durable/audit reference model.
  *
  * This is the executable statement of doc/agent-interface.md sections 9 and
  * 10.  It is a model, not production code: it tracks exactly the invariants
@@ -96,7 +96,7 @@ struct agent_model {
 
 enum agent_model_event_kind {
     AG_EV_SET_DURABLE, /* working-durable write of one cell */
-    AG_EV_ANIM,        /* an animation step: working + scratch cell, then a frame */
+    AG_EV_ANIM,        /* an animation step: working + scratch, then frame */
     AG_EV_ANIM_FRAME,  /* capture a frame from the current scratch view */
     AG_EV_BLOCKING,    /* blocking display: durable boundary */
     AG_EV_INPUT,       /* unsatisfied input request: durable boundary */

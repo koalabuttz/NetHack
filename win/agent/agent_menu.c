@@ -67,7 +67,8 @@ sel_sort(struct agent_selection *out)
 }
 
 enum agent_result
-agent_menu_validate(const struct agent_menu *m, const struct agent_menu_answer *a,
+agent_menu_validate(const struct agent_menu *m,
+                    const struct agent_menu_answer *a,
                     struct agent_selection *out)
 {
     size_t i, j;
@@ -106,7 +107,7 @@ agent_menu_validate(const struct agent_menu *m, const struct agent_menu_answer *
         out->result = 0;
         return AG_OK;
     }
-    /* empty commit: legal for every mode, returns native count 0, no results */
+    /* empty commit: legal for every mode; native count 0, no results */
     if (a->nrows == 0) {
         out->result = 0;
         return AG_OK;

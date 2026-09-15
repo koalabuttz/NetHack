@@ -608,7 +608,7 @@ ag_parse_action_value(struct ag_cur *c, struct agent_action *out)
     ++c->p;
     ag_ws(c);
     if (c->p < c->end && *c->p == '}')
-        return ag_act_fail(out, AG_INV_SCHEMA); /* empty action is not a shape */
+        return ag_act_fail(out, AG_INV_SCHEMA); /* empty action, no shape */
 
     ag_init(&key);
     for (;;) {
@@ -877,7 +877,7 @@ ag_parse_action_value(struct ag_cur *c, struct agent_action *out)
     if (seen_count && !seen_yn)
         return ag_act_fail(out, AG_INV_SCHEMA);
     if (seen_pos && !seen_mod) {
-        out->pmod = 0; /* mod is explicit in the grammar; default is invalid */
+        out->pmod = 0; /* mod is explicit; its absence is invalid */
         return ag_act_fail(out, AG_INV_SCHEMA);
     }
     if (seen_menu && !seen_commit)
@@ -902,8 +902,8 @@ enum agent_result
 agent_parse_action(const char *buf, size_t len, struct agent_action *out)
 {
     struct ag_cur c;
-    bool have_v = false, have_type = false, have_id = false, have_action = false;
-    bool have_seq = false;
+    bool have_v = false, have_type = false, have_id = false;
+    bool have_action = false, have_seq = false;
     struct ag_buf key;
 
     if (!buf || !out)
@@ -1160,7 +1160,7 @@ ag_array_key(int kind)
     return (const char *) 0;
 }
 
-/* Render the whole logical obs record from the parts, in fixed field order. */
+/* Render the logical obs record from the parts, in fixed field order. */
 static bool
 ag_render_obs(const struct ag_parts *ps, struct ag_buf *o)
 {
@@ -1205,7 +1205,8 @@ ag_render_obs(const struct ag_parts *ps, struct ag_buf *o)
                 if (!first_top && !ag_putc(o, ','))
                     return false;
                 first_top = false;
-                if (!ag_putc(o, '"') || !ag_puts(o, "s") || !ag_puts(o, "\":{"))
+                if (!ag_putc(o, '"') || !ag_puts(o, "s")
+                    || !ag_puts(o, "\":{"))
                     return false;
                 open = 1;
                 first_in = true;
@@ -1239,7 +1240,8 @@ ag_render_obs(const struct ag_parts *ps, struct ag_buf *o)
                 if (!first_top && !ag_putc(o, ','))
                     return false;
                 first_top = false;
-                if (!ag_putc(o, '"') || !ag_puts(o, akey) || !ag_puts(o, "\":["))
+                if (!ag_putc(o, '"') || !ag_puts(o, akey)
+                    || !ag_puts(o, "\":["))
                     return false;
                 open = want;
                 first_in = true;
@@ -1264,6 +1266,7 @@ ag_build_parts(struct ag_parts *ps, const struct agent_view *v,
     struct ag_buf b;
     size_t i, j;
     bool ok = true;
+    const char *mname;
 
     ag_init(&b);
 #define EMIT(kind, key)                                                     \
@@ -1386,10 +1389,8 @@ ag_build_parts(struct ag_parts *ps, const struct agent_view *v,
         ag_put_jstr(&b, w->title ? w->title : "");
         if (w->kind) {
             ag_puts(&b, ",\"mode\":");
-            ag_put_jstr(&b, agent_menu_mode_name((enum agent_menu_mode) w->mode)
-                                   ? agent_menu_mode_name(
-                                         (enum agent_menu_mode) w->mode)
-                                   : "none");
+            mname = agent_menu_mode_name((enum agent_menu_mode) w->mode);
+            ag_put_jstr(&b, mname ? mname : "none");
         }
         ag_puts(&b, ",\"content\":");
         ag_put_jstr(&b, w->content ? w->content : "c1");
@@ -1474,10 +1475,8 @@ ag_build_parts(struct ag_parts *ps, const struct agent_view *v,
             ag_puts(&b, ",\"menu\":");
             ag_put_jstr(&b, need->menu ? need->menu : "m1");
             ag_puts(&b, ",\"mode\":");
-            ag_put_jstr(&b, agent_menu_mode_name((enum agent_menu_mode) need->mode)
-                                   ? agent_menu_mode_name(
-                                         (enum agent_menu_mode) need->mode)
-                                   : "none");
+            mname = agent_menu_mode_name((enum agent_menu_mode) need->mode);
+            ag_put_jstr(&b, mname ? mname : "none");
             ag_puts(&b, ",\"content\":");
             ag_put_jstr(&b, need->content ? need->content : "c1");
             ag_puts(&b, ",\"pages\":");
@@ -1642,8 +1641,8 @@ ag_hash(const char *buf, size_t len)
 }
 
 void
-agent_session_init(struct agent_session *s, agent_read_fn rd, agent_write_fn wr,
-                   void *io)
+agent_session_init(struct agent_session *s, agent_read_fn rd,
+                   agent_write_fn wr, void *io)
 {
     memset(s, 0, sizeof *s);
     s->read = rd;
@@ -1665,7 +1664,8 @@ agent_write_hello(struct agent_session *s)
     ag_puts(&o, ",\"profile\":\"normal-ascii-color-v1\"");
     ag_puts(&o, ",\"policy\":\"llm-final-v1\"");
     ag_puts(&o, ",\"caps\":[\"snapshot\",\"menu\",\"paging\"]");
-    ag_puts(&o, ",\"coord\":\"engine-map\",\"size\":[80,21],\"x0\":1,\"y0\":0");
+    ag_puts(&o, ",\"coord\":\"engine-map\",\"size\":[80,21]");
+    ag_puts(&o, ",\"x0\":1,\"y0\":0");
     ag_puts(&o, ",\"limits\":{\"line\":65536,\"page_bytes\":16384");
     ag_puts(&o, ",\"page_rows\":128,\"count\":2147483647}}");
     if (o.ovf) {
@@ -1680,7 +1680,8 @@ agent_write_hello(struct agent_session *s)
 enum agent_result
 agent_write_closed(struct agent_session *s)
 {
-    static const char closed[] = "{\"v\":1,\"ch\":\"control\",\"type\":\"closed\"}";
+    static const char closed[] = "{\"v\":1,\"ch\":\"control\","
+                                 "\"type\":\"closed\"}";
     enum agent_result r;
 
     /* exactly the bare closure: no delivery counter, no reason, no id */
@@ -2016,7 +2017,8 @@ ag_get_string_field(const char *line, size_t len, const char *key, char *out,
  * must be in the allowed list, each allowed key must appear exactly once, and
  * no other key may appear.  This enforces "no additional properties". */
 static bool
-ag_keys_exact(const char *line, size_t len, const char *const *keys, unsigned n)
+ag_keys_exact(const char *line, size_t len, const char *const *keys,
+              unsigned n)
 {
     struct ag_cur c;
     unsigned seen = 0;
@@ -2083,8 +2085,8 @@ ag_keys_exact(const char *line, size_t len, const char *const *keys, unsigned n)
 }
 
 static bool
-ag_field_present(const char *line, size_t len, const char *key, long long *ival,
-                 bool *is_int)
+ag_field_present(const char *line, size_t len, const char *key,
+                 long long *ival, bool *is_int)
 {
     struct ag_cur c;
     bool found = false;
@@ -2150,7 +2152,8 @@ ag_field_present(const char *line, size_t len, const char *key, long long *ival,
 
 /* Emit a single page of the outstanding content. */
 static enum agent_result
-ag_emit_page(struct agent_session *s, const char *content, int page, int pages)
+ag_emit_page(struct agent_session *s, const char *content, int page,
+             int pages)
 {
     struct ag_buf o;
     enum agent_result r;
@@ -2261,8 +2264,8 @@ agent_receive(struct agent_session *s, struct agent_action *out)
                 continue;
             }
             if (strcmp(type, "get_page") == 0) {
-                static const char *const keys[] = { "v", "type", "id", "content",
-                                                    "page" };
+                static const char *const keys[] = { "v", "type", "id",
+                                                    "content", "page" };
                 char content[32];
                 long long page;
                 bool is_int;
@@ -2321,7 +2324,8 @@ agent_receive(struct agent_session *s, struct agent_action *out)
                     return AG_INTERNAL;
                 if (!s->have_reply)
                     return AG_INTERNAL;
-                if (ag_write_all(s, s->last_reply, s->last_reply_len) != AG_OK)
+                if (ag_write_all(s, s->last_reply, s->last_reply_len)
+                    != AG_OK)
                     return AG_IO;
                 ++s->replays;
                 continue;
