@@ -253,10 +253,12 @@ WINAGENTSRC ?= ../win/agent/winagent.c ../win/agent/agent_bootstrap.c \
 	../win/agent/agent_view.c ../win/agent/agent_menu.h \
 	../win/agent/agent_menu.c ../win/agent/agent_protocol.h \
 	../win/agent/agent_protocol.c ../win/agent/agent_handshake.h \
-	../win/agent/agent_policy.c ../win/agent/agent_profile.h
+	../win/agent/agent_policy.c ../win/agent/agent_profile.h \
+	../win/agent/agent_input.h ../win/agent/agent_input.c
 WINAGENTOBJ ?= $(TARGETPFX)winagent.o $(TARGETPFX)agent_bootstrap.o \
 	$(TARGETPFX)agent_view.o $(TARGETPFX)agent_menu.o \
-	$(TARGETPFX)agent_protocol.o $(TARGETPFX)agent_policy.o
+	$(TARGETPFX)agent_protocol.o $(TARGETPFX)agent_policy.o \
+	$(TARGETPFX)agent_input.o
 WINAGENTLIB ?=
 #
 # Files for curses interface
@@ -1194,8 +1196,16 @@ $(TARGETPFX)topl.o: ../win/tty/topl.c $(HACK_H) ../include/tcap.h \
 	$(TARGET_CC) $(TARGET_CFLAGS) -c -o $@ ../win/tty/topl.c
 $(TARGETPFX)winagent.o: ../win/agent/winagent.c $(HACK_H) \
 		../win/agent/agent_types.h ../win/agent/agent_protocol.h \
-		../win/agent/agent_menu.h ../include/winagent.h
+		../win/agent/agent_menu.h ../win/agent/agent_input.h \
+		../include/winagent.h
 	$(TARGET_CC) $(TARGET_CFLAGS) -I../win/agent -c -o $@ ../win/agent/winagent.c
+
+$(TARGETPFX)agent_input.o: ../win/agent/agent_input.c \
+		../win/agent/agent_input.h ../win/agent/agent_types.h \
+		../win/agent/agent_protocol.h ../win/agent/agent_view.h \
+		../win/agent/agent_menu.h ../include/winagent.h
+	$(TARGET_CC) $(TARGET_CFLAGS) -I../win/agent -c -o $@ \
+		../win/agent/agent_input.c
 
 $(TARGETPFX)agent_bootstrap.o: ../win/agent/agent_bootstrap.c \
 		../win/agent/agent_handshake.h ../include/winagent.h

@@ -2184,7 +2184,8 @@ genl_player_selection(void)
     /*NOTREACHED*/
 }
 
-#if defined(TTY_GRAPHICS) || defined(CURSES_GRAPHICS) || defined(SHIM_GRAPHICS)
+#if defined(TTY_GRAPHICS) || defined(CURSES_GRAPHICS) \
+    || defined(SHIM_GRAPHICS) || defined(AGENT_GRAPHICS)
 /* ['#else' far below] */
 
 staticfn boolean reset_role_filtering(void);

@@ -31,6 +31,15 @@ ifdef WANT_AGENT_TEST_IMPOSSIBLE
 NHCFLAGS += -DAGENT_TEST_IMPOSSIBLE
 endif
 
+# WANT_AGENT_TEST_WRECON=1 additionally compiles in the presentation
+# self-check: at every durable boundary the port reconstructs a client model
+# from the emitted snapshot and compares it against the working presentation
+# W.  A mismatch is a private fatal, so a scripted episode built this way
+# only completes when the wire projection round-trips exactly.
+ifdef WANT_AGENT_TEST_WRECON
+NHCFLAGS += -DAGENT_TEST_WRECON
+endif
+
 endif # WANT_WIN_AGENT
 
 #end of agent.500
