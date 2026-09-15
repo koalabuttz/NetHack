@@ -111,7 +111,9 @@ SCHED = {
     "hicolor": ("unavailable-external", "compiled out (obsolete platform)", None),
     "hilite_pet": ("locked-presentation", "pet highlighting on", "on"),
     "hilite_pile": ("locked-presentation", "pile highlighting on", "on"),
-    "hilite_status": ("locked-presentation", "configurable status highlighting off", "off"),
+    "hilite_status": ("locked-presentation",
+                      "configurable status highlighting off; the compiled"
+                      " default is already an empty rule set", None),
     "hitpointbar": ("locked-presentation", "hit-point bar off", "off"),
     "horsename": ("locked-gameplay", "pet name is not an allowlisted "
                   "startup field; pinned at its default", None),
@@ -160,7 +162,8 @@ SCHED = {
     "news": ("locked-presentation", "compiled default pinned", None),
     "nudist": ("locked-gameplay", "role-play extra pinned at default", None),
     "null": ("locked-presentation", "compiled default pinned", None),
-    "number_pad": ("locked-presentation", "standard native bindings; number_pad off", "off"),
+    "number_pad": ("locked-presentation",
+                   "standard native bindings; number_pad off (native 0)", "0"),
     "objects": ("locked-presentation", "object symbol set pinned", None),
     "packorder": ("locked-gameplay", "compiled default pinned", None),
     "palette": ("unavailable-external", "color mutation denied", None),
@@ -604,6 +607,63 @@ def parse_optlist():
     return out
 
 
+def emit_c():
+    """Emit win/agent/agent_profile.h: the enforcement data the agent-only
+    build applies during trusted option initialization.
+
+    Only options whose resolved value differs from the compiled default are
+    listed; everything else is pinned at the compiled default, which the engine
+    already applies.  The table is derived from this generator so the manifest
+    and the enforcement data cannot drift apart.
+    """
+    entries = parse_optlist()
+    by_name = {}
+    for e in entries:
+        by_name.setdefault(e["args"][0].strip('"'), e)
+
+    pins = []
+    for name, e in by_name.items():
+        cls, why, override = SCHED[name]
+        if override is None:
+            continue
+        pins.append((name, override, cls))
+    pins.sort()
+
+    out = []
+    w = out.append
+    w("/* agent_profile.h -- profile enforcement data for the agent port.")
+    w(" *")
+    w(" * GENERATED from doc/agent-profile-v1.tsv by test/agent/gen_profile.py")
+    w(" * (--emit-c).  Do not edit by hand; edit the generator and regenerate.")
+    w(" *")
+    w(" * Every entry is an option whose frozen resolved value differs from this")
+    w(" * revision's compiled default, so the agent profile has no unclassified")
+    w(" * or implicit row: what is not listed here is pinned at the compiled")
+    w(" * default by the engine's own initialization.")
+    w(" */")
+    w("")
+    w("#ifndef AGENT_PROFILE_H")
+    w("#define AGENT_PROFILE_H")
+    w("")
+    w("struct agent_pin {")
+    w("    const char *name;   /* canonical option name */")
+    w("    const char *value;  /* frozen resolved value */")
+    w("    int locked_presentation; /* nonzero = presentation classification */")
+    w("};")
+    w("")
+    w("static const struct agent_pin agent_pins[] = {")
+    for name, value, cls in pins:
+        w('    { "%s", "%s", %d },'
+          % (name, value, 1 if cls == "locked-presentation" else 0))
+    w("};")
+    w("")
+    w("#define AGENT_PIN_COUNT "
+      "(sizeof agent_pins / sizeof agent_pins[0])")
+    w("")
+    w("#endif /* AGENT_PROFILE_H */")
+    print("\n".join(out))
+
+
 def main():
     entries = parse_optlist()
     # Collapse #if/#elif/#else variants: one row per option name, using the
@@ -728,4 +788,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    if "--emit-c" in sys.argv[1:]:
+        emit_c()
+    else:
+        main()

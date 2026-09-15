@@ -86,7 +86,7 @@ herecmd_menu	always	off	locked-presentation	set_in_game	&iflags.herecmd_menu	com
 hicolor	if 0 & if defined(MAC68K)	-	unavailable-external	set_in_config	-	compiled out (obsolete platform); guard inactive in this build
 hilite_pet	always	on (override)	locked-presentation	set_in_game	&iflags.wc_hilite_pet	pet highlighting on
 hilite_pile	always	on (override)	locked-presentation	set_in_game	&iflags.hilite_pile	pile highlighting on
-hilite_status	ifdef STATUS_HILITES	off (override)	locked-presentation	set_in_game	-	configurable status highlighting off
+hilite_status	ifdef STATUS_HILITES	(empty rule set; status highlighting off)	locked-presentation	set_in_game	-	configurable status highlighting off; the compiled default is already an empty rule set
 hitpointbar	always	off (override)	locked-presentation	set_in_game	&iflags.wc2_hitpointbar	hit-point bar off
 horsename	always	(empty)	locked-gameplay	set_gameview	-	pet name is not an allowlisted startup field; pinned at its default
 IBMgraphics	ifdef BACKWARD_COMPAT	-	unavailable-external	set_in_config	-	symset loading disabled
@@ -134,7 +134,7 @@ msghistory	always	20 (iflags.msg_history)	locked-presentation	set_gameview	-	his
 news	ifdef NEWS	off	locked-presentation	set_in_config	&iflags.news	compiled default pinned
 nudist	always	off	locked-gameplay	set_in_config	&u.uroleplay.nudist	role-play extra pinned at default
 null	always	on	locked-presentation	set_in_game	&flags.null	compiled default pinned
-number_pad	always	off (override)	locked-presentation	set_in_game	-	standard native bindings; number_pad off
+number_pad	always	0 (override)	locked-presentation	set_in_game	-	standard native bindings; number_pad off (native 0)
 objects	always	(built-in default symbol set)	locked-presentation	set_in_config	-	object symbol set pinned
 packorder	always	$)"[%?+!=/(*`0_ (flags.inv_order = def_inv_order)	locked-gameplay	set_in_game	-	compiled default pinned
 palette	ifdef CHANGE_COLOR & ifndef MAC68K	-	unavailable-external	set_gameview	-	color mutation denied

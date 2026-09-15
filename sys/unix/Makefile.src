@@ -252,10 +252,11 @@ WINAGENTSRC ?= ../win/agent/winagent.c ../win/agent/agent_bootstrap.c \
 	../win/agent/agent_types.h ../win/agent/agent_view.h \
 	../win/agent/agent_view.c ../win/agent/agent_menu.h \
 	../win/agent/agent_menu.c ../win/agent/agent_protocol.h \
-	../win/agent/agent_protocol.c ../win/agent/agent_handshake.h
+	../win/agent/agent_protocol.c ../win/agent/agent_handshake.h \
+	../win/agent/agent_policy.c ../win/agent/agent_profile.h
 WINAGENTOBJ ?= $(TARGETPFX)winagent.o $(TARGETPFX)agent_bootstrap.o \
 	$(TARGETPFX)agent_view.o $(TARGETPFX)agent_menu.o \
-	$(TARGETPFX)agent_protocol.o
+	$(TARGETPFX)agent_protocol.o $(TARGETPFX)agent_policy.o
 WINAGENTLIB ?=
 #
 # Files for curses interface
@@ -1217,6 +1218,11 @@ $(TARGETPFX)agent_protocol.o: ../win/agent/agent_protocol.c \
 	$(TARGET_CC) $(TARGET_CFLAGS) -I../win/agent -c -o $@ \
 		../win/agent/agent_protocol.c
 
+$(TARGETPFX)agent_policy.o: ../win/agent/agent_policy.c \
+		../include/winagent.h ../win/agent/agent_profile.h
+	$(TARGET_CC) $(TARGET_CFLAGS) -I../win/agent -c -o $@ \
+		../win/agent/agent_policy.c
+
 $(TARGETPFX)wintty.o: ../win/tty/wintty.c $(HACK_H) ../include/dlb.h \
 		../include/tcap.h ../include/wintty.h
 	$(TARGET_CC) $(TARGET_CFLAGS) -c -o $@ ../win/tty/wintty.c
@@ -1227,10 +1233,10 @@ $(TARGETPFX)artifact.o: artifact.c $(HACK_H) ../include/artifact.h
 $(TARGETPFX)attrib.o: attrib.c $(HACK_H)
 $(TARGETPFX)ball.o: ball.c $(HACK_H)
 $(TARGETPFX)bones.o: bones.c $(HACK_H)
-$(TARGETPFX)botl.o: botl.c $(HACK_H)
+$(TARGETPFX)botl.o: botl.c $(HACK_H) ../include/winagent.h
 $(TARGETPFX)calendar.o: calendar.c $(HACK_H)
-$(TARGETPFX)cfgfiles.o: cfgfiles.c $(HACK_H)
-$(TARGETPFX)cmd.o: cmd.c $(HACK_H) ../include/func_tab.h
+$(TARGETPFX)cfgfiles.o: cfgfiles.c $(HACK_H) ../include/winagent.h
+$(TARGETPFX)cmd.o: cmd.c $(HACK_H) ../include/func_tab.h ../include/winagent.h
 $(TARGETPFX)coloratt.o: coloratt.c $(HACK_H)
 $(TARGETPFX)dbridge.o: dbridge.c $(HACK_H)
 $(TARGETPFX)decl.o: decl.c $(HACK_H)
@@ -1314,7 +1320,8 @@ $(TARGETPFX)objects.o: objects.c $(CONFIG_H) ../include/defsym.h \
 $(TARGETPFX)objnam.o: objnam.c $(HACK_H)
 $(TARGETPFX)options.o: options.c $(CONFIG_H) $(HACK_H) ../include/defsym.h \
 		../include/flag.h ../include/objclass.h ../include/objects.h \
-		../include/optlist.h ../include/tcap.h
+		../include/optlist.h ../include/winagent.h \
+		../win/agent/agent_profile.h ../include/tcap.h
 $(TARGETPFX)pager.o: pager.c $(HACK_H) ../include/dlb.h
 $(TARGETPFX)pickup.o: pickup.c $(HACK_H)
 $(TARGETPFX)pline.o: pline.c $(HACK_H)
@@ -1348,7 +1355,8 @@ $(TARGETPFX)stairs.o: stairs.c $(HACK_H)
 $(TARGETPFX)steal.o: steal.c $(HACK_H)
 $(TARGETPFX)steed.o: steed.c $(HACK_H)
 $(TARGETPFX)strutil.o: strutil.c $(HACK_H)
-$(TARGETPFX)symbols.o: symbols.c $(HACK_H) ../include/tcap.h
+$(TARGETPFX)symbols.o: symbols.c $(HACK_H) ../include/tcap.h \
+		../include/winagent.h
 $(TARGETPFX)sys.o: sys.c $(HACK_H)
 $(TARGETPFX)teleport.o: teleport.c $(HACK_H)
 $(TARGETPFX)tile.o: $(SRCDIR)/tile.c $(HACK_H)

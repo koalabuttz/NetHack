@@ -4,6 +4,9 @@
 /* NetHack may be freely redistributed.  See license for details. */
 
 #include "hack.h"
+#ifdef AGENT_GRAPHICS
+#include "winagent.h"
+#endif
 #include "func_tab.h"
 
 #ifdef UNIX
@@ -459,10 +462,51 @@ extcmd_initiator(void)
     return gc.Cmd.extcmd_char;
 }
 
+#ifdef AGENT_GRAPHICS
+/* ---- locked normal-play command policy ----
+ *
+ * External sub-process facilities and policy-changing handlers are denied
+ * by identity, because their availability does not depend on the mutable
+ * `wizard` flag; the WIZMODECMD check below is therefore not sufficient on its
+ * own.  Everything else stays native: help, look, inventory, save, quit,
+ * movement.
+ */
+boolean
+agent_policy_command(int (*fn)(void))
+{
+    if (!agent_mode() || !fn)
+        return TRUE;
+    if (fn == doset || fn == doset_simple) /* runtime option mutation */
+        return FALSE;
+    if (fn == enter_explore_mode)          /* debug/explore entry */
+        return FALSE;
+    if (fn == dosh_core)                   /* shell escape! */
+        return FALSE;
+    return TRUE;
+}
+
+/* Wizard/Lua/fuzzer commands and commands this build marks unavailable are
+ * never reachable from a locked worker, whatever the wizard flag says. */
+boolean
+agent_policy_command_flags(unsigned long cmdflags)
+{
+    if (!agent_mode())
+        return TRUE;
+    return (cmdflags & (WIZMODECMD | CMD_NOT_AVAILABLE)) == 0;
+}
+#endif /* AGENT_GRAPHICS */
+
 staticfn boolean
 can_do_extcmd(const struct ext_func_tab *extcmd)
 {
     int ecflags = extcmd->flags;
+
+#ifdef AGENT_GRAPHICS
+    /* Checked before the Lua callback below, so a locked worker cannot even
+     * reach a wizard, fuzzer or unavailable command. */
+    if (!agent_policy_command_flags((unsigned long) ecflags))
+        return FALSE;
+#endif
 
     if (gl.luacore && nhcb_counts[NHCB_CMD_BEFORE]) {
         lua_getglobal(gl.luacore, "nh_callback_run");
@@ -2672,6 +2716,13 @@ bind_key(uchar key, const char *command, boolean user)
     long len;
     char *buf, *p = NULL, *lastp = NULL;
 
+#ifdef AGENT_GRAPHICS
+    /* Only the engine's own initialization (user == FALSE) may bind keys; a
+     * player or configuration rebinding is refused. */
+    if (agent_mode() && user)
+        return FALSE;
+#endif
+
     /* special case: "nothing" is reserved for unbinding */
     if (!strcmpi(command, "nothing")) {
         cmdbind_remove(key);
@@ -3752,6 +3803,16 @@ rhack(int key)
                 if ((tlist->flags & CMD_INSANE) != 0)
                     iflags.sanity_no_check = iflags.sanity_check;
 
+#ifdef AGENT_GRAPHICS
+                /* Narrow agent-mode predicate at dispatch, not a rewrite: a
+                 * denied command is never invoked and publishes nothing. */
+                if (agent_mode()
+                    && (!agent_policy_command_flags(
+                            (unsigned long) tlist->flags)
+                        || !agent_policy_command(func)))
+                    res = 0;
+                else
+#endif
                 res = (*func)(); /* perform the command */
                 /* if 'func' is doextcmd(), 'tlist' is for Cmd.commands['#']
                    rather than for the command that doextcmd() just ran;

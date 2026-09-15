@@ -16,6 +16,13 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+/* winagent.h is an engine-facing header (it uses the engine's `boolean`), so
+ * this translation unit includes hack.h for its types.  Nothing here touches
+ * engine state: the latch and the private sink use only OS resources and
+ * private static storage, which is what lets the probe run before
+ * early_init() has (re)initialized the globals. */
+#include "hack.h"
+
 #include "winagent.h"
 #include "agent_handshake.h"
 
@@ -168,7 +175,7 @@ agent_bootstrap_probe(int *argc, char ***argvp)
     char **argv = *argvp;
     int i, fd = -1, locator_index = -1;
     struct agent_handshake hs;
-    int flags;
+    int fdflags;
 
     if (!argc || !argvp || !argv || *argc < 1)
         return;
@@ -206,9 +213,9 @@ agent_bootstrap_probe(int *argc, char ***argvp)
         agent_private_fatal("private writable root must be absolute");
 
     /* the descriptor stays owned by this process for the whole run */
-    flags = fcntl(fd, F_GETFD);
-    if (flags >= 0)
-        (void) fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC);
+    fdflags = fcntl(fd, F_GETFD);
+    if (fdflags >= 0)
+        (void) fcntl(fd, F_SETFD, fdflags & ~FD_CLOEXEC);
 
     agent_hs = hs;
     agent_latched_fd = fd;
@@ -234,33 +241,77 @@ agent_bootstrap_after_globals(void)
         agent_private_fatal("private writable root is missing");
 }
 
-/* Wave A argument policy: a latched worker must not be able to choose its
- * frontend, configuration, symbol set, hooks, or crash reporting through
- * ordinary argument parsing.  The full setter gate network is Wave B. */
+/* Classify a rejected argument for the PRIVATE diagnostic only.  The policy
+ * itself is a closed list (nothing is accepted); this exists so the private
+ * sink names which surface a hostile invocation tried to steer. */
+static const char *
+ag_argv_family(const char *arg)
+{
+    char c;
+
+    if (!arg || arg[0] != '-')
+        return "unexpected";
+    c = arg[1];
+    if (c == '\0')
+        return "unexpected";
+    if (c == 'd' && (arg[2] == '\0' || strcmp(arg, "-directory") == 0))
+        return "playground-directory";
+    if (strcmp(arg, "--directory") == 0)
+        return "playground-directory";
+    if (c == 'D' || strcmp(arg, "-debug") == 0)
+        return "debug-or-DECgraphics";
+    if (c == 'X')
+        return "explore";
+    if (c == 'I' || c == 'i')
+        return "IBMgraphics";
+    if (c == 'w' || c == 'W' || strncmp(arg, "--w", 3) == 0)
+        return "window-type";
+    if (strcmp(arg, "-config") == 0 || strcmp(arg, "--config") == 0)
+        return "configuration";
+    if (strcmp(arg, "-nethackrc") == 0 || strcmp(arg, "--nethackrc") == 0
+        || strcmp(arg, "-no-nethackrc") == 0)
+        return "rc-file";
+    if (strcmp(arg, "-symset") == 0 || strcmp(arg, "--symset") == 0)
+        return "symbol-set";
+    if (strcmp(arg, "-hook") == 0 || strcmp(arg, "--hook") == 0)
+        return "hook";
+    if (strcmp(arg, "--showpaths") == 0 || strcmp(arg, "--version") == 0
+        || strcmp(arg, "-version") == 0 || strcmp(arg, "-h") == 0
+        || strcmp(arg, "-help") == 0 || strcmp(arg, "--help") == 0
+        || strcmp(arg, "-?") == 0 || strcmp(arg, "?") == 0)
+        return "startup-probe";
+    return "unexpected";
+}
+
+/* Wave B argument policy: a latched worker has NO untrusted argument surface.
+ *
+ * The trusted launcher passes exactly one worker argument, the private
+ * --agent-fd locator, which agent_bootstrap_probe() has already consumed and
+ * removed.  Any surviving argument is therefore not supervisor-validated and
+ * could steer the frontend (-w/-windowtype), the debug or explore mode
+ * (-D/-debug/-X), the symbol set (-DECgraphics/-IBMgraphics/-symset), the
+ * configuration or rc source (-config/-nethackrc), a hook, a startup probe
+ * that would print privately (--showpaths/--version/-h/?), or the
+ * playground directory (-d/-directory).  Ordinary argument parsing must never
+ * see any of them, so the policy is a closed list rather than an enumeration:
+ * an exact-spelling list would miss abbreviations (-I, -d<path>, --window).
+ * Character start data, when it is implemented, arrives through the trusted
+ * handshake rather than argv. */
 void
 agent_bootstrap_argv_policy(int argc, char **argv)
 {
-    static const char *const rejected[] = {
-        "-D", "-X", "-w", "-windowtype", "--windowtype", "-config",
-        "--config", "-nethackrc", "-symset", "-hook", "--showpaths",
-        "--version", "-version"
-    };
     int i;
-    size_t k;
 
     if (!agent_latched)
         return;
     for (i = 1; i < argc; ++i) {
+        char msg[96];
+
         if (!argv[i])
             continue;
-        for (k = 0; k < sizeof rejected / sizeof rejected[0]; ++k) {
-            if (strcmp(argv[i], rejected[k]) == 0
-                || strncmp(argv[i], "-windowtype=", 13) == 0
-                || strncmp(argv[i], "--windowtype=", 14) == 0) {
-                agent_private_fatal(
-                    "rejected startup option in agent mode");
-            }
-        }
+        (void) snprintf(msg, sizeof msg, "rejected %s argument in agent mode",
+                        ag_argv_family(argv[i]));
+        agent_private_fatal(msg);
     }
 }
 

@@ -1434,6 +1434,18 @@ parse_config_line(char *origbuf)
        but spaces, one of them will be kept even though it leads/trails) */
     mungspaces(buf);
 
+#ifdef AGENT_GRAPHICS
+    /* Directive-level classification: the trusted sysconf may only carry
+     * directives the agent profile recognises.  An unknown statement is an
+     * error rather than a silently ignored line, so a new directive cannot
+     * take effect simply by being unknown. */
+    if (agent_mode() && iflags.parse_config_file_src == set_in_sysconf
+        && !agent_policy_sysconf_directive(buf)) {
+        config_error_add("Unrecognized sysconf directive in agent mode");
+        return FALSE;
+    }
+#endif
+
     /* find the '=' or ':' */
     bufp = find_optparam(buf);
     if (!bufp) {
@@ -1647,12 +1659,20 @@ config_error_done(void)
     return n;
 }
 
+#ifdef AGENT_GRAPHICS
+staticfn boolean agent_config_source_ok(const char *filename, int src);
+#endif
+
 boolean
 read_config_file(const char *filename, int src)
 {
     FILE *fp;
     boolean rv = TRUE;
 
+#ifdef AGENT_GRAPHICS
+    if (agent_mode() && !agent_config_source_ok(filename, src))
+        return FALSE;
+#endif
     if (!(fp = fopen_config_file(filename, src)))
         return FALSE;
 #ifndef SFCTOOL
@@ -1685,6 +1705,22 @@ struct _cnf_parser_state {
 };
 
 /* Initialize config parser data */
+#ifdef AGENT_GRAPHICS
+/* In agent mode the ONLY acceptable configuration source is the launcher
+ * approved immutable sysconf.  Everything else -- personal rc file, the
+ * environment passes, a command line path -- is refused before it is opened,
+ * so no untrusted statement can reach the option table. */
+staticfn boolean
+agent_config_source_ok(const char *filename, int src)
+{
+    const char *trusted = agent_trusted_sysconf();
+
+    if (src != set_in_sysconf || !trusted || !*trusted || !filename)
+        return FALSE;
+    return strcmp(filename, trusted) == 0;
+}
+#endif /* AGENT_GRAPHICS */
+
 staticfn void
 cnf_parser_init(struct _cnf_parser_state *parser)
 {
@@ -1922,6 +1958,14 @@ rcfile(void)
 {
     char *opts = 0, *xtraopts = 0;
     const char *envname, *namesrc, *nameval;
+
+#ifdef AGENT_GRAPHICS
+    /* An agent worker reads no personal or environment configuration at all.
+     * Returning before the getenv() calls closes the rc file, NETHACKOPTIONS,
+     * HACKOPTIONS and every alternate pass that re-enters this function. */
+    if (agent_mode())
+        return;
+#endif
 
     go.opt_phase = environ_opt;
     /* getenv() instead of nhgetenv(): let total length of options be long;

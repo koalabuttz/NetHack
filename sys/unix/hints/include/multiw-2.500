@@ -100,6 +100,10 @@ endif
 # Makefile.src is never used for an agent-only build.
 ifdef WANT_WIN_AGENT
 WINCFLAGS += -DAGENT_GRAPHICS
+# The generated profile enforcement data lives beside the port, and engine
+# files (options.c) include it directly, so the port directory is on the
+# include path for the whole agent build.
+WINCFLAGS += -I../win/agent
 WINSRC += $(WINAGENTSRC)
 WINOBJ0 += $(WINAGENTOBJ)
 WINLIB += $(WINAGENTLIB)

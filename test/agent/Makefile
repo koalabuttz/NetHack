@@ -67,7 +67,7 @@ manifest-check:
 	    exit 1; \
 	fi
 
-check: manifest-check schema-check formatter-check $(TESTS)
+check: manifest-check header-check schema-check formatter-check $(TESTS)
 	@fail=0; for t in $(TESTS); do \
 	    printf '%s: ' "$$t"; ./$$t || fail=1; \
 	done; \
@@ -85,6 +85,36 @@ schema-check: test_protocol
 formatter-check: test_protocol
 	@./test_protocol --dump | python3 format_obs.py --json > /dev/null
 	@python3 format_obs.py --selftest
+
+# The generated enforcement header consumed by the agent-only build
+# (win/agent/agent_profile.h) is emitted by the same generator with --emit-c.
+# Checking it here means the committed artifact cannot drift from its source of
+# truth (`python3 test/agent/gen_profile.py --emit-c`).
+header-check:
+	@python3 gen_profile.py --emit-c > .profile.h.tmp
+	@if diff -q .profile.h.tmp $(AGENT)/agent_profile.h > /dev/null; then \
+	    echo "agent_profile.h: up to date"; \
+	    rm -f .profile.h.tmp; \
+	else \
+	    echo "AGENT_PROFILE.H DRIFTED:"; \
+	    diff .profile.h.tmp $(AGENT)/agent_profile.h | head -40; \
+	    rm -f .profile.h.tmp; \
+	    exit 1; \
+	fi
+
+# The hostile-startup matrix (the M1 exit gate) needs a built agent-only worker
+# and the trusted launcher, so it is not part of `check` (which stays
+# engine-free).  Stage data with `make agent-test-data`, then:
+#   make -C test/agent matrix WORKER=../../src/nethack \
+#       RUNNER=../../src/nethack-agent DATA=/tmp/data SYSCONF=/tmp/data/sysconf
+matrix:
+	@test -n "$(WORKER)" -a -n "$(RUNNER)" -a -n "$(DATA)" || \
+	    { echo "set WORKER, RUNNER, DATA (and optionally SYSCONF,"; \
+	      echo "IMPOSSIBLE_WORKER) for the hostile matrix"; exit 2; }
+	python3 hostile_matrix.py --worker "$(WORKER)" --runner "$(RUNNER)" \
+	    --data "$(DATA)" $(if $(SYSCONF),--sysconf "$(SYSCONF)") \
+	    $(if $(PRIVATE_ROOT),--private-root "$(PRIVATE_ROOT)") \
+	    $(if $(IMPOSSIBLE_WORKER),--impossible-worker "$(IMPOSSIBLE_WORKER)")
 
 # ASan/UBSan build, if the compiler supports the flags.
 sanitize: clean
@@ -122,6 +152,7 @@ depcheck:
 	echo "no engine headers in any fixture translation unit"
 
 clean:
-	rm -f $(TESTS) $(AGENT_OBJS) $(REF_OBJS) .dep.*.d .profile.tmp
+	rm -f $(TESTS) $(AGENT_OBJS) $(REF_OBJS) .dep.*.d .profile.tmp .profile.h.tmp
 
-.PHONY: all check manifest-check schema-check sanitize depcheck clean
+.PHONY: all check manifest-check header-check schema-check matrix sanitize \
+	depcheck clean

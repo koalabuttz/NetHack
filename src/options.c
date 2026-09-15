@@ -14,6 +14,27 @@
 #else
 #define AGENT_SYSCF_FILE SYSCF_FILE
 #endif
+
+/* The agent-only policy seam.  In an agent build every optfn dispatch in this
+ * file goes through agent_checked_option_call(); in a human build the call is
+ * the direct function-pointer invocation it has always been, so human behavior
+ * is byte-for-byte unchanged. */
+#ifdef AGENT_GRAPHICS
+#define AGENT_OPT_CALL(gslot, gopt, greq, gneg, gopts, gbuf)            \
+    agent_checked_option_call((gslot), (gopt), (greq), (gneg), (gopts), \
+                              (gbuf))
+#else
+#define AGENT_OPT_CALL(gslot, gopt, greq, gneg, gopts, gbuf) \
+    (*allopt[(gslot)].optfn)((gopt), (greq), (gneg), (gopts), (gbuf))
+#endif
+
+/* True only while the process carries the agent latch.  A human build has no
+ * latch, so its terminal probes stay exactly as they were. */
+#ifdef AGENT_GRAPHICS
+#define AGENT_LATCHED() (agent_mode() != 0)
+#else
+#define AGENT_LATCHED() FALSE
+#endif
 #include "tcap.h"
 #else /* OPTION_LISTS_ONLY: (AMIGA) external program for opt lists */
 #include "config.h"
@@ -96,7 +117,192 @@ enum requests {
     do_nothing, do_init, do_set, do_handler, get_val, get_cnf_val
 };
 
+/* The runtime option table, populated from allopt_init[] by
+ * allopt_array_init().  It is declared before the agent policy helpers below
+ * because those helpers index it by slot. */
 static struct allopt_t allopt[SIZE(allopt_init)];
+
+#ifdef AGENT_GRAPHICS
+#include "winagent.h"
+#include "agent_profile.h"
+
+/* Scoped trusted initialization: only the profile application may invoke
+ * setters in agent mode, and only for options the frozen profile pins. */
+static boolean agent_trusted_init = FALSE;
+
+void
+agent_policy_begin_trusted_init(void)
+{
+    agent_trusted_init = TRUE;
+}
+
+void
+agent_policy_end_trusted_init(void)
+{
+    agent_trusted_init = FALSE;
+}
+
+/* The runtime mutation allowlist is EMPTY in this round: reads and
+ * initialization are allowed; every setter and handler is denied before it is
+ * invoked, except inside the scoped trusted profile application. */
+boolean
+agent_policy_option(int optidx, int req)
+{
+    (void) optidx;
+    if (!agent_mode())
+        return TRUE;
+    switch (req) {
+    case do_nothing:
+    case do_init:
+    case get_val:
+    case get_cnf_val:
+        return TRUE;
+    case do_set:
+    case do_handler:
+        return agent_trusted_init;
+    default:
+        break;
+    }
+    return FALSE;
+}
+
+static boolean
+agent_pinned_option(const char *name)
+{
+    size_t k;
+
+    for (k = 0; k < AGENT_PIN_COUNT; ++k)
+        if (strcmp(name, agent_pins[k].name) == 0)
+            return TRUE;
+    return FALSE;
+}
+
+static int
+agent_pin_slot(const char *name)
+{
+    int i;
+
+    for (i = 0; allopt[i].name; ++i)
+        if (strcmp(allopt[i].name, name) == 0)
+            return i;
+    return -1;
+}
+
+#ifdef AGENT_TEST_IMPOSSIBLE
+/* Test-only predicate for the hostile-matrix worker: report whether the
+ * runtime policy denies an ordinary set of the named option.  It exercises
+ * the same seam every optfn dispatch uses, so the empty runtime-mutation
+ * allowlist is proven denied rather than merely documented.  Never compiled
+ * into a production binary (no hints file defines AGENT_TEST_IMPOSSIBLE). */
+boolean
+agent_test_runtime_set_denied(const char *name)
+{
+    int slot = agent_pin_slot(name);
+
+    return (slot < 0) || (agent_policy_option(slot, do_set) == FALSE);
+}
+#endif /* AGENT_TEST_IMPOSSIBLE */
+
+/* The single dispatch seam for every optfn invocation.
+ *
+ * `slot` is the allopt[] array index (needed to reach the function pointer
+ * without a reverse index lookup); `opt` is the value passed through to the
+ * handler exactly as before, so no existing call semantics change. */
+static int
+agent_checked_option_call(int slot, int opt, int req, boolean neg, char *opts,
+                          char *buf)
+{
+    if (slot < 0 || !allopt[slot].optfn)
+        return optn_err;
+    if (agent_mode()) {
+        if (!agent_policy_option(opt, req))
+            return optn_err; /* denied before invocation */
+        if ((req == do_set || req == do_handler)
+            && !agent_pinned_option(allopt[slot].name))
+            return optn_err; /* only the frozen profile may set anything */
+    }
+    return (*allopt[slot].optfn)(opt, req, neg, opts, buf);
+}
+
+/* Apply the frozen profile.  Boolean pins are applied exactly the way the
+ * engine applies its own compiled defaults -- a direct assignment to the
+ * option's field -- because an early optfn call for a status boolean runs
+ * window-port side effects (status_initialize(REASSESS_ONLY), via
+ * VIA_WINDOWPORT()) before the port's status system exists.  Non-boolean pins
+ * go through the engine's own option parser under the trusted scope, which is
+ * the same code a configuration file would use.  The effective values are then
+ * verified before the profile is declared valid. */
+void
+agent_apply_profile(void)
+{
+    size_t k;
+    boolean validated = TRUE;
+
+    if (!agent_mode())
+        return;
+    agent_policy_begin_trusted_init();
+    for (k = 0; k < AGENT_PIN_COUNT; ++k) {
+        int slot = agent_pin_slot(agent_pins[k].name);
+
+        if (slot < 0) {
+            validated = FALSE; /* an unclassified pin is not a profile */
+            break;
+        }
+        if (allopt[slot].opttyp == BoolOpt && allopt[slot].addr) {
+            *(allopt[slot].addr) = (strcmp(agent_pins[k].value, "on") == 0);
+        } else if (strcmp(agent_pins[k].name, "windowtype") == 0) {
+            /* The window choice is not an option-parser surface in agent mode:
+             * the trusted latch forces the port in choose_windows(), and the
+             * engine refuses windowtype from anything but a config source.
+             * Verify the enforced port instead of parsing a value. */
+            if (strcmp(windowprocs.name, agent_pins[k].value) != 0)
+                validated = FALSE;
+        } else {
+            char buf[160];
+            int reslt;
+
+            Sprintf(buf, "%s=%s", agent_pins[k].name, agent_pins[k].value);
+            reslt = parseoptions(buf, FALSE, FALSE);
+            if (reslt != optn_ok)
+                validated = FALSE;
+        }
+    }
+    agent_policy_end_trusted_init();
+
+    /* Validate the effective values of the boolean pins. */
+    for (k = 0; k < AGENT_PIN_COUNT && validated; ++k) {
+        int slot = agent_pin_slot(agent_pins[k].name);
+
+        if (slot >= 0 && allopt[slot].opttyp == BoolOpt
+            && allopt[slot].addr) {
+            boolean want = (strcmp(agent_pins[k].value, "on") == 0);
+
+            if (*allopt[slot].addr != want)
+                validated = FALSE;
+        }
+    }
+
+    if (!validated) {
+        /* A profile that did not apply is not a profile: keep the gate closed
+         * and terminate privately rather than run with unknown settings. */
+        agent_publication_close();
+        agent_private_fatal("agent profile validation failed");
+    }
+    /* The profile is applied and verified.  The publication gate is *not*
+     * opened here: plan hook order step 9 opens it only after the startup
+     * sequence has also decided that no restore is pending. */
+    agent_policy_profile_validated();
+}
+
+/* The agent profile finishing pass replaces the untrusted rc file.  The
+ * bookkeeping that follows rcfile() in initoptions_finish() still runs. */
+void
+agent_profile_finish(void)
+{
+    /* Intentionally empty: no personal or environment configuration is
+     * read. */
+}
+#endif /* AGENT_GRAPHICS */
 
 #ifndef OPTION_LISTS_ONLY
 
@@ -644,8 +850,8 @@ parseoptions(
          */
         if (allopt[matchidx].optfn) {
             op = string_for_opt(opts, TRUE);
-            optresult = (*allopt[matchidx].optfn)(allopt[matchidx].idx,
-                                                  do_set, negated, opts, op);
+            optresult = AGENT_OPT_CALL(matchidx, allopt[matchidx].idx,
+                                       do_set, negated, opts, op);
             if (optresult == optn_ok)
                 opt_set_in_config[matchidx] = TRUE;
         }
@@ -7153,6 +7359,15 @@ initoptions_init(void)
     allopt_array_init();
     /* if windowtype has been specified on the command line, set it up
        early so windowtype-specific options use it as their base */
+#ifdef AGENT_GRAPHICS
+    /* In agent mode the trusted latch owns the window choice and no command
+     * line override may re-open it, so this block is skipped entirely and the
+     * bogus value is discarded. */
+    if (agent_mode() && gc.cmdline_windowsys) {
+        free((genericptr_t) gc.cmdline_windowsys);
+        gc.cmdline_windowsys = NULL;
+    }
+#endif
     if (gc.cmdline_windowsys) {
         nmcpy(gc.chosen_windowtype, gc.cmdline_windowsys, WINTYPELEN);
         config_error_init(FALSE, "command line", FALSE);
@@ -7244,7 +7459,9 @@ initoptions_init(void)
      * config file/environment variable below.
      */
     /* this detects the IBM-compatible console on most 386 boxes */
-    if ((opts = nh_getenv("TERM")) && !strncmp(opts, "AT", 2)) {
+    /* (no terminal detection may steer the symbol set in agent mode) */
+    if (!AGENT_LATCHED() && (opts = nh_getenv("TERM"))
+        && !strncmp(opts, "AT", 2)) {
         if (!gs.symset[PRIMARYSET].explicitly)
             load_symset("IBMGraphics", PRIMARYSET);
         if (!gs.symset[ROGUESET].explicitly)
@@ -7256,7 +7473,10 @@ initoptions_init(void)
 #if defined(UNIX) || defined(VMS)
 #ifdef TTY_GRAPHICS
     /* detect whether a "vt" terminal can handle alternate charsets */
-    if ((opts = nh_getenv("TERM"))
+    /* In agent mode there is no terminal, so no environment probe may steer
+     * the symbol set; the fixed profile decides it. */
+    if (!AGENT_LATCHED()
+        && (opts = nh_getenv("TERM"))
         /* [could also check "xterm" which emulates vtXXX by default] */
         && !strncmpi(opts, "vt", 2)
         && AS && AE && strchr(AS, '\016') && strchr(AE, '\017')) {
@@ -7301,6 +7521,13 @@ initoptions_init(void)
      *    set-page/unset-all/unset-page/invert-all/invert-page.
      */
     iflags.menuinvertmode = 1;
+
+#ifdef AGENT_GRAPHICS
+    /* Trusted option initialization is complete: apply the frozen profile
+     * now, before any untrusted source (rc file, environment, config file)
+     * could run, and validate that it took. */
+    agent_apply_profile();
+#endif
 
     /* since this is done before init_objects(), do partial init here */
     objects[SLIME_MOLD].oc_name_idx = SLIME_MOLD;
@@ -7349,7 +7576,12 @@ initoptions_finish(void)
 {   nhsym sym = 0;
 
     disregard_this_option(opt_mention_decor);  /* defer this */
-    rcfile();
+#ifdef AGENT_GRAPHICS
+    if (agent_mode())
+        agent_profile_finish(); /* no personal or environment configuration */
+    else
+#endif
+        rcfile();
 
     (void) fruitadd(svp.pl_fruit, (struct fruit *) 0);
     /*
@@ -7466,8 +7698,8 @@ allopt_array_init(void)
          */
         for (i = 0; i < OPTCOUNT; ++i) {
             if (allopt[i].optfn)
-                (*allopt[i].optfn)(i, do_init, FALSE, empty_optstr,
-                                   empty_optstr);
+                (void) AGENT_OPT_CALL(i, i, do_init, FALSE, empty_optstr,
+                                      empty_optstr);
         }
         options_array_inited_already = TRUE;
     }
@@ -7637,6 +7869,13 @@ boolean
 parsebindings(char *bindings)
 {
     char *bind;
+
+#ifdef AGENT_GRAPHICS
+    /* Runtime key rebinding is not on the profile's allowlist, which is
+     * empty: a locked worker keeps the standard native bindings. */
+    if (agent_mode())
+        return FALSE;
+#endif
     uchar key;
     int i;
     boolean ret = TRUE; /* assume success */
@@ -8534,9 +8773,10 @@ get_option_value(const char *optname, boolean cnfvalid)
             } else if (allopt[i].opttyp == CompOpt && allopt[i].optfn) {
                 int reslt = optn_err;
 
-                reslt = (*allopt[i].optfn)(allopt[i].idx,
-                                           cnfvalid ? get_cnf_val : get_val,
-                                           FALSE, retbuf, empty_optstr);
+                reslt = AGENT_OPT_CALL(
+                            i, allopt[i].idx,
+                            cnfvalid ? get_cnf_val : get_val, FALSE,
+                            retbuf, empty_optstr);
                 if (reslt == optn_ok && retbuf[0])
                     return retbuf;
                 return (char *) 0;
@@ -8654,8 +8894,9 @@ doset_simple_menu(void)
                     buf2[0] = '\0';
                     reslt = optn_err;
                     if (allopt[k].optfn)
-                        reslt = (*allopt[k].optfn)(allopt[k].idx, get_val,
-                                                   FALSE, buf2, empty_optstr);
+                        reslt = AGENT_OPT_CALL(
+                                    k, allopt[k].idx, get_val, FALSE, buf2,
+                                    empty_optstr);
                     Sprintf(buf, fmtstr, name,
                             ((reslt == optn_ok && buf2[0])
                              ? (const char *) buf2 : "unknown"));
@@ -8704,8 +8945,9 @@ doset_simple_menu(void)
         } else {
             /* compound option */
             if (allopt[k].has_handler && allopt[k].optfn) {
-                reslt = (*allopt[k].optfn)(allopt[k].idx, do_handler, FALSE,
-                                           empty_optstr, empty_optstr);
+                reslt = AGENT_OPT_CALL(
+                            k, allopt[k].idx, do_handler, FALSE,
+                            empty_optstr, empty_optstr);
                 /* if player eventually saves options, include this one */
                 if (reslt == optn_ok && allopt[k].idx != pfx_cond_)
                     opt_set_in_config[k] = TRUE;
@@ -8973,9 +9215,9 @@ doset(void) /* changing options via menu by Per Liboriussen */
                 int k = opt_indx, reslt;
 
                 if (allopt[k].has_handler && allopt[k].optfn) {
-                    reslt = (*allopt[k].optfn)(allopt[k].idx, do_handler,
-                                               FALSE, empty_optstr,
-                                               empty_optstr);
+                    reslt = AGENT_OPT_CALL(
+                                k, allopt[k].idx, do_handler, FALSE,
+                                empty_optstr, empty_optstr);
                     /* if player eventually saves options, include this one */
                     if (reslt == optn_ok)
                         opt_set_in_config[k] = TRUE;
@@ -9080,8 +9322,8 @@ doset_add_menu(
     if (i >= 0 && i < OPTCOUNT && allopt[i].name && allopt[i].optfn) {
         any.a_int = (indexoffset == 0) ? 0 : i + 1 + indexoffset;
         if (allopt[i].optfn)
-            reslt = (*allopt[i].optfn)(allopt[i].idx, get_val,
-                                       FALSE, buf2, empty_optstr);
+            reslt = AGENT_OPT_CALL(i, allopt[i].idx, get_val,
+                                   FALSE, buf2, empty_optstr);
         if (reslt == optn_ok && buf2[0])
             value = (const char *) buf2;
     } else {

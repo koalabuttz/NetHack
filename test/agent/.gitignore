@@ -7,4 +7,5 @@ test_state
 *.o
 .dep.*.d
 .profile.tmp
+.profile.h.tmp
 __pycache__/

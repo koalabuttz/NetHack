@@ -3,6 +3,9 @@
 /* NetHack may be freely redistributed.  See license for details. */
 
 #include "hack.h"
+#ifdef AGENT_GRAPHICS
+#include "winagent.h"
+#endif
 #include "tcap.h"
 
 staticfn void savedsym_add(const char *, const char *, int);
@@ -680,6 +683,14 @@ set_symhandling(char *handling, int which_set)
 int
 load_symset(const char *s, int which_set)
 {
+#ifdef AGENT_GRAPHICS
+    /* A locked worker keeps the built-in primary/Rogue symbol sets.  Every
+     * untrusted request for a symbol set arrives through option parsing,
+     * which this rejects; the engine's own default initialization happens
+     * outside parseoptions() and is unaffected. */
+    if (agent_mode() && program_state.in_parseoptions > 0)
+        return 0;
+#endif
     clear_symsetentry(which_set, TRUE);
 
     if (gs.symset[which_set].name)
@@ -781,6 +792,14 @@ boolean
 parsesymbols(char *opts, int which_set)
 {
     int val;
+
+#ifdef AGENT_GRAPHICS
+    /* Custom symbol parsing is a profile-locked surface: it is only reached
+     * from an option or config source, which agent mode refuses. */
+    if (agent_mode())
+        return FALSE;
+#endif
+
     char *symname, *strval, *ch,
          *first_unquoted_comma = 0, *first_unquoted_colon = 0;
     const struct symparse *symp;

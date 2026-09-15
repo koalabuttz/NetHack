@@ -251,6 +251,14 @@ main(int argc, char *argv[])
      */
  attempt_restore:
 
+#ifdef AGENT_GRAPHICS
+    /* Hook order step 9: every attempt_restore path closes the publication
+     * gate, so nothing player-facing is published while a restore is pending
+     * or unresolved.  The private diagnostics remain available. */
+    if (agent_mode())
+        agent_publication_close();
+#endif
+
     /*
      * getlock() complains and quits if there is already a game
      * in progress for current character name (when gl.locknum == 0)
@@ -314,8 +322,18 @@ main(int argc, char *argv[])
            in which case we try to restore under the new name
            and skip selection this time if that didn't succeed */
         if (!iflags.renameinprogress || iflags.defer_plname || neednewlock) {
-            if (!plsel_once)
+            if (!plsel_once) {
+#ifdef AGENT_GRAPHICS
+                /* Hook order step 9: readiness opens the gate just before
+                 * ordinary new-game character selection.  The frozen profile
+                 * was applied and verified during initoptions(); the restore
+                 * attempt above did not resume a game, so no restore is
+                 * pending. */
+                if (agent_mode())
+                    agent_publication_ready();
+#endif
                 player_selection();
+            }
             plsel_once = TRUE;
             if (neednewlock && *svp.plname)
                 goto attempt_restore;

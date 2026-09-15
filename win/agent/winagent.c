@@ -22,6 +22,10 @@
 #include "agent_protocol.h"
 #include "agent_menu.h"
 
+#ifdef AGENT_TEST_IMPOSSIBLE
+#include "func_tab.h" /* WIZMODECMD / CMD_NOT_AVAILABLE */
+#endif
+
 #include <errno.h>
 #include <string.h>
 #include <unistd.h>
@@ -136,11 +140,82 @@ agent_emit_hello(void)
     agent_hello_done = TRUE;
 }
 
+#ifdef AGENT_TEST_IMPOSSIBLE
+/* ------------------------------------------------------------------ */
+/* test-only diagnostic injection (hostile matrix)                      */
+/* ------------------------------------------------------------------ */
+
+/* AGENT_TEST_IMPOSSIBLE is never defined by a production hints file: the
+ * hostile-matrix worker is the only binary built with it.  It does two things
+ * the matrix asserts on:
+ *
+ *   1. evaluates the Wave B runtime policy predicates and reports each result
+ *      to the PRIVATE sink, so the option-set, key-binding, symbol-set and
+ *      command gates are proven denied rather than merely written down;
+ *   2. calls impossible(), proving the diagnostic producer path publishes no
+ *      public byte and terminates low-level (the only public record remains
+ *      the launcher's `closed`).
+ */
+static void
+agent_test_probe(const char *name, int denied)
+{
+    char buf[80];
+
+    (void) snprintf(buf, sizeof buf, "probe %s=%d", name, denied ? 1 : 0);
+    agent_private_diag(buf);
+}
+
+static void
+agent_test_diagnostics(void)
+{
+    int r;
+
+    /* runtime option mutation (the `O`/set surface) */
+    agent_test_probe("denyset",
+                     agent_test_runtime_set_denied("color")
+                         && agent_test_runtime_set_denied("perm_invent"));
+    /* key rebinding */
+    agent_test_probe("bindkeys", parsebindings((char *) "a:help") == FALSE);
+    /* custom symbol set parsing */
+    agent_test_probe("symset",
+                     parsesymbols((char *) "S_foo:x", PRIMARYSET) == FALSE);
+    /* symbol-set loading reached from option parsing */
+    program_state.in_parseoptions += 1;
+    r = load_symset("DECGraphics", PRIMARYSET);
+    program_state.in_parseoptions -= 1;
+    agent_test_probe("symsetload", r == 0);
+    /* wizard/fuzzer/unavailable commands vs an ordinary command */
+    agent_test_probe("wizardcmd",
+                     agent_policy_command_flags(WIZMODECMD) == FALSE);
+    agent_test_probe("ordinary",
+                     agent_policy_command_flags(0) == FALSE);
+    /* policy-changing handlers are denied by identity */
+    agent_test_probe("handlers",
+                     agent_policy_command(doset) == FALSE
+                         && agent_policy_command(enter_explore_mode)
+                             == FALSE);
+
+    impossible("AGENT_TEST_IMPOSSIBLE: injected diagnostic");
+}
+#endif /* AGENT_TEST_IMPOSSIBLE */
+
 static void
 agent_player_selection(void)
 {
     struct agent_view v;
     struct agent_need need;
+
+    /* Publication gate: it is opened only after the frozen profile has been
+     * applied and verified AND the startup sequence has decided that no
+     * restore is pending.  Reaching character selection before then means the
+     * two preconditions did not hold, so nothing may be published. */
+    if (!agent_publication_open())
+        agent_private_fatal("player selection before publication readiness");
+
+#ifdef AGENT_TEST_IMPOSSIBLE
+    /* Test-only diagnostic injection for the hostile matrix (see below). */
+    agent_test_diagnostics();
+#endif
 
     agent_session_open();
     agent_emit_hello();

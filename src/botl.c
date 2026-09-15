@@ -4,6 +4,9 @@
 /* NetHack may be freely redistributed.  See license for details. */
 
 #include "hack.h"
+#ifdef AGENT_GRAPHICS
+#include "winagent.h"
+#endif
 
 extern const char *const hu_stat[]; /* defined in eat.c */
 
@@ -1303,6 +1306,14 @@ void
 condopt(int idx, boolean *addr, boolean negated)
 {
     int i;
+
+#ifdef AGENT_GRAPHICS
+    /* The frozen condition subset is part of the profile: a locked worker
+     * never reconfigures conditions, and the interactive condition menu is
+     * unreachable because the option path and select_menu are refused. */
+    if (agent_mode())
+        return;
+#endif
 
     /* sanity check */
     if ((idx < 0 || idx >= CONDITION_COUNT)
