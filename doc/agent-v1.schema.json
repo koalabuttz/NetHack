@@ -1,0 +1,699 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nethack.org/agent/v1.schema.json",
+  "title": "NetHack agent interface v1",
+  "description": "Exact wire grammar for protocol v=1. One JSON object per physical line, UTF-8, compact, no BOM, no comments, no trailing content. Every object rejects additional properties. Framing (not expressible here) also limits a physical line to 65536 bytes including LF, nesting to 8, object keys to 32, and tokens to 32768. Integers are exact; fractions, exponents, NaN and Infinity are rejected. See doc/agent-interface.md.",
+  "oneOf": [
+    { "$ref": "#/$defs/hello" },
+    { "$ref": "#/$defs/obs" },
+    { "$ref": "#/$defs/act" },
+    { "$ref": "#/$defs/closed" },
+    { "$ref": "#/$defs/get_page" },
+    { "$ref": "#/$defs/ack_chunk" },
+    { "$ref": "#/$defs/ack_seq" },
+    { "$ref": "#/$defs/page" },
+    { "$ref": "#/$defs/chunk" },
+    { "$ref": "#/$defs/invalid" }
+  ],
+  "$defs": {
+    "version": { "const": 1 },
+
+    "counter": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991,
+      "description": "public protocol counter in 1..2^53-1 (uint64_t internally; close before wrap)"
+    },
+
+    "color": {
+      "description": "public basic color name; slot 8 of include/color.h is NO_COLOR and maps to none",
+      "enum": [
+        "black", "red", "green", "brown", "blue", "magenta", "cyan", "gray",
+        "none", "orange", "brightgreen", "yellow", "brightblue",
+        "brightmagenta", "brightcyan", "white"
+      ]
+    },
+
+    "style": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 63,
+      "description": "public style bitmask: bold=1 dim=2 italic=4 underline=8 blink=16 inverse=32"
+    },
+
+    "char": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1,
+      "pattern": "^[ -~]$",
+      "description": "one printable ASCII character; non-ASCII and control characters are rejected"
+    },
+
+    "palette_id": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 65534,
+      "description": "durable palette id; 0 is always the blank tuple"
+    },
+
+    "map_x": { "type": "integer", "minimum": 1, "maximum": 79 },
+    "map_y": { "type": "integer", "minimum": 0, "maximum": 20 },
+
+    "cell": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": false,
+      "prefixItems": [
+        { "$ref": "#/$defs/char" },
+        { "$ref": "#/$defs/color" },
+        { "$ref": "#/$defs/style" },
+        { "$ref": "#/$defs/color" }
+      ],
+      "description": "[char, foreground, style, frame]"
+    },
+
+    "palette_entry": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "prefixItems": [
+        { "$ref": "#/$defs/palette_id" },
+        { "$ref": "#/$defs/char" },
+        { "$ref": "#/$defs/color" },
+        { "$ref": "#/$defs/style" },
+        { "$ref": "#/$defs/color" }
+      ],
+      "items": false,
+      "description": "[id, char, color, style, frame]"
+    },
+
+    "map_triple": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "prefixItems": [
+        { "$ref": "#/$defs/map_x" },
+        { "$ref": "#/$defs/map_y" },
+        { "$ref": "#/$defs/palette_id" }
+      ],
+      "items": false,
+      "description": "[x, y, palette_id], row-major"
+    },
+
+    "status_field_name": {
+      "enum": [
+        "title", "strength", "dexterity", "constitution", "intelligence",
+        "wisdom", "charisma", "alignment", "score", "carrying-capacity",
+        "gold", "power", "power-max", "experience-level", "armor-class", "HD",
+        "time", "hunger", "hitpoints", "hitpoints-max", "dungeon-level",
+        "experience", "version", "weapon", "armor", "terrain"
+      ]
+    },
+
+    "status_value": {
+      "type": "object",
+      "required": ["text", "color", "style"],
+      "additionalProperties": false,
+      "properties": {
+        "text": { "type": "string", "maxLength": 1048576 },
+        "color": { "$ref": "#/$defs/color" },
+        "style": { "$ref": "#/$defs/style" }
+      }
+    },
+
+    "cond_entry": {
+      "type": "object",
+      "required": ["text", "color", "style"],
+      "additionalProperties": false,
+      "properties": {
+        "text": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "color": { "$ref": "#/$defs/color" },
+        "style": { "$ref": "#/$defs/style" }
+      },
+      "description": "one displayed condition, ordered by ascending native ranking then visible option name"
+    },
+
+    "msg_event": {
+      "type": "object",
+      "required": ["e", "text", "style"],
+      "additionalProperties": false,
+      "properties": {
+        "e": { "$ref": "#/$defs/counter" },
+        "text": { "type": "string", "maxLength": 1048576 },
+        "style": { "$ref": "#/$defs/style" }
+      }
+    },
+
+    "window_descriptor": {
+      "type": "object",
+      "required": ["w", "kind", "title", "content", "pages"],
+      "additionalProperties": false,
+      "properties": {
+        "w": { "type": "string", "pattern": "^w[1-9][0-9]*$" },
+        "kind": { "enum": ["menu", "text"] },
+        "title": { "type": "string", "maxLength": 1048576 },
+        "mode": { "enum": ["none", "one", "any"] },
+        "content": { "type": "string", "pattern": "^c[1-9][0-9]*$" },
+        "pages": { "type": "integer", "minimum": 0, "maximum": 65535 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "menu" } }, "required": ["kind"] },
+          "then": { "required": ["mode"] }
+        }
+      ],
+      "description": "mode appears only for menus; w and content ids are presentation-derived"
+    },
+
+    "page_row": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["r", "text", "selectable", "key", "group", "initial", "style", "color", "icon"],
+          "additionalProperties": false,
+          "properties": {
+            "r": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "text": { "type": "string", "maxLength": 1048576 },
+            "selectable": { "type": "boolean" },
+            "key": { "type": ["integer", "null"], "minimum": 1, "maximum": 255 },
+            "group": { "type": ["integer", "null"], "minimum": 1, "maximum": 255 },
+            "initial": {
+              "type": ["integer", "null"],
+              "minimum": -1,
+              "maximum": 2147483647,
+              "description": "null = initially unselected; -1 = selected at native all/default count; positive = explicit native count"
+            },
+            "style": { "$ref": "#/$defs/style" },
+            "color": { "$ref": "#/$defs/color" },
+            "icon": {
+              "oneOf": [{ "$ref": "#/$defs/cell" }, { "type": "null" }]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["text", "style"],
+          "additionalProperties": false,
+          "properties": {
+            "text": { "type": "string", "maxLength": 1048576 },
+            "style": { "$ref": "#/$defs/style" }
+          },
+          "description": "a plain text line"
+        }
+      ]
+    },
+
+    "need": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["id", "kind"],
+          "additionalProperties": false,
+          "properties": {
+            "id": { "$ref": "#/$defs/counter" },
+            "kind": { "enum": ["command", "key", "direction"] },
+            "prompt": { "type": "string", "maxLength": 1048576 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["id", "kind", "prompt", "x0", "y0", "x1", "y1"],
+          "additionalProperties": false,
+          "properties": {
+            "id": { "$ref": "#/$defs/counter" },
+            "kind": { "const": "position" },
+            "prompt": { "type": "string", "maxLength": 1048576 },
+            "x0": { "$ref": "#/$defs/map_x" },
+            "y0": { "$ref": "#/$defs/map_y" },
+            "x1": { "$ref": "#/$defs/map_x" },
+            "y1": { "$ref": "#/$defs/map_y" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["id", "kind", "prompt", "choices", "default", "numeric"],
+          "additionalProperties": false,
+          "properties": {
+            "id": { "$ref": "#/$defs/counter" },
+            "kind": { "const": "yn" },
+            "prompt": { "type": "string", "maxLength": 1048576 },
+            "choices": {
+              "type": ["string", "null"],
+              "description": "displayed choices only: the prefix before the native Escape; null for unrestricted"
+            },
+            "default": { "type": ["integer", "null"], "minimum": 1, "maximum": 255 },
+            "numeric": { "type": "boolean" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["id", "kind", "prompt", "max"],
+          "additionalProperties": false,
+          "properties": {
+            "id": { "$ref": "#/$defs/counter" },
+            "kind": { "enum": ["line", "extcmd"] },
+            "prompt": { "type": "string", "maxLength": 1048576 },
+            "max": { "type": "integer", "minimum": 0, "maximum": 255 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["id", "kind", "menu", "mode", "content", "pages"],
+          "additionalProperties": false,
+          "properties": {
+            "id": { "$ref": "#/$defs/counter" },
+            "kind": { "const": "menu" },
+            "menu": { "type": "string", "pattern": "^m[1-9][0-9]*$" },
+            "mode": { "enum": ["none", "one", "any"] },
+            "content": { "type": "string", "pattern": "^c[1-9][0-9]*$" },
+            "pages": { "type": "integer", "minimum": 0, "maximum": 65535 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["id", "kind", "content", "pages"],
+          "additionalProperties": false,
+          "properties": {
+            "id": { "$ref": "#/$defs/counter" },
+            "kind": { "const": "ack" },
+            "content": { "type": "string", "pattern": "^c[1-9][0-9]*$" },
+            "pages": { "type": "integer", "minimum": 0, "maximum": 65535 }
+          }
+        }
+      ]
+    },
+
+    "menu_commit_pair": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "prefixItems": [
+        { "type": "integer", "minimum": 1, "maximum": 65535 },
+        {
+          "type": "integer",
+          "description": "-1 (native all/default) or a positive count within the protocol bound and native long range"
+        }
+      ],
+      "items": false
+    },
+
+    "action": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["key"],
+          "additionalProperties": false,
+          "properties": { "key": { "type": "integer", "minimum": 1, "maximum": 255 } }
+        },
+        {
+          "type": "object",
+          "required": ["text"],
+          "additionalProperties": false,
+          "properties": { "text": { "type": "string", "maxLength": 255 } }
+        },
+        {
+          "type": "object",
+          "required": ["position", "mod"],
+          "additionalProperties": false,
+          "properties": {
+            "position": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "prefixItems": [
+                { "type": "integer", "minimum": 0, "maximum": 79 },
+                { "type": "integer", "minimum": 0, "maximum": 20 }
+              ],
+              "items": false
+            },
+            "mod": { "type": "integer", "minimum": 0, "maximum": 255 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["yn"],
+          "additionalProperties": false,
+          "properties": {
+            "yn": { "type": "integer", "minimum": 1, "maximum": 255 },
+            "count": { "type": "integer", "minimum": 1, "maximum": 2147483647 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["menu", "commit"],
+          "additionalProperties": false,
+          "properties": {
+            "menu": { "type": "string", "pattern": "^m[1-9][0-9]*$" },
+            "commit": {
+              "type": "array",
+              "maxItems": 65535,
+              "items": { "$ref": "#/$defs/menu_commit_pair" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["cancel"],
+          "additionalProperties": false,
+          "properties": { "cancel": { "const": true } }
+        },
+        {
+          "type": "object",
+          "required": ["ack"],
+          "additionalProperties": false,
+          "properties": { "ack": { "const": true } }
+        }
+      ],
+      "description": "exactly one tagged shape. No then/group/selectall/invert/bulk/keys/raw fields exist in v1."
+    },
+
+    "caps": {
+      "type": "array",
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {
+        "enum": ["snapshot", "menu", "paging"],
+        "description": "Phase 2 advertises only these. See phase2_disallowed."
+      }
+    },
+
+    "phase2_disallowed": {
+      "description": "Capabilities that MUST NOT be advertised or accepted in Phase 2. They are named so a later phase negotiates them explicitly instead of silently changing behavior: delta, ev, continuation, save-token, resync, perm_invent, enhanced colors, unicode, mouse, hilite_status, hitpointbar, extra status, sounds, selectsaved."
+    },
+
+    "limits": {
+      "type": "object",
+      "required": ["line", "page_bytes", "page_rows", "count"],
+      "additionalProperties": false,
+      "properties": {
+        "line": { "const": 65536 },
+        "page_bytes": { "const": 16384 },
+        "page_rows": { "const": 128 },
+        "count": { "const": 2147483647 }
+      },
+      "description": "fixed contract constants, not current resource use"
+    },
+
+    "hello": {
+      "type": "object",
+      "required": ["v", "ch", "type", "d", "profile", "policy", "caps", "coord", "size", "x0", "y0", "limits"],
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "ch": { "const": "control" },
+        "type": { "const": "hello" },
+        "d": { "$ref": "#/$defs/counter" },
+        "profile": { "const": "normal-ascii-color-v1" },
+        "policy": { "const": "llm-final-v1" },
+        "caps": { "$ref": "#/$defs/caps" },
+        "coord": { "const": "engine-map" },
+        "size": {
+          "type": "array", "minItems": 2, "maxItems": 2,
+          "prefixItems": [{ "const": 80 }, { "const": 21 }], "items": false
+        },
+        "x0": { "const": 1 },
+        "y0": { "const": 0 },
+        "limits": { "$ref": "#/$defs/limits" }
+      },
+      "description": "emitted once, after compatible startup/restore readiness and before any player payload. No build hash, pid, seed, worker id, version fingerprint, or diagnostic field."
+    },
+
+    "obs": {
+      "type": "object",
+      "required": ["v", "ch", "type", "d", "seq", "base", "s", "cond", "pal", "map", "cur", "msg", "hist", "windows", "need"],
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "ch": { "const": "player" },
+        "type": { "const": "obs" },
+        "d": { "$ref": "#/$defs/counter" },
+        "seq": { "$ref": "#/$defs/counter" },
+        "base": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 9007199254740991,
+          "description": "required predecessor durable version; null for a full snapshot (Phase 2 always)"
+        },
+        "s": {
+          "type": "object",
+          "maxProperties": 32,
+          "additionalProperties": false,
+          "propertyNames": { "$ref": "#/$defs/status_field_name" },
+          "patternProperties": {
+            ".*": {
+              "oneOf": [{ "$ref": "#/$defs/status_value" }, { "type": "null" }]
+            }
+          },
+          "description": "canonical status field name -> {text,color,style}, or null to delete"
+        },
+        "cond": {
+          "type": "array",
+          "maxItems": 65535,
+          "items": { "$ref": "#/$defs/cond_entry" }
+        },
+        "pal": {
+          "type": "array",
+          "maxItems": 65535,
+          "items": { "$ref": "#/$defs/palette_entry" }
+        },
+        "map": {
+          "type": "array",
+          "maxItems": 65535,
+          "items": { "$ref": "#/$defs/map_triple" }
+        },
+        "cur": {
+          "oneOf": [
+            {
+              "type": "array", "minItems": 2, "maxItems": 2,
+              "prefixItems": [{ "$ref": "#/$defs/map_x" }, { "$ref": "#/$defs/map_y" }],
+              "items": false
+            },
+            { "type": "null" }
+          ]
+        },
+        "msg": { "type": "array", "maxItems": 65535, "items": { "$ref": "#/$defs/msg_event" } },
+        "hist": { "type": "array", "maxItems": 65535, "items": { "$ref": "#/$defs/msg_event" } },
+        "windows": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/window_descriptor" } },
+        "need": { "$ref": "#/$defs/need" }
+      }
+    },
+
+    "act": {
+      "type": "object",
+      "required": ["v", "type", "id", "action"],
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "type": { "const": "act" },
+        "seq": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 9007199254740991,
+          "description": "durable version this action acknowledges (optional)"
+        },
+        "id": { "$ref": "#/$defs/counter" },
+        "action": { "$ref": "#/$defs/action" }
+      }
+    },
+
+    "closed": {
+      "type": "object",
+      "required": ["v", "ch", "type"],
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "ch": { "const": "control" },
+        "type": { "const": "closed" }
+      },
+      "maxProperties": 3,
+      "description": "exactly these three keys. This is the documented closed-counter exception to the rule that every output record carries a delivery counter d: terminal closure is not retryable, not acknowledged, emitted at most once, and architecture 6.5 mandates this bare object. Every other control record carries d."
+    },
+
+    "get_page": {
+      "type": "object",
+      "required": ["v", "type", "id", "content", "page"],
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "type": { "const": "get_page" },
+        "id": { "$ref": "#/$defs/counter" },
+        "content": { "type": "string", "pattern": "^c[1-9][0-9]*$" },
+        "page": { "type": "integer", "minimum": 0, "maximum": 65534 }
+      }
+    },
+
+    "ack_chunk": {
+      "type": "object",
+      "required": ["v", "type", "rid", "i"],
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "type": { "const": "ack_chunk" },
+        "rid": { "$ref": "#/$defs/counter" },
+        "i": { "type": "integer", "minimum": 0, "maximum": 65534 }
+      }
+    },
+
+    "ack_seq": {
+      "type": "object",
+      "required": ["v", "type", "seq"],
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "type": { "const": "ack_seq" },
+        "seq": { "$ref": "#/$defs/counter" }
+      }
+    },
+
+    "page": {
+      "type": "object",
+      "required": ["v", "ch", "type", "d", "content", "page", "pages", "rows"],
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "ch": { "const": "control" },
+        "type": { "const": "page" },
+        "d": { "$ref": "#/$defs/counter" },
+        "content": { "type": "string", "pattern": "^c[1-9][0-9]*$" },
+        "page": { "type": "integer", "minimum": 0, "maximum": 65534 },
+        "pages": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "rows": { "type": "array", "maxItems": 128, "items": { "$ref": "#/$defs/page_row" } }
+      },
+      "description": "a stable content slice; selections are forbidden until every required page has been delivered and acknowledged"
+    },
+
+    "chunk_part": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["p", "k", "val"],
+          "additionalProperties": false,
+          "properties": {
+            "p": { "const": "h" },
+            "k": { "enum": ["v", "ch", "type", "seq", "base"] },
+            "val": {}
+          },
+          "description": "header scalar; only in chunk 0"
+        },
+        {
+          "type": "object",
+          "required": ["p", "k", "val"],
+          "additionalProperties": false,
+          "properties": {
+            "p": { "const": "s" },
+            "k": { "$ref": "#/$defs/status_field_name" },
+            "val": { "oneOf": [{ "$ref": "#/$defs/status_value" }, { "type": "null" }] }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["p", "val"],
+          "additionalProperties": false,
+          "properties": { "p": { "const": "cond" }, "val": { "$ref": "#/$defs/cond_entry" } }
+        },
+        {
+          "type": "object",
+          "required": ["p", "val"],
+          "additionalProperties": false,
+          "properties": { "p": { "const": "pal" }, "val": { "$ref": "#/$defs/palette_entry" } }
+        },
+        {
+          "type": "object",
+          "required": ["p", "val"],
+          "additionalProperties": false,
+          "properties": { "p": { "const": "map" }, "val": { "$ref": "#/$defs/map_triple" } }
+        },
+        {
+          "type": "object",
+          "required": ["p", "val"],
+          "additionalProperties": false,
+          "properties": { "p": { "const": "msg" }, "val": { "$ref": "#/$defs/msg_event" } }
+        },
+        {
+          "type": "object",
+          "required": ["p", "val"],
+          "additionalProperties": false,
+          "properties": { "p": { "const": "hist" }, "val": { "$ref": "#/$defs/msg_event" } }
+        },
+        {
+          "type": "object",
+          "required": ["p", "val"],
+          "additionalProperties": false,
+          "properties": { "p": { "const": "win" }, "val": { "$ref": "#/$defs/window_descriptor" } }
+        },
+        {
+          "type": "object",
+          "required": ["p", "val"],
+          "additionalProperties": false,
+          "properties": {
+            "p": { "const": "cur" },
+            "val": {
+              "oneOf": [
+                {
+                  "type": "array", "minItems": 2, "maxItems": 2,
+                  "prefixItems": [{ "$ref": "#/$defs/map_x" }, { "$ref": "#/$defs/map_y" }],
+                  "items": false
+                },
+                { "type": "null" }
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["p", "val"],
+          "additionalProperties": false,
+          "properties": { "p": { "const": "need" }, "val": { "$ref": "#/$defs/need" } }
+        },
+        {
+          "type": "object",
+          "required": ["p", "path", "offset", "text", "last"],
+          "additionalProperties": false,
+          "properties": {
+            "p": { "const": "t" },
+            "path": { "enum": ["msg", "hist", "title", "windows"] },
+            "offset": { "type": "integer", "minimum": 0, "maximum": 1048575 },
+            "text": { "type": "string", "maxLength": 1048576 },
+            "last": { "type": "boolean" }
+          },
+          "description": "long text; offsets are UTF-8 byte counts at scalar boundaries, never cutting a UTF-8 sequence"
+        }
+      ],
+      "description": "enumerated chunk part grammar; there is no arbitrary JSON-pointer patch language"
+    },
+
+    "chunk": {
+      "type": "object",
+      "required": ["v", "ch", "type", "d", "rid", "i", "last", "parts"],
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "ch": { "const": "control" },
+        "type": { "const": "chunk" },
+        "d": { "$ref": "#/$defs/counter" },
+        "rid": { "$ref": "#/$defs/counter", "description": "logical output record id: the delivery id of the first chunk" },
+        "i": { "type": "integer", "minimum": 0, "maximum": 65534 },
+        "last": { "type": "boolean" },
+        "parts": { "type": "array", "minItems": 0, "maxItems": 8192, "items": { "$ref": "#/$defs/chunk_part" } }
+      },
+      "description": "a large logical record is an ordered chunk stream, never partial independently applicable observations. Retries preserve d and the exact bytes; identical retry chunks are deduplicated by (rid,i)."
+    },
+
+    "invalid": {
+      "type": "object",
+      "required": ["v", "ch", "type", "d", "code"],
+      "additionalProperties": false,
+      "properties": {
+        "v": { "$ref": "#/$defs/version" },
+        "ch": { "const": "control" },
+        "type": { "const": "invalid" },
+        "d": { "$ref": "#/$defs/counter" },
+        "code": {
+          "enum": ["schema", "stale", "kind", "range", "incomplete"],
+          "description": "public code only; invalid carries no diagnostic text and leaves the outstanding request unchanged"
+        }
+      }
+    }
+  }
+}
