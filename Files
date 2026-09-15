@@ -622,9 +622,10 @@ winval.c
 
 win/agent:
 (files for the agent window port - no terminal required)
-agent_bootstrap.c   agent_handshake.h   agent_menu.c        agent_menu.h
-agent_policy.c      agent_profile.h     agent_protocol.c    agent_protocol.h
-agent_types.h       agent_view.c        agent_view.h        winagent.c
+agent_bootstrap.c   agent_handshake.h   agent_input.c        agent_input.h
+agent_menu.c        agent_menu.h        agent_policy.c       agent_profile.h
+agent_protocol.c    agent_protocol.h    agent_types.h        agent_view.c
+agent_view.h        winagent.c
 
 win/chain:
 (files for stacking window systems)

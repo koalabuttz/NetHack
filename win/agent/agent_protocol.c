@@ -2682,6 +2682,9 @@ agent_commit(struct agent_session *s, const struct agent_view *v,
 
     if (!s || !v)
         return AG_INTERNAL;
+    /* a commit supersedes content registered for the previous request */
+    s->content_rows = (const struct agent_content_row *) 0;
+    s->content_nrows = 0;
     /* validate every public value before anything is built or counted, so a
      * malformed view fails closed with no output and no counter movement */
     if (!ag_validate_view(v, need))
@@ -2831,6 +2834,7 @@ ag_emit_page(struct agent_session *s, const char *content, long page,
     struct ag_buf o;
     enum agent_result r;
     uint64_t d;
+    size_t first, last, i;
 
     if (!ag_bump(s, &s->next_delivery))
         return AG_LIMIT;
@@ -2844,7 +2848,72 @@ ag_emit_page(struct agent_session *s, const char *content, long page,
     ag_put_i64(&o, page);
     ag_puts(&o, ",\"pages\":");
     ag_put_i64(&o, pages);
-    ag_puts(&o, ",\"rows\":[]}");
+    ag_puts(&o, ",\"rows\":[");
+    first = (size_t) page * AG_CONTENT_ROWS_PER_PAGE;
+    last = first + AG_CONTENT_ROWS_PER_PAGE;
+    if (last > s->content_nrows)
+        last = s->content_nrows;
+    for (i = first; i < last; ++i) {
+        const struct agent_content_row *row = &s->content_rows[i];
+
+        if (i > first)
+            ag_putc(&o, ',');
+        if (row->r > 0) {
+            ag_puts(&o, "{\"r\":");
+            ag_put_i64(&o, row->r);
+            ag_puts(&o, ",\"text\":");
+            ag_put_jstr(&o, row->text ? row->text : "");
+            ag_puts(&o, ",\"selectable\":");
+            ag_puts(&o, row->selectable ? "true" : "false");
+            ag_puts(&o, ",\"key\":");
+            if (row->key)
+                ag_put_i64(&o, row->key);
+            else
+                ag_puts(&o, "null");
+            ag_puts(&o, ",\"group\":");
+            if (row->group)
+                ag_put_i64(&o, row->group);
+            else
+                ag_puts(&o, "null");
+            ag_puts(&o, ",\"initial\":");
+            if (row->has_initial)
+                ag_put_i64(&o, row->initial);
+            else
+                ag_puts(&o, "null");
+            ag_puts(&o, ",\"style\":");
+            ag_put_u64(&o, row->style);
+            ag_puts(&o, ",\"color\":");
+            ag_put_jstr(&o, agent_color_name(row->color)
+                                ? agent_color_name(row->color)
+                                : "none");
+            ag_puts(&o, ",\"icon\":");
+            if (row->has_icon) {
+                ag_puts(&o, "[\"");
+                ag_putc(&o, (char) row->icon.ch);
+                ag_puts(&o, "\",");
+                ag_put_jstr(&o, agent_color_name(row->icon.fg)
+                                ? agent_color_name(row->icon.fg)
+                                : "none");
+                ag_puts(&o, ",");
+                ag_put_u64(&o, row->icon.style);
+                ag_puts(&o, ",");
+                ag_put_jstr(&o, agent_color_name(row->icon.frame)
+                                ? agent_color_name(row->icon.frame)
+                                : "none");
+                ag_putc(&o, ']');
+            } else {
+                ag_puts(&o, "null");
+            }
+            ag_putc(&o, '}');
+        } else {
+            ag_puts(&o, "{\"text\":");
+            ag_put_jstr(&o, row->text ? row->text : "");
+            ag_puts(&o, ",\"style\":");
+            ag_put_u64(&o, row->style);
+            ag_putc(&o, '}');
+        }
+    }
+    ag_puts(&o, "]}");
     if (o.ovf) {
         ag_free(&o);
         return AG_LIMIT;
@@ -2852,6 +2921,24 @@ ag_emit_page(struct agent_session *s, const char *content, long page,
     r = ag_emit(s, o.p, o.len, d, false);
     ag_free(&o);
     return r;
+}
+
+size_t
+agent_content_pages(size_t nrows)
+{
+    return (nrows + AG_CONTENT_ROWS_PER_PAGE - 1) / AG_CONTENT_ROWS_PER_PAGE;
+}
+
+void
+agent_session_set_content(struct agent_session *s,
+                          const struct agent_content_row *rows,
+                          size_t nrows)
+{
+    if (!s)
+        return;
+    s->content_rows = (rows && nrows)
+                          ? rows : (const struct agent_content_row *) 0;
+    s->content_nrows = (rows && nrows) ? nrows : 0;
 }
 
 /* Handle one parsed transport auxiliary.  Returns AG_OK to continue reading,

@@ -31,6 +31,30 @@ enum agent_aux_kind {
     AG_AUX_GET_PAGE
 };
 
+/* One row of the content behind the outstanding request, registered by the
+ * adapter so that get_page can return real slices.  A menu row carries the
+ * full public row (r >= 1); a plain text line uses r == 0 and only
+ * text/style.
+ * The adapter owns the storage and must keep it valid until the request
+ * completes (a new commit or receive supersedes it). */
+struct agent_content_row {
+    long r;              /* 0 = plain text line, else 1-based menu row id */
+    const char *text;
+    bool selectable;
+    int key;             /* advisory accelerator byte, 0 = null */
+    int group;           /* advisory group byte, 0 = null */
+    bool has_initial;
+    long initial;        /* -1 native all/default, else explicit */
+    uint8_t style;
+    uint8_t color;
+    bool has_icon;
+    struct agent_cell icon;
+};
+
+/* Rows per stable content page.  The adapter computes the declared page count
+ * with agent_content_pages() so the request and the page records agree. */
+#define AG_CONTENT_ROWS_PER_PAGE AG_PAGE_MAX_ROWS
+
 struct agent_aux {
     enum agent_aux_kind kind;
     uint64_t id;      /* get_page request id */
@@ -85,6 +109,11 @@ struct agent_session {
     unsigned char pages_done[AG_PAGES_BITMAP_BYTES];
     int pages_delivered;    /* count of distinct delivered page indices */
 
+    /* adapter-registered rows behind the outstanding content; borrowed, not
+     * owned, and superseded by the next commit/receive */
+    const struct agent_content_row *content_rows;
+    size_t content_nrows;
+
     /* exact accepted-action identity (bytes, plus a hash pre-filter) */
     bool have_action;
     uint64_t action_id;
@@ -127,9 +156,20 @@ void agent_session_init(struct agent_session *s, agent_read_fn rd,
                         agent_write_fn wr, void *io);
 void agent_session_free(struct agent_session *s);
 
+/* Number of stable content pages for nrows rows (0 for no content).  The
+ * adapter declares this as the request's page count so get_page and the page
+ * records agree. */
+size_t agent_content_pages(size_t nrows);
+
+/* Register the rows behind the outstanding content so get_page can emit real
+ * page slices.  rows is borrowed and must stay valid until the request
+ * completes; passing NULL/0 clears it. */
+void agent_session_set_content(struct agent_session *s,
+                               const struct agent_content_row *rows,
+                               size_t nrows);
+
 /* Emit hello once, before any player payload.  A second call is rejected. */
 enum agent_result agent_write_hello(struct agent_session *s);
-
 /* Freeze and deliver the durable presentation, retaining the response for the
  * last accepted action.  need may be NULL for a final boundary. */
 enum agent_result agent_commit(struct agent_session *s,
