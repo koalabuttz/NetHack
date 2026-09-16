@@ -306,6 +306,56 @@ agent_apply_profile(void)
     agent_policy_profile_validated();
 }
 
+/* Restored-flags validation (plan section 4 step 9, architecture section
+ * 6.4).  The save file overwrote the entire `flags` struct (restore.c), so a
+ * hostile or hand-edited save could flip a profile-locked setting, enable
+ * wizard/discovery play, or turn on the fuzzer before any of it could drive
+ * rendering or a facility.  This is the seam that rejects it: it runs
+ * immediately after Sfi_flag and before set_playmode()/role_init(), and it
+ * rejects rather than downgrades.
+ *
+ * Only `flags` is restored; `iflags` presentation fields are set by the
+ * profile during trusted initialization and cannot be moved by save bytes,
+ * but every pin is checked anyway so the whole frozen profile -- not just
+ * its persisted half -- is proven on a restored game. */
+void
+agent_validate_restored_flags(void)
+{
+    size_t k;
+
+    if (!agent_mode())
+        return; /* the human build and SFCTOOL are unchanged */
+
+    /* wizard and discovery are the restored flags.debug / flags.explore;
+     * the fuzzer is iflags state and is checked for completeness. */
+    if (flags.debug)
+        agent_private_fatal("restored save enables wizard mode");
+    if (flags.explore)
+        agent_private_fatal("restored save enables discover mode");
+    if (iflags.debug_fuzzer != fuzzer_off)
+        agent_private_fatal("restored save enables the fuzzer");
+
+    for (k = 0; k < AGENT_PIN_COUNT; ++k) {
+        int slot = agent_pin_slot(agent_pins[k].name);
+
+        if (slot < 0)
+            agent_private_fatal("restored save: unclassified profile pin");
+        if (allopt[slot].opttyp == BoolOpt && allopt[slot].addr) {
+            boolean want = (strcmp(agent_pins[k].value, "on") == 0);
+
+            if (*allopt[slot].addr != want)
+                agent_private_fatal("restored save violates the frozen"
+                                    " profile");
+        } else if (strcmp(agent_pins[k].name, "windowtype") == 0) {
+            if (strcmp(windowprocs.name, agent_pins[k].value) != 0)
+                agent_private_fatal("restored save violates the frozen"
+                                    " profile");
+        }
+        /* number_pad/playmode/statushilites have no restorable field: their
+         * effective value cannot be moved by a save file. */
+    }
+}
+
 /* The agent profile finishing pass replaces the untrusted rc file.  The
  * bookkeeping that follows rcfile() in initoptions_finish() still runs. */
 void

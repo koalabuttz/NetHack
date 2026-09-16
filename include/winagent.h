@@ -31,6 +31,16 @@ void agent_bootstrap_probe(int *argc, char ***argv);
  * set or clear it. */
 int agent_mode(void);
 
+/* True when the trusted launcher selected a restore episode (the handshake
+ * mode is AG_HS_MODE_RESTORE).  FALSE without a latch. */
+int agent_restore_mode(void);
+
+/* Called by unixmain after a compatible restore has completed and while the
+ * publication gate is still closed: re-validate the restored flags, open the
+ * gate, and emit the hello so the first post-restore boundary publishes a
+ * full snapshot.  No-op outside agent mode. */
+void agent_after_restore(void);
+
 /* Post-early_init setup: private prefixes, diagnostic routing, and the
  * runtime policy phase.  Called after early_init() has reset the globals. */
 void agent_bootstrap_after_globals(void);
@@ -88,6 +98,14 @@ void agent_apply_profile(void);
 /* Replace the untrusted rc-file pass with profile finishing.  Called by
  * initoptions_finish() in agent mode. */
 void agent_profile_finish(void);
+
+/* Restored-flags validation (plan section 4 step 9, architecture section
+ * 6.4).  Called by restore() immediately after the save file's flags have
+ * been deserialized and BEFORE the restored debug/explore mode, rendering,
+ * or external facilities can take effect.  A save that carries wizard or
+ * discovery mode, a fuzzer state, or any frozen-profile violation is
+ * rejected privately rather than downgraded.  No-op outside agent mode. */
+void agent_validate_restored_flags(void);
 
 /* Runtime option gate: reads and initialization are allowed; setters and
  * handlers are denied before invocation unless they run inside the scoped

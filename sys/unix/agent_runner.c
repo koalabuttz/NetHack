@@ -48,6 +48,9 @@ struct runner_config {
     const char *sysconf;
     const char *private_root;
     const char *profile;
+    const char *save_out;    /* copy the episode's save artifacts here */
+    const char *restore_in;  /* seed the episode's save dir from here */
+    int restore;
     int deadline;
 };
 
@@ -68,6 +71,7 @@ usage(void)
 {
     fputs("usage: nethack-agent --worker PATH [--data DIR] [--config DIR]\n"
           "       [--sysconf FILE] [--private-root DIR] [--profile NAME]\n"
+          "       [--mode new|restore] [--restore-in DIR] [--save-out DIR]\n"
           "       [--deadline SECONDS]\n", stderr);
 }
 
@@ -99,6 +103,66 @@ r_remove_tree(const char *path)
         closedir(d);
     }
     (void) rmdir(path);
+}
+
+/* Copy the regular files of a directory tree from src into dst, creating dst
+ * (mode 0700) as needed and never following symlinks.  Used to move a save
+ * artifact between a finished episode root and the caller-owned directory the
+ * trusted test controller provides: the launcher owns the transfer, so the
+ * player-facing channel never carries a path or file bytes. */
+static int r_write_all(int, const char *, size_t);
+
+static int
+r_copy_tree(const char *src, const char *dst)
+{
+    DIR *d;
+    struct dirent *e;
+    struct stat st;
+
+    if (stat(src, &st) != 0 || !S_ISDIR(st.st_mode))
+        return -1;
+    if (mkdir(dst, 0700) != 0 && errno != EEXIST)
+        return -1;
+    d = opendir(src);
+    if (!d)
+        return -1;
+    while ((e = readdir(d)) != NULL) {
+        char from[RUNNER_PATH_MAX], to[RUNNER_PATH_MAX];
+        struct stat es;
+
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+            continue;
+        if ((size_t) snprintf(from, sizeof from, "%s/%s", src, e->d_name)
+                >= sizeof from
+            || (size_t) snprintf(to, sizeof to, "%s/%s", dst, e->d_name)
+                   >= sizeof to)
+            continue;
+        if (lstat(from, &es) != 0)
+            continue;
+        if (S_ISDIR(es.st_mode))
+            (void) r_copy_tree(from, to);
+        else if (S_ISREG(es.st_mode)) {
+            int in = open(from, O_RDONLY), out;
+            char buf[65536];
+            ssize_t n;
+
+            if (in < 0)
+                continue;
+            out = open(to, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (out < 0) {
+                (void) close(in);
+                continue;
+            }
+            while ((n = read(in, buf, sizeof buf)) > 0) {
+                if (r_write_all(out, buf, (size_t) n) != 0)
+                    break;
+            }
+            (void) close(in);
+            (void) close(out);
+        }
+    }
+    closedir(d);
+    return 0;
 }
 
 /* Write exactly len bytes to fd, retrying short writes. */
@@ -226,7 +290,21 @@ main(int argc, char **argv)
         TAKE("--sysconf", sysconf)
         TAKE("--private-root", private_root)
         TAKE("--profile", profile)
+        TAKE("--save-out", save_out)
+        TAKE("--restore-in", restore_in)
 #undef TAKE
+        if (strcmp(a, "--mode") == 0 && v) {
+            if (strcmp(v, "new") == 0)
+                cfg.restore = 0;
+            else if (strcmp(v, "restore") == 0)
+                cfg.restore = 1;
+            else {
+                r_diag("unknown mode %s", v);
+                return 2;
+            }
+            ++i;
+            continue;
+        }
         if (strcmp(a, "--deadline") == 0 && v) {
             cfg.deadline = atoi(v);
             ++i;
@@ -279,6 +357,24 @@ main(int argc, char **argv)
         r_diag("private path too long");
         r_remove_tree(workdir);
         return 4;
+    }
+
+    /* Restore: seed the episode's save directory from the controller-owned
+     * directory before the worker starts.  The launcher owns the transfer and
+     * the handshake names no file, only that a restore is in progress. */
+    if (cfg.restore_in) {
+        struct stat rs;
+
+        if (stat(cfg.restore_in, &rs) != 0 || !S_ISDIR(rs.st_mode)) {
+            r_diag("restore source is missing or not a directory");
+            r_remove_tree(workdir);
+            return 7;
+        }
+        if (r_copy_tree(cfg.restore_in, savedir) != 0) {
+            r_diag("could not seed the episode save directory");
+            r_remove_tree(workdir);
+            return 7;
+        }
     }
 
     /* The private episode root is the worker's playground.  Immutable game
@@ -425,7 +521,7 @@ main(int argc, char **argv)
     memset(&hs, 0, sizeof hs);
     hs.magic = AG_HS_MAGIC;
     hs.version = AG_HS_VERSION;
-    hs.mode = AG_HS_MODE_NEW;
+    hs.mode = cfg.restore ? AG_HS_MODE_RESTORE : AG_HS_MODE_NEW;
     hs.reserved = 0u;
     r_copy_bounded(hs.profile, sizeof hs.profile, cfg.profile);
     r_copy_bounded(hs.data_root, sizeof hs.data_root, cfg.data_root);
@@ -539,6 +635,14 @@ cleanup:
     if (r_write_all(STDOUT_FILENO, closed_record,
                     sizeof closed_record - 1) == 0)
         (void) r_write_all(STDOUT_FILENO, "\n", 1);
+
+    /* Save: the worker produced its native save artifact under the episode's
+     * save directory.  The launcher copies it into the caller-owned directory
+     * the trusted test controller provides, so the artifact is retrievable
+     * without exposing a path or bytes on the player channel; the episode
+     * root is then removed exactly as for every other mode. */
+    if (cfg.save_out)
+        (void) r_copy_tree(savedir, cfg.save_out);
 
     /* remove only the tree we created */
     r_remove_tree(workdir);

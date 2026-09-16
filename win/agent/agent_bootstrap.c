@@ -94,6 +94,14 @@ agent_mode(void)
     return agent_latched;
 }
 
+/* True when the trusted launcher selected a restore episode.  Absent a latch
+ * this is FALSE, so a human or non-agent build is unaffected. */
+int
+agent_restore_mode(void)
+{
+    return agent_latched && agent_hs.mode == AG_HS_MODE_RESTORE;
+}
+
 int
 agent_bootstrap_fd(void)
 {
@@ -249,7 +257,7 @@ agent_bootstrap_probe(int *argc, char ***argvp)
         agent_private_fatal("unsupported handshake version");
     if (hs.reserved != 0u)
         agent_private_fatal("handshake reserved field not zero");
-    if (hs.mode != AG_HS_MODE_NEW
+    if (hs.mode != AG_HS_MODE_NEW && hs.mode != AG_HS_MODE_RESTORE
 #ifdef AGENT_TEST_IMPOSSIBLE
         /* Test-only launch modes (see agent_handshake.h): the matrix drives
          * one unimplemented decision callback per worker process. */

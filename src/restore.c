@@ -5,6 +5,9 @@
 
 #include "hack.h"
 #include "tcap.h" /* for TERMLIB and ASCIIGRAPH */
+#ifdef AGENT_GRAPHICS
+#include "winagent.h" /* restored-flags validation seam */
+#endif
 
 #if defined(MICRO)
 extern int dotcnt; /* shared with save */
@@ -578,6 +581,19 @@ restgamestate(NHFILE *nhfp)
        if partial restore fails and we resort to starting a new game */
     newgameflags = flags;
     Sfi_flag(nhfp, &flags, "gamestate-flags");
+
+#ifdef AGENT_GRAPHICS
+    /* Plan section 4 hook-order step 9 / architecture section 6.4: the save
+     * file has just overwritten the whole `flags` struct.  Before the
+     * restored debug/explore mode, presentation settings, or external
+     * facilities can take effect -- and before set_playmode()/role_init()
+     * below -- validate the restored flags against the frozen profile and
+     * terminate privately on any violation.  This is a rejection, never a
+     * downgrade: a save carrying wizard/discovery mode or a profile-locked
+     * setting change never reaches a publication or facility.  Outside
+     * agent mode this is a no-op. */
+    agent_validate_restored_flags();
+#endif
 
 #ifndef SFCTOOL
     /* avoid keeping permanent inventory window up to date during restore

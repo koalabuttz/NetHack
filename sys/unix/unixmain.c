@@ -324,7 +324,17 @@ main(int argc, char *argv[])
             pline("Restoring save file...");
         mark_synch(); /* flush output */
         if (dorecover(nhfp)) {
-            resuming = TRUE; /* not starting new game */
+            resuming = TRUE; /* not starting a new game */
+#ifdef AGENT_GRAPHICS
+            /* Hook order step 9-10: the save's flags were validated inside
+             * restore(), before set_playmode()/role_init().  Restoration is
+             * now complete and compatible, so the quarantine ends here: the
+             * gate opens and the port emits its hello.  The next durable
+             * boundary publishes a full snapshot whose restored history is
+             * tagged hist; the sequence namespace is this fresh process's. */
+            if (agent_mode())
+                agent_after_restore();
+#endif
             wd_message();
             if (discover || wizard) {
                 /* this seems like a candidate for paranoid_confirmation... */
@@ -340,6 +350,14 @@ main(int argc, char *argv[])
             program_state.in_self_recover = FALSE;
         }
     }
+#ifdef AGENT_GRAPHICS
+    /* A trusted restore launch that could not restore a compatible save must
+     * terminate generically rather than quietly fall through to a new
+     * character game: the launcher asked for a restore, and starting a new
+     * game would silently answer a different request. */
+    if (agent_mode() && agent_restore_mode() && !resuming)
+        agent_private_fatal("restore requested but no compatible save");
+#endif
 
     if (!resuming) {
         boolean neednewlock = (!*svp.plname);

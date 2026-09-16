@@ -750,6 +750,15 @@ agent_init_nhwindows(int *argc, char **argv)
     (void) argc;
     (void) argv;
     agent_session_open();
+    /* Every other port marks the window system live here (tty sets it when
+     * its first window becomes active; X11/curses at init).  The engine keys
+     * two things off iflags.window_inited: pline() sends ordinary messages to
+     * the message window instead of raw_print(), and end.c's endgame
+     * (displaying the closing message and the tombstone through the text
+     * window) treats the window system as available instead of forcing
+     * done_stopprint.  Without it, agent messages are silently discarded to
+     * the private sink and the endgame renders nothing. */
+    iflags.window_inited = TRUE;
 }
 
 static void
@@ -1829,6 +1838,23 @@ agent_player_selection(void)
     agent_port_set_input_context("gameplay input");
 }
 
+/* Called by unixmain after a compatible restore has completed, while the
+ * publication gate is still closed.  Re-validates the restored flags (restore
+ * itself already rejected a violating save before the restored mode could
+ * take effect), then ends the quarantine: the gate opens and the port emits
+ * its hello.  The next durable boundary publishes a full snapshot whose
+ * restored history has been tagged hist by putmsghistory(restoring=TRUE);
+ * this fresh process starts its own sequence namespace at 1. */
+void
+agent_after_restore(void)
+{
+    if (!agent_mode())
+        return;
+    agent_validate_restored_flags();
+    agent_publication_ready();
+    agent_emit_hello_once();
+}
+
 static void
 agent_askname(void)
 {
@@ -2676,11 +2702,15 @@ agent_get_color_string(void)
 static void
 agent_outrip(winid window, int how, time_t when)
 {
-    /* the endgame rendering arrives in M4; until then it publishes nothing
-     * and must not fabricate a player-visible epitaph */
-    (void) window;
-    (void) how;
-    (void) when;
+    /* The endgame tombstone is rendered through the ordinary native text
+     * window, exactly as the tty port does: genl_outrip() builds the tty
+     * rip text lines (name, gold, death description, year) and hands them
+     * to putstr(); end.c then calls display_nhwindow(endwin, TRUE), which
+     * is this port's blocking acknowledgement boundary.  So the tombstone
+     * reaches the agent as ordinary player presentation -- text lines, not
+     * graphics -- and no raw or diagnostic output is involved.  It exists
+     * in this build because DUMPLOG defines TEXT_TOMBSTONE (src/rip.c). */
+    genl_outrip(window, how, when);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2892,8 +2922,39 @@ agent_test_mode_dispatch(void)
         agent_test_exec_inventory();
         return;
     }
+    if (mode == AG_HS_MODE_TEST_WIZSAVE) {
+        /* Test-only: prove the restored-flags validator rejects a save that
+         * carries wizard mode.  This drives the SAME seam restore() calls
+         * (agent_validate_restored_flags) with the same in-memory input it
+         * would see right after Sfi_flag, so it must terminate privately with
+         * the wizard diagnostic and emit zero public bytes.  It runs before
+         * the session is opened, so nothing can be published even on
+         * success. */
+        flags.debug = TRUE;
+        agent_validate_restored_flags();
+        agent_private_fatal("wizard-save probe was not rejected");
+    }
+    if (mode == AG_HS_MODE_TEST_RIP) {
+        /* Render the endgame tombstone through the port's ordinary text
+         * window, exactly as the engine's done()/really_done() path does:
+         * outrip() fills the text window and the blocking display publishes
+         * it as one acknowledgement boundary.  A death needs a real killer
+         * for formatkiller(), so give it the same shape the engine would. */
+        winid win;
+
+        Strcpy(svk.killer.name, "jackal");
+        svk.killer.format = KILLED_BY_AN;
+        agent_session_open();
+        agent_emit_hello_once();
+        agent_port_set_input_context("native character selection");
+        win = agent_create_nhwindow(NHW_TEXT);
+        agent_outrip(win, DIED, (time_t) 0);
+        agent_display_nhwindow(win, TRUE);
+        agent_destroy_nhwindow(win);
+        return;
+    }
     if (mode == AG_HS_MODE_TEST_DISPLAY || mode == AG_HS_MODE_TEST_SELECT
-        || mode == AG_HS_MODE_TEST_MSGMENU) {
+        || mode == AG_HS_MODE_TEST_MSGMENU || mode == AG_HS_MODE_TEST_RIP) {
         agent_session_open();
         agent_emit_hello_once();
         agent_port_set_input_context("native character selection");
