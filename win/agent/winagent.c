@@ -56,12 +56,29 @@ static uint64_t agent_next_window = 1;
 static uint64_t agent_next_content = 1;
 static uint64_t agent_next_menu = 1;
 
+/* The publication gate is enforced at the one place every player-facing byte
+ * leaves the process (the transport write callback) and the one place a
+ * decision boundary can block (the transport read callback).  A quarantined
+ * process -- a restore in progress, a restore that failed, or a run whose
+ * profile has not been validated -- must never publish and must never wait
+ * for the agent, so a write or read attempted while the gate is closed
+ * terminates privately with zero public bytes.  The named emission points
+ * below (commit, hello) add a precise diagnostic before reaching the
+ * callback; this is the backstop that no native callback path can bypass. */
+static void
+ag_require_publication(const char *what)
+{
+    if (!agent_publication_open())
+        agent_private_fatal(what);
+}
+
 static long
 agent_read_cb(void *ctx, char *buf, size_t cap)
 {
     int fd = *(const int *) ctx;
     ssize_t n;
 
+    ag_require_publication("input read while the publication gate is closed");
     if (fd < 0)
         return 0;
     do {
@@ -78,6 +95,8 @@ agent_write_cb(void *ctx, const char *buf, size_t len)
     int fd = *(const int *) ctx;
     ssize_t n;
 
+    ag_require_publication(
+        "public write while the publication gate is closed");
     if (fd < 0)
         return -1;
     do {
@@ -615,6 +634,13 @@ agent_port_commit_need(const struct agent_need *need)
     struct agent_view v;
     enum agent_result r;
 
+    /* Fail closed before anything is built: a durable snapshot published
+     * while the gate is closed would let a failed or unfinished restore
+     * influence the public stream, and a blocking boundary would wait for an
+     * agent decision the quarantine forbids.  This is the central guard for
+     * every native input and acknowledgement path, which all commit through
+     * here. */
+    ag_require_publication("commit while the publication gate is closed");
     if (!agent_session_ready)
         agent_private_fatal("commit before the transport was opened");
     if (!agent_hello_done) {
@@ -766,6 +792,7 @@ agent_emit_hello_once(void)
 {
     if (agent_hello_done)
         return;
+    ag_require_publication("hello while the publication gate is closed");
     agent_session_open();
     if (agent_write_hello(&agent_session) != AG_OK)
         agent_private_fatal("could not emit the hello record");
@@ -1811,6 +1838,7 @@ agent_test_menu_contract_probe(void)
 
 static void agent_test_mode_dispatch(void);
 static void agent_test_exec_inventory(void);
+static void agent_test_write_save_variant(boolean wizmode);
 #endif /* AGENT_TEST_IMPOSSIBLE */
 
 static void
@@ -1850,6 +1878,22 @@ agent_after_restore(void)
 {
     if (!agent_mode())
         return;
+#ifdef AGENT_TEST_IMPOSSIBLE
+    /* Test-only fixtures for the M4 restore-publication gate: from a valid
+     * save, write a same-build save carrying one hostile field with the
+     * engine's own writer, then exit without publishing.  The matrix replays
+     * a REAL restore over that artifact. */
+    switch (agent_bootstrap_test_mode()) {
+    case AG_HS_MODE_TEST_BADSAVE:
+        agent_test_write_save_variant(FALSE);
+        return;
+    case AG_HS_MODE_TEST_WIZSAVEFILE:
+        agent_test_write_save_variant(TRUE);
+        return;
+    default:
+        break;
+    }
+#endif
     agent_validate_restored_flags();
     agent_publication_ready();
     agent_emit_hello_once();
@@ -2908,6 +2952,29 @@ agent_test_exec_inventory(void)
     agent_private_fatal("descriptor-inventory helper could not be executed");
 }
 
+/* Test-only: rewrite the just-restored game as a new save that carries one
+ * hostile field, so the matrix can replay a REAL restore over a save that was
+ * produced by the engine's own writer (no byte surgery, no build-specific
+ * offset).  The field is written by the ordinary save path (dosave0), which
+ * is what makes the resulting artifact a same-build save in every respect.
+ * `wizmode` selects debug mode; otherwise the hero is made unsurvivable. */
+static void
+agent_test_write_save_variant(boolean wizmode)
+{
+    if (wizmode)
+        flags.debug = TRUE;
+    else
+        u.uhp = 0, u.mh = 0;
+    /* the restored save is still present (and chmod 0 for the restore);
+     * remove it so the save path does not find an old file and prompt */
+    (void) delete_savefile();
+    if (dosave0()) {
+        agent_private_diag("test save variant written");
+        _exit(0);
+    }
+    agent_private_fatal("could not write the test save variant");
+}
+
 /* Test-only: drive ONE test path per worker process, selected by the
  * handshake launch mode the matrix sends (see agent_handshake.h).  The M2
  * decision-boundary cases each publish exactly one durable snapshot carrying
@@ -2921,6 +2988,20 @@ agent_test_mode_dispatch(void)
     if (mode == AG_HS_MODE_TEST_EXEC) {
         agent_test_exec_inventory();
         return;
+    }
+    if (mode == AG_HS_MODE_TEST_GATEPROBE) {
+        /* Test-only: with the publication gate closed, a commit must fail
+         * closed.  Proves the central guard covers agent_port_commit_need
+         * directly, independent of the restore path that also reaches it. */
+        struct agent_need need;
+
+        agent_session_open();
+        agent_publication_close();
+        memset(&need, 0, sizeof need);
+        need.kind = AG_NEED_ACK;
+        need.id = agent_port_alloc_request();
+        (void) agent_port_commit_need(&need);
+        agent_private_fatal("gate-closed commit was not rejected");
     }
     if (mode == AG_HS_MODE_TEST_WIZSAVE) {
         /* Test-only: prove the restored-flags validator rejects a save that

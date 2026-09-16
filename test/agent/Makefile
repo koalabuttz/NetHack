@@ -173,6 +173,8 @@ breadth:
 # asserts the save artifact is retrievable, restore starts with a full seq-1
 # snapshot with restored history tagged hist, the same map is reproduced, and
 # play continues; every episode closes generically and cleans its root.
+# The restore assertions also prove hist/msg exclusivity: a known restored
+# line appears in hist and never in the live message window.
 lifecycle:
 	@test -n "$(WORKER)" -a -n "$(RUNNER)" -a -n "$(DATA)" || \
 	    { echo "set WORKER, RUNNER, DATA (and optionally SYSCONF,"; \
@@ -183,6 +185,20 @@ lifecycle:
 	    --data "$(DATA)" $(if $(SYSCONF),--sysconf "$(SYSCONF)") \
 	    --private-root "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-lifecycle)/unused" \
 	    --root "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-lifecycle)"
+
+# Two-episode contamination sentinels: episode A annotates its level with a
+# fixed unique marker and saves; a FRESH episode must contain the marker
+# nowhere, an episode RESTORED from A's artifact must contain it.
+sentinel:
+	@test -n "$(WORKER)" -a -n "$(RUNNER)" -a -n "$(DATA)" || \
+	    { echo "set WORKER, RUNNER, DATA (and optionally SYSCONF,"; \
+	      echo "PRIVATE_ROOT) for the sentinel test"; exit 2; }
+	rm -rf "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-sentinel)"
+	mkdir -p "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-sentinel)"
+	python3 driver.py sentinel --runner "$(RUNNER)" --worker "$(WORKER)" \
+	    --data "$(DATA)" $(if $(SYSCONF),--sysconf "$(SYSCONF)") \
+	    --private-root "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-sentinel)/unused" \
+	    --root "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-sentinel)"
 
 # 100 sequential episodes, each reset at a varying point (prompt, mid-move,
 # mid-menu, quit confirmation): reaping, descriptor/process plateau, and a
@@ -231,7 +247,14 @@ asan-lifecycle:
 	    --deadline 120 --timeout 240 \
 	    --private-root "$(if $(ASAN_PRIVATE_ROOT),$(ASAN_PRIVATE_ROOT),/tmp/agent-asan)/lc/unused" \
 	    --root "$(if $(ASAN_PRIVATE_ROOT),$(ASAN_PRIVATE_ROOT),/tmp/agent-asan)/lc"
-	@echo "asan-lifecycle: play, breadth and save/restore completed with a clean exit under the sanitizer worker"
+	rm -rf "$(if $(ASAN_PRIVATE_ROOT),$(ASAN_PRIVATE_ROOT),/tmp/agent-asan)/sn"
+	mkdir -p "$(if $(ASAN_PRIVATE_ROOT),$(ASAN_PRIVATE_ROOT),/tmp/agent-asan)/sn"
+	python3 driver.py sentinel --runner "$(ASAN_RUNNER)" --worker "$(ASAN_WORKER)" \
+	    --data "$(ASAN_DATA)" $(if $(ASAN_SYSCONF),--sysconf "$(ASAN_SYSCONF)") \
+	    --deadline 120 --timeout 240 \
+	    --private-root "$(if $(ASAN_PRIVATE_ROOT),$(ASAN_PRIVATE_ROOT),/tmp/agent-asan)/sn/unused" \
+	    --root "$(if $(ASAN_PRIVATE_ROOT),$(ASAN_PRIVATE_ROOT),/tmp/agent-asan)/sn"
+	@echo "asan-lifecycle: play, breadth, save/restore and the sentinel completed with a clean exit under the sanitizer worker"
 
 # ASan/UBSan build, if the compiler supports the flags.
 sanitize: clean
@@ -272,4 +295,5 @@ clean:
 	rm -f $(TESTS) $(AGENT_OBJS) $(REF_OBJS) .dep.*.d .profile.tmp .profile.h.tmp
 
 .PHONY: all check manifest-check header-check schema-check matrix \
-	episode play breadth matrix-full sanitize asan-lifecycle depcheck clean
+	episode play breadth matrix-full sanitize asan-lifecycle depcheck clean \
+	sentinel

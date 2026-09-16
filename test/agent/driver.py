@@ -36,6 +36,35 @@ KEY_Y = 121
 KEY_N = 110
 KEY_S = 83  # native save command (number_pad off)
 
+# The controller-owned provenance record the launcher writes alongside an
+# exported save artifact (sys/unix/agent_runner.c, R_META_NAME).  It lives in
+# the artifact directory the test controller owns -- never on the player
+# channel -- and binds the artifact to the build, staged data, profile, mode
+# and owner scope it was produced with.
+PROVENANCE_NAME = "provenance.txt"
+
+# The fixed, unique string the contamination-sentinel scenario puts into a
+# saved level annotation.  It is never emitted by any engine code path, so its
+# presence or absence in a public stream is a real contradiction sentinel.
+SENTINEL_MARKER = "AGENT-CONTAMINATION-SENTINEL-A"
+
+
+def read_provenance(directory):
+    """Parse the launcher's provenance record into a dict (empty if no
+    record)."""
+    path = os.path.join(directory, PROVENANCE_NAME)
+    if not os.path.isfile(path):
+        return {}
+    out = {}
+    with open(path) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if "=" in line:
+                key, val = line.split("=", 1)
+                out[key] = val
+    return out
+
+
 # The deterministic play script's expected character-selection menu titles and
 # its request-kind transcript.  These pin the native interaction sequence the
 # script exercises; they change only when the scripted play path changes.
@@ -981,13 +1010,20 @@ def _assert_closed(pol, label):
                              % (label, closed[0]))
 
 
-def _do_save(args):
+def _do_save(args, policy=None):
     """Run the native-save episode; the launcher copies the save artifact into
-    args.save_out.  Returns (policy, saved_map, saved_title)."""
+    args.save_out.  Returns (policy, saved_map, saved_title, artifacts)."""
+    # The controller-owned artifact directory must be fresh: accepting a
+    # pre-existing file would let a run "pass" on an artifact it did not
+    # produce.  The launcher exports by staging + atomic rename, so a
+    # non-empty destination is a refusal, not a merge.
+    if os.path.isdir(args.save_out) and os.listdir(args.save_out):
+        raise AssertionError("save episode: output dir %r is not empty"
+                             % args.save_out)
     os.makedirs(args.save_out, exist_ok=True)
     os.makedirs(args.private_root, exist_ok=True)
     before = set(os.listdir(args.private_root))
-    pol, code = _run_policy(args, SavePolicy)
+    pol, code = _run_policy(args, policy or SavePolicy)
     if code != 0:
         raise AssertionError("save episode: runner exited %d" % code)
     _assert_closed(pol, "save")
@@ -1002,11 +1038,33 @@ def _do_save(args):
     if after != before:
         raise AssertionError("save episode: private root not cleaned: %s"
                              % sorted(after - before))
-    artifacts = [f for f in os.listdir(args.save_out)
-                 if os.path.isfile(os.path.join(args.save_out, f))]
+    artifacts = []
+    for f in sorted(os.listdir(args.save_out)):
+        if f == PROVENANCE_NAME:
+            continue
+        p = os.path.join(args.save_out, f)
+        if not os.path.isfile(p):
+            raise AssertionError("save episode: %r is not a regular file" % f)
+        size = os.path.getsize(p)
+        if size <= 0:
+            raise AssertionError("save episode: artifact %r is empty" % f)
+        artifacts.append((f, size))
     if not artifacts:
         raise AssertionError("save episode: no native save artifact produced")
-    return pol, dict(pol.client.map), pol.client.s.get("title"), artifacts
+    # the artifact must be the one this episode produced: the launcher's
+    # provenance record names it and binds its bytes
+    meta = os.path.join(args.save_out, PROVENANCE_NAME)
+    if not os.path.isfile(meta):
+        raise AssertionError("save episode: no provenance record was written")
+    names = read_provenance(args.save_out)
+    if names.get("mode") != "new":
+        raise AssertionError("save episode: provenance mode %r, expected"
+                             " 'new'" % names.get("mode"))
+    if names.get("save-name") != artifacts[0][0]:
+        raise AssertionError("save episode: provenance names %r, artifact %r"
+                             % (names.get("save-name"), artifacts[0][0]))
+    return pol, dict(pol.client.map), pol.client.s.get("title"), [
+        a[0] for a in artifacts]
 
 
 def _do_restore(args, saved_map, saved_title):
@@ -1030,6 +1088,29 @@ def _do_restore(args, saved_map, saved_title):
     if not any(o.get("hist") for o in obs):
         raise AssertionError("restore episode: no restored history was tagged"
                              " hist")
+    # Restored history is tagged hist AND is exclusive of the live message
+    # window at the boundary that publishes it: the very first boundary must
+    # already carry the history, and no line in that boundary may be tagged
+    # both hist and msg.  The known saved-game line is the concrete proof --
+    # it is restored history and must never be published as a live message.
+    hist_lines = [m.get("text") for o in obs for m in o.get("hist", [])]
+    msg_lines = [m.get("text") for o in obs for m in o.get("msg", [])]
+    if not first.get("hist"):
+        raise AssertionError("restore episode: the first boundary publishes"
+                             " no restored history")
+    both = sorted({m.get("text") for m in first.get("hist", [])}
+                  & {m.get("text") for m in first.get("msg", [])})
+    if both:
+        raise AssertionError("restore episode: the first boundary tags"
+                             " restored lines as live msgs: %r" % both[:3])
+    if "Saving..." not in hist_lines:
+        raise AssertionError("restore episode: the known saved-game history"
+                             " line is not tagged hist; hist=%r"
+                             % hist_lines[:6])
+    if "Saving..." in msg_lines:
+        raise AssertionError("restore episode: the known restored line was"
+                             " published as a live message, not history")
+    pol.restored_hist_lines = hist_lines
     if not first.get("map"):
         raise AssertionError("restore episode: the restored map is empty")
     # same game essence: the restored first snapshot reproduces the saved map
@@ -1102,6 +1183,124 @@ def cmd_lifecycle(args):
           % (len(spol.records), artifacts, len(rpol.records),
              rpol.time_first, rpol.time_last))
     return 0
+
+
+class SentinelSavePolicy(PlayPolicy):
+    """Play the deterministic opening, annotate the current level with a fixed
+    unique marker through the native #annotate path, then issue the native
+    save command.  The annotation is part of the saved game state, so a later
+    restore of this artifact re-publishes the marker ("You remember this level
+    as ...", the restore branch of moveloop's welcome) while a fresh episode
+    never can.  That makes the marker a two-direction contradiction sentinel:
+    absent from a fresh episode, present in the episode restored from this
+    one."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("quit", False)
+        PlayPolicy.__init__(self, *args, **kwargs)
+        self.save_requested = False
+        self.annotated = False
+
+    def answer_key(self, need):
+        if not self.gameplay_started:
+            self.gameplay_started = True
+        if self.time_first is None:
+            self.time_first = self.client.time_value()
+        self.time_last = self.client.time_value()
+        if self.move_index < len(self.moves):
+            key = self.moves[self.move_index]
+            self.move_index += 1
+        elif not self.annotated:
+            key = KEY_HASH
+            self.annotated = True
+        else:
+            key = KEY_S
+            self.save_requested = True
+        self.keys_sent.append(key)
+        self.send_act(need, {"key": key})
+
+    def answer_text(self, need):
+        # the single '#' reached the extended-command prompt: name the level
+        self.saw_extcmd = True
+        self.did_annotate = True
+        self.send_act(need, {"text": "annotate"})
+
+    def answer_line(self, need):
+        # the native annotation getlin: the fixed unique marker goes on the
+        # wire as ordinary player input and into the saved level annotation.
+        self.saw_line = True
+        self.send_act(need, {"text": SENTINEL_MARKER})
+
+
+def cmd_sentinel(args):
+    """Two-episode contamination sentinels.  Episode A annotates its level
+    with a fixed unique marker and saves; then a FRESH episode and an episode
+    RESTORED from A's artifact are both checked against that marker: the fresh
+    one must contain it nowhere, the restored one must contain it.  As a
+    restored game it must also carry A's message history as hist, exclusive of
+    the live message window."""
+    savedir = os.path.join(args.root, "save-artifact")
+    savepriv = os.path.join(args.root, "save-episode")
+    sa = argparse.Namespace(**vars(args))
+    sa.private_root, sa.mode, sa.save_out, sa.restore_in = \
+        savepriv, "new", savedir, None
+    try:
+        os.makedirs(args.root, exist_ok=True)
+        spol, _map, _title, artifacts = _do_save(
+            sa, policy=SentinelSavePolicy)
+    except AssertionError as exc:
+        return _fail(str(exc))
+    if not spol.did_annotate or not spol.saw_line:
+        return _fail("sentinel: the episode never reached the native"
+                     " annotation line prompt")
+    if not spol.save_requested:
+        return _fail("sentinel: the annotated episode was never saved")
+
+    # fresh episode: the marker must appear NOWHERE in its public stream
+    fresh_priv = os.path.join(args.root, "fresh-episode")
+    fa = argparse.Namespace(**vars(args))
+    fa.private_root, fa.mode, fa.save_out, fa.restore_in = \
+        fresh_priv, "new", None, None
+    try:
+        fpol, fcode = _run_policy(fa, PlayPolicy, moves=(KEY_L,), quit=True)
+    except (AssertionError, TimeoutError) as exc:
+        return _fail("sentinel fresh episode: %s" % exc)
+    if fcode != 0:
+        return _fail("sentinel fresh episode: runner exited %d" % fcode)
+    if _record_contains(fpol, SENTINEL_MARKER):
+        return _fail("sentinel: the FRESH episode published episode A's"
+                     " marker")
+
+    # restored episode: the same marker must now be present, because it lives
+    # in the saved game state A produced
+    rest_priv = os.path.join(args.root, "restore-episode")
+    ra = argparse.Namespace(**vars(args))
+    ra.private_root, ra.mode, ra.save_out, ra.restore_in = \
+        rest_priv, "restore", None, savedir
+    try:
+        rpol = _do_restore(ra, None, None)
+    except AssertionError as exc:
+        return _fail("sentinel restored episode: %s" % exc)
+    if not _record_contains(rpol, SENTINEL_MARKER):
+        return _fail("sentinel: the RESTORED episode did not reproduce"
+                     " episode A's marker from the saved state")
+    if _record_contains(fpol, SENTINEL_MARKER) or not _record_contains(
+            rpol, SENTINEL_MARKER):
+        return _fail("sentinel: marker directions are inconsistent")
+    print("driver: sentinel ok: artifact=%r; marker absent from fresh,"
+          " present in restored; %d restored hist lines"
+          % (artifacts, len(getattr(rpol, "restored_hist_lines", []))))
+    return 0
+
+
+def _record_contains(pol, needle):
+    """True when any public record's message, history, window or map text
+    carries `needle`.  The search covers the whole snapshot, not one field, so
+    a marker smuggled into a window title or a menu still counts."""
+    for rec in pol.records:
+        if needle in json.dumps(rec):
+            return True
+    return False
 
 
 class AbortPolicy(PlayPolicy):
@@ -1220,6 +1419,11 @@ def main(argv):
     common(lc)
     lc.add_argument("--root", required=True)
     lc.set_defaults(func=cmd_lifecycle)
+
+    sn = sub.add_parser("sentinel")
+    common(sn)
+    sn.add_argument("--root", required=True)
+    sn.set_defaults(func=cmd_sentinel)
 
     pl = sub.add_parser("plateau")
     common(pl)

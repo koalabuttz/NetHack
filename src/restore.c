@@ -847,7 +847,22 @@ dorecover(NHFILE *nhfp)
     if (!restgamestate(nhfp)) {
         NHFILE *tnhfp = get_freeing_nhfile();
 
+#ifdef AGENT_GRAPHICS
+        /* Plan section 4 hook-order step 10 / architecture section 7.2: a
+         * failed restore is a private fatal, never a publication.  The
+         * blocking flush below would publish the failure prose as a durable
+         * boundary and then wait for an agent acknowledgement while the
+         * publication gate is still closed -- exactly the state the
+         * quarantine forbids.  The message already went to the private sink,
+         * so in agent mode skip the flush and let the ordinary cleanup below
+         * run; the caller then terminates privately because the requested
+         * restore did not resume.  Human and SFCTOOL behavior is
+         * byte-identical. */
+        if (!agent_mode())
+            display_nhwindow(WIN_MESSAGE, TRUE);
+#else
         display_nhwindow(WIN_MESSAGE, TRUE);
+#endif
         savelev(tnhfp, 0); /* discard current level */
         close_nhfile(tnhfp);
         close_nhfile(nhfp);

@@ -128,6 +128,52 @@ saved-field binding, rationale. Rows behind a guard that is inactive in this
 build — and the two blocks that are compiled out entirely — are marked
 `unavailable-external`.
 
+## Save-artifact provenance (controller metadata)
+
+A native save crosses three trust boundaries — the worker writes it, the
+launcher moves it, and a later restore feeds it back — so the trusted launcher
+binds each exported artifact to the inputs that produced it. This record lives
+in the **controller-owned export directory** the test controller passes to
+`--save-out`, never on the player channel, and the worker never reads it.
+
+On **export** (`--save-out DIR`), the launcher writes `provenance.txt`
+alongside the artifact after copying it into a fresh staging path, fsync'ing,
+and renaming the staging directory into place. It is a canonical, sorted
+`key=value` file:
+
+| key | value |
+|---|---|
+| `version` | `1` |
+| `mode` | the launch mode that produced the artifact (`new`) |
+| `profile` | the frozen rendering profile name |
+| `owner-uid` | the uid that produced the artifact |
+| `worker-sha256` | digest of the worker executable |
+| `data-nhdat-sha256`, `data-license-sha256`, `data-symbols-sha256` | digest of each staged immutable data file |
+| `sysconf-sha256` | digest of the trusted sysconf |
+| `save-name` | the artifact's file name |
+| `save-sha256` | digest of the artifact bytes |
+
+On **restore** (`--restore-in DIR`), the launcher requires
+`provenance.txt` in that directory, recomputes every digest against what it is
+about to stage, and re-checks the profile, mode, owner scope and artifact name.
+An absence, an extra or missing artifact, or any mismatch is a **private
+launch failure** (exit 7, no worker started, no player byte). This is a
+per-save binding, not a substitute for the native restored-flags validation,
+which still runs inside `restore()` on the deserialized save.
+
+The harness stands in for the launcher when it drives a worker directly
+(`hostile_matrix.run_worker`), so `hostile_matrix.write_provenance` synthesises
+the same record for artifacts the matrix produces itself.
+
+```sh
+make -C test/agent lifecycle \
+    WORKER="$PWD/src/nethack" RUNNER="$PWD/src/nethack-agent" \
+    DATA=/tmp/agent-data SYSCONF=/tmp/agent-data/sysconf
+make -C test/agent sentinel \
+    WORKER="$PWD/src/nethack" RUNNER="$PWD/src/nethack-agent" \
+    DATA=/tmp/agent-data SYSCONF=/tmp/agent-data/sysconf
+```
+
 ## Explicit limits
 
 * `struct agent_view`, `struct agent_action`, and `struct agent_session` use

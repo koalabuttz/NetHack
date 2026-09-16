@@ -80,6 +80,9 @@ HS_MODE_TEST_MSGMENU = 62
 HS_MODE_TEST_EXEC = 63
 HS_MODE_TEST_RIP = 64
 HS_MODE_TEST_WIZSAVE = 65
+HS_MODE_TEST_BADSAVE = 66
+HS_MODE_TEST_WIZSAVEFILE = 67
+HS_MODE_TEST_GATEPROBE = 68
 TEST_MODE_KINDS = {
     "test-display": HS_MODE_TEST_DISPLAY,
     "test-select": HS_MODE_TEST_SELECT,
@@ -87,6 +90,9 @@ TEST_MODE_KINDS = {
     "test-exec": HS_MODE_TEST_EXEC,
     "test-rip": HS_MODE_TEST_RIP,
     "test-wizsave": HS_MODE_TEST_WIZSAVE,
+    "test-badsave": HS_MODE_TEST_BADSAVE,
+    "test-wizsavefile": HS_MODE_TEST_WIZSAVEFILE,
+    "test-gateprobe": HS_MODE_TEST_GATEPROBE,
     "restore": HS_MODE_RESTORE,
 }
 
@@ -107,6 +113,11 @@ CANONICAL_SYSCONF = (
 )
 
 FORBIDDEN_DIAG = "forbidden sysconf directive in agent mode"
+
+# The launcher's terminal-closure object (sys/unix/agent_runner.c).  It is the
+# only public line a rejected launch may carry: the worker itself publishes
+# nothing.
+CLOSED_LINE = '{"v":1,"ch":"control","type":"closed"}'
 
 # The game's lock file in the episode root: <letter>lock.<n>.  Its content is
 # the live process id, so it is compared by type and mode only.
@@ -192,9 +203,17 @@ def tree_signature(root):
             elif "/" not in rel and LOCKFILE_RE.match(rel):
                 sig[rel] = ("lockfile", stat.S_IMODE(st.st_mode))
             else:
-                with open(p, "rb") as fh:
-                    digest = hashlib.sha256(fh.read()).hexdigest()[:16]
-                sig[rel] = ("file", stat.S_IMODE(st.st_mode), digest)
+                mode = stat.S_IMODE(st.st_mode)
+                try:
+                    with open(p, "rb") as fh:
+                        digest = hashlib.sha256(fh.read()).hexdigest()[:16]
+                except OSError:
+                    # A file the engine deliberately made unreadable (mode 0,
+                    # the "disallow parallel restores" marker a restore
+                    # puts on the save it consumed) is compared by mode
+                    # alone.
+                    digest = None
+                sig[rel] = ("file", mode, digest)
     return sig
 
 
@@ -256,7 +275,8 @@ def setup_workdir(private_root, label, data_root):
 
 def run_worker(args, label, *, worker=None, extra_argv=(), env=None,
                handshake_kind="full", hostile_home=None, sysconf=None,
-               timeout=30, seed_save=None):
+               timeout=30, seed_save=None, capture_save=None,
+               shutdown_write=True):
     worker = worker or args.worker
     if sysconf is None:
         sysconf = args.sysconf
@@ -299,7 +319,8 @@ def run_worker(args, label, *, worker=None, extra_argv=(), env=None,
         blob = build_handshake(args.data, sysconf, workdir, handshake_kind)
         try:
             parent_sock.sendall(blob)
-            parent_sock.shutdown(socket.SHUT_WR)
+            if shutdown_write:
+                parent_sock.shutdown(socket.SHUT_WR)
         except OSError:
             pass
 
@@ -313,24 +334,63 @@ def run_worker(args, label, *, worker=None, extra_argv=(), env=None,
 
     with open(diagpath, "rb") as fh:
         diag_text = fh.read().decode("utf-8", "replace")
+    # Capture an artifact the worker wrote into its own save directory before
+    # the episode tree is torn down (test-only fixture production).
+    if capture_save:
+        os.makedirs(capture_save, exist_ok=True)
+        sd = os.path.join(workdir, "save")
+        if os.path.isdir(sd):
+            for name in os.listdir(sd):
+                src = os.path.join(sd, name)
+                if os.path.isfile(src):
+                    shutil.copyfile(src, os.path.join(capture_save, name))
     tree = tree_signature(workdir)
     shutil.rmtree(workdir, ignore_errors=True)
     return Result(public, code, diag_text, tree)
 
 
-def run_runner(args, label, env):
+def run_runner(args, label, env, extra=()):
     priv = tempfile.mkdtemp(prefix=label + ".", dir=args.private_root)
     argv = [args.runner, "--worker", args.worker, "--private-root", priv]
     if args.data:
         argv += ["--data", args.data]
     if args.sysconf:
         argv += ["--sysconf", args.sysconf]
+    argv += list(extra)
     proc = subprocess.run(argv, input=b"", stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, env=env, timeout=90)
     tree = tree_signature(priv)
     shutil.rmtree(priv, ignore_errors=True)
     return Result(proc.stdout, proc.returncode,
                   proc.stderr.decode("utf-8", "replace"), tree)
+
+
+def write_provenance(directory, worker, data, sysconf, artifact,
+                     profile=HS_PROFILE, mode="new", uid=None):
+    """Synthesise the controller-owned provenance record for an artifact the
+    harness produced directly (the matrix stands in for the launcher).  The
+    contract is the launcher's, in sys/unix/agent_runner.c: canonical
+    key=value lines binding the artifact to the build, staged data, profile,
+    producing mode and owner scope."""
+    if uid is None:
+        uid = os.getuid()
+
+    def dig(path):
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+
+    lines = ["version=1", "mode=%s" % mode, "profile=%s" % profile,
+             "owner-uid=%d" % uid, "worker-sha256=%s" % dig(worker)]
+    for name in ("nhdat", "license", "symbols"):
+        p = os.path.join(data, name) if data else None
+        if p and os.path.exists(p):
+            lines.append("data-%s-sha256=%s" % (name, dig(p)))
+    if sysconf:
+        lines.append("sysconf-sha256=%s" % dig(sysconf))
+    lines.append("save-name=%s" % artifact)
+    lines.append("save-sha256=%s" % dig(os.path.join(directory, artifact)))
+    with open(os.path.join(directory, "provenance.txt"), "w") as fh:
+        fh.write("\n".join(lines) + "\n")
 
 
 def worker_survivors(worker):
@@ -659,9 +719,8 @@ def main(argv):
             deadline=30, timeout=args.timeout,
             save_out=save_art, mode="new", restore_in=None)
         os.makedirs(ns.private_root, exist_ok=True)
-        _driver._do_save(ns)
-        real_save = [f for f in os.listdir(save_art)
-                     if os.path.isfile(os.path.join(save_art, f))]
+        _pol, _m, _t, artifacts = _driver._do_save(ns)
+        real_save = list(artifacts)
     except Exception as exc:
         failures.append("restore-fixture: could not produce a native save: %s"
                         % exc)
@@ -721,6 +780,31 @@ def main(argv):
                 failures.append("%s: restored map is empty" % label)
             if obs and not any(o.get("hist") for o in obs):
                 failures.append("%s: no restored history tagged hist" % label)
+            # restgamestate() carries the saved message history as hist and
+            # exclusive of the live message window AT THE BOUNDARY THAT
+            # PUBLISHES IT: the first boundary already carries the history, no
+            # line of it may be tagged both hist and msg there, and the known
+            # saved-game line must appear as history and never as a live msg.
+            if obs:
+                hist = [m.get("text") for o in obs for m in o.get("hist", [])]
+                msg = [m.get("text") for o in obs for m in o.get("msg", [])]
+                if not obs[0].get("hist"):
+                    failures.append("%s: the first boundary carries no"
+                                    " restored history" % label)
+                both = sorted({m.get("text") for m in obs[0].get("hist", [])}
+                              & {m.get("text")
+                                 for m in obs[0].get("msg", [])})
+                if both:
+                    failures.append("%s: the first boundary tags restored"
+                                    " lines as live messages: %r"
+                                    % (label, both[:3]))
+                if "Saving..." not in hist:
+                    failures.append("%s: the known saved-game history line"
+                                    " is not tagged hist (hist=%r)"
+                                    % (label, hist[:5]))
+                if "Saving..." in msg:
+                    failures.append("%s: the known restored line was"
+                                    " published as a live message" % label)
         else:
             if res.public:
                 failures.append("%s: expected zero public bytes, saw %r"
@@ -734,6 +818,149 @@ def main(argv):
                      str(res.exit_code),
                      "ok" if not any(label in f for f in failures)
                      else "FAIL"))
+
+    # ---- M4 restore gate: a same-build save that fails INSIDE
+    # restgamestate() and a same-build save carrying wizard mode.  Both
+    # fixtures are produced by the impossible worker's BADSAVE / WIZSAVEFILE
+    # launch modes, which restore the valid save above and re-write it through
+    # the engine's OWN save path with one hostile field -- so the matrix
+    # replays a REAL restore over a genuine same-build artifact rather than
+    # mutating bytes at a build-specific offset or driving a seam.
+    bad_save = tempfile.mkdtemp(prefix="badsave.", dir=args.private_root)
+    wiz_save = tempfile.mkdtemp(prefix="wizsavefile.", dir=args.private_root)
+    fixture_produced = {"badsave": [], "wizsavefile": []}
+    if real_save and args.impossible_worker:
+        for label, kind, dest in (
+                ("badsave", "test-badsave", bad_save),
+                ("wizsavefile", "test-wizsavefile", wiz_save)):
+            res = run_worker(args, "mk-" + label,
+                             worker=args.impossible_worker,
+                             handshake_kind=kind, seed_save=save_art,
+                             capture_save=dest, timeout=args.timeout)
+            fixture_produced[label] = [
+                f for f in os.listdir(dest)
+                if os.path.isfile(os.path.join(dest, f))]
+            if not fixture_produced[label]:
+                failures.append("%s fixture: the helper wrote no save;"
+                                " diag %r" % (label, res.diag[:160]))
+            rows.append(("mk-" + label, "fixture",
+                         "empty" if not res.public
+                         else "%d lines" % len(res.lines()),
+                         str(res.exit_code),
+                         "ok" if fixture_produced[label] else "FAIL"))
+
+        if fixture_produced["badsave"]:
+            # High 1: restgamestate() returns false, so dorecover()'s failure
+            # path is reached.  The restore must terminate privately with ZERO
+            # public bytes and must NEVER wait for an agent decision (the
+            # transport write side stays open here, so a blocking publish
+            # would hang instead of silently succeeding).
+            label = "restore-dead-hero"
+            res = run_worker(args, label, handshake_kind="restore",
+                             seed_save=bad_save, shutdown_write=False,
+                             timeout=args.timeout)
+            parse_records(res, schema, label, failures)
+            if res.public:
+                failures.append("%s: expected zero public bytes, saw %r"
+                                % (label, res.public[:80]))
+            if res.exit_code != 70:
+                failures.append("%s: exit %d, expected private 70"
+                                % (label, res.exit_code))
+            rows.append((label, "reject", "empty" if not res.public
+                         else "%d lines" % len(res.lines()),
+                         str(res.exit_code),
+                         "ok" if not any(label in f for f in failures)
+                         else "FAIL"))
+
+            # Launcher-level: give the same hostile artifact the controller's
+            # provenance so it passes the per-save binding and reaches the
+            # native restore, then assert the launcher publishes no player
+            # byte and cleans the private root it created.
+            label = "runner-restore-dead-hero"
+            lbad = tempfile.mkdtemp(prefix="badsave-prov.",
+                                    dir=args.private_root)
+            for f in fixture_produced["badsave"]:
+                shutil.copyfile(os.path.join(bad_save, f),
+                                os.path.join(lbad, f))
+            art = [f for f in os.listdir(lbad)
+                   if os.path.isfile(os.path.join(lbad, f))][0]
+            write_provenance(lbad, args.worker, args.data, args.sysconf, art)
+            lhome = os.path.join(hostile_home_root, label)
+            os.makedirs(lhome, exist_ok=True)
+            res = run_runner(args, label, clean_env(lhome),
+                             extra=["--mode", "restore",
+                                    "--restore-in", lbad])
+            parse_records(res, schema, label, failures)
+            if res.lines() != [CLOSED_LINE]:
+                failures.append("%s: expected only the launcher's terminal"
+                                " closure, saw %r" % (label, res.lines()[:3]))
+            if res.exit_code != 0:
+                failures.append("%s: launcher exit %d, expected 0"
+                                % (label, res.exit_code))
+            if res.tree:
+                failures.append("%s: private root not cleaned: %s"
+                                % (label, sorted(res.tree)[:5]))
+            rows.append((label, "reject", "empty" if not res.public
+                         else "%d lines" % len(res.lines()),
+                         str(res.exit_code),
+                         "ok" if not any(label in f for f in failures)
+                         else "FAIL"))
+
+        if fixture_produced["wizsavefile"]:
+            # Medium 4b: a valid save whose serialized flags carry debug mode
+            # must be rejected by agent_validate_restored_flags() DURING A
+            # REAL restore(), not only by the in-memory seam probe above.
+            label = "restore-wizard-savefile"
+            res = run_worker(args, label, handshake_kind="restore",
+                             seed_save=wiz_save, timeout=args.timeout)
+            parse_records(res, schema, label, failures)
+            if res.public:
+                failures.append("%s: expected zero public bytes, saw %r"
+                                % (label, res.public[:80]))
+            if res.exit_code != 70:
+                failures.append("%s: exit %d, expected private 70"
+                                % (label, res.exit_code))
+            if "restored save enables wizard mode" not in res.diag:
+                failures.append("%s: the restored-flags validator did not"
+                                " reject the real save; diag %r"
+                                % (label, res.diag[:160]))
+            rows.append((label, "reject", "empty" if not res.public
+                         else "%d lines" % len(res.lines()),
+                         str(res.exit_code),
+                         "ok" if not any(label in f for f in failures)
+                         else "FAIL"))
+
+        # Central gate enforcement, independent of the restore path: a commit
+        # attempted while the publication gate is closed must fail closed with
+        # a private fatal and zero public bytes.
+        label = "gate-closed-commit"
+        res = run_worker(args, label, worker=args.impossible_worker,
+                         handshake_kind="test-gateprobe",
+                         timeout=args.timeout)
+        parse_records(res, schema, label, failures)
+        if res.public:
+            failures.append("%s: expected zero public bytes, saw %r"
+                            % (label, res.public[:80]))
+        if res.exit_code != 70:
+            failures.append("%s: exit %d, expected private 70"
+                            % (label, res.exit_code))
+        if "commit while the publication gate is closed" not in res.diag:
+            failures.append("%s: the central guard did not fire; diag %r"
+                            % (label, res.diag[:160]))
+        rows.append((label, "reject", "empty" if not res.public
+                     else "%d lines" % len(res.lines()),
+                     str(res.exit_code),
+                     "ok" if not any(label in f for f in failures)
+                     else "FAIL"))
+    else:
+        for label in ("mk-badsave", "mk-wizsavefile", "restore-dead-hero",
+                      "runner-restore-dead-hero", "restore-wizard-savefile",
+                      "gate-closed-commit"):
+            rows.append((label, "skipped", "-", "-", "skipped"))
+        if args.require_impossible:
+            failures.append("--require-impossible: the M4 restore-gate cases "
+                            "could not run (no artifact or impossible"
+                            " worker)")
 
     # ---- runner-level case: hostile parent environment must not reach the
     # worker, and the worker's own HOME stays private.

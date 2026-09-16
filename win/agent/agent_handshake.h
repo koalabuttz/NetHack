@@ -39,7 +39,21 @@
 #define AG_HS_MODE_TEST_EXEC 63u
 #define AG_HS_MODE_TEST_RIP 64u
 #define AG_HS_MODE_TEST_WIZSAVE 65u
-#define AG_HS_MODE_TEST_LAST 65u
+#define AG_HS_MODE_TEST_LAST 68u
+/* The remaining test-only modes drive the M4 restore-publication gate end to
+ * end rather than a single seam:
+ *   BADSAVE      restores a valid save, rewrites it with a fallen hero
+ *                (u.uhp/u.mh zeroed) so a later restore fails inside
+ *                restgamestate(), and exits -- the broken-save fixture;
+ *   WIZSAVEFILE  restores a valid save and rewrites it with debug mode set,
+ *                so the restored-flags validator sees the flag through a REAL
+ *                save deserialization, not the in-memory seam;
+ *   GATEPROBE    closes the publication gate and commits a durable snapshot,
+ *                proving the central guard fails closed (private fatal, zero
+ *                public bytes) with no agent wait. */
+#define AG_HS_MODE_TEST_BADSAVE 66u
+#define AG_HS_MODE_TEST_WIZSAVEFILE 67u
+#define AG_HS_MODE_TEST_GATEPROBE 68u
 #endif /* AGENT_TEST_IMPOSSIBLE */
 
 #define AG_HS_PROFILE_MAX 64
