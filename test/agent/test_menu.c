@@ -281,6 +281,132 @@ main(void)
     CHECK(sel.rows[1].r == 3 && sel.rows[1].count == 2);
     CHECK(sel.rows[2].r == 4 && sel.rows[2].count == 1);
 
+    /* ---- selector-zero selectable row beyond the first protocol page ----
+     * A declared page boundary is a presentation slice, not an id boundary:
+     * row ids stay authoritative across pages, so a selection naming a row
+     * that would fall on a later page is legal and a large menu validates. */
+    {
+        static struct agent_menu_row big[AG_PAGE_MAX_ROWS + 40];
+        struct agent_menu bm;
+        size_t i;
+
+        for (i = 0; i < sizeof big / sizeof big[0]; ++i) {
+            memset(&big[i], 0, sizeof big[i]);
+            big[i].r = (long) i + 1;
+            snprintf(big[i].text, sizeof big[i].text, "row %lu",
+                     (unsigned long) (i + 1));
+            big[i].selectable = true;
+            /* row 140 carries no accelerator (selector zero) yet stays
+             * selectable, and it lies on the second page */
+            big[i].key = (i == AG_PAGE_MAX_ROWS + 11) ? 0
+                                                      : (int) ('a' + (i % 26));
+        }
+        memset(&bm, 0, sizeof bm);
+        bm.id = "m9";
+        bm.mode = AG_MENU_ANY;
+        bm.rows = big;
+        bm.nrows = sizeof big / sizeof big[0];
+        bm.cap = bm.nrows;
+        CHECK(agent_menu_check(&bm) == AG_OK);
+        memset(&a, 0, sizeof a);
+        commit[0].r = AG_PAGE_MAX_ROWS + 12; /* second page, selector zero */
+        commit[0].count = -1;
+        a.rows = commit;
+        a.nrows = 1;
+        CHECK(agent_menu_validate(&bm, &a, &sel) == AG_OK && sel.nrows == 1);
+        CHECK(sel.rows[0].r == AG_PAGE_MAX_ROWS + 12);
+        /* an id past the last row is rejected */
+        commit[0].r = (long) bm.nrows + 1;
+        CHECK(agent_menu_validate(&bm, &a, &sel) == AG_BAD_INPUT);
+    }
+
+    /* ---- SKIPINVERT row: explicit-id selection is legal in v1 ---------- */
+    {
+        struct agent_menu_row srow[3];
+        struct agent_menu sm;
+
+        /* row 2 is a native MENU_ITEMFLAGS_SKIPINVERT item.  Version 1
+         * publishes it as an ordinary selectable row (there is no public
+         * invert affordance) and requires explicit row-id selection; the
+         * group/invert/bulk shapes below stay rejected. */
+        memset(srow, 0, sizeof srow);
+        srow[0].r = 1;
+        snprintf(srow[0].text, sizeof srow[0].text, "heading");
+        srow[1].r = 2;
+        snprintf(srow[1].text, sizeof srow[1].text, "skipinvert item");
+        srow[1].selectable = true;
+        srow[1].key = 'i';
+        srow[1].group = ')';
+        srow[2].r = 3;
+        snprintf(srow[2].text, sizeof srow[2].text, "plain item");
+        srow[2].selectable = true;
+        srow[2].key = 'p';
+        srow[2].group = ')';
+        memset(&sm, 0, sizeof sm);
+        sm.id = "m1";
+        sm.mode = AG_MENU_ANY;
+        sm.rows = srow;
+        sm.nrows = 3;
+        sm.cap = 3;
+        CHECK(agent_menu_check(&sm) == AG_OK);
+        memset(&a, 0, sizeof a);
+        commit[0].r = 2;
+        commit[0].count = -1;
+        a.rows = commit;
+        a.nrows = 1;
+        CHECK(agent_menu_validate(&sm, &a, &sel) == AG_OK && sel.result == 1);
+        /* the advisory group accelerator never authorizes a bulk operation */
+        a.group_op = true;
+        CHECK(agent_menu_validate(&sm, &a, &sel) == AG_BAD_INPUT);
+        CHECK(sel.code == AG_INV_SCHEMA);
+        a.group_op = false;
+        a.invert = true;
+        CHECK(agent_menu_validate(&sm, &a, &sel) == AG_BAD_INPUT);
+        a.invert = false;
+        a.bulk = true;
+        CHECK(agent_menu_validate(&sm, &a, &sel) == AG_BAD_INPUT);
+    }
+
+    /* ---- duplicate visible text is never an identity ------------------ */
+    {
+        struct agent_menu_row drow[2];
+        struct agent_menu dm;
+
+        memset(drow, 0, sizeof drow);
+        drow[0].r = 1;
+        snprintf(drow[0].text, sizeof drow[0].text, "an apple");
+        drow[0].selectable = true;
+        drow[0].key = 'a';
+        drow[1].r = 2;
+        snprintf(drow[1].text, sizeof drow[1].text, "an apple");
+        drow[1].selectable = true;
+        drow[1].key = 'b';
+        memset(&dm, 0, sizeof dm);
+        dm.id = "m2";
+        dm.mode = AG_MENU_ANY;
+        dm.rows = drow;
+        dm.nrows = 2;
+        dm.cap = 2;
+        CHECK(agent_menu_check(&dm) == AG_OK);
+        /* two identical texts are distinct row ids: selecting both yields two
+         * results in insertion order, and there is no select-by-label path
+         * that could pick one of them arbitrarily. */
+        memset(&a, 0, sizeof a);
+        commit[0].r = 2;
+        commit[0].count = -1;
+        commit[1].r = 1;
+        commit[1].count = -1;
+        a.rows = commit;
+        a.nrows = 2;
+        CHECK(agent_menu_validate(&dm, &a, &sel) == AG_OK && sel.nrows == 2);
+        CHECK(sel.rows[0].r == 1 && sel.rows[1].r == 2);
+        /* an id that does not exist is rejected, never matched by text */
+        commit[0].r = 3;
+        a.nrows = 1;
+        CHECK(agent_menu_validate(&dm, &a, &sel) == AG_BAD_INPUT);
+        CHECK(sel.code == AG_INV_RANGE);
+    }
+
     /* ---- structural row invariants ---- */
     {
         struct agent_menu_row r2[3];

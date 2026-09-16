@@ -56,6 +56,22 @@ EXPECTED_PLAY_KINDS = [
     "yn", "yn", "yn", "yn", "yn",           # native confirmations
 ]
 
+# The breadth scenario's pinned interaction core, at need-kind offsets 16..29:
+# the shared selection prefix (8 kinds) and the movement keys + the first
+# breadth key (8 commands) come first, then inventory (menu + item menu),
+# farlook (menu + tips menu + position), help (menu + paged text ack),
+# annotation (#extcmd + line), and the quit extcmd.  The remaining kinds are
+# the native quit confirmations.
+EXPECTED_BREADTH_KINDS = [
+    "menu", "menu",                              # inventory, item menu
+    "command",                                   # farlook
+    "menu", "menu", "position",                  # look menu, tips, getpos
+    "command",                                   # help
+    "menu", "ack",                               # help topics, paged text
+    "command", "extcmd", "line",                 # annotate
+    "command", "extcmd",                         # quit
+]
+
 
 def _fail(msg):
     print("driver: FAIL: %s" % msg)
@@ -377,11 +393,15 @@ class PlayPolicy(Episode):
 
     def __init__(self, runner, schema, timeout=30,
                  moves=(KEY_L, KEY_L, KEY_H, 46, KEY_J, KEY_K, 46),
-                 role_text="Barbarian", quit=True):
+                 role_text="Barbarian", quit=True, breadth=()):
         Episode.__init__(self, runner, schema, timeout)
         self.moves = list(moves)
         self.role_text = role_text
         self.quit = quit
+        # breadth commands issued between the movement script and the quit path
+        self.breadth = list(breadth)
+        self.bi = 0
+        self.saw_text_page = 0
         self.answered_menus = 0
         self.role_chosen = None
         self.menu_titles = []
@@ -410,6 +430,7 @@ class PlayPolicy(Episode):
             pages = need.get("pages", 0)
             if pages:
                 self.fetch_pages(need)
+                self.saw_text_page += 1
             self.send_act(need, {"ack": True})
         elif kind in ("line", "extcmd"):
             if kind == "line":
@@ -417,13 +438,22 @@ class PlayPolicy(Episode):
             else:
                 self.answer_text(need)
         elif kind == "position":
-            self.send_act(need, {"key": ord(".")})
+            # a farlook/getpos request is cancelled with native Escape; a
+            # breadth script never needs to select a map square
+            self.send_act(need, {"key": 27})
         else:
             raise AssertionError("unexpected need kind %r" % kind)
 
     def answer_yn(self, need):
         prompt = need.get("prompt") or ""
         low = prompt.lower()
+        if self.breadth and self.gameplay_started \
+                and need.get("choices") is None \
+                and need.get("default") is None:
+            # an unrestricted native getobj prompt during play: Escape aborts
+            # it cleanly and returns to the command prompt
+            self.send_act(need, {"yn": 27})
+            return
         if "shall i pick" in low:
             key = KEY_N
         elif "quit" in low or "save" in low:
@@ -445,14 +475,25 @@ class PlayPolicy(Episode):
         self.menu_titles.append(title)
         selectable = [r for r in rows if r.get("selectable")]
         choice = None
-        # prefer the deterministic non-tutorial path, then the confirmation
-        for marker in ("No, just start play", "Yes; start game"):
-            for r in selectable:
-                if marker in r["text"]:
-                    choice = r
+        # breadth: from the inventory pick an item to inspect, and from the
+        # help topic list choose a text topic (so a text window is paged)
+        if self.breadth:
+            for marker in ("Look up information", "List of game commands"):
+                for r in selectable:
+                    if marker in r["text"]:
+                        choice = r
+                        break
+                if choice is not None:
                     break
-            if choice is not None:
-                break
+        # prefer the deterministic non-tutorial path, then the confirmation
+        if choice is None:
+            for marker in ("No, just start play", "Yes; start game"):
+                for r in selectable:
+                    if marker in r["text"]:
+                        choice = r
+                        break
+                if choice is not None:
+                    break
         if choice is None and self.role_chosen is None:
             for r in selectable:
                 if self.role_text.lower() in r["text"].lower():
@@ -482,6 +523,9 @@ class PlayPolicy(Episode):
         if self.move_index < len(self.moves):
             key = self.moves[self.move_index]
             self.move_index += 1
+        elif self.bi < len(self.breadth):
+            key = ord(self.breadth[self.bi])
+            self.bi += 1
         elif self.quit and self.hash_count < 2:
             # first '#' reaches the native line prompt, second asks to quit
             key = KEY_HASH
@@ -628,6 +672,83 @@ def cmd_play(args):
     return 0
 
 
+def cmd_breadth(args):
+    """Interaction breadth on real engine menus: inventory, farlook, help
+    (with text paging), annotation, and the native quit confirmations."""
+    schema = json.load(open(schema_check.SCHEMA))
+    os.makedirs(args.private_root, exist_ok=True)
+    before = set(os.listdir(args.private_root))
+
+    runner = Runner(args)
+    pol = PlayPolicy(runner, schema, timeout=args.timeout,
+                     breadth=("i", "/", "?", "#"))
+    try:
+        pol.run()
+        pol.verify_reconstruction()
+    except (AssertionError, TimeoutError) as exc:
+        runner.finish()
+        return _fail(str(exc))
+    code, out, err = runner.finish()
+
+    if code != 0:
+        return _fail("runner exited %d (expected a clean 0)" % code)
+    if pol.seen_hello != 1:
+        return _fail("expected exactly one hello, saw %d" % pol.seen_hello)
+    if pol.seen_closed != 1:
+        return _fail("expected exactly one closed, saw %d" % pol.seen_closed)
+    if pol.invalids:
+        return _fail("the episode emitted invalid records: %r" % pol.invalids)
+    if not pol.gameplay_started:
+        return _fail("character selection never completed")
+    if pol.role_chosen != "a Barbarian":
+        return _fail("unexpected role selection %r" % (pol.role_chosen,))
+    if pol.bi < len(pol.breadth):
+        return _fail("only %d of %d breadth commands were issued"
+                     % (pol.bi, len(pol.breadth)))
+    if pol.saw_text_page < 1:
+        return _fail("expected at least one paged text window, saw %d"
+                     % pol.saw_text_page)
+    if not pol.saw_line:
+        return _fail("no native line prompt was ever answered")
+    if not pol.saw_extcmd:
+        return _fail("the extended-command path was never exercised")
+    if not pol.saw_quit_yn:
+        return _fail("the native quit confirmation was never requested")
+
+    # one durable response per accepted action
+    if pol.obs_seen + pol.seen_closed != pol.acts_sent + 1:
+        return _fail("expected one response per action: %d obs + %d closed "
+                     "for %d acts" % (pol.obs_seen, pol.seen_closed,
+                                      pol.acts_sent))
+    # the deterministic selection prefix, then the movement+breadth commands,
+    # then the pinned interaction core, then the native quit confirmations
+    if pol.need_kinds[:8] != EXPECTED_PLAY_KINDS[:8]:
+        return _fail("selection-kind prefix differs:\n  got      %r\n"
+                     "  expected %r" % (pol.need_kinds[:8],
+                                       EXPECTED_PLAY_KINDS[:8]))
+    if pol.need_kinds[8:16] != ["command"] * 8:
+        return _fail("movement/breadth command block differs: %r"
+                     % (pol.need_kinds[8:16],))
+    if pol.need_kinds[16:30] != EXPECTED_BREADTH_KINDS:
+        return _fail("breadth-kind transcript differs:\n  got      %r\n"
+                     "  expected %r" % (pol.need_kinds[16:30],
+                                       EXPECTED_BREADTH_KINDS))
+    tail = pol.need_kinds[30:]
+    if not tail or any(k != "yn" for k in tail):
+        return _fail("quit-confirmation tail differs: %r" % (tail,))
+
+    after = set(os.listdir(args.private_root))
+    if after != before:
+        return _fail("private root was not cleaned: leftovers %s"
+                     % sorted(after - before))
+
+    print("driver: breadth ok: %d records; role=%r; menus=%r; paged-text=%d; "
+          "keys=%r" % (len(pol.records), pol.role_chosen, pol.menu_titles,
+                       pol.saw_text_page, pol.keys_sent))
+    print("driver: request-kind transcript: %s" % (pol.need_kinds,))
+    return 0
+
+
 def main(argv):
     ap = argparse.ArgumentParser(prog="driver.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -649,6 +770,10 @@ def main(argv):
     pl = sub.add_parser("play")
     common(pl)
     pl.set_defaults(func=cmd_play)
+
+    br = sub.add_parser("breadth")
+    common(br)
+    br.set_defaults(func=cmd_breadth)
 
     args = ap.parse_args(argv)
     return args.func(args)

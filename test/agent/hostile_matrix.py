@@ -695,7 +695,21 @@ def main(argv):
                      "probe yn-reset=1", "probe yn-escape=1",
                      "probe yn-hidden=1", "probe yn-count=1",
                      "probe yn-zero=1", "probe yndir-kind=1",
-                     "probe ynkind-other=1"):
+                     "probe ynkind-other=1",
+                     "probe menu-multipage=1",
+                     "probe menu-incomplete=1",
+                     "probe menu-selector0-multipage=1",
+                     "probe menu-public-rows=1",
+                     "probe menu-duplicate=1",
+                     "probe menu-heading-reject=1",
+                     "probe menu-skipinvert=1",
+                     "probe menu-forbidden=1",
+                     "probe menu-count=1",
+                     "probe menu-empty=1",
+                     "probe menu-preselect=1",
+                     "probe menu-cancel=1",
+                     "probe menu-repeat=1",
+                     "probe menu-stale=1"):
             if want not in res.diag:
                 failures.append("impossible: private diag missing %r" % want)
         rows.append(("impossible", "reject", "empty", str(res.exit_code),

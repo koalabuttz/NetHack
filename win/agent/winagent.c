@@ -833,9 +833,17 @@ static void agent_test_msg_store_probe(void);
 static void agent_test_msghistory_probe(void);
 static void agent_test_display_file_probe(void);
 static void agent_test_yn_parity_probe(void);
+static void agent_test_menu_contract_probe(void);
 static winid agent_create_nhwindow(int type);
 static void agent_clear_nhwindow(winid window);
 static void agent_destroy_nhwindow(winid window);
+static int agent_select_menu(winid window, int how, MENU_ITEM_P **menu_list);
+static void agent_start_menu(winid window, unsigned long mbehavior);
+static void agent_add_menu(winid window, const glyph_info *glyphinfo,
+                           const ANY_P *identifier, char ch, char gch,
+                           int attr, int color, const char *str,
+                           unsigned int itemflags);
+static void agent_end_menu(winid window, const char *prompt);
 static void ag_display_file_title(struct ag_winrec *r);
 static void agent_putmsghistory(const char *msg, boolean restoring);
 
@@ -877,6 +885,7 @@ agent_test_diagnostics(void)
     agent_test_msghistory_probe();
     agent_test_display_file_probe();
     agent_test_yn_parity_probe();
+    agent_test_menu_contract_probe();
 
     impossible("AGENT_TEST_IMPOSSIBLE: injected diagnostic");
 }
@@ -1197,6 +1206,393 @@ agent_test_yn_parity_probe(void)
     program_state.input_state = otherInp;
     agent_test_probe("ynkind-other",
                      agent_input_yn_kind() == AG_NEED_YN);
+}
+
+/* ------------------------------------------------------------------ */
+/* M3: the complete adapter-level menu contract, through REAL callbacks. */
+/*                                                                      */
+/* Every menu below is constructed with the engine's own start_menu/    */
+/* add_menu/end_menu path and answered through the real                  */
+/* agent_select_menu, so sidecar capture, the public model, final-set    */
+/* validation and the native result mapping are exercised together.      */
+/* Each gate vector reports one `probe menu-*=1` line the matrix checks. */
+/* ------------------------------------------------------------------ */
+
+#define AG_TEST_MENU_CAP 256
+#define AG_TEST_LINE 160
+
+struct ag_test_item {
+    const char *text;
+    int ch;              /* advisory accelerator, 0 = selector zero */
+    unsigned int flags;  /* MENU_ITEMFLAGS_* */
+    int heading;         /* nonzero: no identifier (unselectable) */
+};
+
+/* Build a menu through the real callbacks.  Identifiers are the copied
+ * integers 1..n (never dereferenced); a heading row supplies no identifier. */
+static winid
+ag_test_build_menu(const struct ag_test_item *items, size_t n,
+                   const char *prompt, unsigned long behavior)
+{
+    static anything anys[AG_TEST_MENU_CAP];
+    winid win = agent_create_nhwindow(NHW_MENU);
+    size_t i;
+
+    agent_start_menu(win, behavior);
+    for (i = 0; i < n; ++i) {
+        anys[i] = cg.zeroany;
+        anys[i].a_int = (int) (i + 1);
+        agent_add_menu(win, &nul_glyphinfo,
+                       items[i].heading ? (const ANY_P *) 0 : &anys[i],
+                       (char) items[i].ch, 0, ATR_NONE, NO_COLOR,
+                       items[i].text, items[i].flags);
+    }
+    agent_end_menu(win, prompt);
+    return win;
+}
+
+static size_t
+ag_test_menu_pages(struct ag_winrec *r)
+{
+    size_t nrows = 0, pages;
+    struct agent_content_row *rows = ag_menu_to_rows(r, &nrows);
+
+    pages = agent_content_pages(rows, nrows);
+    if (rows)
+        free(rows);
+    return pages;
+}
+
+/* Drive one real select_menu against scripted action lines. */
+static int
+ag_scr_run_menu(winid win, int how, MENU_ITEM_P **out,
+                const char **lines, size_t n)
+{
+    struct agent_session *s = agent_port_session();
+    agent_read_fn sr = s->read;
+    agent_write_fn sw = s->write;
+    void *sio = s->io;
+    int ret;
+
+    ag_scr.lines = lines;
+    ag_scr.n = n;
+    ag_scr.i = 0;
+    ag_scr.outlen = 0;
+    ag_scr.out[0] = '\0';
+    s->read = ag_scr_read;
+    s->write = ag_scr_write;
+    s->io = &ag_scr;
+
+    ret = agent_select_menu(win, how, out);
+
+    s->read = sr;
+    s->write = sw;
+    s->io = sio;
+    return ret;
+}
+
+static void
+ag_test_commit(char *buf, size_t cap, uint64_t id, const char *menu,
+               long (*pairs)[2], size_t n)
+{
+    size_t i, o = 0;
+
+    o += (size_t) snprintf(buf + o, cap - o,
+                           "{\"v\":1,\"type\":\"act\",\"id\":%llu,"
+                           "\"action\":{\"menu\":\"%s\",\"commit\":[",
+                           (unsigned long long) id, menu);
+    for (i = 0; i < n; ++i)
+        o += (size_t) snprintf(buf + o, cap - o, "%s[%ld,%ld]",
+                               i ? "," : "", pairs[i][0], pairs[i][1]);
+    (void) snprintf(buf + o, cap - o, "]}}\n");
+}
+
+static void
+ag_test_getpage(char *buf, size_t cap, uint64_t id, const char *content,
+                unsigned page)
+{
+    (void) snprintf(buf, cap,
+                    "{\"v\":1,\"type\":\"get_page\",\"id\":%llu,"
+                    "\"content\":\"%s\",\"page\":%u}\n",
+                    (unsigned long long) id, content, page);
+}
+
+static void
+agent_test_menu_contract_probe(void)
+{
+    static struct ag_test_item items[AG_TEST_MENU_CAP];
+    static char names[AG_TEST_MENU_CAP][24];
+    static struct ag_test_item sitems[2];
+    struct ag_winrec *wr, *wr2;
+    MENU_ITEM_P *out;
+    winid win, win2;
+    char l1[AG_TEST_LINE], l2[AG_TEST_LINE];
+    char g0[AG_TEST_LINE], g1[AG_TEST_LINE];
+    const char *script[6];
+    long pairs[2][2];
+    uint64_t id;
+    size_t pages, pages2, n;
+    int ret, first_ok;
+
+    agent_session_open();
+
+    /* menu M: heading, preselected row, duplicate visible text, a selector-zero
+     * selectable row, a SKIPINVERT row, then fillers so the menu spans more
+     * than one protocol page (> AG_PAGE_MAX_ROWS). */
+    n = 0;
+    items[n].text = "Weapons"; items[n].ch = 0;
+    items[n].flags = MENU_ITEMFLAGS_NONE; items[n].heading = 1; ++n;
+    items[n].text = "a dagger"; items[n].ch = 'a';
+    items[n].flags = MENU_ITEMFLAGS_SELECTED; items[n].heading = 0; ++n;
+    items[n].text = "a dagger"; items[n].ch = 'b';
+    items[n].flags = MENU_ITEMFLAGS_NONE; items[n].heading = 0; ++n;
+    items[n].text = "b dagger"; items[n].ch = 0;   /* selector zero */
+    items[n].flags = MENU_ITEMFLAGS_NONE; items[n].heading = 0; ++n;
+    items[n].text = "c dagger"; items[n].ch = 'c';
+    items[n].flags = MENU_ITEMFLAGS_SKIPINVERT; items[n].heading = 0; ++n;
+    while (n < 205) {
+        (void) snprintf(names[n], sizeof names[n], "filler %u",
+                        (unsigned) (n + 1));
+        items[n].text = names[n]; items[n].ch = 0;
+        items[n].flags = MENU_ITEMFLAGS_NONE; items[n].heading = 0; ++n;
+    }
+    win = ag_test_build_menu(items, n, "What do you want?",
+                             MENU_BEHAVE_STANDARD);
+    wr = ag_winrec_find(win);
+    pages = ag_test_menu_pages(wr);
+    agent_test_probe("menu-multipage",
+                     wr != 0 && wr->nrows == 205 && pages >= 2);
+
+    /* no selection until every required page is delivered: a commit first
+     * yields invalid(incomplete) and leaves the request outstanding. */
+    id = agent_next_request;
+    ag_test_getpage(g0, sizeof g0, id, wr->content, 0);
+    ag_test_getpage(g1, sizeof g1, id, wr->content, 1);
+    pairs[0][0] = 4; pairs[0][1] = -1;  /* the selector-zero row */
+    ag_test_commit(l1, sizeof l1, id, wr->menu_id, pairs, 1);
+    script[0] = l1; script[1] = g0; script[2] = g1; script[3] = l1;
+    out = (MENU_ITEM_P *) 0;
+    ret = ag_scr_run_menu(win, PICK_ANY, &out, script, 4);
+    agent_test_probe("menu-incomplete",
+                     ret == 1 && out && out[0].item.a_int == 4
+                         && out[0].count == -1
+                         && ag_scr_count("\"code\":\"incomplete\"") >= 1
+                         && ag_scr_count("\"type\":\"page\"") == 2);
+    if (out)
+        free(out);
+
+    /* selector-zero selectable row, reachable by row id across pages, and the
+     * public content preserves the ordered heading, the duplicate text, the
+     * preselected initial, and the unselectable heading row. */
+    id = agent_next_request;
+    ag_test_getpage(g0, sizeof g0, id, wr->content, 0);
+    ag_test_getpage(g1, sizeof g1, id, wr->content, 1);
+    pairs[0][0] = 4; pairs[0][1] = -1;
+    ag_test_commit(l1, sizeof l1, id, wr->menu_id, pairs, 1);
+    script[0] = g0; script[1] = g1; script[2] = l1;
+    out = (MENU_ITEM_P *) 0;
+    ret = ag_scr_run_menu(win, PICK_ANY, &out, script, 3);
+    agent_test_probe("menu-selector0-multipage",
+                     ret == 1 && out && out[0].item.a_int == 4
+                         && out[0].count == -1);
+    agent_test_probe("menu-public-rows",
+                     ag_scr_count("\"text\":\"a dagger\"") == 2
+                         && ag_scr_count("\"text\":\"Weapons\"") == 1
+                         && ag_scr_count("\"initial\":-1") >= 1
+                         && ag_scr_count("\"selectable\":false") >= 1);
+    if (out)
+        free(out);
+
+    /* duplicate visible text: row ids are authoritative, and the submitted
+     * set is normalized to menu insertion order with per-row counts. */
+    id = agent_next_request;
+    ag_test_getpage(g0, sizeof g0, id, wr->content, 0);
+    ag_test_getpage(g1, sizeof g1, id, wr->content, 1);
+    pairs[0][0] = 2; pairs[0][1] = 3;
+    pairs[1][0] = 3; pairs[1][1] = -1;
+    ag_test_commit(l1, sizeof l1, id, wr->menu_id, pairs, 2);
+    script[0] = g0; script[1] = g1; script[2] = l1;
+    out = (MENU_ITEM_P *) 0;
+    ret = ag_scr_run_menu(win, PICK_ANY, &out, script, 3);
+    agent_test_probe("menu-duplicate",
+                     ret == 2 && out && out[0].item.a_int == 2
+                         && out[0].count == 3 && out[1].item.a_int == 3
+                         && out[1].count == -1);
+    if (out)
+        free(out);
+
+    /* a heading row is not selectable: explicit selection is rejected and the
+     * request stays outstanding until a legal commit. */
+    id = agent_next_request;
+    ag_test_getpage(g0, sizeof g0, id, wr->content, 0);
+    ag_test_getpage(g1, sizeof g1, id, wr->content, 1);
+    pairs[0][0] = 1; pairs[0][1] = -1;
+    ag_test_commit(l1, sizeof l1, id, wr->menu_id, pairs, 1);
+    pairs[0][0] = 2; pairs[0][1] = -1;
+    ag_test_commit(l2, sizeof l2, id, wr->menu_id, pairs, 1);
+    script[0] = g0; script[1] = g1; script[2] = l1; script[3] = l2;
+    out = (MENU_ITEM_P *) 0;
+    ret = ag_scr_run_menu(win, PICK_ANY, &out, script, 4);
+    agent_test_probe("menu-heading-reject",
+                     ret == 1 && out && out[0].item.a_int == 2
+                         && ag_scr_count("\"code\":\"kind\"") >= 1);
+    if (out)
+        free(out);
+
+    /* SKIPINVERT row: explicit row-id selection is legal in v1. */
+    id = agent_next_request;
+    ag_test_getpage(g0, sizeof g0, id, wr->content, 0);
+    ag_test_getpage(g1, sizeof g1, id, wr->content, 1);
+    pairs[0][0] = 5; pairs[0][1] = -1;
+    ag_test_commit(l1, sizeof l1, id, wr->menu_id, pairs, 1);
+    script[0] = g0; script[1] = g1; script[2] = l1;
+    out = (MENU_ITEM_P *) 0;
+    ret = ag_scr_run_menu(win, PICK_ANY, &out, script, 3);
+    agent_test_probe("menu-skipinvert",
+                     ret == 1 && out && out[0].item.a_int == 5
+                         && out[0].count == -1);
+    if (out)
+        free(out);
+
+    /* group/invert/bulk shapes remain rejected end-to-end, without consuming
+     * the request. */
+    id = agent_next_request;
+    ag_test_getpage(g0, sizeof g0, id, wr->content, 0);
+    ag_test_getpage(g1, sizeof g1, id, wr->content, 1);
+    (void) snprintf(l1, sizeof l1,
+                    "{\"v\":1,\"type\":\"act\",\"id\":%llu,"
+                    "\"action\":{\"menu\":\"%s\",\"commit\":[[5,1]],"
+                    "\"invert\":true}}\n",
+                    (unsigned long long) id, wr->menu_id);
+    pairs[0][0] = 5; pairs[0][1] = 1;
+    ag_test_commit(l2, sizeof l2, id, wr->menu_id, pairs, 1);
+    script[0] = g0; script[1] = g1; script[2] = l1; script[3] = l2;
+    out = (MENU_ITEM_P *) 0;
+    ret = ag_scr_run_menu(win, PICK_ANY, &out, script, 4);
+    agent_test_probe("menu-forbidden",
+                     ret == 1 && out
+                         && ag_scr_count("\"code\":\"schema\"") >= 1);
+    if (out)
+        free(out);
+
+    /* positive count roundtrip. */
+    id = agent_next_request;
+    ag_test_getpage(g0, sizeof g0, id, wr->content, 0);
+    ag_test_getpage(g1, sizeof g1, id, wr->content, 1);
+    pairs[0][0] = 2; pairs[0][1] = 3;
+    ag_test_commit(l1, sizeof l1, id, wr->menu_id, pairs, 1);
+    script[0] = g0; script[1] = g1; script[2] = l1;
+    out = (MENU_ITEM_P *) 0;
+    ret = ag_scr_run_menu(win, PICK_ANY, &out, script, 3);
+    agent_test_probe("menu-count", ret == 1 && out && out[0].count == 3);
+    if (out)
+        free(out);
+
+    /* PICK_ANY preselected: an accepted empty commit returns native 0 and no
+     * results, never the preselection. */
+    id = agent_next_request;
+    ag_test_getpage(g0, sizeof g0, id, wr->content, 0);
+    ag_test_getpage(g1, sizeof g1, id, wr->content, 1);
+    (void) snprintf(l1, sizeof l1,
+                    "{\"v\":1,\"type\":\"act\",\"id\":%llu,"
+                    "\"action\":{\"menu\":\"%s\",\"commit\":[]}}\n",
+                    (unsigned long long) id, wr->menu_id);
+    script[0] = g0; script[1] = g1; script[2] = l1;
+    out = (MENU_ITEM_P *) -1;
+    ret = ag_scr_run_menu(win, PICK_ANY, &out, script, 3);
+    agent_test_probe("menu-empty", ret == 0 && out == (MENU_ITEM_P *) 0);
+
+    /* explicit commit of the preselected row works. */
+    id = agent_next_request;
+    ag_test_getpage(g0, sizeof g0, id, wr->content, 0);
+    ag_test_getpage(g1, sizeof g1, id, wr->content, 1);
+    pairs[0][0] = 2; pairs[0][1] = -1;
+    ag_test_commit(l1, sizeof l1, id, wr->menu_id, pairs, 1);
+    script[0] = g0; script[1] = g1; script[2] = l1;
+    out = (MENU_ITEM_P *) 0;
+    ret = ag_scr_run_menu(win, PICK_ANY, &out, script, 3);
+    agent_test_probe("menu-preselect",
+                     ret == 1 && out && out[0].item.a_int == 2);
+    if (out)
+        free(out);
+
+    /* explicit cancel returns native -1 and no results. */
+    id = agent_next_request;
+    (void) snprintf(l1, sizeof l1,
+                    "{\"v\":1,\"type\":\"act\",\"id\":%llu,"
+                    "\"action\":{\"cancel\":true}}\n",
+                    (unsigned long long) id);
+    script[0] = l1;
+    out = (MENU_ITEM_P *) -1;
+    ret = ag_scr_run_menu(win, PICK_ANY, &out, script, 1);
+    agent_test_probe("menu-cancel",
+                     ret == -1 && out == (MENU_ITEM_P *) 0);
+
+    /* repeated select_menu on the SAME constructed menu: the private template
+     * is retained (row count unchanged), a fresh request is created, and the
+     * previous request's id is dead. */
+    id = agent_next_request;
+    ag_test_getpage(g0, sizeof g0, id, wr->content, 0);
+    ag_test_getpage(g1, sizeof g1, id, wr->content, 1);
+    pairs[0][0] = 2; pairs[0][1] = -1;
+    ag_test_commit(l1, sizeof l1, id, wr->menu_id, pairs, 1);
+    script[0] = g0; script[1] = g1; script[2] = l1;
+    out = (MENU_ITEM_P *) 0;
+    ret = ag_scr_run_menu(win, PICK_ANY, &out, script, 3);
+    first_ok = (ret == 1 && out && out[0].item.a_int == 2);
+    if (out)
+        free(out);
+
+    id = agent_next_request;
+    ag_test_getpage(g0, sizeof g0, id, wr->content, 0);
+    ag_test_getpage(g1, sizeof g1, id, wr->content, 1);
+    /* an ancestral request id (id 1 was accepted long ago) is dead: a commit
+     * carrying it is stale, then the fresh request's commit succeeds. */
+    (void) snprintf(l2, sizeof l2,
+                    "{\"v\":1,\"type\":\"act\",\"id\":1,"
+                    "\"action\":{\"menu\":\"%s\",\"commit\":[[3,-1]]}}\n",
+                    wr->menu_id);
+    pairs[0][0] = 3; pairs[0][1] = -1;
+    ag_test_commit(l1, sizeof l1, id, wr->menu_id, pairs, 1);
+    script[0] = g0; script[1] = g1; script[2] = l2; script[3] = l1;
+    out = (MENU_ITEM_P *) 0;
+    ret = ag_scr_run_menu(win, PICK_ANY, &out, script, 4);
+    agent_test_probe("menu-repeat",
+                     first_ok && ret == 1 && out && out[0].item.a_int == 3
+                         && wr->nrows == 205
+                         && ag_scr_count("\"code\":\"stale\"") >= 1);
+    if (out)
+        free(out);
+
+    /* a commit naming a superseded menu generation is stale, the request stays
+     * outstanding, and a legal commit on the current generation then works. */
+    sitems[0].text = "alpha"; sitems[0].ch = 'a';
+    sitems[0].flags = MENU_ITEMFLAGS_NONE; sitems[0].heading = 0;
+    sitems[1].text = "beta"; sitems[1].ch = 'b';
+    sitems[1].flags = MENU_ITEMFLAGS_NONE; sitems[1].heading = 0;
+    win2 = ag_test_build_menu(sitems, 2, "pick one", MENU_BEHAVE_STANDARD);
+    wr2 = ag_winrec_find(win2);
+    pages2 = ag_test_menu_pages(wr2);
+    id = agent_next_request;
+    ag_test_getpage(g0, sizeof g0, id, wr2->content, 0);
+    (void) snprintf(l1, sizeof l1,
+                    "{\"v\":1,\"type\":\"act\",\"id\":%llu,"
+                    "\"action\":{\"menu\":\"%s\",\"commit\":[[1,-1]]}}\n",
+                    (unsigned long long) id, wr->menu_id);
+    pairs[0][0] = 1; pairs[0][1] = -1;
+    ag_test_commit(l2, sizeof l2, id, wr2->menu_id, pairs, 1);
+    script[0] = g0; script[1] = l1; script[2] = l2;
+    out = (MENU_ITEM_P *) 0;
+    ret = ag_scr_run_menu(win2, PICK_ANY, &out, script, 3);
+    agent_test_probe("menu-stale",
+                     pages2 == 1 && ret == 1 && out
+                         && out[0].item.a_int == 1
+                         && ag_scr_count("\"code\":\"stale\"") >= 1);
+    if (out)
+        free(out);
+
+    agent_destroy_nhwindow(win2);
+    agent_destroy_nhwindow(win);
 }
 
 static void agent_test_mode_dispatch(void);

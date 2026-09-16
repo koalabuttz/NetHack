@@ -2034,6 +2034,14 @@ ag_build_parts(struct ag_parts *ps, const struct agent_view *v,
         if (need->prompt) {
             ag_puts(&b, ",\"prompt\":");
             ag_put_jstr(&b, need->prompt);
+        } else if (need->kind == AG_NEED_POSITION || need->kind == AG_NEED_YN
+                   || need->kind == AG_NEED_LINE
+                   || need->kind == AG_NEED_EXTCMD) {
+            /* these requests advertise a displayed prompt, so the field is
+             * always present; a native position request is prompted through
+             * the message window (already published in msg), so the adapter
+             * supplies no separate prompt and an empty one is published. */
+            ag_puts(&b, ",\"prompt\":\"\"");
         }
         if (need->kind == AG_NEED_POSITION) {
             ag_puts(&b, ",\"x0\":");

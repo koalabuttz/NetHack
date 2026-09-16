@@ -830,6 +830,10 @@ test_action_grammar(void)
     need.x1 = 10;
     need.y1 = 10;
     CHECK(agent_commit(&sess, &view, &need) == AG_OK);
+    /* the position request advertises a prompt field: the native seam supplies
+     * none, so an empty one is published and the record stays schema-valid */
+    CHECK(strstr(outstr(), "\"kind\":\"position\"") != NULL);
+    CHECK(strstr(outstr(), "\"prompt\":\"\"") != NULL);
 
     /* x=0 is rejected by the parser and nothing is consumed */
     feed("{\"v\":1,\"type\":\"act\",\"id\":6,\"action\":{\"position\":[0,6],"
@@ -853,6 +857,65 @@ test_action_grammar(void)
     feed("{\"v\":1,\"type\":\"act\",\"id\":6,\"action\":{\"position\":[6,6],"
          "\"mod\":0}}\n");
     CHECK(recv(&a) == AG_OK && a.kind == AG_ACT_POSITION && a.px == 6);
+    CHECK(agent_accept(&sess) == AG_OK);
+
+    /* ---- column sweep: every legal public column and row round-trips ----
+     * The public map is x=1..79, y=0..20 (column zero is the native sentinel
+     * and is never accepted).  Each cell is committed as a fresh full-map
+     * position request and answered with an explicit position, proving the
+     * whole width is addressable, not just a checked corner. */
+    {
+        long x, y;
+        bool ok = true;
+
+        for (x = AG_MAP_MIN_X; x <= AG_MAP_MAX_X && ok; ++x) {
+            for (y = AG_MAP_MIN_Y; y <= AG_MAP_MAX_Y && ok; ++y) {
+                char buf[144];
+
+                reset_io();
+                memset(&need, 0, sizeof need);
+                need.kind = AG_NEED_POSITION;
+                need.id = (uint64_t) (1000 + x * 100 + y);
+                need.x0 = AG_MAP_MIN_X;
+                need.y0 = AG_MAP_MIN_Y;
+                need.x1 = AG_MAP_MAX_X;
+                need.y1 = AG_MAP_MAX_Y;
+                if (agent_commit(&sess, &view, &need) != AG_OK) {
+                    ok = false;
+                    break;
+                }
+                (void) snprintf(
+                    buf, sizeof buf,
+                    "{\"v\":1,\"type\":\"act\",\"id\":%llu,"
+                    "\"action\":{\"position\":[%ld,%ld],\"mod\":0}}\n",
+                    (unsigned long long) need.id, x, y);
+                feed(buf);
+                if (recv(&a) != AG_OK || a.kind != AG_ACT_POSITION
+                    || a.px != x || a.py != y) {
+                    ok = false;
+                    break;
+                }
+                if (agent_accept(&sess) != AG_OK) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        CHECK(ok);
+        /* the sentinel column and the column past the map are rejected */
+        reset_io();
+        memset(&need, 0, sizeof need);
+        need.kind = AG_NEED_POSITION;
+        need.id = 6000;
+        need.x0 = AG_MAP_MIN_X;
+        need.y0 = AG_MAP_MIN_Y;
+        need.x1 = AG_MAP_MAX_X;
+        need.y1 = AG_MAP_MAX_Y;
+        CHECK(agent_commit(&sess, &view, &need) == AG_OK);
+        feed("{\"v\":1,\"type\":\"act\",\"id\":6000,"
+             "\"action\":{\"position\":[80,10],\"mod\":0}}\n");
+        CHECK(recv(&a) == AG_BAD_INPUT && a.code == AG_INV_RANGE);
+    }
 }
 
 /* ---- finding 6: strict auxiliary parsing ---- */

@@ -156,6 +156,47 @@ play:
 	    --data "$(DATA)" $(if $(SYSCONF),--sysconf "$(SYSCONF)") \
 	    --private-root "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-play)"
 
+# Interaction breadth on real engine menus (inventory, farlook, help with text
+# paging, annotation, native quit confirmations).  Needs a built agent worker
+# and launcher, so it is opt-in like `play`.
+breadth:
+	@test -n "$(WORKER)" -a -n "$(RUNNER)" -a -n "$(DATA)" || \
+	    { echo "set WORKER, RUNNER, DATA (and optionally SYSCONF,"; \
+	      echo "PRIVATE_ROOT) for the interaction-breadth test"; exit 2; }
+	rm -rf "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-breadth)"
+	mkdir -p "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-breadth)"
+	python3 driver.py breadth --runner "$(RUNNER)" --worker "$(WORKER)" \
+	    --data "$(DATA)" $(if $(SYSCONF),--sysconf "$(SYSCONF)") \
+	    --private-root "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-breadth)"
+
+# Menu ownership hardening under AddressSanitizer + UndefinedBehaviorSanitizer.
+#
+# The menu sidecar lives in the engine-linked window port, so this drives the
+# real worker (built with `make USE_ASAN=1 USE_UBSAN=1 WANT_WIN_AGENT=1
+# WANT_DEFAULT=agent WANT_AGENT_STRICT=1 all`) through the play and breadth
+# flows.  Under ASan a use-after-free or heap overflow aborts the worker, so
+# the launcher relays a nonzero status and the driver fails here; a completed
+# run with a clean exit is evidence the menu sidecar lifecycle (capture,
+# selection, cancel, repeated select_menu, window destroy, exit) is sound.
+# The engine-free menu model and protocol peers are covered by `sanitize`, and
+# the real-callback menu probes are exercised under the sanitizer by running
+# `matrix`/`matrix-full` with an ASan impossible worker.
+asan-lifecycle:
+	@test -n "$(ASAN_WORKER)" -a -n "$(ASAN_RUNNER)" -a -n "$(ASAN_DATA)" || \
+	    { echo "set ASAN_WORKER, ASAN_RUNNER, ASAN_DATA (and optionally"; \
+	      echo "ASAN_SYSCONF, ASAN_PRIVATE_ROOT) for the sanitizer run"; exit 2; }
+	rm -rf "$(if $(ASAN_PRIVATE_ROOT),$(ASAN_PRIVATE_ROOT),/tmp/agent-asan)"
+	mkdir -p "$(if $(ASAN_PRIVATE_ROOT),$(ASAN_PRIVATE_ROOT),/tmp/agent-asan)"
+	python3 driver.py play --runner "$(ASAN_RUNNER)" --worker "$(ASAN_WORKER)" \
+	    --data "$(ASAN_DATA)" $(if $(ASAN_SYSCONF),--sysconf "$(ASAN_SYSCONF)") \
+	    --deadline 120 --timeout 240 \
+	    --private-root "$(if $(ASAN_PRIVATE_ROOT),$(ASAN_PRIVATE_ROOT),/tmp/agent-asan)/play"
+	python3 driver.py breadth --runner "$(ASAN_RUNNER)" --worker "$(ASAN_WORKER)" \
+	    --data "$(ASAN_DATA)" $(if $(ASAN_SYSCONF),--sysconf "$(ASAN_SYSCONF)") \
+	    --deadline 120 --timeout 240 \
+	    --private-root "$(if $(ASAN_PRIVATE_ROOT),$(ASAN_PRIVATE_ROOT),/tmp/agent-asan)/breadth"
+	@echo "asan-lifecycle: play and breadth completed with a clean exit under the sanitizer worker"
+
 # ASan/UBSan build, if the compiler supports the flags.
 sanitize: clean
 	@$(CC) $(CFLAGS) $(SAN) -o test_view test_view.c $(AGENT)/agent_view.c \
@@ -195,4 +236,4 @@ clean:
 	rm -f $(TESTS) $(AGENT_OBJS) $(REF_OBJS) .dep.*.d .profile.tmp .profile.h.tmp
 
 .PHONY: all check manifest-check header-check schema-check matrix \
-	episode play matrix-full sanitize depcheck clean
+	episode play breadth matrix-full sanitize asan-lifecycle depcheck clean
