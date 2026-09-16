@@ -35,8 +35,21 @@
 #include "agent_handshake.h"
 
 #define RUNNER_DIAG_CAP (1024u * 1024u) /* private diagnostic sink bound */
-#define RUNNER_DEFAULT_DEADLINE 20 /* seconds before terminate then kill */
+/* Seconds a LIVE worker may run before it is terminated then killed.  A
+ * deadline kill can no longer cost public output -- see r_relay() and
+ * r_drain() -- but it does abort the episode, so this is honest headroom
+ * for a loaded machine, not a correctness bound.  The trusted controller
+ * may name its own with --deadline. */
+#define RUNNER_DEFAULT_DEADLINE 30
 #define RUNNER_IO_BUF 65536
+/* One public line, terminator included (the protocol's AG_MAX_LINE_BYTES).
+ * Used to bound the fragment r_relay() holds back. */
+#define RUNNER_LINE_MAX 65536
+/* Secondary bound on the post-exit drain.  It exists only so a descriptor
+ * the worker leaked into a descendant cannot hold the socket open forever:
+ * the worker is already reaped when the drain starts, so EOF is normally
+ * immediate and this never fires. */
+#define RUNNER_DRAIN_CAP 5
 #define RUNNER_PATH_MAX 1024
 
 /* Test-only fault injection for the all-or-error copy path.  When
@@ -538,6 +551,127 @@ r_write_all(int fd, const char *buf, size_t len)
     return 0;
 }
 
+/* Relay one buffer of worker output to the public channel, holding back an
+ * incomplete trailing line.
+ *
+ * The channel carries JSON lines only and the launcher is the sole writer of
+ * its terminal record.  Forwarding raw bytes would break both properties: a
+ * line split across two reads, or a line the worker never finished writing,
+ * would reach the consumer without its newline, and the closure record the
+ * launcher writes next would be appended to it -- one truncated, unparsable
+ * line.  So complete lines go out as they arrive and the trailing fragment is
+ * held in `hold` until its newline arrives (then forwarded with it) or the
+ * stream ends (then discarded by the caller, never published).
+ *
+ * Returns 0, or -1 when stdout failed or the worker wrote a line beyond the
+ * protocol bound (a refusal, not something to publish). */
+static int
+r_relay(char *hold, size_t *held, const char *data, size_t len)
+{
+    size_t keep;
+
+    /* Finish a line already in progress first, so both halves reach the
+     * consumer as one uninterrupted line. */
+    if (*held > 0) {
+        const char *nl = (const char *) memchr(data, '\n', len);
+
+        if (!nl) {
+            if (*held + len > RUNNER_LINE_MAX) {
+                r_diag("worker public line exceeds the protocol bound");
+                return -1;
+            }
+            memcpy(hold + *held, data, len);
+            *held += len;
+            return 0;
+        }
+        if (r_write_all(STDOUT_FILENO, hold, *held) != 0)
+            return -1;
+        *held = 0;
+        if (r_write_all(STDOUT_FILENO, data,
+                        (size_t) (nl - data) + 1) != 0)
+            return -1;
+        len -= (size_t) (nl - data) + 1;
+        data = nl + 1;
+    }
+
+    /* Everything through the last terminator in the remainder is whole lines:
+     * forward it in one write, then hold the unterminated tail (at most one
+     * line's worth) for the next read. */
+    keep = len;
+    while (keep > 0 && data[keep - 1] != '\n')
+        --keep;
+    if (keep > 0) {
+        if (r_write_all(STDOUT_FILENO, data, keep) != 0)
+            return -1;
+        data += keep;
+        len -= keep;
+    }
+    if (len > RUNNER_LINE_MAX - 1) {
+        r_diag("worker public line exceeds the protocol bound");
+        return -1;
+    }
+    if (len > 0) {
+        memcpy(hold, data, len);
+        *held = len;
+    }
+    return 0;
+}
+
+/* Post-exit drain of the worker transport.
+ *
+ * The caller has already terminated and reaped the worker, so no further byte
+ * can arrive and EOF is normally immediate -- but every byte the worker had
+ * already written is still readable in the socket buffer, and those complete
+ * lines must reach the consumer.  No liveness deadline applies here: the
+ * deadline bounds a LIVE worker, and applying it to this phase is exactly
+ * what used to drop buffered output.  A secondary cap still applies so a
+ * descriptor leaked into a descendant cannot hold the socket open, and an
+ * unterminated tail -- a line the worker died in the middle of -- is
+ * discarded rather than published. */
+static void
+r_drain(int fd, char *hold, size_t *held)
+{
+    time_t until = time((time_t *) 0) + RUNNER_DRAIN_CAP;
+
+    for (;;) {
+        struct pollfd pfd;
+        char buf[RUNNER_IO_BUF];
+        ssize_t n;
+        int rc;
+
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        rc = poll(&pfd, 1, 250);
+        if (rc < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (rc == 0) {
+            if (time((time_t *) 0) >= until) {
+                r_diag("worker transport drain timed out");
+                break;
+            }
+            continue;
+        }
+        n = read(fd, buf, sizeof buf);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (n == 0)
+            break; /* EOF: the worker is gone, everything readable is read */
+        if (r_relay(hold, held, buf, (size_t) n) != 0)
+            break; /* consumer gone or the line bound was exceeded */
+    }
+    if (*held > 0) {
+        r_diag("worker died mid-line; discarding an unterminated record");
+        *held = 0;
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* content digests                                                      */
 /* ------------------------------------------------------------------ */
@@ -941,6 +1075,10 @@ main(int argc, char **argv)
     int child_status = 0;
     int stdin_open = 1;
     int handshake_sent = 0;
+    /* Fragment of a public line the worker has not terminated yet.  It is
+     * never forwarded on its own (see r_relay). */
+    char hold[RUNNER_LINE_MAX];
+    size_t held = 0;
 
     /* Suppress SIGPIPE for the whole run.  A worker that exits mid-write, or
      * a consumer that closes our stdout, must surface as an ordinary write
@@ -1278,7 +1416,7 @@ main(int argc, char **argv)
 
             if (n <= 0)
                 break;
-            if (r_write_all(STDOUT_FILENO, buf, (size_t) n) != 0)
+            if (r_relay(hold, &held, buf, (size_t) n) != 0)
                 break;
         }
         /* bound the private diagnostic sink */
@@ -1299,11 +1437,20 @@ main(int argc, char **argv)
     /* ---- ONE cleanup path for every post-fork outcome ----
      * Reached by falling out of the loop (transport end, write failure
      * including EPIPE, diagnostic bound, or deadline) and by a handshake
-     * failure.  It closes the transport, terminates the worker's whole
-     * process group, reaps the worker, and removes only the tree this runner
-     * created. */
+     * failure.  It terminates the worker's whole process group, reaps the
+     * worker, drains whatever the worker had already written, closes the
+     * transport, and removes only the tree this runner created.
+     *
+     * The order matters.  The worker is terminated and reaped FIRST: once it
+     * is gone nothing more can arrive, so the drain that follows reaches EOF
+     * immediately and every byte the worker wrote before it died -- including
+     * whole lines that were still sitting in the socket buffer when the
+     * deadline expired -- is delivered.  Closing the transport before
+     * draining (or draining under the liveness deadline) truncated a
+     * buffered line on a deadline kill, and the launcher's closure record
+     * then extended it into an unparsable one.  The deadline above still
+     * governs a LIVE worker. */
 cleanup:
-    (void) close(sv[0]);
     r_kill_tree(child, SIGTERM);
     for (i = 0; i < 40; ++i) {
         pid_t w = waitpid(child, &child_status, WNOHANG);
@@ -1329,6 +1476,8 @@ cleanup:
             w = waitpid(child, &child_status, 0);
         } while (w < 0 && errno == EINTR);
     }
+    r_drain(sv[0], hold, &held);
+    (void) close(sv[0]);
 
     /* Save: the worker produced its native save artifact under the episode's
      * save directory.  The launcher copies it into the caller-owned directory

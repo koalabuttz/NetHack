@@ -16,8 +16,10 @@ import argparse
 import json
 import os
 import select
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -980,7 +982,8 @@ def _open_fds():
 
 
 def _run_policy(args, policy, **kwargs):
-    """Launch one episode with the given policy; return (policy, exit_code)."""
+    """Launch one episode with the given policy.
+    Return (policy, exit_code)."""
     schema = json.load(open(schema_check.SCHEMA))
     os.makedirs(args.private_root, exist_ok=True)
     runner = Runner(args)
@@ -1379,6 +1382,245 @@ def cmd_plateau(args):
     return 0
 
 
+# ------------------------------------------------------------------
+# transport-teardown regression: the launcher's relay under deadline pressure
+# ------------------------------------------------------------------
+
+# The bare terminal record the launcher alone publishes.
+CLOSED_RECORD = {"v": 1, "ch": "control", "type": "closed"}
+
+# A synthetic transport peer: not the game and not a protocol peer, it
+# exercises only the LAUNCHER's relay and teardown, which is where a deadline
+# kill used to truncate a public line.  It writes whole JSON lines to the
+# transport descriptor the launcher passes as --agent-fd, then optionally an
+# unterminated fragment, then sleeps so that a deadline kill is what ends the
+# episode.  Every record carries an increasing "n" plus a fixed length pad, so
+# the driver can assert the delivered stream is a contiguous, complete prefix
+# of the log and nothing else.
+RELAY_WORKER = '''#!/usr/bin/env python3
+"""Synthetic transport peer for the launcher relay regression.
+
+Parameters (lines, pad, throttle, partial) are substituted by driver.py.
+"""
+import os
+import sys
+import time
+
+LINES = %(lines)d
+PAD = "x" * %(pad)d
+THROTTLE = %(throttle)r
+PARTIAL = %(partial)r
+
+
+def transport():
+    for arg in sys.argv[1:]:
+        if arg.startswith("--agent-fd="):
+            return int(arg.split("=", 1)[1])
+    return -1
+
+
+def put(fd, data):
+    off = 0
+    while off < len(data):
+        n = os.write(fd, data[off:])
+        if n <= 0:
+            os._exit(1)
+        off += n
+
+
+def main():
+    fd = transport()
+    if fd < 0:
+        return 2
+    for i in range(1, LINES + 1):
+        line = '{"v":1,"n":%%d,"pad":"%%s"}\\n' %% (i, PAD)
+        put(fd, line.encode("ascii"))
+        if THROTTLE:
+            time.sleep(THROTTLE)
+    if PARTIAL:
+        put(fd, ('{"v":1,"n":%%d,"pad":"%%s"}' %% (LINES + 1, PAD))
+            .encode("ascii"))
+    while True:
+        time.sleep(0.05)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
+def _synthetic_worker(path, lines, pad, partial, throttle=0.0):
+    with open(path, "w") as fh:
+        fh.write(RELAY_WORKER % dict(lines=lines, pad=pad, partial=partial,
+                                     throttle=throttle))
+    os.chmod(path, 0o755)
+
+
+def _relay_run(args, worker, deadline, stall=0.0, stall_after=1,
+               timeout=90):
+    """Run the launcher against `worker` and return (code, stdout, stderr,
+    elapsed).  `stall` seconds of not reading the launcher's stdout are
+    inserted after `stall_after` chunks, which is what lets its own write
+    block and the transport buffer back up -- the state a deadline break
+    must not discard."""
+    priv = tempfile.mkdtemp(prefix="ep.", dir=args.private_root)
+    argv = [args.runner, "--worker", worker, "--private-root", priv,
+            "--deadline", str(deadline)]
+    started = time.time()
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc.stdin.close()
+    out = bytearray()
+    chunks = 0
+    stalled = False
+    hard = started + timeout
+    while True:
+        if stall and not stalled and chunks >= stall_after:
+            time.sleep(stall)
+            stalled = True
+        r, _, _ = select.select([proc.stdout], [], [], 0.5)
+        if r:
+            chunk = proc.stdout.read1(65536)
+            if not chunk:
+                break
+            chunks += 1
+            out += chunk
+            continue
+        if proc.poll() is not None:
+            out += proc.stdout.read()
+            break
+        if time.time() > hard:
+            proc.kill()
+            proc.wait()
+            raise TimeoutError("launcher did not finish within %d s"
+                               % timeout)
+    code = proc.wait(timeout=30)
+    err = proc.stderr.read().decode("utf-8", "replace")
+    shutil.rmtree(priv, ignore_errors=True)
+    return code, bytes(out), err, time.time() - started
+
+
+def _relay_delivered(raw):
+    """Split a public stream into lines, refusing anything that is not a
+    sequence of LF-terminated lines.  Returns (lines, None) or (None, why)."""
+    text = raw.decode("utf-8", "replace")
+    if text and not text.endswith("\n"):
+        return None, "the public stream ended mid-line: %r" % text[-60:]
+    return (text[:-1].split("\n") if text else []), None
+
+
+def _relay_content(args, label, lines, pad, partial, deadline, stall=0.0,
+                   min_lines=1, failures=None):
+    """One case: run the launcher against a synthetic worker and assert the
+    delivered stream is exactly the complete prefix the worker wrote, followed
+    by the bare closure record -- never a partial line, and never a complete
+    line lost to the deadline."""
+    workdir = tempfile.mkdtemp(prefix="%s." % label, dir=args.private_root)
+    worker = os.path.join(workdir, "worker")
+    _synthetic_worker(worker, lines, pad, partial)
+    code, out, err, elapsed = _relay_run(args, worker, deadline, stall=stall)
+    where = "%s: " % label
+    if code != 0:
+        failures.append(where + "launcher exited %d (stderr %r)"
+                        % (code, err[-160:]))
+    raw, why = _relay_delivered(out)
+    if raw is None:
+        failures.append(where + why)
+        shutil.rmtree(workdir, ignore_errors=True)
+        return None
+    got = []
+    for i, line in enumerate(raw):
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            failures.append(where + "public line %d is not JSON: %r"
+                            % (i, line[:120]))
+            shutil.rmtree(workdir, ignore_errors=True)
+            return None
+        got.append(rec)
+    if not got or got[-1] != CLOSED_RECORD:
+        failures.append(where + "the stream does not end with exactly one "
+                        "bare closure record: %r"
+                        % (got[-1] if got else None))
+    body = got[:-1] if got and got[-1] == CLOSED_RECORD else got
+    for i, rec in enumerate(body):
+        if rec.get("n") != i + 1 or rec.get("pad") != "x" * pad:
+            failures.append(where + "record %d is not the expected complete "
+                            "line %d: %r" % (i, i + 1, str(rec)[:80]))
+            break
+    if len(body) < min_lines:
+        failures.append(where + "delivered only %d complete lines, expected "
+                        "at least %d" % (len(body), min_lines))
+    if len(body) > lines:
+        failures.append(where + "delivered %d complete lines but the worker "
+                        "wrote only %d" % (len(body), lines))
+    # The truncated fragment is never published.
+    if partial and any("n" in rec and rec.get("pad") != "x" * pad
+                       for rec in got):
+        failures.append(where + "a truncated record reached the channel")
+    # The liveness deadline still bounds a LIVE worker: the launcher must not
+    # sit out the (idle) drain cap on top of it.
+    if elapsed > deadline + 4:
+        failures.append(where + "launcher took %.1fs for a %ds deadline"
+                        % (elapsed, deadline))
+    shutil.rmtree(workdir, ignore_errors=True)
+    return dict(lines=len(body), elapsed=elapsed, deadline=deadline)
+
+
+def cmd_drain(args):
+    """The launcher's post-exit drain and line-boundary relay.
+
+    A deadline kill must not cost public output: every COMPLETE line the
+    worker wrote before the launcher reaped it is delivered, in order, exactly
+    once -- including lines still sitting in the transport buffer when the
+    deadline expired -- while a line the worker died in the middle of is never
+    published (the stream ends with the complete lines and the bare closure
+    record).  Each case is exact, so the old failure signature (a truncated
+    line merged into the closure record, i.e. 'public line is not JSON')
+    fails here deterministically instead of once in a few hundred episodes.
+    """
+    os.makedirs(args.private_root, exist_ok=True)
+    failures = []
+    table = []
+
+    # 1. A fragment in flight when the deadline expires: the eight complete
+    #    lines must arrive, the unterminated ninth must not.
+    r = _relay_content(args, "partial-tail", lines=8, pad=16, partial=True,
+                       deadline=args.deadline, min_lines=8, failures=failures)
+    table.append(("partial-tail", r, args.deadline))
+
+    # 2. Output still buffered when the deadline expires: the consumer stalls
+    #    past the deadline, so the worker fills the transport buffer while the
+    #    launcher is blocked on its own stdout.  The drain must deliver every
+    #    buffered complete line.
+    burst = _relay_content(args, "buffered-drain", lines=4000, pad=1000,
+                           partial=False, deadline=args.deadline,
+                           stall=args.deadline + 1.0, min_lines=100,
+                           failures=failures)
+    table.append(("buffered-drain", burst, args.deadline))
+
+    # 3. A silent worker still dies at the deadline (liveness), and the drain
+    #    adds nothing measurable on top of it: the stream is the bare closure
+    #    record alone.
+    r = _relay_content(args, "silent-worker", lines=0, pad=16, partial=False,
+                       deadline=args.deadline, min_lines=0, failures=failures)
+    table.append(("silent-worker", r, args.deadline))
+
+    print("%-16s %8s %8s %7s" % ("case", "lines", "elapsed", "deadline"))
+    for name, res, deadline in table:
+        print("%-16s %8s %8.1f %7d"
+              % (name, res["lines"] if res else "-",
+                 res["elapsed"] if res else -1.0, deadline))
+    if failures:
+        print("\ndriver: drain FAILED (%d):" % len(failures))
+        for f in failures:
+            print("  - %s" % f)
+        return 1
+    print("driver: drain ok: every complete line survives the deadline; no"
+          " partial line ever reaches the channel")
+    return 0
+
+
 def main(argv):
     ap = argparse.ArgumentParser(prog="driver.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1429,6 +1671,12 @@ def main(argv):
     common(pl)
     pl.add_argument("--count", type=int, default=100)
     pl.set_defaults(func=cmd_plateau)
+
+    dr = sub.add_parser("drain")
+    dr.add_argument("--runner", required=True)
+    dr.add_argument("--private-root", required=True)
+    dr.add_argument("--deadline", type=int, default=2)
+    dr.set_defaults(func=cmd_drain)
 
     args = ap.parse_args(argv)
     return args.func(args)

@@ -1846,11 +1846,17 @@ ag_build_parts(struct ag_parts *ps, const struct agent_view *v,
         AG_EMIT_SIMPLE(AG_P_COND, (const char *) 0);
     }
     for (i = 0; i < v->npal && ok; ++i) {
+        char glyph = (char) v->pal[i].ch;
+
         ag_putc(&b, '[');
         ag_put_u64(&b, i);
-        ag_puts(&b, ",\"");
-        ag_putc(&b, (char) v->pal[i].ch);
-        ag_puts(&b, "\",");
+        ag_putc(&b, ',');
+        /* The glyph is arbitrary displayable text -- NetHack draws 'lurkers'
+         * as '"' and the field is free text in general -- so it must go
+         * through the string escaper.  Raw quotes here emitted an unescaped
+         * '"' that made the whole observation line unparsable JSON. */
+        ag_put_jstr_n(&b, &glyph, 1);
+        ag_putc(&b, ',');
         ag_put_color(&b, v->pal[i].fg);
         ag_putc(&b, ',');
         ag_put_u64(&b, v->pal[i].style);
@@ -2879,9 +2885,13 @@ ag_put_content_row(struct ag_buf *o, const struct agent_content_row *row)
                            : "none");
         ag_puts(o, ",\"icon\":");
         if (row->has_icon) {
-            ag_puts(o, "[\"");
-            ag_putc(o, (char) row->icon.ch);
-            ag_puts(o, "\",");
+            char icon = (char) row->icon.ch;
+
+            ag_putc(o, '[');
+            /* same string discipline as the palette glyph: a menu icon can
+             * legitimately be '"' or '\' and must not break the line */
+            ag_put_jstr_n(o, &icon, 1);
+            ag_putc(o, ',');
             ag_put_jstr(o, agent_color_name(row->icon.fg)
                                ? agent_color_name(row->icon.fg)
                                : "none");

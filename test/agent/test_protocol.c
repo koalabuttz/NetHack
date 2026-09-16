@@ -616,6 +616,25 @@ test_escaping(void)
         CHECK(agent_commit(&sess, &v, &n) == AG_OK);
         CHECK(strstr(outstr(), "a\\\"b\\\\c\\nd") != NULL);
     }
+    {
+        /* A palette glyph is free text, not a bare byte between quotes: the
+         * game draws lurkers as '"' and a backslash is a legal glyph, so both
+         * must be escaped like any other string.  Emitting them raw produced
+         * a '"' inside a string and made the whole observation line
+         * unparsable JSON. */
+        struct agent_view v;
+        struct agent_need n;
+
+        build_view(3);
+        v = view;
+        v.pal[1].ch = '"';
+        v.pal[2].ch = '\\';
+        reset_io();
+        need_cmd(&n, 1);
+        CHECK(agent_commit(&sess, &v, &n) == AG_OK);
+        CHECK(strstr(outstr(), "[1,\"\\\"\",") != NULL);
+        CHECK(strstr(outstr(), "[2,\"\\\\\",") != NULL);
+    }
 }
 
 static void
@@ -830,7 +849,8 @@ test_action_grammar(void)
     need.x1 = 10;
     need.y1 = 10;
     CHECK(agent_commit(&sess, &view, &need) == AG_OK);
-    /* the position request advertises a prompt field: the native seam supplies
+    /* the position request advertises a prompt field: the native seam
+     * supplies
      * none, so an empty one is published and the record stays schema-valid */
     CHECK(strstr(outstr(), "\"kind\":\"position\"") != NULL);
     CHECK(strstr(outstr(), "\"prompt\":\"\"") != NULL);
@@ -1525,6 +1545,61 @@ test_chunk_emission_details(void)
     }
 }
 
+/* Drive one content page whose two rows carry the glyphs that need JSON
+ * escaping ('"' and '\'), leaving the emitted page record in io.out.  A menu
+ * row icon is a display glyph straight from the game, so it is free text.
+ * Returns true when the page was produced. */
+static bool
+build_icon_page(void)
+{
+    static struct agent_content_row rows[2];
+    struct agent_need need;
+    struct agent_action a;
+    char g[96];
+
+    memset(rows, 0, sizeof rows);
+    rows[0].r = 1;
+    rows[0].text = "first";
+    rows[0].selectable = true;
+    rows[0].key = 'a';
+    rows[0].has_icon = true;
+    rows[0].icon.ch = '"';
+    rows[0].icon.fg = AG_COL_CYAN;
+    rows[1].r = 2;
+    rows[1].text = "second";
+    rows[1].has_icon = true;
+    rows[1].icon.ch = '\\';
+    rows[1].icon.fg = AG_COL_GRAY;
+
+    reset_io();
+    CHECK(agent_write_hello(&sess) == AG_OK);
+    build_view(2);
+    memset(&need, 0, sizeof need);
+    need.kind = AG_NEED_ACK;
+    need.id = 41;
+    need.content = "c7";
+    need.pages = 1;
+    CHECK(agent_commit(&sess, &view, &need) == AG_OK);
+    agent_session_set_content(&sess, rows, 2);
+    (void) snprintf(g, sizeof g,
+                    "{\"v\":1,\"type\":\"get_page\",\"id\":41,"
+                    "\"content\":\"c7\",\"page\":0}\n");
+    feed(g);
+    prep(&a);
+    return agent_receive(&sess, &a) == AG_IO;
+}
+
+/* A menu row's icon is a display glyph (the game draws lurkers as '"'), so it
+ * needs the same JSON-string escaping as any other text.  Emitting it raw
+ * between quotes made the whole page record unparsable. */
+static void
+test_content_icon_escaping(void)
+{
+    CHECK(build_icon_page());
+    CHECK(strstr(outstr(), "\"icon\":[\"\\\"\",\"cyan\"") != NULL);
+    CHECK(strstr(outstr(), "\"icon\":[\"\\\\\",\"gray\"") != NULL);
+}
+
 /* Emit real encoder output for schema validation by test-side tooling. */
 static void
 dump_vectors(void)
@@ -1552,6 +1627,29 @@ dump_vectors(void)
     sess.force_chunk = true;
     CHECK(agent_commit(&sess, &view, NULL) == AG_OK);
     fwrite(io.out, 1, io.outlen, stdout);
+
+    /* a palette carrying the glyphs that need JSON escaping ('"' and '\'):
+     * schema_check parses every one of these lines with a real JSON parser,
+     * so a missing escape is a deterministic failure rather than the rare
+     * unparsable observation the game used to emit. */
+    {
+        struct agent_view v;
+        struct agent_need need2;
+
+        build_view(3);
+        v = view;
+        v.pal[1].ch = '"';
+        v.pal[2].ch = '\\';
+        reset_io();
+        need_cmd(&need2, 1);
+        CHECK(agent_commit(&sess, &v, &need2) == AG_OK);
+        fwrite(io.out, 1, io.outlen, stdout);
+    }
+
+    /* a menu row's icon is the game's display glyph, so it needs the same
+     * escaping; schema_check parses this line too */
+    if (build_icon_page())
+        fwrite(io.out, 1, io.outlen, stdout);
 
     reset_io();
     CHECK(agent_write_closed(&sess) == AG_OK);
@@ -2261,6 +2359,7 @@ main(int argc, char **argv)
     test_commit_guard();
     test_message_store_complete();
     test_page_byte_plan();
+    test_content_icon_escaping();
 
     if (failures) {
         printf("test_protocol: %d failure(s)\n", failures);

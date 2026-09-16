@@ -214,6 +214,22 @@ plateau:
 	    --private-root "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-plateau)" \
 	    --count "$(if $(COUNT),$(COUNT),100)"
 
+# The launcher's transport teardown under a deadline that fires while the
+# worker still has output to deliver: every complete line the worker wrote
+# before it was reaped must reach the channel, and a line it died in the
+# middle of must never.  Uses a synthetic transport peer (no game build needed
+# beyond the launcher), so the case that used to fail once in a few hundred
+# episodes fails deterministically here.
+drain:
+	@test -n "$(RUNNER)" || \
+	    { echo "set RUNNER (and optionally PRIVATE_ROOT, DEADLINE) for the"; \
+	      echo "launcher drain regression"; exit 2; }
+	rm -rf "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-drain)"
+	mkdir -p "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-drain)"
+	python3 driver.py drain --runner "$(RUNNER)" \
+	    --deadline "$(if $(DEADLINE),$(DEADLINE),2)" \
+	    --private-root "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-drain)"
+
 # Menu ownership hardening under AddressSanitizer + UndefinedBehaviorSanitizer.
 #
 # The menu sidecar lives in the engine-linked window port, so this drives the
@@ -296,4 +312,4 @@ clean:
 
 .PHONY: all check manifest-check header-check schema-check matrix \
 	episode play breadth matrix-full sanitize asan-lifecycle depcheck clean \
-	sentinel
+	sentinel drain
