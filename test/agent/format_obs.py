@@ -17,6 +17,13 @@ client must reject:
   * long-text slices must name an existing element and have contiguous
     offsets, and are validated before the record is rebuilt atomically.
 
+:class:`IncrementalAssembler` exposes the same rules one physical line at a
+time (the shape a live proxy needs).  The batch ``assemble`` generator is a
+thin wrapper over an unlimited instance, so the two cannot drift.  A live
+consumer may set retained-state budgets; when one is reached the assembler
+releases every byte it holds and raises :class:`AssemblerLimit`, which means
+"stop rendering", never "the wire was wrong".
+
 Usage:
     python3 format_obs.py transcript.jsonl        # human projection
     python3 format_obs.py --json transcript.jsonl # assembled records
@@ -30,9 +37,25 @@ import sys
 MAP_W, MAP_H = 80, 21
 BLANK = [" ", "none", 0, "none"]  # char, color, style, frame
 
+# Conservative per-container charges, applied only when a live consumer sets a
+# retained-state budget.  Batch assembly sets no budget, so these constants
+# never change reference behavior.
+CHUNK_OVERHEAD = 64
+STREAM_OVERHEAD = 256
+
 
 class ChunkError(Exception):
     """A chunk stream a client must reject."""
+
+
+class AssemblerLimit(Exception):
+    """A retained-state budget was exhausted.
+
+    The assembler has already released every retained stream and canonical
+    chunk.  This is not a wire rejection -- the bytes a client receives are
+    untouched -- only the auxiliary copy a visualizer was assembling, so the
+    caller must stop rendering rather than treat it as bad input.
+    """
 
 
 def canonical(parts):
@@ -40,33 +63,77 @@ def canonical(parts):
     return json.dumps(parts, sort_keys=True, separators=(",", ":"))
 
 
-def assemble(lines):
-    """Yield logical records, validating each chunk stream strictly."""
-    pending = {}
-    for line in lines:
+class IncrementalAssembler(object):
+    """Strict chunk assembly fed one physical line at a time.
+
+    ``feed`` returns the logical records the line completed (normally zero or
+    one).  ``finish`` makes the incomplete-at-EOF policy explicit and
+    ``clear`` releases every byte of retained state.
+
+    The optional ``max_*`` budgets exist for a live visualizer.  Exact
+    validation of arbitrarily old retries cannot run forever with finite
+    memory, so the selected policy is to disable the visualization visibly at
+    the cap instead of silently evicting history: a completed stream keeps its
+    canonical chunks for exact post-completion retry comparison, and that
+    retention is what the budgets bound.
+    """
+
+    def __init__(self, max_retained_bytes=None, max_chunks=None,
+                 max_streams=None, max_line_bytes=None):
+        self.max_retained_bytes = max_retained_bytes
+        self.max_chunks = max_chunks
+        self.max_streams = max_streams
+        self.max_line_bytes = max_line_bytes
+        self.clear()
+
+    def clear(self):
+        """Release all retained assembly state."""
+        self._streams = {}
+        self._chunks = 0
+        self._bytes = 0
+
+    def feed(self, line):
+        """Feed one physical line; return the records it completes.
+
+        Raises :class:`ChunkError` for a protocol violation and
+        :class:`AssemblerLimit` when a budget is reached; ``ValueError`` and
+        friends surface malformed JSON or malformed record shapes unchanged.
+        """
+        if isinstance(line, bytes):
+            line = line.decode("utf-8")
         line = line.strip()
         if not line:
-            continue
+            return []
+        if self.max_line_bytes is not None \
+                and len(line) > self.max_line_bytes:
+            self._limit("physical line exceeds %d bytes"
+                        % self.max_line_bytes)
         rec = json.loads(line)
         if rec.get("type") != "chunk":
-            yield rec
-            continue
+            return [rec]
 
         rid = rec["rid"]
         i = rec["i"]
-        slot = pending.setdefault(rid, {"rid": rid, "chunks": {},
-                                        "last": None, "done": False})
+        canon = canonical(rec["parts"])
+        slot = self._streams.get(rid)
+        if slot is None:
+            if self.max_streams is not None \
+                    and len(self._streams) >= self.max_streams:
+                self._limit("more than %d chunk streams" % self.max_streams)
+            self._charge(STREAM_OVERHEAD)
+            slot = {"chunks": {}, "last": None, "done": False}
+            self._streams[rid] = slot
 
         if slot["done"]:
             # a repeat of a chunk from a completed stream is a retry
-            if slot["chunks"].get(i) != canonical(rec["parts"]):
+            if slot["chunks"].get(i) != canon:
                 raise ChunkError(
                     "rid %s: chunk %s changed content after completion"
                     % (rid, i))
-            continue
+            return []
 
         if i in slot["chunks"]:
-            if slot["chunks"][i] != canonical(rec["parts"]):
+            if slot["chunks"][i] != canon:
                 raise ChunkError(
                     "rid %s chunk %s changed content" % (rid, i))
             # an exact repeat is a retry and is ignored
@@ -79,7 +146,12 @@ def assemble(lines):
                 if part["p"] == "h" and i != 0:
                     raise ChunkError(
                         "rid %s: header part in chunk %s" % (rid, i))
-            slot["chunks"][i] = canonical(rec["parts"])
+            if self.max_chunks is not None \
+                    and self._chunks >= self.max_chunks:
+                self._limit("more than %d chunks" % self.max_chunks)
+            self._charge(len(canon) + CHUNK_OVERHEAD)
+            slot["chunks"][i] = canon
+            self._chunks += 1
 
         if rec.get("last"):
             slot["last"] = i
@@ -89,9 +161,43 @@ def assemble(lines):
                 raise ChunkError(
                     "rid %s: last flag on chunk %d but %d chunks arrived"
                     % (rid, slot["last"], len(slot["chunks"])))
-            build = slot["chunks"]
             slot["done"] = True
-            yield rebuild(rid, dict(build))
+            return [rebuild(rid, dict(slot["chunks"]))]
+        return []
+
+    def finish(self):
+        """Apply the incomplete-at-EOF policy: drop tails, report them.
+
+        Returns one diagnostic string per stream that never completed.  The
+        batch path never calls this, so its output is unchanged; a live
+        consumer may surface the diagnostics as a render note.
+        """
+        notes = []
+        for rid, slot in self._streams.items():
+            if not slot["done"]:
+                notes.append(
+                    "rid %s: stream incomplete at EOF (%d chunk(s))"
+                    % (rid, len(slot["chunks"])))
+        return notes
+
+    def _charge(self, amount):
+        if self.max_retained_bytes is not None \
+                and self._bytes + amount > self.max_retained_bytes:
+            self._limit("more than %d retained bytes"
+                        % self.max_retained_bytes)
+        self._bytes += amount
+
+    def _limit(self, reason):
+        self.clear()
+        raise AssemblerLimit(reason)
+
+
+def assemble(lines):
+    """Yield logical records, validating each chunk stream strictly."""
+    asm = IncrementalAssembler()
+    for line in lines:
+        for rec in asm.feed(line):
+            yield rec
 
 
 def rebuild(rid, chunks):
@@ -286,6 +392,15 @@ def _run(records):
     return list(assemble(json.dumps(r) for r in records))
 
 
+def _feed_all(records, asm=None):
+    """Drive an incremental assembler over raw record dicts."""
+    asm = asm or IncrementalAssembler()
+    out = []
+    for rec in records:
+        out.extend(asm.feed(json.dumps(rec)))
+    return out, asm
+
+
 def _expect_reject(name, records):
     try:
         _run(records)
@@ -313,6 +428,16 @@ def selftest():
     got = _run(retried)
     if len(got) != 1 or got[0] != clean[0]:
         print("SELFTEST FAIL: retried stream did not deduplicate")
+        bad += 1
+
+    # the incremental API reproduces the batch output exactly
+    inc, _asm = _feed_all(lines)
+    if inc != clean:
+        print("SELFTEST FAIL: incremental output differs from batch")
+        bad += 1
+    inc, _asm = _feed_all(retried)
+    if inc != clean:
+        print("SELFTEST FAIL: incremental retries did not deduplicate")
         bad += 1
 
     # a gap: chunk 1 never arrives
@@ -348,6 +473,40 @@ def selftest():
         [_chunk(1, 0, True, HEAD + [
             {"p": "t", "k": "msg", "e": 9, "f": "text", "offset": 0,
              "text": "abc", "last": True}])])
+
+    # an incomplete stream is dropped, and finish() reports it
+    inc = IncrementalAssembler()
+    if inc.feed(json.dumps(lines[0])) != []:
+        print("SELFTEST FAIL: an incomplete chunk produced a record")
+        bad += 1
+    notes = inc.finish()
+    if not notes or "incomplete" not in notes[0]:
+        print("SELFTEST FAIL: an incomplete stream was not reported")
+        bad += 1
+
+    # a budget hit raises, clears state, and leaves nothing behind
+    limited = IncrementalAssembler(max_chunks=1)
+    limited.feed(json.dumps(lines[0]))
+    try:
+        limited.feed(json.dumps(lines[1]))
+    except AssemblerLimit:
+        pass
+    else:
+        print("SELFTEST FAIL: the chunk budget was not enforced")
+        bad += 1
+    if limited.finish() or limited._streams or limited._chunks:
+        print("SELFTEST FAIL: a budget hit did not clear assembler state")
+        bad += 1
+
+    # an overlong physical line is a budget hit, not a protocol error
+    limited = IncrementalAssembler(max_line_bytes=4)
+    try:
+        limited.feed(json.dumps(lines[0]))
+    except AssemblerLimit:
+        pass
+    else:
+        print("SELFTEST FAIL: the line budget was not enforced")
+        bad += 1
 
     if bad:
         print("format_obs selftest: %d failure(s)" % bad)

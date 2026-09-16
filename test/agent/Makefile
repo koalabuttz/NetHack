@@ -87,11 +87,16 @@ formatter-check: test_protocol
 	@./test_protocol --dump | python3 format_obs.py --json > /dev/null
 	@python3 format_obs.py --selftest
 
-# The live spectate/replay tool reuses the formatter's chunk assembler, so its
-# renderer must decode a chunk stream identically to a plain record, coalesce
-# fast frames to the newest, and survive a line it cannot parse.
+# The live spectate/replay tool renders the flowing records without ever
+# touching the wire.  `spectate.py selftest` covers the synchronous
+# formatter; the integration suite covers the timed render pipeline, the
+# writer helper, byte-exact relay/transcript semantics and the CLI.  The
+# large performance benchmarks stay opt-in:
+#   python3 test_spectate.py --benchmark --sizes 10000,50000 \\
+#       --workload plain --output /tmp/spec-perf.json
 spectate-check:
 	@python3 spectate.py selftest
+	@python3 -m unittest discover -s . -p test_spectate.py
 
 # The generated enforcement header consumed by the agent-only build
 # (win/agent/agent_profile.h) is emitted by the same generator with --emit-c.

@@ -67,6 +67,7 @@ prints only `win/agent/*.h` plus system headers.
 | `test/agent/format_obs.py` | canonical client formatter: assembles chunk streams back into logical records (deriving `d` from `rid` and splicing `t` long-text slices) and prints a human-readable projection |
 | `test/agent/schema_check.py` | dependency-free JSON Schema subset validator plus 25 positive and 29 negative vectors; also validates real encoder output piped from `test_protocol --dump` |
 | `test/agent/spectate.py` | live spectate: a transparent byte-exact proxy that renders the flowing records to a side channel while relaying the wire, a transcript replay mode, and a runner-mode shim usable as the driver's `--runner` |
+| `test/agent/test_spectate.py` | integration tests for the spectate revision: incremental/batch assembler agreement and every rejection vector, the deadline-scheduled render pipeline and its bounded shutdown, the writer helper and its acknowledgements, byte-exact relay/transcript back-pressure, argv identity, failure exit-status hygiene, replay equivalence, plus the opt-in performance (`--benchmark`) and byte-exact (`--byte-exact`) harnesses |
 
 ## Formatter
 
@@ -91,8 +92,21 @@ observation (an 80×21 coloured map, the status line, the last few messages, and
 the outstanding `need`) — so a human can watch while a scripted policy or an LLM
 harness plays. It is a **transparent proxy**: it spawns the real launcher and
 relays the player channel byte-for-byte in both directions, rendering a *copy*.
-Nothing is re-serialised or buffered, so a consumer sees exactly the bytes it
-would have seen without it.
+Rendering is bounded and best-effort: it runs on its own schedule behind a
+small handoff queue, coalesces frames under load, and disables itself (never
+silently, and never by changing a wire byte) rather than growing without
+bound. A stalled side channel therefore cannot stall the player, and shutdown
+stays bounded.
+
+The transcript is exact in a precise, narrow sense: on success it is exactly
+the launcher-output bytes the consumer-stdout writes accepted, in order. It
+contains no rendered frames or diagnostics and is never reserialised. That
+confirms delivery to the operating-system channel, **not** that the consumer
+application read or processed the bytes. On a downstream write failure,
+forwarding stops immediately, the transcript ends at the last confirmed write
+(possibly inside a line), the launcher is terminated and reaped, and the
+wrapper exits nonzero; a transcript-storage failure is reported as an
+incomplete recording.
 
 Watch a scripted play run (frames to the terminal, verbatim transcript saved):
 
@@ -107,10 +121,22 @@ python3 test/agent/driver.py play \
 Here `spectate.py` *is* the driver's `--runner`, so the driver builds the
 launcher argv and the tool's own options come from `SPECTATE_*` environment
 variables (`SPECTATE_LAUNCHER` overrides the launcher path, which defaults to
-`<repo>/src/nethack-agent`). `SPECTATE_RENDER_FD=tty` sends frames to the
-terminal even though the driver pipes the wrapper's stderr; with no controlling
-terminal the frames fall back to stderr. The same shape runs `breadth` or any
-other subcommand the driver drives.
+`<repo>/src/nethack-agent`). `SPECTATE_RENDER_FD=tty` opens `/dev/tty`
+independently, so frames reach the terminal even though the driver pipes the
+wrapper's stderr; with no controlling terminal the frames fall back to
+isolated writes on fd 2, with a one-time note. The same shape runs `breadth` or
+any other subcommand the driver drives.
+
+The default live channel is the logical fd 2. Launcher diagnostics share it,
+so frames and diagnostics can interleave, and a launcher that writes to an
+undrained stderr can block on it independently of this wrapper; `--render-fd
+N` (or `SPECTATE_RENDER_FD=N`, plus `N>file` on the command line) gives frames
+a dedicated sink and avoids both. **Live rendering rejects fd 1** — that is the
+consumer's stdout, and rendering there would corrupt the wire — as does any
+obvious alias of that stdout (a shared pipe or regular file). Replay keeps
+fd 1 as its valid default. An integer fd is duplicated and never has its own
+flags changed, so a caller's non-blocking descriptor stays non-blocking and is
+never repurposed.
 
 Insert it in front of an external player (an LLM harness that speaks the wire),
 giving the options explicitly on the command line:
@@ -124,7 +150,11 @@ python3 test/agent/spectate.py wrap --launcher "$PWD/src/nethack-agent" \
 ```
 
 A harness configured with the wrapper as its runner uses the same implicit
-form, `spectate.py <launcher args...>`.
+form, `spectate.py <launcher args...>`. In implicit (runner) mode every
+remaining argument is forwarded to the launcher verbatim — spectate parses no
+options there, so the tool's own settings come from `SPECTATE_*` alone. A
+launcher whose first argument is literally `wrap`, `replay`, `selftest`,
+`help`, `-h` or `--help` needs the explicit `wrap --` form.
 
 Replay a saved transcript with no runner at all — full speed by default, paced
 with `--replay-speed FRAMES-PER-SECOND`:
@@ -142,7 +172,18 @@ Options (wrap/replay, and the same names as `SPECTATE_*` in runner mode):
 (default 0.15 — observations arriving faster than this coalesce to the newest
 frame, redrawn in place on a TTY and appended otherwise), `--replay-speed S`
 (frames per second, or `instant`, the default) and `--quiet`. Replay assembles
-chunked records through the same strict decoder as `format_obs.py`.
+chunked records through the same strict incremental decoder as `format_obs.py`
+and applies no live coalescing, so every saved record is rendered in order.
+
+The environment variables actually read are `SPECTATE_LAUNCHER`,
+`SPECTATE_TRANSCRIPT`, `SPECTATE_RENDER_FD`, `SPECTATE_MESSAGES`,
+`SPECTATE_MIN_FRAME_INTERVAL`, `SPECTATE_REPLAY_SPEED`, `SPECTATE_NO_COLOR` and
+`NO_COLOR`. `--quiet` (and `-q`) is a wrap/replay command-line flag only; there
+is no `SPECTATE_QUIET` or `SPECTATE_COLOR`. Numeric settings are validated
+before the launcher is spawned: a bad value is a usage error (exit 2), not a
+traceback. Rendering that fails where no diagnostic can be delivered returns a
+nonzero status rather than a clean success, while a reportable degrade leaves
+the launcher's own exit status intact.
 
 Sessions own heap allocations. Release every session with `agent_session_free`
 on shutdown and before reinitializing it, or the retained response stream and
