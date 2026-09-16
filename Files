@@ -9,7 +9,7 @@ from or not transferred to your system if you wish.
 (files in top directory)
 .clang-format        Contributing.md      Cross-compiling
 Files                Porting              README
-azure-pipelines.yml
+agent.sh             azure-pipelines.yml
 
 DEVEL:
 (files for people developing changes to NetHack)
@@ -66,7 +66,8 @@ wizard3.lua   wizhelp
 
 doc:
 (files for all versions)
-agent-interface.md  agent-profile-v1.tsv  agent-v1.schema.json
+agent-interface.md  agent-llm-quickstart.md  agent-profile-v1.tsv
+agent-v1.schema.json
 Gbk-1pg-pfx.mn     Gbk-1pg-sfx.mn     Guidebook.mn       Guidebook.tex
 Guidebook.txt      config.nh          dlb.6              dlb.txt
 fixes1-0.txt       fixes1-4-f.txt     fixes2-2.txt       fixes2-3-e.txt
