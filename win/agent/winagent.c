@@ -182,10 +182,19 @@ struct ag_eventlist {
     size_t bytes;   /* retained text bytes, terminators included */
 };
 
-/* A copied menu row (native identifiers are copied, never dereferenced). */
+/* A copied menu row (native identifiers are copied, never dereferenced).
+ *
+ * The construction-time native fields (ident, itemflags, displayed content)
+ * are immutable for the menu generation.  `cur_count` is the adapter's
+ * THEN-CURRENT selection state for this row, which a later native
+ * select_menu for the same constructed menu must start from: 0 means
+ * unselected (published as initial:null), -1 means the native all/default
+ * count, and a positive value is a count accepted from a prior selection.
+ * It is the only field an accepted selection mutates. */
 struct ag_mrow {
     anything ident;
     unsigned int itemflags;
+    long cur_count;
     char ch, gch;
     int attr, color;
     glyph_info gi;
@@ -1229,7 +1238,8 @@ struct ag_test_item {
 };
 
 /* Build a menu through the real callbacks.  Identifiers are the copied
- * integers 1..n (never dereferenced); a heading row supplies no identifier. */
+ * integers 1..n (never dereferenced); a heading row supplies no
+ * identifier. */
 static winid
 ag_test_build_menu(const struct ag_test_item *items, size_t n,
                    const char *prompt, unsigned long behavior)
@@ -1261,6 +1271,38 @@ ag_test_menu_pages(struct ag_winrec *r)
     if (rows)
         free(rows);
     return pages;
+}
+
+/* The then-current selection state a menu's retained template publishes right
+ * now: the number of selectable rows published as selected, plus the first
+ * such row's id and its initial count.  This reads exactly the rows the
+ * encoder will page, so it is the state a later select_menu would start
+ * from. */
+static size_t
+ag_test_menu_selected(struct ag_winrec *r, long *first, long *initial)
+{
+    struct agent_content_row *rows;
+    size_t nrows = 0, i, n = 0;
+
+    if (first)
+        *first = 0;
+    if (initial)
+        *initial = 0;
+    rows = ag_menu_to_rows(r, &nrows);
+    for (i = 0; i < nrows; ++i) {
+        if (!rows[i].selectable || !rows[i].has_initial)
+            continue;
+        if (n == 0) {
+            if (first)
+                *first = rows[i].r;
+            if (initial)
+                *initial = rows[i].initial;
+        }
+        ++n;
+    }
+    if (rows)
+        free(rows);
+    return n;
 }
 
 /* Drive one real select_menu against scripted action lines. */
@@ -1336,9 +1378,9 @@ agent_test_menu_contract_probe(void)
 
     agent_session_open();
 
-    /* menu M: heading, preselected row, duplicate visible text, a selector-zero
-     * selectable row, a SKIPINVERT row, then fillers so the menu spans more
-     * than one protocol page (> AG_PAGE_MAX_ROWS). */
+    /* menu M: heading, preselected row, duplicate visible text, a
+     * selector-zero selectable row, a SKIPINVERT row, then fillers so the
+     * menu spans more than one protocol page (> AG_PAGE_MAX_ROWS). */
     n = 0;
     items[n].text = "Weapons"; items[n].ch = 0;
     items[n].flags = MENU_ITEMFLAGS_NONE; items[n].heading = 1; ++n;
@@ -1454,26 +1496,44 @@ agent_test_menu_contract_probe(void)
     if (out)
         free(out);
 
-    /* group/invert/bulk shapes remain rejected end-to-end, without consuming
-     * the request. */
-    id = agent_next_request;
-    ag_test_getpage(g0, sizeof g0, id, wr->content, 0);
-    ag_test_getpage(g1, sizeof g1, id, wr->content, 1);
-    (void) snprintf(l1, sizeof l1,
-                    "{\"v\":1,\"type\":\"act\",\"id\":%llu,"
-                    "\"action\":{\"menu\":\"%s\",\"commit\":[[5,1]],"
-                    "\"invert\":true}}\n",
-                    (unsigned long long) id, wr->menu_id);
-    pairs[0][0] = 5; pairs[0][1] = 1;
-    ag_test_commit(l2, sizeof l2, id, wr->menu_id, pairs, 1);
-    script[0] = g0; script[1] = g1; script[2] = l1; script[3] = l2;
-    out = (MENU_ITEM_P *) 0;
-    ret = ag_scr_run_menu(win, PICK_ANY, &out, script, 4);
-    agent_test_probe("menu-forbidden",
-                     ret == 1 && out
-                         && ag_scr_count("\"code\":\"schema\"") >= 1);
-    if (out)
-        free(out);
+    /* group/invert/bulk/selectall shapes remain rejected end-to-end: each
+     * spelling is a complete final-set description that names an operation v1
+     * omits, so it must be rejected as invalid(schema) while the request
+     * stays outstanding and a legal commit on the same request then works. */
+    {
+        static const char *const forbidden[] = { "group", "invert", "bulk",
+                                                 "selectall" };
+        int all_ok = 1;
+        size_t k;
+
+        for (k = 0; k < SIZE(forbidden); ++k) {
+            id = agent_next_request;
+            ag_test_getpage(g0, sizeof g0, id, wr->content, 0);
+            ag_test_getpage(g1, sizeof g1, id, wr->content, 1);
+            (void) snprintf(l1, sizeof l1,
+                            "{\"v\":1,\"type\":\"act\",\"id\":%llu,"
+                            "\"action\":{\"menu\":\"%s\",\"commit\":[[5,1]],"
+                            "\"%s\":true}}\n",
+                            (unsigned long long) id, wr->menu_id,
+                            forbidden[k]);
+            pairs[0][0] = 5;
+            pairs[0][1] = 1;
+            ag_test_commit(l2, sizeof l2, id, wr->menu_id, pairs, 1);
+            script[0] = g0;
+            script[1] = g1;
+            script[2] = l1;
+            script[3] = l2;
+            out = (MENU_ITEM_P *) 0;
+            ret = ag_scr_run_menu(win, PICK_ANY, &out, script, 4);
+            if (!(ret == 1 && out && out[0].item.a_int == 5
+                  && out[0].count == 1
+                  && ag_scr_count("\"code\":\"schema\"") >= 1))
+                all_ok = 0;
+            if (out)
+                free(out);
+        }
+        agent_test_probe("menu-forbidden", all_ok);
+    }
 
     /* positive count roundtrip. */
     id = agent_next_request;
@@ -1501,6 +1561,11 @@ agent_test_menu_contract_probe(void)
     out = (MENU_ITEM_P *) -1;
     ret = ag_scr_run_menu(win, PICK_ANY, &out, script, 3);
     agent_test_probe("menu-empty", ret == 0 && out == (MENU_ITEM_P *) 0);
+    /* an accepted EMPTY final set clears every current initial: omission from
+     * the accepted set means unselected, even for a construction-time
+     * preselection (row 2 was carried at count 3 by menu-count) */
+    agent_test_probe("menu-state-empty",
+                     ag_test_menu_selected(wr, (long *) 0, (long *) 0) == 0);
 
     /* explicit commit of the preselected row works. */
     id = agent_next_request;
@@ -1516,17 +1581,156 @@ agent_test_menu_contract_probe(void)
     if (out)
         free(out);
 
-    /* explicit cancel returns native -1 and no results. */
-    id = agent_next_request;
-    (void) snprintf(l1, sizeof l1,
-                    "{\"v\":1,\"type\":\"act\",\"id\":%llu,"
-                    "\"action\":{\"cancel\":true}}\n",
-                    (unsigned long long) id);
-    script[0] = l1;
-    out = (MENU_ITEM_P *) -1;
-    ret = ag_scr_run_menu(win, PICK_ANY, &out, script, 1);
-    agent_test_probe("menu-cancel",
-                     ret == -1 && out == (MENU_ITEM_P *) 0);
+    /* explicit cancel returns native -1 and no results, and must NOT move the
+     * then-current selection state -- only an accepted set does that.  The
+     * state before the cancel is the one menu-preselect's accepted set left:
+     * row 2 alone, at the native all/default count. */
+    {
+        long fb = 0, ib = 0, fa = 0, ia = 0;
+        size_t nb, na;
+
+        nb = ag_test_menu_selected(wr, &fb, &ib);
+        id = agent_next_request;
+        (void) snprintf(l1, sizeof l1,
+                        "{\"v\":1,\"type\":\"act\",\"id\":%llu,"
+                        "\"action\":{\"cancel\":true}}\n",
+                        (unsigned long long) id);
+        script[0] = l1;
+        out = (MENU_ITEM_P *) -1;
+        ret = ag_scr_run_menu(win, PICK_ANY, &out, script, 1);
+        na = ag_test_menu_selected(wr, &fa, &ia);
+        agent_test_probe("menu-cancel",
+                         ret == -1 && out == (MENU_ITEM_P *) 0);
+        agent_test_probe("menu-state-cancel",
+                         nb == 1 && fb == 2 && ib == -1 && na == nb
+                             && fa == fb && ia == ib);
+    }
+
+    /* Repeated select_menu must start from the adapter's THEN-CURRENT
+     * selection state, not the construction-time preselection: a menu whose
+     * row 2 begins selected and whose first accepted final set selects only
+     * row 3 at count 5 must publish row 2 as initial:null and row 3 as
+     * initial:5 when the same constructed menu is selected again -- under a
+     * FRESH request id, with the previous id dead. */
+    {
+        static struct ag_test_item ritems[3];
+        struct ag_winrec *rw;
+        winid rwin;
+        MENU_ITEM_P *rout;
+        uint64_t id1, id2;
+        long fr = 0, fi = 0;
+        int rret, rok;
+
+        ritems[0].text = "alpha";
+        ritems[0].ch = 'a';
+        ritems[0].flags = MENU_ITEMFLAGS_NONE;
+        ritems[0].heading = 0;
+        ritems[1].text = "beta";
+        ritems[1].ch = 'b';
+        ritems[1].flags = MENU_ITEMFLAGS_SELECTED; /* row 2 preselected */
+        ritems[1].heading = 0;
+        ritems[2].text = "gamma";
+        ritems[2].ch = 'c';
+        ritems[2].flags = MENU_ITEMFLAGS_NONE;
+        ritems[2].heading = 0;
+        rwin = ag_test_build_menu(ritems, 3, "pick", MENU_BEHAVE_STANDARD);
+        rw = ag_winrec_find(rwin);
+
+        /* the construction-time preselection is the *initial* current
+         * state */
+        rok = (ag_test_menu_selected(rw, &fr, &fi) == 1 && fr == 2
+               && fi == -1);
+
+        /* first selection: only row 3, with an explicit positive count */
+        id1 = agent_next_request;
+        ag_test_getpage(g0, sizeof g0, id1, rw->content, 0);
+        pairs[0][0] = 3;
+        pairs[0][1] = 5;
+        ag_test_commit(l1, sizeof l1, id1, rw->menu_id, pairs, 1);
+        script[0] = g0;
+        script[1] = l1;
+        rout = (MENU_ITEM_P *) 0;
+        rret = ag_scr_run_menu(rwin, PICK_ANY, &rout, script, 2);
+        if (!(rret == 1 && rout && rout[0].item.a_int == 3
+              && rout[0].count == 5))
+            rok = 0;
+        if (rout)
+            free(rout);
+        /* the first request published the construction preselection */
+        if (ag_scr_count("\"r\":2,\"text\":\"beta\",\"selectable\":true,"
+                         "\"key\":98,\"group\":null,\"initial\":-1") < 1)
+            rok = 0;
+        /* the accepted set replaced the preselection wholesale */
+        if (!(ag_test_menu_selected(rw, &fr, &fi) == 1 && fr == 3 && fi == 5))
+            rok = 0;
+
+        /* An interim CANCELLED selection on the same constructed menu.  It
+         * consumes a request id, so the first selection's id becomes strictly
+         * older than the last completed request -- which the protocol reports
+         * as invalid(stale).  (Reusing the immediately preceding accepted id
+         * with different bytes is a conflicting reuse, not a stale one.)  The
+         * cancel must also leave the then-current state exactly as it was. */
+        {
+            const char *canc[1];
+
+            (void) snprintf(l2, sizeof l2,
+                            "{\"v\":1,\"type\":\"act\",\"id\":%llu,"
+                            "\"action\":{\"cancel\":true}}\n",
+                            (unsigned long long) agent_next_request);
+            canc[0] = l2;
+            rout = (MENU_ITEM_P *) -1;
+            rret = ag_scr_run_menu(rwin, PICK_ANY, &rout, canc, 1);
+            if (!(rret == -1 && rout == (MENU_ITEM_P *) 0
+                  && ag_test_menu_selected(rw, &fr, &fi) == 1 && fr == 3
+                  && fi == 5))
+                rok = 0;
+        }
+
+        /* second selection for the SAME constructed menu, no start_menu: the
+         * published pages must show the then-current state, the request id
+         * must be fresh, and the first selection's id must now be stale. */
+        id2 = agent_next_request;
+        ag_test_getpage(g0, sizeof g0, id2, rw->content, 0);
+        (void) snprintf(l2, sizeof l2,
+                        "{\"v\":1,\"type\":\"act\",\"id\":%llu,"
+                        "\"action\":{\"menu\":\"%s\",\"commit\":[[1,7]]}}\n",
+                        (unsigned long long) id1, rw->menu_id);
+        pairs[0][0] = 1;
+        pairs[0][1] = 7;
+        pairs[1][0] = 2;
+        pairs[1][1] = -1;
+        ag_test_commit(l1, sizeof l1, id2, rw->menu_id, pairs, 2);
+        script[0] = g0;
+        script[1] = l2;
+        script[2] = l1;
+        rout = (MENU_ITEM_P *) 0;
+        rret = ag_scr_run_menu(rwin, PICK_ANY, &rout, script, 3);
+        if (!(rret == 2 && rout && rout[0].item.a_int == 1
+              && rout[0].count == 7 && rout[1].item.a_int == 2
+              && rout[1].count == -1))
+            rok = 0;
+        if (rout)
+            free(rout);
+        if (id1 == id2)
+            rok = 0;
+        /* the second request's own pages really were delivered ... */
+        if (ag_scr_count("\"type\":\"page\"") != 1)
+            rok = 0;
+        /* ... and they carry the then-current state: row 2 is now unselected
+         * (it was selected at construction) and row 3 carries the accepted
+         * count 5 */
+        if (ag_scr_count("\"r\":2,\"text\":\"beta\",\"selectable\":true,"
+                         "\"key\":98,\"group\":null,\"initial\":null") < 1)
+            rok = 0;
+        if (ag_scr_count("\"r\":3,\"text\":\"gamma\",\"selectable\":true,"
+                         "\"key\":99,\"group\":null,\"initial\":5") < 1)
+            rok = 0;
+        /* the previous request id is dead and the template is retained */
+        if (ag_scr_count("\"code\":\"stale\"") < 1 || rw->nrows != 3)
+            rok = 0;
+        agent_test_probe("menu-state-roundtrip", rok);
+        agent_destroy_nhwindow(rwin);
+    }
 
     /* repeated select_menu on the SAME constructed menu: the private template
      * is retained (row count unchanged), a fresh request is created, and the
@@ -1564,8 +1768,9 @@ agent_test_menu_contract_probe(void)
     if (out)
         free(out);
 
-    /* a commit naming a superseded menu generation is stale, the request stays
-     * outstanding, and a legal commit on the current generation then works. */
+    /* a commit naming a superseded menu generation is stale, the request
+     * stays outstanding, and a legal commit on the current generation then
+     * works. */
     sitems[0].text = "alpha"; sitems[0].ch = 'a';
     sitems[0].flags = MENU_ITEMFLAGS_NONE; sitems[0].heading = 0;
     sitems[1].text = "beta"; sitems[1].ch = 'b';
@@ -1820,8 +2025,8 @@ ag_menu_to_rows(struct ag_winrec *r, size_t *nrows)
         cr->selectable = (mr->ident.a_void != (void *) 0);
         cr->key = (unsigned char) mr->ch;
         cr->group = (unsigned char) mr->gch;
-        cr->has_initial = (mr->itemflags & MENU_ITEMFLAGS_SELECTED) != 0;
-        cr->initial = cr->has_initial ? -1 : 0;
+        cr->has_initial = (mr->cur_count != 0);
+        cr->initial = cr->has_initial ? mr->cur_count : 0;
         cr->style = ag_style_from_attr(mr->attr);
         cr->color = ag_color_slot(mr->color);
         agent_render_glyph(&mr->gi, (const glyph_info *) 0, AG_RC_MENU,
@@ -2115,6 +2320,9 @@ agent_add_menu(winid window, const glyph_info *glyphinfo,
     if (identifier)
         row->ident = *identifier;
     row->itemflags = itemflags;
+    /* the construction-time preselection is the *initial* current state; a
+     * positive count only ever arrives from an accepted prior selection */
+    row->cur_count = (itemflags & MENU_ITEMFLAGS_SELECTED) ? -1 : 0;
     row->ch = ch;
     row->gch = gch;
     row->attr = attr;
@@ -2162,8 +2370,8 @@ ag_build_menu_model(struct ag_winrec *r, struct agent_menu_row *rows,
         p->selectable = (mr->ident.a_void != (void *) 0);
         p->key = (unsigned char) mr->ch;
         p->group = (unsigned char) mr->gch;
-        p->has_initial = (mr->itemflags & MENU_ITEMFLAGS_SELECTED) != 0;
-        p->initial = p->has_initial ? -1 : 0;
+        p->has_initial = (mr->cur_count != 0);
+        p->initial = p->has_initial ? mr->cur_count : 0;
         p->style = ag_style_from_attr(mr->attr);
         p->color = ag_color_slot(mr->color);
         agent_render_glyph(&mr->gi, (const glyph_info *) 0, AG_RC_MENU,
@@ -2271,7 +2479,18 @@ agent_select_menu(winid window, int how, MENU_ITEM_P **menu_list)
                 agent_port_fatal_ctx("could not write an invalid record");
             continue;
         }
-        /* accepted */
+        /* accepted: fold the final set into the menu's then-current selection
+         * state BEFORE the completion boundary is crossed, so a later
+         * select_menu for this same constructed menu is published from it.
+         * Cancellation is not a selection and leaves the state untouched.
+         * The retained native fields (copied identifiers and the ORIGINAL ABI
+         * item flags) are never modified here. */
+        if (agent_menu_apply_selection(&m, &sel) != AG_OK)
+            agent_private_fatal("accepted selection did not apply to the"
+                                " menu state");
+        for (i = 0; i < r->nrows; ++i)
+            r->rows[i].cur_count =
+                m.rows[i].has_initial ? m.rows[i].initial : 0;
         result = (int) sel.result;
         break;
     }

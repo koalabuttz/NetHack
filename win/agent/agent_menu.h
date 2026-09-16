@@ -86,6 +86,24 @@ enum agent_result agent_menu_validate(const struct agent_menu *m,
  */
 enum agent_result agent_menu_check(const struct agent_menu *m);
 
+/* Fold an accepted selection into a menu's THEN-CURRENT selection state.
+ *
+ * The adapter's menu state is the final set of the most recent *accepted*
+ * selection, not the construction-time preselection: a selectable row omitted
+ * from that set becomes unselected (has_initial false) and a selected row
+ * takes its accepted count (native all/default -1 or the explicit positive
+ * count).  A later request for the same constructed menu is published from
+ * this state, so a positive initial count is only ever the result of an
+ * accepted prior selection.
+ *
+ * Only selectable rows participate -- a heading row can never be selected.
+ * The whole set is validated before anything is mutated, so a rejected set
+ * leaves the state untouched.  Cancellation is not a selection: it returns
+ * AG_OK and changes nothing.
+ */
+enum agent_result agent_menu_apply_selection(
+    struct agent_menu *m, const struct agent_selection *sel);
+
 /* Mode name helpers used by the encoder. */
 const char *agent_menu_mode_name(enum agent_menu_mode mode);
 bool agent_menu_mode_parse(const char *s, enum agent_menu_mode *out);

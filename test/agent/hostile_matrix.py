@@ -121,7 +121,8 @@ def build_handshake(data_root, sysconf, writable_root, kind="full"):
     blob = _HS.pack(
         magic, version, mode, 0,
         _field(profile, 64), _field(data_root or "", 512),
-        _field("", 512), _field(writable_root, 512), _field(sysconf or "", 512),
+        _field("", 512), _field(writable_root, 512),
+        _field(sysconf or "", 512),
     )
     if kind == "short":
         return blob[:8]
@@ -206,7 +207,8 @@ class Result(object):
         self.tree = tree
 
     def lines(self):
-        return [ln for ln in self.public.decode("utf-8", "replace").split("\n")
+        return [ln for ln in self.public.decode("utf-8",
+                                                "replace").split("\n")
                 if ln.strip()]
 
 
@@ -273,9 +275,10 @@ def run_worker(args, label, *, worker=None, extra_argv=(), env=None,
                                 stderr=diag, cwd=workdir, env=env,
                                 pass_fds=pass_fds, close_fds=True)
 
-    # The parent must not keep the worker's end of the socket open: if it does,
-    # its own reads never see EOF when the worker exits (the peer is still
-    # open).  The child's copy is closed at exec when it is not passed.
+    # The parent must not keep the worker's end of the socket open: if it
+    # does, its own reads never see EOF when the worker exits (the peer
+    # is still open).  The child's copy is closed at exec when it is not
+    # passed.
     child_sock.close()
 
     if handshake_kind != "none":
@@ -570,8 +573,8 @@ def main(argv):
                 baseline = res
             else:
                 if res.public != baseline.public:
-                    failures.append("%s: public transcript differs from baseline"
-                                    % name)
+                    failures.append(
+                        "%s: public transcript differs from baseline" % name)
                 if res.tree != baseline.tree:
                     failures.append(
                         "%s: episode tree differs from baseline (%s)"
@@ -587,11 +590,11 @@ def main(argv):
                 failures.append("%s: private diag missing %r; got %r"
                                 % (name, case["diag_min"], res.diag[:160]))
 
-        rows.append((name, "reject" if case["expect"] == "reject" else "normal",
-                     "empty" if not res.public else "%d lines" % len(records),
-                     str(res.exit_code),
-                     "ok" if not any(name in f for f in failures)
-                     else "FAIL"))
+        rows.append(
+            (name, "reject" if case["expect"] == "reject" else "normal",
+             "empty" if not res.public else "%d lines" % len(records),
+             str(res.exit_code),
+             "ok" if not any(name in f for f in failures) else "FAIL"))
 
     # ---- forbidden sysconf directives, one at a time --------------------
     for name, path in sorted(forbidden_sysconfs.items()):
@@ -706,9 +709,12 @@ def main(argv):
                      "probe menu-forbidden=1",
                      "probe menu-count=1",
                      "probe menu-empty=1",
+                     "probe menu-state-empty=1",
                      "probe menu-preselect=1",
                      "probe menu-cancel=1",
+                     "probe menu-state-cancel=1",
                      "probe menu-repeat=1",
+                     "probe menu-state-roundtrip=1",
                      "probe menu-stale=1"):
             if want not in res.diag:
                 failures.append("impossible: private diag missing %r" % want)
@@ -757,8 +763,9 @@ def main(argv):
                 failures.append("%s: private diag missing the selection "
                                 "context; got %r" % (label, res.diag[:160]))
             if "wrecon ok" not in res.diag:
-                failures.append("%s: the presentation reconstruction self-check "
-                                "did not run; got %r" % (label, res.diag[:160]))
+                failures.append(
+                    "%s: the presentation reconstruction self-check "
+                    "did not run; got %r" % (label, res.diag[:160]))
             rows.append((label, "reject",
                          "empty" if not res.public
                          else "%d lines" % len(res.lines()),

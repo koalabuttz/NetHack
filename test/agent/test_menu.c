@@ -2,7 +2,8 @@
  *
  * Covers selector-zero selectable rows, headings, duplicate visible text,
  * preselected PICK_ANY, counts (-1/positive/zero/overflow), empty versus
- * cancel, PICK_NONE/ONE/ANY, and rejection of group/bulk fields.
+ * cancel, PICK_NONE/ONE/ANY, rejection of group/bulk fields, and the
+ * then-current selection state a repeated selection starts from.
  */
 
 #include <stdio.h>
@@ -298,8 +299,8 @@ main(void)
             big[i].selectable = true;
             /* row 140 carries no accelerator (selector zero) yet stays
              * selectable, and it lies on the second page */
-            big[i].key = (i == AG_PAGE_MAX_ROWS + 11) ? 0
-                                                      : (int) ('a' + (i % 26));
+            big[i].key = (i == AG_PAGE_MAX_ROWS + 11)
+                             ? 0 : (int) ('a' + (i % 26));
         }
         memset(&bm, 0, sizeof bm);
         bm.id = "m9";
@@ -460,6 +461,74 @@ main(void)
         r2[1].icon.fg = AG_COL_GRAY;
         r2[1].icon.frame = AG_COL_NONE;
         CHECK(agent_menu_check(&m) == AG_OK);
+    }
+
+    /* ---- then-current selection state for repeated selections ---- */
+    {
+        struct agent_menu pm;
+        struct agent_selection_row pr[4];
+        struct agent_selection psel;
+
+        /* a heading, two selectable rows, and a preselection on row 3 */
+        mkrow(0, "heading", false, 0, 0, false, 0);
+        mkrow(1, "a", true, 'a', 0, false, 0);
+        mkrow(2, "b", true, 'b', 0, true, -1);
+        pm = make_menu(AG_MENU_ANY, 3);
+
+        memset(&psel, 0, sizeof psel);
+        memset(pr, 0, sizeof pr);
+        psel.rows = pr;
+        psel.cap = sizeof pr / sizeof pr[0];
+
+        /* an accepted set replaces the state wholesale: the omitted row 3
+         * becomes unselected and row 2 takes the explicit positive count,
+         * which is the only way a positive initial count can arise */
+        pr[0].r = 2;
+        pr[0].count = 5;
+        psel.nrows = 1;
+        psel.result = 1;
+        CHECK(agent_menu_apply_selection(&pm, &psel) == AG_OK);
+        CHECK(rows[0].has_initial == false); /* heading never selected */
+        CHECK(rows[1].has_initial == true && rows[1].initial == 5);
+        CHECK(rows[2].has_initial == false && rows[2].initial == 0);
+        /* the folded state is itself a legal published menu */
+        CHECK(agent_menu_check(&pm) == AG_OK);
+
+        /* an accepted EMPTY set clears every selectable initial */
+        psel.nrows = 0;
+        psel.result = 0;
+        CHECK(agent_menu_apply_selection(&pm, &psel) == AG_OK);
+        CHECK(rows[1].has_initial == false && rows[1].initial == 0);
+        CHECK(rows[2].has_initial == false && rows[2].initial == 0);
+
+        /* restore a native-default selection, then prove cancellation does
+         * not move the state */
+        pr[0].r = 3;
+        pr[0].count = -1;
+        psel.nrows = 1;
+        psel.result = 1;
+        CHECK(agent_menu_apply_selection(&pm, &psel) == AG_OK);
+        psel.result = -1; /* cancel: not a selection */
+        psel.nrows = 0;
+        CHECK(agent_menu_apply_selection(&pm, &psel) == AG_OK);
+        CHECK(rows[1].has_initial == false);
+        CHECK(rows[2].has_initial == true && rows[2].initial == -1);
+
+        /* a rejected set is never applied: an unselectable row, a zero count
+         * and an out-of-range row each leave the state exactly as it was */
+        pr[0].r = 1;
+        pr[0].count = -1;
+        psel.nrows = 1;
+        psel.result = 1;
+        CHECK(agent_menu_apply_selection(&pm, &psel) == AG_BAD_INPUT);
+        pr[0].r = 2;
+        pr[0].count = 0;
+        CHECK(agent_menu_apply_selection(&pm, &psel) == AG_BAD_INPUT);
+        pr[0].r = 4;
+        pr[0].count = -1;
+        CHECK(agent_menu_apply_selection(&pm, &psel) == AG_BAD_INPUT);
+        CHECK(rows[1].has_initial == false && rows[1].initial == 0);
+        CHECK(rows[2].has_initial == true && rows[2].initial == -1);
     }
 
     if (failures) {

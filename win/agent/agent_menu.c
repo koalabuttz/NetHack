@@ -105,6 +105,48 @@ agent_menu_check(const struct agent_menu *m)
 }
 
 enum agent_result
+agent_menu_apply_selection(struct agent_menu *m,
+                           const struct agent_selection *sel)
+{
+    size_t i;
+
+    if (!m || !sel || (!m->rows && m->nrows))
+        return AG_INTERNAL;
+    /* cancellation is not a selection: the then-current state is untouched */
+    if (sel->result < 0)
+        return AG_OK;
+    if (sel->nrows > m->nrows || sel->nrows > sel->cap)
+        return AG_BAD_INPUT;
+    /* validate the whole set first so a rejected set cannot leave a
+     * half-applied state */
+    for (i = 0; i < sel->nrows; ++i) {
+        long r = sel->rows[i].r;
+
+        if (r < 1 || (size_t) r > m->nrows)
+            return AG_BAD_INPUT;
+        if (!m->rows[r - 1].selectable)
+            return AG_BAD_INPUT;
+        if (sel->rows[i].count == 0 || sel->rows[i].count < -1)
+            return AG_BAD_INPUT;
+    }
+    /* omitted selectable rows become unselected; headings are never selected
+     * and keep whatever state they were published with */
+    for (i = 0; i < m->nrows; ++i) {
+        if (!m->rows[i].selectable)
+            continue;
+        m->rows[i].has_initial = false;
+        m->rows[i].initial = 0;
+    }
+    for (i = 0; i < sel->nrows; ++i) {
+        long r = sel->rows[i].r;
+
+        m->rows[r - 1].has_initial = true;
+        m->rows[r - 1].initial = sel->rows[i].count;
+    }
+    return AG_OK;
+}
+
+enum agent_result
 agent_menu_validate(const struct agent_menu *m,
                     const struct agent_menu_answer *a,
                     struct agent_selection *out)

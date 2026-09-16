@@ -72,6 +72,49 @@ EXPECTED_BREADTH_KINDS = [
     "command", "extcmd",                         # quit
 ]
 
+# The breadth scenario's full menu-title sequence: the shared character
+# selection menus, then the inventory item menu, the farlook look/tip menus,
+# and the help topic list.  The item-action menu names the hero's randomly
+# chosen starting weapon, so that single title is matched by shape instead of
+# being pinned verbatim; every other entry is exact.
+def _item_action_title(title):
+    return title.startswith("Do what with the ") and title.endswith("?")
+
+
+EXPECTED_BREADTH_MENUS = EXPECTED_PLAY_MENUS + [
+    " ",                              # inventory
+    _item_action_title,               # item action menu (random weapon name)
+    "What do you want to look at:",   # farlook
+    " ",                              # farlook tip
+    "Select one item:",               # help topic list
+]
+
+# Absolute need indices inside the breadth episode.  The shared selection
+# prefix (8 kinds) and the movement keys plus the first breadth key (8
+# commands) come first, so the breadth block starts at offset 8 + 8.
+BREADTH_BASE = 16
+# The help topic list and the paged text window it selects, scoped by position
+# so the paging assertion cannot be satisfied by an earlier acknowledgement.
+BREADTH_HELP_MENU = BREADTH_BASE + EXPECTED_BREADTH_KINDS.index("menu", 7)
+BREADTH_HELP_ACK = BREADTH_BASE + EXPECTED_BREADTH_KINDS.index("ack")
+# The help topic rows a breadth run must actually choose between; a run that
+# silently falls back to the first selectable row has not exercised help.
+HELP_TOPIC_MARKERS = ("Look up information", "List of game commands")
+
+
+def titles_match(got, expected):
+    """Compare a menu-title sequence against an expectation whose entries are
+    either exact strings or predicates."""
+    if len(got) != len(expected):
+        return False
+    for got_title, want in zip(got, expected):
+        if callable(want):
+            if not want(got_title):
+                return False
+        elif got_title != want:
+            return False
+    return True
+
 
 def _fail(msg):
     print("driver: FAIL: %s" % msg)
@@ -398,13 +441,19 @@ class PlayPolicy(Episode):
         self.moves = list(moves)
         self.role_text = role_text
         self.quit = quit
-        # breadth commands issued between the movement script and the quit path
+        # breadth commands issued between the movement script and the quit
+        # path
         self.breadth = list(breadth)
         self.bi = 0
         self.saw_text_page = 0
         self.answered_menus = 0
         self.role_chosen = None
         self.menu_titles = []
+        # per-need-index observations, so an assertion can be scoped to the
+        # one request that is supposed to carry a property rather than to an
+        # episode-global counter any acknowledgement could satisfy
+        self.ack_info = {}
+        self.menu_choice_marker = {}
         self.move_index = 0
         self.gameplay_started = False
         self.time_first = None
@@ -427,10 +476,19 @@ class PlayPolicy(Episode):
         elif kind in ("command", "key", "direction"):
             self.answer_key(need)
         elif kind == "ack":
+            idx = len(self.need_kinds) - 1
             pages = need.get("pages", 0)
+            rows = []
             if pages:
-                self.fetch_pages(need)
+                rows = self.fetch_pages(need)
                 self.saw_text_page += 1
+            # record what THIS acknowledgement published, addressed by its own
+            # need index and its own window descriptor
+            self.ack_info[idx] = {
+                "pages": pages,
+                "rows": len(rows),
+                "window_kind": self.window_kind(need.get("content")),
+            }
             self.send_act(need, {"ack": True})
         elif kind in ("line", "extcmd"):
             if kind == "line":
@@ -475,22 +533,25 @@ class PlayPolicy(Episode):
         self.menu_titles.append(title)
         selectable = [r for r in rows if r.get("selectable")]
         choice = None
+        marker = None
         # breadth: from the inventory pick an item to inspect, and from the
         # help topic list choose a text topic (so a text window is paged)
         if self.breadth:
-            for marker in ("Look up information", "List of game commands"):
+            for wanted in HELP_TOPIC_MARKERS:
                 for r in selectable:
-                    if marker in r["text"]:
+                    if wanted in r["text"]:
                         choice = r
+                        marker = wanted
                         break
                 if choice is not None:
                     break
         # prefer the deterministic non-tutorial path, then the confirmation
         if choice is None:
-            for marker in ("No, just start play", "Yes; start game"):
+            for wanted in ("No, just start play", "Yes; start game"):
                 for r in selectable:
-                    if marker in r["text"]:
+                    if wanted in r["text"]:
                         choice = r
+                        marker = wanted
                         break
                 if choice is not None:
                     break
@@ -498,8 +559,12 @@ class PlayPolicy(Episode):
             for r in selectable:
                 if self.role_text.lower() in r["text"].lower():
                     choice = r
+                    marker = self.role_text
                     self.role_chosen = r["text"]
                     break
+        # how this menu was answered, so a fallback to the first selectable
+        # row cannot masquerade as a deliberate choice
+        self.menu_choice_marker[len(self.need_kinds) - 1] = marker
         if choice is None and selectable:
             choice = selectable[0]
         if choice is None:
@@ -513,6 +578,15 @@ class PlayPolicy(Episode):
             if w["content"] == content:
                 return w["title"]
         return ""
+
+    def window_kind(self, content):
+        """The descriptor kind ("menu" or "text") of the window whose
+        content id is content in the current view, or None when it is not
+        published."""
+        for w in self.client.windows.values():
+            if w["content"] == content:
+                return w["kind"]
+        return None
 
     def answer_key(self, need):
         if not self.gameplay_started:
@@ -705,9 +779,6 @@ def cmd_breadth(args):
     if pol.bi < len(pol.breadth):
         return _fail("only %d of %d breadth commands were issued"
                      % (pol.bi, len(pol.breadth)))
-    if pol.saw_text_page < 1:
-        return _fail("expected at least one paged text window, saw %d"
-                     % pol.saw_text_page)
     if not pol.saw_line:
         return _fail("no native line prompt was ever answered")
     if not pol.saw_extcmd:
@@ -736,6 +807,33 @@ def cmd_breadth(args):
     tail = pol.need_kinds[30:]
     if not tail or any(k != "yn" for k in tail):
         return _fail("quit-confirmation tail differs: %r" % (tail,))
+
+    # The help topic list must be answered out of a real help row, not by a
+    # silent fallback to the first selectable row.
+    help_marker = pol.menu_choice_marker.get(BREADTH_HELP_MENU)
+    if help_marker not in HELP_TOPIC_MARKERS:
+        return _fail("the help topic list was not answered from a help row"
+                     " (marker %r)" % (help_marker,))
+    # The acknowledgement at the help position must itself be the paged TEXT
+    # window.  Scoping to that one request by index is the point: an earlier
+    # paged acknowledgement elsewhere in the episode must not be able to
+    # satisfy this, and the assertion must fail if the help topic's window is
+    # empty.
+    ack = pol.ack_info.get(BREADTH_HELP_ACK)
+    if not ack:
+        return _fail("no acknowledgement was published at the help position")
+    if ack["pages"] < 1:
+        return _fail("the help text window published no pages: %r" % (ack,))
+    if ack["rows"] < 1:
+        return _fail("the help text window returned no rows: %r" % (ack,))
+    if ack["window_kind"] != "text":
+        return _fail("the paged help window is not a text window: %r"
+                     % (ack["window_kind"],))
+    # The menu-title sequence of the whole breadth scenario.
+    if not titles_match(pol.menu_titles, EXPECTED_BREADTH_MENUS):
+        return _fail("breadth menu-title sequence differs:\n  got      %r\n"
+                     "  expected %r" % (pol.menu_titles,
+                                       EXPECTED_BREADTH_MENUS))
 
     after = set(os.listdir(args.private_root))
     if after != before:
