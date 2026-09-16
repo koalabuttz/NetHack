@@ -156,10 +156,13 @@ void agent_session_init(struct agent_session *s, agent_read_fn rd,
                         agent_write_fn wr, void *io);
 void agent_session_free(struct agent_session *s);
 
-/* Number of stable content pages for nrows rows (0 for no content).  The
- * adapter declares this as the request's page count so get_page and the page
- * records agree. */
-size_t agent_content_pages(size_t nrows);
+/* Number of stable content pages for the given content rows: pages are
+ * planned deterministically by BOTH the row count and the encoded byte
+ * size, so the request's declared page count, a window descriptor, and
+ * get_page emission all agree (0 for no content).  The adapter declares this
+ * as the request's page count so get_page and the page records agree. */
+size_t agent_content_pages(const struct agent_content_row *rows,
+                           size_t nrows);
 
 /* Register the rows behind the outstanding content so get_page can emit real
  * page slices.  rows is borrowed and must stay valid until the request

@@ -49,7 +49,6 @@
 #define AG_VIEW_MAX_PALETTE 256
 #define AG_VIEW_MAX_STATUS 32
 #define AG_VIEW_MAX_COND 32
-#define AG_VIEW_MAX_MSG 64
 #define AG_VIEW_MAX_WINDOWS 32
 #define AG_VIEW_MAX_COMMIT 256
 
@@ -261,9 +260,14 @@ struct agent_view {
     size_t nstatus;
     struct agent_cond cond[AG_VIEW_MAX_COND];
     size_t ncond;
-    struct agent_msg msg[AG_VIEW_MAX_MSG];
+    /* The message/history arrays are sized to the retained content (complete
+     * up to the frozen byte limit), so a boundary can publish any number of
+     * ordered events.  The arrays are owned by the caller that built the view
+     * and borrowed by agent_commit(); a view with n > 0 must have a non-NULL
+     * pointer. */
+    struct agent_msg *msg;
     size_t nmsg;
-    struct agent_msg hist[AG_VIEW_MAX_MSG];
+    struct agent_msg *hist;
     size_t nhist;
     struct agent_window windows[AG_VIEW_MAX_WINDOWS];
     size_t nwindows;

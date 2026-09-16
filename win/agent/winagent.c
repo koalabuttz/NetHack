@@ -157,8 +157,6 @@ ag_next_id(uint64_t *counter, const char *what)
 /* ------------------------------------------------------------------ */
 
 #define AGW_TITLE 256
-#define AGW_MSG_MAX 64
-#define AGW_HIST_MAX 64
 #define AGW_STATUS_MAX MAXBLSTATS
 #define AGW_WIN_MAX 64
 
@@ -171,6 +169,17 @@ struct ag_event {
     uint64_t e;
     char *text;
     uint8_t style;
+};
+
+/* Dynamically sized, byte-accounted event/history storage.  The contract
+ * requires a COMPLETE ordered message/history record up to the retained-state
+ * byte limit; exceeding it is a generic close, never a silent drop of the
+ * oldest entry.  Restored history (hist), live display events (msg), and the
+ * private ^P recall list are kept in semantically separate lists. */
+struct ag_eventlist {
+    struct ag_event *v;
+    size_t n, cap;
+    size_t bytes;   /* retained text bytes, terminators included */
 };
 
 /* A copied menu row (native identifiers are copied, never dereferenced). */
@@ -220,10 +229,16 @@ static struct ag_status_slot ag_w_status[AGW_STATUS_MAX];
 static struct agent_cond ag_w_cond[CONDITION_COUNT];
 static size_t ag_w_ncond;
 
-static struct ag_event ag_w_msg[AGW_MSG_MAX];
-static size_t ag_w_nmsg;
-static struct ag_event ag_w_hist[AGW_HIST_MAX];
-static size_t ag_w_nhist;
+/* live display events published as `msg` (never history-only callbacks) */
+static struct ag_eventlist ag_w_msg;
+/* restored-history entries only, published as `hist` */
+static struct ag_eventlist ag_w_hist;
+/* the private native ^P recall history: displayed messages, history-only
+ * callbacks, and restored entries in native recall order */
+static struct ag_eventlist ag_w_recall;
+/* this-session recall held aside while restored entries are put in place */
+static struct ag_eventlist ag_restore_hold;
+static boolean ag_restoring_history = FALSE;
 
 static struct ag_winrec ag_wins[AGW_WIN_MAX];
 
@@ -232,6 +247,13 @@ static int ag_window_serial = 0;
 /* a transient menu descriptor published with the selection request */
 static struct agent_window ag_menu_desc;
 static boolean ag_menu_desc_active = FALSE;
+
+/* forward declarations: the byte-aware page plan needs the content rows */
+static struct agent_content_row *
+ag_lines_to_rows(struct ag_winrec *, size_t *);
+static struct agent_content_row *
+ag_menu_to_rows(struct ag_winrec *, size_t *);
+static size_t ag_win_content_pages(struct ag_winrec *r);
 
 static struct agent_cell
 ag_blank_cell(void)
@@ -423,23 +445,6 @@ ag_build_view(struct agent_view *v)
         v->cond[v->ncond++] = ag_w_cond[i];
     }
 
-    for (i = 0; i < ag_w_nmsg; ++i) {
-        if (v->nmsg >= AG_VIEW_MAX_MSG)
-            return FALSE;
-        v->msg[v->nmsg].e = ag_w_msg[i].e;
-        v->msg[v->nmsg].text = ag_w_msg[i].text;
-        v->msg[v->nmsg].style = ag_w_msg[i].style;
-        ++v->nmsg;
-    }
-    for (i = 0; i < ag_w_nhist; ++i) {
-        if (v->nhist >= AG_VIEW_MAX_MSG)
-            return FALSE;
-        v->hist[v->nhist].e = ag_w_hist[i].e;
-        v->hist[v->nhist].text = ag_w_hist[i].text;
-        v->hist[v->nhist].style = ag_w_hist[i].style;
-        ++v->nhist;
-    }
-
     if (ag_menu_desc_active) {
         if (v->nwindows >= AG_VIEW_MAX_WINDOWS)
             return FALSE;
@@ -460,10 +465,48 @@ ag_build_view(struct agent_view *v)
             w->title = r->title[0] ? r->title : " ";
             w->mode = 0;
             w->content = r->content;
-            w->pages = (int) agent_content_pages(r->nlines);
+            w->pages = (int) ag_win_content_pages(r);
         }
     }
+
+    /* The message/history arrays are sized to the retained content, which is
+     * complete up to the frozen byte limit (enforced when it was stored), so
+     * no entry is ever dropped.  They are filled last because the allocation
+     * cannot fail; every fallible check above returns first. */
+    if (ag_w_msg.n) {
+        v->msg = (struct agent_msg *) alloc(
+            (unsigned) (ag_w_msg.n * sizeof *v->msg));
+        for (i = 0; i < ag_w_msg.n; ++i) {
+            v->msg[i].e = ag_w_msg.v[i].e;
+            v->msg[i].text = ag_w_msg.v[i].text;
+            v->msg[i].style = ag_w_msg.v[i].style;
+        }
+        v->nmsg = ag_w_msg.n;
+    }
+    if (ag_w_hist.n) {
+        v->hist = (struct agent_msg *) alloc(
+            (unsigned) (ag_w_hist.n * sizeof *v->hist));
+        for (i = 0; i < ag_w_hist.n; ++i) {
+            v->hist[i].e = ag_w_hist.v[i].e;
+            v->hist[i].text = ag_w_hist.v[i].text;
+            v->hist[i].style = ag_w_hist.v[i].style;
+        }
+        v->nhist = ag_w_hist.n;
+    }
     return TRUE;
+}
+
+/* Release the heap message/history arrays a view carries. */
+static void
+ag_view_release(struct agent_view *v)
+{
+    if (v->msg)
+        free(v->msg);
+    if (v->hist)
+        free(v->hist);
+    v->msg = (struct agent_msg *) 0;
+    v->hist = (struct agent_msg *) 0;
+    v->nmsg = v->nhist = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -540,17 +583,17 @@ ag_recon_check(const struct agent_view *v)
             || v->cond[i].style != ag_w_cond[i].style)
             agent_private_fatal("wrecon-mismatch: condition differs");
 
-    if (v->nmsg != ag_w_nmsg || v->nhist != ag_w_nhist)
+    if (v->nmsg != ag_w_msg.n || v->nhist != ag_w_hist.n)
         agent_private_fatal("wrecon-mismatch: message count differs");
     for (i = 0; i < v->nmsg; ++i)
-        if (v->msg[i].e != ag_w_msg[i].e
-            || strcmp(v->msg[i].text, ag_w_msg[i].text) != 0
-            || v->msg[i].style != ag_w_msg[i].style)
+        if (v->msg[i].e != ag_w_msg.v[i].e
+            || strcmp(v->msg[i].text, ag_w_msg.v[i].text) != 0
+            || v->msg[i].style != ag_w_msg.v[i].style)
             agent_private_fatal("wrecon-mismatch: message differs");
     for (i = 0; i < v->nhist; ++i)
-        if (v->hist[i].e != ag_w_hist[i].e
-            || strcmp(v->hist[i].text, ag_w_hist[i].text) != 0
-            || v->hist[i].style != ag_w_hist[i].style)
+        if (v->hist[i].e != ag_w_hist.v[i].e
+            || strcmp(v->hist[i].text, ag_w_hist.v[i].text) != 0
+            || v->hist[i].style != ag_w_hist.v[i].style)
             agent_private_fatal("wrecon-mismatch: history differs");
 
     agent_private_diag("wrecon ok");
@@ -561,6 +604,7 @@ enum agent_result
 agent_port_commit_need(const struct agent_need *need)
 {
     struct agent_view v;
+    enum agent_result r;
 
     if (!agent_session_ready)
         agent_private_fatal("commit before the transport was opened");
@@ -574,7 +618,9 @@ agent_port_commit_need(const struct agent_need *need)
 #ifdef AGENT_TEST_WRECON
     ag_recon_check(&v);
 #endif
-    if (agent_commit(&agent_session, &v, need) != AG_OK)
+    r = agent_commit(&agent_session, &v, need);
+    ag_view_release(&v);
+    if (r != AG_OK)
         agent_private_fatal("could not emit the durable snapshot");
     return AG_OK;
 }
@@ -609,29 +655,76 @@ ag_winrec_reset(struct ag_winrec *r)
 }
 
 static void
-ag_msg_free(struct ag_event *ev)
-{
-    if (ev->text)
-        free(ev->text);
-    ev->text = (char *) 0;
-}
-
-static void
-ag_msg_push(struct ag_event *list, size_t *n, size_t cap, const char *text,
-            uint8_t style, uint64_t e)
+ag_eventlist_clear(struct ag_eventlist *l)
 {
     size_t i;
 
-    if (*n == cap) {
-        ag_msg_free(&list[0]);
-        for (i = 1; i < cap; ++i)
-            list[i - 1] = list[i];
-        --*n;
+    for (i = 0; i < l->n; ++i)
+        if (l->v[i].text)
+            free(l->v[i].text);
+    l->n = 0;
+    l->bytes = 0;
+}
+
+static void
+ag_event_push(struct ag_eventlist *l, const char *text, uint8_t style,
+              uint64_t e)
+{
+    size_t len = text ? strlen(text) : 0;
+
+    /* byte-accounted: a complete ordered history up to the frozen
+     * retained-state limit; exceeding it closes generically rather than
+     * silently dropping the oldest entry */
+    if (l->bytes + len + 1 > AG_MAX_RETAINED_BYTES)
+        agent_private_fatal("retained message history exceeds the public"
+                            " bound");
+    if (l->n == l->cap) {
+        size_t ncap = l->cap ? l->cap * 2 : 32;
+        struct ag_event *nv = (struct ag_event *) alloc(
+            (unsigned) (ncap * sizeof *nv));
+
+        if (l->n)
+            memcpy(nv, l->v, l->n * sizeof *nv);
+        if (l->v)
+            free(l->v);
+        l->v = nv;
+        l->cap = ncap;
     }
-    list[*n].e = e;
-    list[*n].text = ag_strdup(text);
-    list[*n].style = style;
-    ++*n;
+    l->v[l->n].e = e;
+    l->v[l->n].text = ag_strdup(text ? text : "");
+    l->v[l->n].style = style;
+    l->bytes += len + 1;
+    ++l->n;
+}
+
+/* append every entry of src to dst, preserving order, then empty src */
+static void
+ag_eventlist_move(struct ag_eventlist *dst, struct ag_eventlist *src)
+{
+    size_t i;
+
+    for (i = 0; i < src->n; ++i)
+        ag_event_push(dst, src->v[i].text ? src->v[i].text : "",
+                      src->v[i].style, src->v[i].e);
+    ag_eventlist_clear(src);
+}
+
+static uint64_t
+ag_next_event_id(void)
+{
+    return ag_next_id(&agent_next_event, "message id exhausted");
+}
+
+/* Record one live DISPLAYED message: it is a new event in `msg` and part of
+ * the private native ^P recall list.  History-only callbacks are handled
+ * separately and never appear in `msg`. */
+static void
+ag_display_message(const char *text, uint8_t style)
+{
+    uint64_t e = ag_next_event_id();
+
+    ag_event_push(&ag_w_msg, text, style, e);
+    ag_event_push(&ag_w_recall, text, style, e);
 }
 
 /* ------------------------------------------------------------------ */
@@ -733,6 +826,19 @@ agent_test_glyph_equality(void)
     agent_test_probe("glypheq-female", ag_cells_equal(&ca, &cb));
 }
 
+/* M2 review-finding probes and the callbacks they drive; the definitions of
+ * both groups follow later in this file. */
+static void agent_test_map_clear_probe(void);
+static void agent_test_msg_store_probe(void);
+static void agent_test_msghistory_probe(void);
+static void agent_test_display_file_probe(void);
+static void agent_test_yn_parity_probe(void);
+static winid agent_create_nhwindow(int type);
+static void agent_clear_nhwindow(winid window);
+static void agent_destroy_nhwindow(winid window);
+static void ag_display_file_title(struct ag_winrec *r);
+static void agent_putmsghistory(const char *msg, boolean restoring);
+
 static void
 agent_test_diagnostics(void)
 {
@@ -766,7 +872,331 @@ agent_test_diagnostics(void)
 
     agent_test_glyph_equality();
 
+    agent_test_map_clear_probe();
+    agent_test_msg_store_probe();
+    agent_test_msghistory_probe();
+    agent_test_display_file_probe();
+    agent_test_yn_parity_probe();
+
     impossible("AGENT_TEST_IMPOSSIBLE: injected diagnostic");
+}
+
+/* ------------------------------------------------------------------ */
+/* M2 review findings: engine-side self-checks.                         */
+/*                                                                      */
+/* Each probe asserts one behaviour the review required and reports a   */
+/* single private `probe NAME=1` line, which the hostile matrix checks. */
+/* ------------------------------------------------------------------ */
+
+/* A tiny in-memory transport so the REAL input primitives can be driven
+ * against scripted answers without a peer process.  Only compiled into the
+ * matrix worker (AGENT_TEST_IMPOSSIBLE). */
+struct ag_script {
+    const char **lines;
+    size_t n, i;
+    char out[65536];
+    size_t outlen;
+};
+static struct ag_script ag_scr;
+
+static long
+ag_scr_read(void *ctx, char *buf, size_t cap)
+{
+    struct ag_script *s = (struct ag_script *) ctx;
+    const char *ln;
+    size_t n;
+
+    if (s->i >= s->n)
+        return 0; /* EOF */
+    ln = s->lines[s->i++];
+    n = strlen(ln);
+    if (n > cap)
+        n = cap;
+    memcpy(buf, ln, n);
+    return (long) n;
+}
+
+static long
+ag_scr_write(void *ctx, const char *buf, size_t len)
+{
+    struct ag_script *s = (struct ag_script *) ctx;
+
+    if (s->outlen + len > sizeof s->out - 1)
+        return -1;
+    memcpy(s->out + s->outlen, buf, len);
+    s->outlen += len;
+    s->out[s->outlen] = '\0'; /* keep the captured text a C string */
+    return (long) len;
+}
+
+static size_t
+ag_scr_count(const char *needle)
+{
+    size_t n = 0;
+    const char *p = ag_scr.out;
+
+    while ((p = strstr(p, needle)) != 0) {
+        ++n;
+        ++p;
+    }
+    return n;
+}
+
+/* Drive one real agent_input_yn against scripted action lines, capturing the
+ * records it emits.  Returns the native yn result. */
+static int
+ag_scr_run_yn(const char **lines, size_t n, const char *choices, char def)
+{
+    struct agent_session *s = agent_port_session();
+    agent_read_fn sr = s->read;
+    agent_write_fn sw = s->write;
+    void *sio = s->io;
+    int ret;
+
+    ag_scr.lines = lines;
+    ag_scr.n = n;
+    ag_scr.i = 0;
+    ag_scr.outlen = 0;
+    ag_scr.out[0] = '\0';
+    s->read = ag_scr_read;
+    s->write = ag_scr_write;
+    s->io = &ag_scr;
+
+    ret = agent_input_yn("probe?", choices, def);
+
+    s->read = sr;
+    s->write = sw;
+    s->io = sio;
+    return ret;
+}
+
+/* High 1: clearing WIN_MAP must leave no painted cell and no cursor. */
+static void
+agent_test_map_clear_probe(void)
+{
+    winid w = agent_create_nhwindow(NHW_MAP);
+    struct agent_cell c = ag_blank_cell();
+    boolean ok = TRUE;
+    int y, x;
+
+    c.ch = '#';
+    ag_w_map[5][10] = c;
+    ag_w_map[6][11] = c;
+    ag_w_painted[5][10] = TRUE;
+    ag_w_painted[6][11] = TRUE;
+    ag_w_cursor = TRUE;
+    ag_w_cx = 10;
+    ag_w_cy = 5;
+
+    agent_clear_nhwindow(w);
+
+    for (y = 0; y < AG_MAP_ROWS && ok; ++y)
+        for (x = 0; x < AG_MAP_COLS && ok; ++x)
+            if (ag_w_painted[y][x])
+                ok = FALSE;
+    if (ag_w_cursor)
+        ok = FALSE;
+    if (!ag_cell_is_blank(&ag_w_map[5][10]))
+        ok = FALSE;
+    if (!ag_cell_is_blank(&ag_w_map[6][11]))
+        ok = FALSE;
+    agent_test_probe("mapclear", ok);
+    agent_destroy_nhwindow(w);
+}
+
+/* Medium 3 (engine side): the live message store is complete and ordered, and
+ * the frozen view carries every entry, past the old 64-entry shift limit. */
+static void
+agent_test_msg_store_probe(void)
+{
+    size_t n0 = ag_w_msg.n, i;
+    boolean ok = TRUE;
+    char buf[40];
+
+    for (i = 0; i < 100; ++i) {
+        (void) snprintf(buf, sizeof buf, "store message %u", (unsigned) i);
+        ag_display_message(buf, 0);
+    }
+    if (ag_w_msg.n != n0 + 100)
+        ok = FALSE;
+    for (i = 0; i < 100 && ok; ++i) {
+        (void) snprintf(buf, sizeof buf, "store message %u", (unsigned) i);
+        if (strcmp(ag_w_msg.v[n0 + i].text, buf) != 0)
+            ok = FALSE;
+    }
+    {
+        struct agent_view v;
+
+        if (!ag_build_view(&v))
+            ok = FALSE;
+        else if (v.nmsg != ag_w_msg.n)
+            ok = FALSE;
+        ag_view_release(&v);
+    }
+    agent_test_probe("msgstore", ok);
+}
+
+/* Medium 5: restored entries populate `hist`; a live history-only callback
+ * populates only the private recall list; recall order puts the restored
+ * entries before this session's entries. */
+static void
+agent_test_msghistory_probe(void)
+{
+    boolean ok;
+
+    ag_eventlist_clear(&ag_w_msg);
+    ag_eventlist_clear(&ag_w_hist);
+    ag_eventlist_clear(&ag_w_recall);
+    ag_eventlist_clear(&ag_restore_hold);
+    ag_restoring_history = FALSE;
+
+    ag_display_message("live one", 0);        /* msg + recall */
+    agent_putmsghistory("hist-only", FALSE);  /* recall only */
+    agent_putmsghistory("restored A", TRUE);  /* recall + hist */
+    agent_putmsghistory("restored B", TRUE);  /* recall + hist */
+    agent_putmsghistory((char *) 0, TRUE);    /* terminating NULL */
+
+    ok = (ag_w_hist.n == 2 && ag_w_msg.n == 1
+          && ag_w_recall.n == 4
+          && strcmp(ag_w_hist.v[0].text, "restored A") == 0
+          && strcmp(ag_w_hist.v[1].text, "restored B") == 0
+          && strcmp(ag_w_msg.v[0].text, "live one") == 0
+          && strcmp(ag_w_recall.v[0].text, "restored A") == 0
+          && strcmp(ag_w_recall.v[1].text, "restored B") == 0
+          && strcmp(ag_w_recall.v[2].text, "live one") == 0
+          && strcmp(ag_w_recall.v[3].text, "hist-only") == 0);
+    agent_test_probe("msghistory", ok);
+}
+
+/* Medium 7: a data-file text window never carries the native file name. */
+static void
+agent_test_display_file_probe(void)
+{
+    winid w = agent_create_nhwindow(NHW_TEXT);
+    struct ag_winrec *r = ag_winrec_find(w);
+    boolean ok;
+
+    if (r)
+        Strcpy(r->title, "/sentinel/private/path");
+    ag_display_file_title(r);
+    ok = (r != 0 && r->title[0] == '\0');
+    agent_test_probe("dispfile", ok);
+    agent_destroy_nhwindow(w);
+}
+
+/* Medium 6 / High 2: the yn primitive against scripted answers, proving the
+ * single-request contract, tty parity, and the direction context. */
+static void
+agent_test_yn_parity_probe(void)
+{
+    struct agent_session *s;
+    char a[160], b[160];
+    const char *one[1], *two[2];
+    uint64_t id, seq0;
+    int ret;
+
+    agent_session_open();
+    s = agent_port_session();
+
+    /* High 2: an unacceptable byte then a good one leaves ONE request
+     * outstanding: one obs, one invalid, one seq step, the original id. */
+    id = agent_next_request;
+    (void) snprintf(a, sizeof a,
+                    "{\"v\":1,\"type\":\"act\",\"id\":%llu,"
+                    "\"action\":{\"yn\":122}}\n",
+                    (unsigned long long) id);
+    (void) snprintf(b, sizeof b,
+                    "{\"v\":1,\"type\":\"act\",\"id\":%llu,"
+                    "\"action\":{\"yn\":121}}\n",
+                    (unsigned long long) id);
+    two[0] = a;
+    two[1] = b;
+    seq0 = s->next_seq;
+    ret = ag_scr_run_yn(two, 2, "ynq", 'q');
+    agent_test_probe("yn-one-request",
+                     ret == 'y' && s->next_seq == seq0 + 1
+                         && ag_scr_count("\"type\":\"obs\"") == 1
+                         && ag_scr_count("\"type\":\"invalid\"") == 1
+                         && s->outstanding_id == id);
+
+    /* Medium 6b: an unrestricted answer keeps its case. */
+    id = agent_next_request;
+    (void) snprintf(a, sizeof a,
+                    "{\"v\":1,\"type\":\"act\",\"id\":%llu,"
+                    "\"action\":{\"yn\":65}}\n",
+                    (unsigned long long) id);
+    one[0] = a;
+    ret = ag_scr_run_yn(one, 1, (const char *) 0, 0);
+    agent_test_probe("yn-case", ret == 'A');
+
+    /* Medium 6a: yn_number is reset before every prompt. */
+    yn_number = 42L;
+    id = agent_next_request;
+    (void) snprintf(a, sizeof a,
+                    "{\"v\":1,\"type\":\"act\",\"id\":%llu,"
+                    "\"action\":{\"yn\":121}}\n",
+                    (unsigned long long) id);
+    one[0] = a;
+    ret = ag_scr_run_yn(one, 1, "ynq", 0);
+    agent_test_probe("yn-reset", ret == 'y' && yn_number == 0L);
+
+    /* Medium 6: Escape maps to the native default chain. */
+    id = agent_next_request;
+    (void) snprintf(a, sizeof a,
+                    "{\"v\":1,\"type\":\"act\",\"id\":%llu,"
+                    "\"action\":{\"yn\":27}}\n",
+                    (unsigned long long) id);
+    one[0] = a;
+    ret = ag_scr_run_yn(one, 1, "ynq", 'q');
+    agent_test_probe("yn-escape", ret == 'q');
+
+    /* Medium 6: a hidden suffix is accepted but never published. */
+    id = agent_next_request;
+    (void) snprintf(a, sizeof a,
+                    "{\"v\":1,\"type\":\"act\",\"id\":%llu,"
+                    "\"action\":{\"yn\":89}}\n",
+                    (unsigned long long) id);
+    one[0] = a;
+    ret = ag_scr_run_yn(one, 1, "ynq\033Y", 0);
+    agent_test_probe("yn-hidden", ret == 'Y');
+    agent_test_probe("yn-hidden-choices",
+                     ag_scr_count("\"choices\":\"ynq\"") == 1);
+
+    /* Medium 6: numeric counts, and zero means "no". */
+    id = agent_next_request;
+    (void) snprintf(a, sizeof a,
+                    "{\"v\":1,\"type\":\"act\",\"id\":%llu,"
+                    "\"action\":{\"yn\":35,\"count\":7}}\n",
+                    (unsigned long long) id);
+    one[0] = a;
+    ret = ag_scr_run_yn(one, 1, "ynq#", 0);
+    agent_test_probe("yn-count", ret == '#' && yn_number == 7L);
+
+    id = agent_next_request;
+    (void) snprintf(a, sizeof a,
+                    "{\"v\":1,\"type\":\"act\",\"id\":%llu,"
+                    "\"action\":{\"yn\":48}}\n",
+                    (unsigned long long) id);
+    one[0] = a;
+    ret = ag_scr_run_yn(one, 1, "ynq#", 0);
+    agent_test_probe("yn-zero", ret == 'n');
+
+    /* Medium 6c: the getdir() context publishes a direction request, and the
+     * classification helper agrees. */
+    program_state.input_state = getdirInp;
+    id = agent_next_request;
+    (void) snprintf(a, sizeof a,
+                    "{\"v\":1,\"type\":\"act\",\"id\":%llu,"
+                    "\"action\":{\"key\":104}}\n",
+                    (unsigned long long) id);
+    one[0] = a;
+    ret = ag_scr_run_yn(one, 1, (const char *) 0, 0);
+    agent_test_probe("yndir-kind",
+                     agent_input_yn_kind() == AG_NEED_DIRECTION && ret == 104
+                         && ag_scr_count("\"kind\":\"direction\"") == 1);
+    program_state.input_state = otherInp;
+    agent_test_probe("ynkind-other",
+                     agent_input_yn_kind() == AG_NEED_YN);
 }
 
 static void agent_test_mode_dispatch(void);
@@ -912,10 +1342,25 @@ agent_clear_nhwindow(winid window)
 
     if (!r)
         return;
+    if (r->type == NHW_MAP) {
+        /* A cleared map holds no cells at all: every cell returns to the
+         * declared blank tuple, the painted bitmap is emptied, and the cursor
+         * is removed.  Without this, stale terrain from an earlier display
+         * would survive into a later full snapshot (corruption, and possible
+         * disclosure of previously-shown terrain). */
+        int y, x;
+
+        for (y = 0; y < AG_MAP_ROWS; ++y)
+            for (x = 0; x < AG_MAP_COLS; ++x) {
+                ag_w_map[y][x] = ag_blank_cell();
+                ag_w_painted[y][x] = FALSE;
+            }
+        ag_w_cursor = FALSE;
+        ag_w_cx = ag_w_cy = 0;
+        return;
+    }
     if (r->type == NHW_MESSAGE) {
-        for (i = 0; i < ag_w_nmsg; ++i)
-            ag_msg_free(&ag_w_msg[i]);
-        ag_w_nmsg = 0;
+        ag_eventlist_clear(&ag_w_msg);
         return;
     }
     for (i = 0; i < r->nlines; ++i)
@@ -927,15 +1372,11 @@ static void
 agent_destroy_nhwindow(winid window)
 {
     struct ag_winrec *r = ag_winrec_find(window);
-    size_t i;
 
     if (!r)
         return;
-    if (r->type == NHW_MESSAGE) {
-        for (i = 0; i < ag_w_nmsg; ++i)
-            ag_msg_free(&ag_w_msg[i]);
-        ag_w_nmsg = 0;
-    }
+    if (r->type == NHW_MESSAGE)
+        ag_eventlist_clear(&ag_w_msg);
     ag_winrec_reset(r);
 }
 
@@ -997,16 +1438,36 @@ ag_menu_to_rows(struct ag_winrec *r, size_t *nrows)
     return rows;
 }
 
+/* The declared page count for a window's current content, computed from the
+ * same content rows the encoder will slice, so a descriptor, a request, and
+ * get_page emission all agree. */
+static size_t
+ag_win_content_pages(struct ag_winrec *r)
+{
+    struct agent_content_row *rows;
+    size_t nrows = 0, pages;
+
+    if (!r)
+        return 0;
+    rows = (r->type == NHW_MENU) ? ag_menu_to_rows(r, &nrows)
+                                 : ag_lines_to_rows(r, &nrows);
+    pages = agent_content_pages(rows, nrows);
+    if (rows)
+        free(rows);
+    return pages;
+}
+
 /* Emit a blocking display boundary: freeze W with an acknowledgement request
  * and wait until the agent acknowledges or cancels.  rows/nrows describe the
  * content that must be paged before the acknowledgement is accepted. */
 static void
-ag_blocking_ack(const char *content, int pages,
-                struct agent_content_row *rows, size_t nrows)
+ag_blocking_ack(const char *content, struct agent_content_row *rows,
+                size_t nrows)
 {
     struct agent_need need;
     struct agent_action act;
     struct agent_commit_row commit_rows[1];
+    int pages = (int) agent_content_pages(rows, nrows);
 
     memset(&act, 0, sizeof act);
     act.commit = commit_rows;
@@ -1049,7 +1510,7 @@ agent_display_nhwindow(winid window, boolean blocking)
     if (!r || r->type == NHW_MESSAGE) {
         /* the message content is already part of msg; the acknowledgement is
          * immediate */
-        ag_blocking_ack((const char *) 0, 0,
+        ag_blocking_ack((const char *) 0,
                         (struct agent_content_row *) 0, 0);
         return;
     }
@@ -1060,8 +1521,7 @@ agent_display_nhwindow(winid window, boolean blocking)
         char content[AG_ID_STR_MAX];
 
         Strcpy(content, r->content);
-        ag_blocking_ack(content, (int) agent_content_pages(nrows), rows,
-                        nrows);
+        ag_blocking_ack(content, rows, nrows);
         if (rows)
             free(rows);
         return;
@@ -1073,8 +1533,7 @@ agent_display_nhwindow(winid window, boolean blocking)
         char content[AG_ID_STR_MAX];
 
         Strcpy(content, r->content);
-        ag_blocking_ack(content, (int) agent_content_pages(nrows), rows,
-                        nrows);
+        ag_blocking_ack(content, rows, nrows);
         if (rows)
             free(rows);
     }
@@ -1126,8 +1585,7 @@ agent_putstr(winid window, int attr, const char *str)
     if (r->type == NHW_MESSAGE) {
         if (!str[0])
             return;
-        ag_msg_push(ag_w_msg, &ag_w_nmsg, AGW_MSG_MAX, str, style,
-                    ag_next_id(&agent_next_event, "message id exhausted"));
+        ag_display_message(str, style);
         return;
     }
     ag_push_line(r, str, style);
@@ -1147,8 +1605,7 @@ agent_putmixed(winid window, int attr, const char *str)
 
         if (!txt[0])
             return;
-        ag_msg_push(ag_w_msg, &ag_w_nmsg, AGW_MSG_MAX, txt, style,
-                    ag_next_id(&agent_next_event, "message id exhausted"));
+        ag_display_message(txt, style);
         return;
     }
     {
@@ -1163,6 +1620,17 @@ agent_putmixed(winid window, int attr, const char *str)
         free(buf);
         free(copy);
     }
+}
+
+/* The title of a text window populated from a native data file.  The native
+ * file name is a private path, never player presentation, so it is never
+ * copied here; tty's display_file shows the file text with no title at all,
+ * which is the tty-equivalent presentation. */
+static void
+ag_display_file_title(struct ag_winrec *r)
+{
+    if (r)
+        r->title[0] = '\0';
 }
 
 static void
@@ -1180,19 +1648,17 @@ agent_display_file(const char *fname, boolean complain)
             struct ag_winrec *mw = ag_winrec_find(WIN_MESSAGE);
 
             if (mw)
-                ag_msg_push(ag_w_msg, &ag_w_nmsg, AGW_MSG_MAX,
-                            "Cannot open the requested data file.", 0,
-                            ag_next_id(&agent_next_event,
-                                       "message id exhausted"));
+                ag_display_message("Cannot open the requested data file.",
+                                   0);
         }
         return;
     }
     win = agent_create_nhwindow(NHW_TEXT);
     {
-        struct ag_winrec *r = ag_winrec_find(win);
-
-        if (r)
-            Strcpy(r->title, fname);
+        /* The native file name is NEVER published: it is a private path, not
+         * player presentation; the window carries the tty-equivalent (empty)
+         * title instead. */
+        ag_display_file_title(ag_winrec_find(win));
         while (dlb_fgets(buf, BUFSZ, f)) {
             char *cr = strchr(buf, '\n');
 
@@ -1369,7 +1835,7 @@ agent_select_menu(winid window, int how, MENU_ITEM_P **menu_list)
     need.menu = r->menu_id;
     need.mode = m.mode;
     need.content = r->content;
-    need.pages = (int) agent_content_pages(nrows);
+    need.pages = (int) agent_content_pages(crows, nrows);
 
     /* publish the menu descriptor alongside the request */
     ag_menu_desc.w = r->w;
@@ -1452,9 +1918,7 @@ agent_message_menu(char let, int how, const char *mesg)
     if (how == PICK_NONE) {
         r = ag_winrec_find(WIN_MESSAGE);
         if (r && mesg && mesg[0])
-            ag_msg_push(ag_w_msg, &ag_w_nmsg, AGW_MSG_MAX, mesg, 0,
-                        ag_next_id(&agent_next_event,
-                                   "message id exhausted"));
+            ag_display_message(mesg, 0);
         return '\0';
     }
     {
@@ -1532,8 +1996,10 @@ agent_nh_poskey(coordxy *x, coordxy *y, int *mod)
 static int
 agent_doprev_message(void)
 {
-    /* present the message history through an ordinary text window and the
-     * blocking-display acknowledgement (no privileged input path) */
+    /* Present the PRIVATE native ^P recall history (displayed messages plus
+     * history-only callbacks plus restored entries, in native recall order)
+     * through an ordinary text window and the blocking-display
+     * acknowledgement; there is no privileged input path. */
     winid win;
     size_t i;
 
@@ -1545,8 +2011,12 @@ agent_doprev_message(void)
             Strcpy(r->title, "Message History");
     }
     agent_putstr(win, 0, "Message History");
-    for (i = 0; i < ag_w_nmsg; ++i)
-        agent_putstr(win, 0, ag_w_msg[i].text);
+    for (i = 0; i < ag_w_recall.n; ++i) {
+        const char *t = ag_w_recall.v[i].text;
+
+        if (t && t[0])
+            agent_putstr(win, 0, t);
+    }
     agent_display_nhwindow(win, TRUE);
     agent_destroy_nhwindow(win);
     return 0;
@@ -1607,21 +2077,45 @@ static size_t ag_hist_cursor = 0;
 static char *
 agent_getmsghistory(boolean init)
 {
+    /* the save path reads the complete private recall history, oldest first,
+     * terminated by a NULL result */
     if (init)
         ag_hist_cursor = 0;
-    if (ag_hist_cursor >= ag_w_nhist)
+    if (ag_hist_cursor >= ag_w_recall.n)
         return (char *) 0;
-    return ag_w_hist[ag_hist_cursor++].text;
+    return ag_w_recall.v[ag_hist_cursor++].text;
 }
 
 static void
 agent_putmsghistory(const char *msg, boolean restoring)
 {
-    (void) restoring;
-    if (!msg)
+    if (restoring) {
+        if (!ag_restoring_history) {
+            /* First restored entry of a restore: hold this session's recall
+             * aside so the restored (older session) entries logically precede
+             * it, exactly as tty's snapshot dance does. */
+            ag_eventlist_move(&ag_restore_hold, &ag_w_recall);
+            ag_restoring_history = TRUE;
+        }
+        if (msg) {
+            /* a restored entry is both recall and published history */
+            uint64_t e = ag_next_event_id();
+
+            ag_event_push(&ag_w_recall, msg, 0, e);
+            ag_event_push(&ag_w_hist, msg, 0, e);
+        } else {
+            /* terminating NULL: restoration is complete, put the held
+             * this-session entries back after the restored ones */
+            ag_eventlist_move(&ag_w_recall, &ag_restore_hold);
+            ag_restoring_history = FALSE;
+        }
         return;
-    ag_msg_push(ag_w_hist, &ag_w_nhist, AGW_HIST_MAX, msg, 0,
-                ag_next_id(&agent_next_event, "history id exhausted"));
+    }
+    /* A live history-only callback (^P recall without display) updates the
+     * private recall storage only: it is neither a new displayed event (msg)
+     * nor restored history (hist). */
+    if (msg)
+        ag_event_push(&ag_w_recall, msg, 0, ag_next_event_id());
 }
 
 /* ------------------------------------------------------------------ */

@@ -688,7 +688,14 @@ def main(argv):
                      "probe wizardcmd=1", "probe ordinary=0",
                      "probe handlers=1",
                      "probe glypheq-map=1", "probe glypheq-frame=1",
-                     "probe glypheq-menu=1", "probe glypheq-female=1"):
+                     "probe glypheq-menu=1", "probe glypheq-female=1",
+                     "probe mapclear=1", "probe msgstore=1",
+                     "probe msghistory=1", "probe dispfile=1",
+                     "probe yn-one-request=1", "probe yn-case=1",
+                     "probe yn-reset=1", "probe yn-escape=1",
+                     "probe yn-hidden=1", "probe yn-count=1",
+                     "probe yn-zero=1", "probe yndir-kind=1",
+                     "probe ynkind-other=1"):
             if want not in res.diag:
                 failures.append("impossible: private diag missing %r" % want)
         rows.append(("impossible", "reject", "empty", str(res.exit_code),
@@ -698,11 +705,12 @@ def main(argv):
         # One M2 decision boundary per worker process: each publishes exactly
         # one durable snapshot carrying its outstanding request and then
         # terminates privately on the silent transport rather than fabricating
-        # a decision the agent never made.
-        for kind, label in (
-                ("test-display", "display"),
-                ("test-select", "select"),
-                ("test-msgmenu", "msgmenu")):
+        # a decision the agent never made.  The published request shape (need
+        # kind and durable seq) is asserted, not just the record kinds.
+        for kind, label, need_kind in (
+                ("test-display", "display", "ack"),
+                ("test-select", "select", "menu"),
+                ("test-msgmenu", "msgmenu", "key")):
             label = "decision-" + label
             res = run_worker(args, label, worker=args.impossible_worker,
                              handshake_kind=kind, timeout=args.timeout)
@@ -711,6 +719,23 @@ def main(argv):
             if kinds != ["hello", "obs"]:
                 failures.append("%s: expected exactly [hello, obs], saw %s"
                                 % (label, kinds))
+            obs = [r for r in records if r.get("type") == "obs"]
+            if len(obs) == 1:
+                need = obs[0].get("need")
+                nk = need.get("kind") if isinstance(need, dict) else None
+                if nk != need_kind:
+                    failures.append(
+                        "%s: obs need %r, expected kind %r"
+                        % (label, need, need_kind))
+                elif need.get("id") != 1:
+                    failures.append("%s: obs need id %r, expected 1"
+                                    % (label, need.get("id")))
+                if obs[0].get("seq") != 1:
+                    failures.append("%s: obs seq %r, expected 1"
+                                    % (label, obs[0].get("seq")))
+                if obs[0].get("base") is not None:
+                    failures.append("%s: obs base %r, not a full snapshot"
+                                    % (label, obs[0].get("base")))
             if res.exit_code != 70:
                 failures.append("%s: exit %d, expected private 70"
                                 % (label, res.exit_code))

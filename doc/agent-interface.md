@@ -238,8 +238,10 @@ advance `seq` (section 9).
 `yn_function` receives a `choices` string in which an embedded native Escape
 (`0x1b`) separates the *displayed* choices from an *undisplayed* accepted
 suffix. The public choices field stops before the first Escape and is `null` for
-an unrestricted prompt. The native acceptable set, the default byte, Escape
-handling, and `yn_number` remain private.
+an unrestricted prompt. The displayed default byte is **public** (tty shows it
+in the prompt and returns it on Escape, so `default` is player presentation);
+the native acceptable set beyond the visible prefix, Escape handling, and
+`yn_number` remain private.
 
 `agent_visible_choices` performs this projection: it copies the prefix before
 the first `0x1b` or `0x00`, rejects bytes outside `0x20`–`0x7E`, and rejects

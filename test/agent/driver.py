@@ -24,6 +24,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import schema_check  # noqa: E402  (test-side validator)
+import format_obs  # noqa: E402  (test-side independent chunk/page decoder)
 
 ESC = 27
 KEY_H = 104
@@ -33,6 +34,27 @@ KEY_L = 108
 KEY_HASH = 35
 KEY_Y = 121
 KEY_N = 110
+
+# The deterministic play script's expected character-selection menu titles and
+# its request-kind transcript.  These pin the native interaction sequence the
+# script exercises; they change only when the scripted play path changes.
+EXPECTED_PLAY_MENUS = [
+    "Pick a role or profession",
+    "Pick a race or species",
+    "Pick a gender or sex",
+    "Pick an alignment or creed",
+    "Is this ok? [ynq]",
+    "Do you want a tutorial?",
+]
+EXPECTED_PLAY_KINDS = [
+    "yn",                                   # "Shall I pick ...?"
+    "menu", "menu", "menu", "menu", "menu",  # role, race, gender, align, ok
+    "ack", "menu",                          # menu display, tutorial prompt
+    "command", "command", "command", "command", "command", "command",
+    "command", "command",                   # the seven movement keys + '.'
+    "extcmd", "line", "command", "extcmd",  # quit path
+    "yn", "yn", "yn", "yn", "yn",           # native confirmations
+]
 
 
 def _fail(msg):
@@ -190,11 +212,16 @@ class Episode(object):
         self.timeout = timeout
         self.client = Client()
         self.records = []
+        self.raw_lines = []
         self.pages = {}
         self.seen_hello = 0
         self.seen_closed = 0
         self.invalids = []
         self.reconstructions = 0
+        self.obs_seen = 0
+        self.acts_sent = 0
+        self.need_kinds = []
+        self.last_seq = 0
 
     def validate(self, rec):
         errs = validate_record(self.schema, rec, rec.get("type", "?"))
@@ -209,6 +236,7 @@ class Episode(object):
             return None
         if not line.strip():
             return {}
+        self.raw_lines.append(line)
         try:
             rec = json.loads(line)
         except ValueError:
@@ -216,8 +244,44 @@ class Episode(object):
         self.validate(rec)
         return rec
 
+    def decode(self):
+        """Independently assemble the ACTUAL emitted records (plain + chunked)
+        through the shared strict decoder and return the logical stream.  This
+        is the reconstruction authority; the live view is a cross-check."""
+        return list(format_obs.assemble(self.raw_lines))
+
+    def verify_reconstruction(self):
+        """Rebuild the presentation from the assembled logical records and
+        compare it with the live client view.  A disagreement means the wire
+        projection is not lossless (or the decoder caught a stream defect)."""
+        recon = Client()
+        seen_obs = 0
+        for rec in self.decode():
+            if rec.get("type") == "obs":
+                recon.apply(rec)
+                seen_obs += 1
+        if seen_obs != self.obs_seen:
+            raise AssertionError(
+                "decoder saw %d obs, live view saw %d" % (seen_obs,
+                                                          self.obs_seen))
+        if recon.seq != self.client.seq:
+            raise AssertionError("decoded seq %r != live seq %r"
+                                 % (recon.seq, self.client.seq))
+        if recon.map != self.client.map:
+            raise AssertionError("decoded map differs from the live view")
+        if recon.cur != self.client.cur:
+            raise AssertionError("decoded cursor differs from the live view")
+        if recon.msg != self.client.msg:
+            raise AssertionError("decoded messages differ from the live view")
+        if recon.hist != self.client.hist:
+            raise AssertionError("decoded history differs from the live view")
+        if recon.s != self.client.s:
+            raise AssertionError("decoded status differs from the live view")
+        if recon.need != self.client.need:
+            raise AssertionError("decoded request differs from the live view")
+
     def fetch_pages(self, need):
-        """Request every required page of the outstanding content."""
+        """Request every page; verify index uniqueness and order."""
         pages = need.get("pages", 0)
         content = need.get("content")
         if not pages:
@@ -225,24 +289,43 @@ class Episode(object):
         for k in range(pages):
             self.runner.send({"v": 1, "type": "get_page", "id": need["id"],
                               "content": content, "page": k})
-        want = pages
-        rows = []
-        while len(rows) < want:
+        got = {}
+        order = []
+        while len(order) < pages:
             rec = self.read_record()
             if rec is None:
                 raise AssertionError("transport closed while paging")
             if rec.get("type") == "page":
                 if rec["content"] != content:
                     raise AssertionError("page for the wrong content")
-                rows.append(rec["rows"])
+                if rec["pages"] != pages:
+                    raise AssertionError(
+                        "page declared %r pages, request declared %d"
+                        % (rec["pages"], pages))
+                idx = rec["page"]
+                if idx in got:
+                    raise AssertionError("duplicate page index %r" % idx)
+                if idx != len(order):
+                    raise AssertionError(
+                        "page %r out of order (expected %d)"
+                        % (idx, len(order)))
+                got[idx] = rec["rows"]
+                order.append(idx)
             elif rec.get("type") in ("hello", "obs", "closed"):
                 raise AssertionError("unexpected %r during paging"
                                      % rec.get("type"))
-        return [r for page in rows for r in page]
+        return [r for k in order for r in got[k]]
 
     def menu_rows(self, need):
         rows = self.fetch_pages(need)
         return rows
+
+    def send_act(self, need, action):
+        """Send one action answering need; every action is counted so the
+        one-observation-per-action invariant can be checked."""
+        self.acts_sent += 1
+        self.runner.send({"v": 1, "type": "act", "id": need["id"],
+                          "action": action})
 
     # -- policy hooks, overridden by the play policy -----------------
 
@@ -262,14 +345,23 @@ class Episode(object):
             if t == "hello":
                 self.seen_hello += 1
             elif t == "obs":
+                if rec["seq"] <= self.last_seq:
+                    raise AssertionError(
+                        "durable seq is not strictly increasing: %r after %r"
+                        % (rec["seq"], self.last_seq))
+                self.last_seq = rec["seq"]
                 self.client.apply(rec)
+                self.obs_seen += 1
                 self.reconstructions += 1
-                if rec["need"] is not None:
-                    self.answer(rec["need"])
+                need = rec["need"]
+                if need is not None:
+                    self.need_kinds.append(need["kind"])
+                    self.answer(need)
             elif t == "page":
                 pass  # consumed by fetch_pages
             elif t == "chunk":
-                raise AssertionError("chunked records are not expected here")
+                # a chunked snapshot is legitimate; the decoder reassembles it
+                pass
             elif t == "invalid":
                 self.invalids.append(rec["code"])
             elif t == "closed":
@@ -318,16 +410,14 @@ class PlayPolicy(Episode):
             pages = need.get("pages", 0)
             if pages:
                 self.fetch_pages(need)
-            self.runner.send({"v": 1, "type": "act", "id": need["id"],
-                              "action": {"ack": True}})
+            self.send_act(need, {"ack": True})
         elif kind in ("line", "extcmd"):
             if kind == "line":
                 self.answer_line(need)
             else:
                 self.answer_text(need)
         elif kind == "position":
-            self.runner.send({"v": 1, "type": "act", "id": need["id"],
-                              "action": {"key": ord(".")}})
+            self.send_act(need, {"key": ord(".")})
         else:
             raise AssertionError("unexpected need kind %r" % kind)
 
@@ -346,8 +436,7 @@ class PlayPolicy(Episode):
             key = ord(need["choices"][0])
         else:
             key = KEY_N
-        self.runner.send({"v": 1, "type": "act", "id": need["id"],
-                          "action": {"yn": key}})
+        self.send_act(need, {"yn": key})
 
     def answer_menu(self, need):
         rows = self.menu_rows(need)
@@ -373,12 +462,10 @@ class PlayPolicy(Episode):
         if choice is None and selectable:
             choice = selectable[0]
         if choice is None:
-            self.runner.send({"v": 1, "type": "act", "id": need["id"],
-                              "action": {"cancel": True}})
+            self.send_act(need, {"cancel": True})
             return
-        self.runner.send({"v": 1, "type": "act", "id": need["id"],
-                          "action": {"menu": need["menu"],
-                                     "commit": [[choice["r"], -1]]}})
+        self.send_act(need, {"menu": need["menu"],
+                             "commit": [[choice["r"], -1]]})
 
     def window_title(self, content):
         for w in self.client.windows.values():
@@ -405,8 +492,7 @@ class PlayPolicy(Episode):
         else:
             key = KEY_L
         self.keys_sent.append(key)
-        self.runner.send({"v": 1, "type": "act", "id": need["id"],
-                          "action": {"key": key}})
+        self.send_act(need, {"key": key})
 
     def answer_text(self, need):
         self.saw_extcmd = True
@@ -417,13 +503,11 @@ class PlayPolicy(Episode):
             text = "annotate"
         else:
             text = "quit" if self.quit else "wait"
-        self.runner.send({"v": 1, "type": "act", "id": need["id"],
-                          "action": {"text": text}})
+        self.send_act(need, {"text": text})
 
     def answer_line(self, need):
         self.saw_line = True
-        self.runner.send({"v": 1, "type": "act", "id": need["id"],
-                          "action": {"text": "M2 line entry"}})
+        self.send_act(need, {"text": "M2 line entry"})
 
 
 # ------------------------------------------------------------------
@@ -441,6 +525,7 @@ def cmd_episode(args):
     ep = Episode(runner, schema, timeout=args.timeout)
     try:
         ep.run()
+        ep.verify_reconstruction()
     except (AssertionError, TimeoutError) as exc:
         runner.finish()
         return _fail(str(exc))
@@ -475,17 +560,24 @@ def cmd_play(args):
     pol = PlayPolicy(runner, schema, timeout=args.timeout)
     try:
         pol.run()
+        # the independently assembled logical stream is the reconstruction
+        # authority for the whole episode
+        pol.verify_reconstruction()
     except (AssertionError, TimeoutError) as exc:
         runner.finish()
         return _fail(str(exc))
     code, out, err = runner.finish()
 
+    if code != 0:
+        return _fail("runner exited %d (expected a clean 0)" % code)
     if pol.seen_hello != 1:
         return _fail("expected exactly one hello, saw %d" % pol.seen_hello)
     if pol.invalids:
         return _fail("the episode emitted invalid records: %r" % pol.invalids)
     if not pol.gameplay_started:
         return _fail("character selection never completed")
+    if pol.role_chosen != "a Barbarian":
+        return _fail("unexpected role selection %r" % (pol.role_chosen,))
     if pol.move_index < len(pol.moves):
         return _fail("only %d of %d moves were issued"
                      % (pol.move_index, len(pol.moves)))
@@ -501,6 +593,23 @@ def cmd_play(args):
     if not pol.saw_line:
         return _fail("no native line prompt was ever answered")
 
+    # Exactly one durable response per accepted action: every action is
+    # answered by one observation or by the terminal closure, and the episode
+    # opens with exactly one un-prompted observation (character selection).
+    if pol.obs_seen + pol.seen_closed != pol.acts_sent + 1:
+        return _fail("expected one response per action: %d obs + %d closed "
+                     "for %d acts" % (pol.obs_seen, pol.seen_closed,
+                                      pol.acts_sent))
+
+    # the request-kind transcript of the deterministic script
+    if pol.need_kinds != EXPECTED_PLAY_KINDS:
+        return _fail("request-kind transcript differs:\n  got      %r\n"
+                     "  expected %r" % (pol.need_kinds, EXPECTED_PLAY_KINDS))
+    # the menu-title sequence of the character-selection menus
+    if pol.menu_titles != EXPECTED_PLAY_MENUS:
+        return _fail("menu-title sequence differs:\n  got      %r\n"
+                     "  expected %r" % (pol.menu_titles, EXPECTED_PLAY_MENUS))
+
     if pol.seen_closed != 1:
         return _fail("expected exactly one closed, saw %d" % pol.seen_closed)
 
@@ -514,6 +623,7 @@ def cmd_play(args):
           "time %s->%s; keys=%r"
           % (len(pol.records), pol.role_chosen, pol.menu_titles,
              pol.move_index, pol.time_first, pol.time_last, pol.keys_sent))
+    print("driver: request-kind transcript: %s" % (pol.need_kinds,))
     print("driver: record kinds: %s" % (kinds,))
     return 0
 

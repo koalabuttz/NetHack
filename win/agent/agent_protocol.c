@@ -672,8 +672,9 @@ ag_validate_view(const struct agent_view *v, const struct agent_need *need)
     int j, k;
 
     if (!v || v->npal > AG_VIEW_MAX_PALETTE || v->nstatus > AG_VIEW_MAX_STATUS
-        || v->ncond > AG_VIEW_MAX_COND || v->nmsg > AG_VIEW_MAX_MSG
-        || v->nhist > AG_VIEW_MAX_MSG || v->nwindows > AG_VIEW_MAX_WINDOWS)
+        || v->ncond > AG_VIEW_MAX_COND || v->nwindows > AG_VIEW_MAX_WINDOWS)
+        return false;
+    if ((v->nmsg && !v->msg) || (v->nhist && !v->hist))
         return false;
 
     for (i = 0; i < v->npal; ++i) {
@@ -2685,6 +2686,16 @@ agent_commit(struct agent_session *s, const struct agent_view *v,
     /* a commit supersedes content registered for the previous request */
     s->content_rows = (const struct agent_content_row *) 0;
     s->content_nrows = 0;
+    /* Fail closed if this commit would silently replace an outstanding
+     * request whose action the native handler has NOT accepted.  A gameplay
+     * request may only succeed one that was already accepted: the frozen
+     * contract (section 11.3) leaves a semantically rejected action's request
+     * outstanding, so republishing a fresh request id (and advancing the
+     * durable sequence) here would be a protocol violation.  Checked before
+     * anything is built, counted, or written. */
+    if (need && need->kind != AG_NEED_NONE && s->outstanding_id != 0
+        && !(s->have_action && s->action_id == s->outstanding_id))
+        return AG_INTERNAL;
     /* validate every public value before anything is built or counted, so a
      * malformed view fails closed with no output and no counter movement */
     if (!ag_validate_view(v, need))
@@ -2826,6 +2837,121 @@ ag_mark_page(struct agent_session *s, long page)
     }
 }
 
+/* Render one content row exactly as a page record carries it. */
+static void
+ag_put_content_row(struct ag_buf *o, const struct agent_content_row *row)
+{
+    if (row->r > 0) {
+        ag_puts(o, "{\"r\":");
+        ag_put_i64(o, row->r);
+        ag_puts(o, ",\"text\":");
+        ag_put_jstr(o, row->text ? row->text : "");
+        ag_puts(o, ",\"selectable\":");
+        ag_puts(o, row->selectable ? "true" : "false");
+        ag_puts(o, ",\"key\":");
+        if (row->key)
+            ag_put_i64(o, row->key);
+        else
+            ag_puts(o, "null");
+        ag_puts(o, ",\"group\":");
+        if (row->group)
+            ag_put_i64(o, row->group);
+        else
+            ag_puts(o, "null");
+        ag_puts(o, ",\"initial\":");
+        if (row->has_initial)
+            ag_put_i64(o, row->initial);
+        else
+            ag_puts(o, "null");
+        ag_puts(o, ",\"style\":");
+        ag_put_u64(o, row->style);
+        ag_puts(o, ",\"color\":");
+        ag_put_jstr(o, agent_color_name(row->color)
+                           ? agent_color_name(row->color)
+                           : "none");
+        ag_puts(o, ",\"icon\":");
+        if (row->has_icon) {
+            ag_puts(o, "[\"");
+            ag_putc(o, (char) row->icon.ch);
+            ag_puts(o, "\",");
+            ag_put_jstr(o, agent_color_name(row->icon.fg)
+                               ? agent_color_name(row->icon.fg)
+                               : "none");
+            ag_puts(o, ",");
+            ag_put_u64(o, row->icon.style);
+            ag_puts(o, ",");
+            ag_put_jstr(o, agent_color_name(row->icon.frame)
+                               ? agent_color_name(row->icon.frame)
+                               : "none");
+            ag_putc(o, ']');
+        } else {
+            ag_puts(o, "null");
+        }
+        ag_putc(o, '}');
+    } else {
+        ag_puts(o, "{\"text\":");
+        ag_put_jstr(o, row->text ? row->text : "");
+        ag_puts(o, ",\"style\":");
+        ag_put_u64(o, row->style);
+        ag_putc(o, '}');
+    }
+}
+
+/* The largest wrapper around a page's row array: the fixed page-record
+ * preamble/postamble with every integer at its widest.  A page's encoded line
+ * is bounded by this plus the sum of its rows, so bounding the whole line by
+ * AG_PAGE_MAX_BYTES keeps every page inside the advertised byte limit. */
+#define AG_PAGE_WRAPPER_RESERVE 160
+
+/* Deterministically pack the content rows into pages bounded by BOTH
+ * AG_PAGE_MAX_ROWS rows and AG_PAGE_MAX_BYTES encoded bytes.  The plan is a
+ * pure function of the rows, so the request's declared page count, the window
+ * descriptor, and get_page emission all agree exactly and retries reproduce
+ * identical pages.  A row that alone exceeds the byte budget still occupies a
+ * page by itself (content is never truncated, split, or reordered).  Returns
+ * the number of pages and, when target < that count, the row range of the
+ * target page. */
+static size_t
+ag_page_walk(const struct agent_content_row *rows, size_t nrows,
+             size_t target, size_t *first, size_t *last)
+{
+    struct ag_buf t;
+    size_t i = 0, pages = 0;
+
+    if (!rows || nrows == 0)
+        return 0;
+    ag_init(&t);
+    while (i < nrows) {
+        size_t pf = i, used = 0;
+
+        while (i < nrows) {
+            size_t rsz;
+
+            t.len = 0;
+            ag_put_content_row(&t, &rows[i]);
+            rsz = t.len;
+            if (i > pf) {
+                if ((i - pf) >= AG_PAGE_MAX_ROWS)
+                    break;
+                if (AG_PAGE_WRAPPER_RESERVE + used + 1 + rsz
+                    > AG_PAGE_MAX_BYTES)
+                    break;
+                used += 1 + rsz;
+            } else {
+                used = rsz;
+            }
+            ++i;
+        }
+        if (target == pages) {
+            *first = pf;
+            *last = i;
+        }
+        ++pages;
+    }
+    ag_free(&t);
+    return pages;
+}
+
 /* Emit a single page of the outstanding content. */
 static enum agent_result
 ag_emit_page(struct agent_session *s, const char *content, long page,
@@ -2834,8 +2960,10 @@ ag_emit_page(struct agent_session *s, const char *content, long page,
     struct ag_buf o;
     enum agent_result r;
     uint64_t d;
-    size_t first, last, i;
+    size_t first = 0, last = 0, i;
 
+    (void) ag_page_walk(s->content_rows, s->content_nrows, (size_t) page,
+                        &first, &last);
     if (!ag_bump(s, &s->next_delivery))
         return AG_LIMIT;
     d = s->next_delivery;
@@ -2849,69 +2977,10 @@ ag_emit_page(struct agent_session *s, const char *content, long page,
     ag_puts(&o, ",\"pages\":");
     ag_put_i64(&o, pages);
     ag_puts(&o, ",\"rows\":[");
-    first = (size_t) page * AG_CONTENT_ROWS_PER_PAGE;
-    last = first + AG_CONTENT_ROWS_PER_PAGE;
-    if (last > s->content_nrows)
-        last = s->content_nrows;
     for (i = first; i < last; ++i) {
-        const struct agent_content_row *row = &s->content_rows[i];
-
         if (i > first)
             ag_putc(&o, ',');
-        if (row->r > 0) {
-            ag_puts(&o, "{\"r\":");
-            ag_put_i64(&o, row->r);
-            ag_puts(&o, ",\"text\":");
-            ag_put_jstr(&o, row->text ? row->text : "");
-            ag_puts(&o, ",\"selectable\":");
-            ag_puts(&o, row->selectable ? "true" : "false");
-            ag_puts(&o, ",\"key\":");
-            if (row->key)
-                ag_put_i64(&o, row->key);
-            else
-                ag_puts(&o, "null");
-            ag_puts(&o, ",\"group\":");
-            if (row->group)
-                ag_put_i64(&o, row->group);
-            else
-                ag_puts(&o, "null");
-            ag_puts(&o, ",\"initial\":");
-            if (row->has_initial)
-                ag_put_i64(&o, row->initial);
-            else
-                ag_puts(&o, "null");
-            ag_puts(&o, ",\"style\":");
-            ag_put_u64(&o, row->style);
-            ag_puts(&o, ",\"color\":");
-            ag_put_jstr(&o, agent_color_name(row->color)
-                                ? agent_color_name(row->color)
-                                : "none");
-            ag_puts(&o, ",\"icon\":");
-            if (row->has_icon) {
-                ag_puts(&o, "[\"");
-                ag_putc(&o, (char) row->icon.ch);
-                ag_puts(&o, "\",");
-                ag_put_jstr(&o, agent_color_name(row->icon.fg)
-                                ? agent_color_name(row->icon.fg)
-                                : "none");
-                ag_puts(&o, ",");
-                ag_put_u64(&o, row->icon.style);
-                ag_puts(&o, ",");
-                ag_put_jstr(&o, agent_color_name(row->icon.frame)
-                                ? agent_color_name(row->icon.frame)
-                                : "none");
-                ag_putc(&o, ']');
-            } else {
-                ag_puts(&o, "null");
-            }
-            ag_putc(&o, '}');
-        } else {
-            ag_puts(&o, "{\"text\":");
-            ag_put_jstr(&o, row->text ? row->text : "");
-            ag_puts(&o, ",\"style\":");
-            ag_put_u64(&o, row->style);
-            ag_putc(&o, '}');
-        }
+        ag_put_content_row(&o, &s->content_rows[i]);
     }
     ag_puts(&o, "]}");
     if (o.ovf) {
@@ -2924,9 +2993,11 @@ ag_emit_page(struct agent_session *s, const char *content, long page,
 }
 
 size_t
-agent_content_pages(size_t nrows)
+agent_content_pages(const struct agent_content_row *rows, size_t nrows)
 {
-    return (nrows + AG_CONTENT_ROWS_PER_PAGE - 1) / AG_CONTENT_ROWS_PER_PAGE;
+    size_t first = 0, last = 0;
+
+    return ag_page_walk(rows, nrows, (size_t) -1, &first, &last);
 }
 
 void

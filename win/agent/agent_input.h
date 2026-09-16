@@ -44,6 +44,10 @@ int agent_input_poskey(coordxy *x, coordxy *y, int *mod);
  * semantics are reproduced. */
 int agent_input_yn(const char *query, const char *choices, char def);
 
+/* The request kind for the current yn_function context: AG_NEED_DIRECTION in
+ * the getdir() input context, else AG_NEED_YN. */
+enum agent_need_kind agent_input_yn_kind(void);
+
 /* getlin(): bounded line request; cancellation yields the native Escape
  * result in buf.  cap is the native destination capacity in bytes. */
 void agent_input_line(const char *query, char *buf, size_t cap);

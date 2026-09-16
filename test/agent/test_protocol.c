@@ -301,12 +301,25 @@ collect_text_parts(const char *stream, const char *tag, long ref,
 static struct agent_view view;
 static char textbuf[AG_MAX_TEXT_BYTES + 4096];
 
+/* The view borrows heap arrays in production; the fixtures borrow these small
+ * static backing arrays so `v->msg`/`v->hist` are always non-NULL. */
+static struct agent_msg fix_msg[1024];
+static struct agent_msg fix_hist[1024];
+
+static void
+fix_attach(struct agent_view *v)
+{
+    v->msg = fix_msg;
+    v->hist = fix_hist;
+}
+
 static void
 build_view(int ncells)
 {
     int i;
 
     memset(&view, 0, sizeof view);
+    fix_attach(&view);
     view.full = true;
     view.pal[0].ch = AG_BLANK_CHAR;
     view.pal[0].fg = AG_COL_NONE;
@@ -1239,6 +1252,7 @@ test_long_text(void)
     textbuf[LEN] = '\0';
 
     memset(&v, 0, sizeof v);
+    fix_attach(&v);
     v.full = true;
     v.pal[0].ch = AG_BLANK_CHAR;
     v.pal[0].fg = AG_COL_NONE;
@@ -1768,6 +1782,7 @@ test_encoder_utf8(void)
     size_t i, budget;
 
     memset(&v, 0, sizeof v);
+    fix_attach(&v);
     v.full = true;
     v.pal[0].ch = AG_BLANK_CHAR;
     v.pal[0].fg = AG_COL_NONE;
@@ -1911,6 +1926,243 @@ test_page_bounds(void)
     CHECK(io.outlen == 0);
 }
 
+/* ================================================================= */
+/* M2 review findings                                                */
+/* ================================================================= */
+
+/* High 2: a commit may not silently replace an outstanding request whose
+ * action the native handler has not accepted; once accepted, replacement is
+ * allowed.  Nothing is emitted and no counter moves on the rejection. */
+static void
+test_commit_guard(void)
+{
+    struct agent_need n1, n2;
+    struct agent_action a;
+    size_t d, sq, olen;
+
+    prep(&a);
+    build_view(2);
+    reset_io();
+    CHECK(agent_write_hello(&sess) == AG_OK);
+    need_cmd(&n1, 1);
+    CHECK(agent_commit(&sess, &view, &n1) == AG_OK);
+    CHECK(sess.outstanding_id == 1);
+
+    d = sess.next_delivery;
+    sq = sess.next_seq;
+    olen = io.outlen;
+    need_cmd(&n2, 2);
+    CHECK(agent_commit(&sess, &view, &n2) == AG_INTERNAL);
+    CHECK(sess.next_delivery == d && sess.next_seq == sq);
+    CHECK(io.outlen == olen);
+    CHECK(sess.outstanding_id == 1);
+
+    feed("{\"v\":1,\"type\":\"act\",\"id\":1,\"action\":{\"key\":104}}\n");
+    CHECK(recv(&a) == AG_OK);
+    CHECK(agent_accept(&sess) == AG_OK);
+    CHECK(agent_commit(&sess, &view, &n2) == AG_OK);
+    CHECK(sess.outstanding_id == 2);
+}
+
+/* Medium 3: a boundary carries every ordered message; never shift-dropped
+ * past a fixed cap.  Too many for the byte limit is a fail-closed error,
+ * not a partial snapshot. */
+static void
+test_message_store_complete(void)
+{
+    static char texts[200][24];
+    struct agent_need need;
+    size_t i;
+    const char *p;
+
+    build_view(2);
+    for (i = 0; i < 200; ++i) {
+        (void) snprintf(texts[i], sizeof texts[i], "message-%03u",
+                        (unsigned) i);
+        fix_msg[i].e = (uint64_t) (i + 1);
+        fix_msg[i].text = texts[i];
+        fix_msg[i].style = 0;
+    }
+    view.msg = fix_msg;
+    view.nmsg = 200;
+    view.hist = fix_hist;
+    view.nhist = 0;
+
+    reset_io();
+    need_cmd(&need, 1);
+    CHECK(agent_commit(&sess, &view, &need) == AG_OK);
+    p = outstr();
+    CHECK(count_sub(p, "\"text\":\"message-") == 200);
+    {
+        const char *first = strstr(p, "\"text\":\"message-000\"");
+        const char *last = strstr(p, "\"text\":\"message-199\"");
+
+        CHECK(first != NULL && last != NULL && first < last);
+    }
+
+    /* a view that claims messages without storage fails closed */
+    {
+        struct agent_view bad = view;
+
+        bad.msg = NULL;
+        reset_io();
+        CHECK(agent_commit(&sess, &bad, &need) == AG_LIMIT);
+    }
+}
+
+/* Replace the full snapshot's own "d":N with a fixed token so two emissions
+ * of the same content can be compared byte for byte. */
+static void
+strip_d(char *dst, size_t cap, const char *line)
+{
+    const char *d = find_key(line, "d");
+    size_t head;
+    const char *rest;
+
+    if (!d) {
+        snprintf(dst, cap, "%s", line);
+        return;
+    }
+    head = (size_t) (d - line);
+    if (head >= cap)
+        head = cap - 1;
+    memcpy(dst, line, head);
+    dst[head] = '\0';
+    rest = strchr(d, ',');
+    if (rest)
+        snprintf(dst + head, cap - head, "0%s", rest);
+}
+
+/* Medium 4: page planning is bounded by BOTH rows and encoded byte size, and
+ * get_page emission uses the same plan, so pages are stable, ordered, in
+ * insertion order, and idempotent on retry. */
+static void
+test_page_byte_plan(void)
+{
+    static struct agent_content_row rows[300];
+    static char text[300][200];
+    struct agent_need need;
+    struct agent_action a;
+    size_t pages, i, k;
+    size_t npages = 0, idx = 0;
+    bool fits = true, ordered = true;
+    char first_page[AG_PAGE_MAX_BYTES + 64];
+    size_t first_page_len = 0;
+
+    for (i = 0; i < 300; ++i) {
+        memset(text[i], (int) ('a' + (int) (i % 26)), 180);
+        text[i][180] = '\0';
+        memset(&rows[i], 0, sizeof rows[i]);
+        rows[i].text = text[i];
+    }
+    pages = agent_content_pages(rows, 300);
+    /* 128 rows of ~180 bytes would far exceed one page's byte budget, so the
+     * plan must split well before the row-count limit */
+    CHECK(pages >= 4);
+
+    prep(&a);
+    build_view(2);
+    reset_io();
+    CHECK(agent_write_hello(&sess) == AG_OK);
+    memset(&need, 0, sizeof need);
+    need.kind = AG_NEED_ACK;
+    need.id = 41;
+    need.content = "c7";
+    need.pages = (int) pages;
+    CHECK(agent_commit(&sess, &view, &need) == AG_OK);
+    agent_session_set_content(&sess, rows, 300);
+
+    for (k = 0; k < pages; ++k) {
+        char g[96];
+
+        (void) snprintf(g, sizeof g,
+                        "{\"v\":1,\"type\":\"get_page\",\"id\":41,"
+                        "\"content\":\"c7\",\"page\":%u}\n", (unsigned) k);
+        feed(g);
+    }
+    CHECK(agent_receive(&sess, &a) == AG_IO);
+
+    {
+        const char *q = outstr();
+
+        while (*q) {
+            const char *nl = strchr(q, '\n');
+            size_t len;
+            char line[AG_PAGE_MAX_BYTES + 64];
+
+            if (!nl)
+                break;
+            len = (size_t) (nl - q) + 1;
+            if (len >= sizeof line) {
+                fits = false;
+                break;
+            }
+            memcpy(line, q, len);
+            line[len] = '\0';
+            if (strstr(line, "\"type\":\"page\"")) {
+                const char *t;
+
+                if (len > AG_PAGE_MAX_BYTES)
+                    fits = false;
+                if (npages == 0) {
+                    size_t clen = len;
+
+                    if (clen >= sizeof first_page)
+                        clen = sizeof first_page - 1;
+                    memcpy(first_page, line, clen);
+                    first_page[clen] = '\0';
+                    first_page_len = len;
+                }
+                ++npages;
+                t = line;
+                while ((t = strstr(t, "\"text\":\"")) != NULL) {
+                    if (idx < 300
+                        && t[8] != (char) ('a' + (int) (idx % 26)))
+                        ordered = false;
+                    ++idx;
+                    t += 8;
+                }
+            }
+            q = nl + 1;
+        }
+    }
+    CHECK(npages == pages);
+    CHECK(idx == 300);
+    CHECK(ordered);
+    CHECK(fits);
+    CHECK(sess.pages_delivered == (int) pages);
+
+    /* an idempotent retry of page 0: the delivered set is unchanged and the
+     * re-emitted page equals the first one apart from its delivery counter */
+    {
+        char g[96];
+        char second[AG_PAGE_MAX_BYTES + 64];
+        char n0[AG_PAGE_MAX_BYTES + 64], n1[AG_PAGE_MAX_BYTES + 64];
+        size_t base = io.outlen;
+
+        (void) snprintf(g, sizeof g,
+                        "{\"v\":1,\"type\":\"get_page\",\"id\":41,"
+                        "\"content\":\"c7\",\"page\":0}\n");
+        feed(g);
+        CHECK(agent_receive(&sess, &a) == AG_IO);
+        CHECK(sess.pages_delivered == (int) pages);
+        {
+            const char *q = io.out + base;
+            const char *nl = strchr(q, '\n');
+            size_t len = nl ? (size_t) (nl - q) + 1 : 0;
+
+            CHECK(len > 0 && len < sizeof second);
+            if (len > 0 && len < sizeof second) {
+                memcpy(second, q, len);
+                second[len] = '\0';
+                strip_d(n0, sizeof n0, first_page);
+                strip_d(n1, sizeof n1, second);
+                CHECK(first_page_len > 0 && strcmp(n0, n1) == 0);
+            }
+        }
+    }
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1943,6 +2195,9 @@ main(int argc, char **argv)
     test_encoder_utf8();
     test_accept_identity();
     test_page_bounds();
+    test_commit_guard();
+    test_message_store_complete();
+    test_page_byte_plan();
 
     if (failures) {
         printf("test_protocol: %d failure(s)\n", failures);

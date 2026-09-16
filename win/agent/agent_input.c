@@ -170,6 +170,17 @@ agent_input_poskey(coordxy *x, coordxy *y, int *mod)
 
 /* ---- yn_function --------------------------------------------------- */
 
+/* The request kind for the current native yn_function context.  getdir()
+ * drives yn_function with no choices while the direction input context is set
+ * (src/cmd.c:4051-4057), so that interaction is published as a direction
+ * request rather than a yes/no question.  Native validation is untouched. */
+enum agent_need_kind
+agent_input_yn_kind(void)
+{
+    return (program_state.input_state == getdirInp) ? AG_NEED_DIRECTION
+                                                    : AG_NEED_YN;
+}
+
 int
 agent_input_yn(const char *query, const char *choices, char def)
 {
@@ -180,6 +191,10 @@ agent_input_yn(const char *query, const char *choices, char def)
     boolean allow_num = FALSE, preserve_case = FALSE, unrestricted;
     size_t rlen = 0;
     char result = def;
+
+    /* tty_yn_function resets yn_number on entry (win/tty/topl.c:390), so a
+     * stale count from an earlier prompt can never leak into this one. */
+    yn_number = 0L;
 
     if (choices) {
         rlen = strlen(choices);
@@ -205,20 +220,41 @@ agent_input_yn(const char *query, const char *choices, char def)
     /* the numeric affordance is advertised only when the *displayed* choices
      * carry it; a hidden numeric suffix stays private */
 
+    unrestricted = (respbuf == 0);
+    /* an unrestricted prompt returns the raw byte unchanged: tty's
+     * choices==NULL path never folds case (win/tty/topl.c:422-428); the
+     * "preserve case" test applies only to a restricted prompt */
+    if (unrestricted)
+        preserve_case = TRUE;
+
+    /* getdir() drives yn_function with no choices while the direction input
+     * context is set (src/cmd.c:4051-4057).  Publish that interaction as a
+     * direction request rather than a yes/no question; the native validation
+     * is untouched. */
+    /* Allocate and commit the request exactly ONCE.  A semantic rejection
+     * re-enters the receive loop below on the SAME request: the frozen
+     * contract leaves the outstanding request unchanged, so a fresh request
+     * id, an advanced durable sequence, or a second commit would be a
+     * protocol violation (section 11.3). */
+    memset(&need, 0, sizeof need);
+    need.kind = agent_input_yn_kind();
+    need.id = agent_port_alloc_request();
+    need.prompt = query;
+    need.choices = respbuf ? vis.buf : (const char *) 0;
+    need.def = (int) (unsigned char) def;
+    need.numeric = respbuf && strchr(vis.buf, '#') != 0;
+
+    ag_prep();
+    if (agent_port_commit_need(&need) != AG_OK)
+        ag_fatal("could not publish the outstanding request");
+
     for (;;) {
         char q;
         boolean digit_ok;
 
-        memset(&need, 0, sizeof need);
-        need.kind = AG_NEED_YN;
-        need.id = agent_port_alloc_request();
-        need.prompt = query;
-        need.choices = respbuf ? vis.buf : (const char *) 0;
-        need.def = (int) (unsigned char) def;
-        need.numeric = respbuf && strchr(vis.buf, '#') != 0;
-
-        unrestricted = (respbuf == 0);
-        (void) ag_request(&need);
+        /* read one protocol-valid action on the request committed above; a
+         * rejected line emitted `invalid` and left it outstanding */
+        ag_wait();
 
         q = (char) ag_action.key;
         if (!preserve_case)
@@ -240,6 +276,7 @@ agent_input_yn(const char *query, const char *choices, char def)
             break;
         }
         if (!strchr(respbuf, q) && !digit_ok) {
+            /* semantic rejection: the SAME request stays outstanding */
             ag_reject(AG_INV_RANGE);
             continue;
         }
