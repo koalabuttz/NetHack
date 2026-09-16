@@ -169,6 +169,35 @@ breadth:
 	    --data "$(DATA)" $(if $(SYSCONF),--sysconf "$(SYSCONF)") \
 	    --private-root "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-breadth)"
 
+# Native save -> trusted artifact transfer -> restore into a fresh worker:
+# asserts the save artifact is retrievable, restore starts with a full seq-1
+# snapshot with restored history tagged hist, the same map is reproduced, and
+# play continues; every episode closes generically and cleans its root.
+lifecycle:
+	@test -n "$(WORKER)" -a -n "$(RUNNER)" -a -n "$(DATA)" || \
+	    { echo "set WORKER, RUNNER, DATA (and optionally SYSCONF,"; \
+	      echo "PRIVATE_ROOT) for the lifecycle test"; exit 2; }
+	rm -rf "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-lifecycle)"
+	mkdir -p "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-lifecycle)"
+	python3 driver.py lifecycle --runner "$(RUNNER)" --worker "$(WORKER)" \
+	    --data "$(DATA)" $(if $(SYSCONF),--sysconf "$(SYSCONF)") \
+	    --private-root "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-lifecycle)/unused" \
+	    --root "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-lifecycle)"
+
+# 100 sequential episodes, each reset at a varying point (prompt, mid-move,
+# mid-menu, quit confirmation): reaping, descriptor/process plateau, and a
+# fresh public namespace per episode.
+plateau:
+	@test -n "$(WORKER)" -a -n "$(RUNNER)" -a -n "$(DATA)" || \
+	    { echo "set WORKER, RUNNER, DATA (and optionally SYSCONF,"; \
+	      echo "PRIVATE_ROOT, COUNT) for the plateau test"; exit 2; }
+	rm -rf "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-plateau)"
+	mkdir -p "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-plateau)"
+	python3 driver.py plateau --runner "$(RUNNER)" --worker "$(WORKER)" \
+	    --data "$(DATA)" $(if $(SYSCONF),--sysconf "$(SYSCONF)") \
+	    --private-root "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-plateau)" \
+	    --count "$(if $(COUNT),$(COUNT),100)"
+
 # Menu ownership hardening under AddressSanitizer + UndefinedBehaviorSanitizer.
 #
 # The menu sidecar lives in the engine-linked window port, so this drives the
@@ -195,7 +224,14 @@ asan-lifecycle:
 	    --data "$(ASAN_DATA)" $(if $(ASAN_SYSCONF),--sysconf "$(ASAN_SYSCONF)") \
 	    --deadline 120 --timeout 240 \
 	    --private-root "$(if $(ASAN_PRIVATE_ROOT),$(ASAN_PRIVATE_ROOT),/tmp/agent-asan)/breadth"
-	@echo "asan-lifecycle: play and breadth completed with a clean exit under the sanitizer worker"
+	rm -rf "$(if $(ASAN_PRIVATE_ROOT),$(ASAN_PRIVATE_ROOT),/tmp/agent-asan)/lc"
+	mkdir -p "$(if $(ASAN_PRIVATE_ROOT),$(ASAN_PRIVATE_ROOT),/tmp/agent-asan)/lc"
+	python3 driver.py lifecycle --runner "$(ASAN_RUNNER)" --worker "$(ASAN_WORKER)" \
+	    --data "$(ASAN_DATA)" $(if $(ASAN_SYSCONF),--sysconf "$(ASAN_SYSCONF)") \
+	    --deadline 120 --timeout 240 \
+	    --private-root "$(if $(ASAN_PRIVATE_ROOT),$(ASAN_PRIVATE_ROOT),/tmp/agent-asan)/lc/unused" \
+	    --root "$(if $(ASAN_PRIVATE_ROOT),$(ASAN_PRIVATE_ROOT),/tmp/agent-asan)/lc"
+	@echo "asan-lifecycle: play, breadth and save/restore completed with a clean exit under the sanitizer worker"
 
 # ASan/UBSan build, if the compiler supports the flags.
 sanitize: clean

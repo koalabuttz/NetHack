@@ -68,6 +68,7 @@ _HS = struct.Struct("<IIII64s512s512s512s512s")
 HS_MAGIC = 0x4741484E
 HS_VERSION = 1
 HS_MODE_NEW = 0
+HS_MODE_RESTORE = 1
 HS_PROFILE = "normal-ascii-color-v1"
 
 # Test-only launch modes, accepted ONLY by a worker built with
@@ -77,11 +78,16 @@ HS_MODE_TEST_DISPLAY = 60
 HS_MODE_TEST_SELECT = 61
 HS_MODE_TEST_MSGMENU = 62
 HS_MODE_TEST_EXEC = 63
+HS_MODE_TEST_RIP = 64
+HS_MODE_TEST_WIZSAVE = 65
 TEST_MODE_KINDS = {
     "test-display": HS_MODE_TEST_DISPLAY,
     "test-select": HS_MODE_TEST_SELECT,
     "test-msgmenu": HS_MODE_TEST_MSGMENU,
     "test-exec": HS_MODE_TEST_EXEC,
+    "test-rip": HS_MODE_TEST_RIP,
+    "test-wizsave": HS_MODE_TEST_WIZSAVE,
+    "restore": HS_MODE_RESTORE,
 }
 
 RC_CONTENT = (
@@ -250,12 +256,20 @@ def setup_workdir(private_root, label, data_root):
 
 def run_worker(args, label, *, worker=None, extra_argv=(), env=None,
                handshake_kind="full", hostile_home=None, sysconf=None,
-               timeout=30):
+               timeout=30, seed_save=None):
     worker = worker or args.worker
     if sysconf is None:
         sysconf = args.sysconf
     workdir = setup_workdir(args.private_root, label, args.data)
     diagpath = os.path.join(workdir, "diag", "worker.log")
+
+    # A restore episode finds the save where the engine looks for it: the
+    # episode's own save directory.  The trusted controller (here) seeds it.
+    if seed_save:
+        for name in os.listdir(seed_save):
+            src = os.path.join(seed_save, name)
+            if os.path.isfile(src):
+                shutil.copyfile(src, os.path.join(workdir, "save", name))
 
     if env is None:
         env = clean_env(os.path.join(workdir, "home"))
@@ -628,6 +642,99 @@ def main(argv):
     rows.append(("sysconf-side-effects", "reject", "-", "-",
                  "ok" if not leftovers else "FAIL"))
 
+    # ---- lifecycle: restore rejection before publication -----------------
+    # A trusted controller owns the save files.  The harness produces one real
+    # native save via the launcher, then seeds episodes with it and with
+    # deliberately broken variants; every broken variant must be refused
+    # before a single public byte.
+    import driver as _driver
+    save_art = os.path.join(args.private_root, "save-artifact")
+    os.makedirs(save_art, exist_ok=True)
+    real_save = []
+    try:
+        ns = argparse.Namespace(
+            runner=args.runner, worker=args.worker, data=args.data,
+            sysconf=args.sysconf, config=None,
+            private_root=os.path.join(args.private_root, "save-episode"),
+            deadline=30, timeout=args.timeout,
+            save_out=save_art, mode="new", restore_in=None)
+        os.makedirs(ns.private_root, exist_ok=True)
+        _driver._do_save(ns)
+        real_save = [f for f in os.listdir(save_art)
+                     if os.path.isfile(os.path.join(save_art, f))]
+    except Exception as exc:
+        failures.append("restore-fixture: could not produce a native save: %s"
+                        % exc)
+
+    def _seed_variant(mutate):
+        d = tempfile.mkdtemp(prefix="saveseed.", dir=args.private_root)
+        for f in real_save:
+            shutil.copyfile(os.path.join(save_art, f), os.path.join(d, f))
+        if mutate:
+            mutate(d)
+        return d
+
+    def _mutate_truncated(d):
+        for f in os.listdir(d):
+            p = os.path.join(d, f)
+            with open(p, "rb") as fh:
+                body = fh.read()
+            with open(p, "wb") as fh:
+                fh.write(body[: max(1, len(body) // 2)])
+
+    def _mutate_foreign(d):
+        for f in os.listdir(d):
+            with open(os.path.join(d, f), "wb") as fh:
+                fh.write(b"this file is not a nethack save\n" * 8)
+
+    if real_save:
+        restore_cases = [
+            ("restore-ok", _seed_variant(None)),
+            ("restore-truncated", _seed_variant(_mutate_truncated)),
+            ("restore-foreign", _seed_variant(_mutate_foreign)),
+        ]
+    else:
+        restore_cases = [("restore-missing", None)]
+
+    for label, seeddir in restore_cases:
+        if seeddir is None:
+            # a restore launch with nothing to restore must fail closed
+            seeddir = tempfile.mkdtemp(prefix="saveseed-empty.",
+                                       dir=args.private_root)
+        res = run_worker(args, label, handshake_kind="restore",
+                         seed_save=seeddir, timeout=args.timeout)
+        parse_records(res, schema, label, failures)
+        if label == "restore-ok":
+            if res.exit_code != 70:
+                failures.append("%s: exit %d, expected private 70"
+                                % (label, res.exit_code))
+            recs = [json.loads(x) for x in res.lines()]
+            kinds = [r.get("type") for r in recs]
+            if kinds[:2] != ["hello", "obs"]:
+                failures.append("%s: expected [hello, obs, ...], saw %s"
+                                % (label, kinds[:3]))
+            obs = [r for r in recs if r.get("type") == "obs"]
+            if obs and obs[0].get("seq") != 1:
+                failures.append("%s: first obs seq %r, expected 1"
+                                % (label, obs[0].get("seq")))
+            if obs and not obs[0].get("map"):
+                failures.append("%s: restored map is empty" % label)
+            if obs and not any(o.get("hist") for o in obs):
+                failures.append("%s: no restored history tagged hist" % label)
+        else:
+            if res.public:
+                failures.append("%s: expected zero public bytes, saw %r"
+                                % (label, res.public[:80]))
+            if res.exit_code != 70:
+                failures.append("%s: exit %d, expected private 70"
+                                % (label, res.exit_code))
+        rows.append((label, "restore" if label == "restore-ok" else "reject",
+                     "empty" if not res.public
+                     else "%d lines" % len(res.lines()),
+                     str(res.exit_code),
+                     "ok" if not any(label in f for f in failures)
+                     else "FAIL"))
+
     # ---- runner-level case: hostile parent environment must not reach the
     # worker, and the worker's own HOME stays private.
     hostile = os.path.join(hostile_home_root, "runner")
@@ -730,7 +837,8 @@ def main(argv):
         for kind, label, need_kind in (
                 ("test-display", "display", "ack"),
                 ("test-select", "select", "menu"),
-                ("test-msgmenu", "msgmenu", "key")):
+                ("test-msgmenu", "msgmenu", "key"),
+                ("test-rip", "rip", "ack")):
             label = "decision-" + label
             res = run_worker(args, label, worker=args.impossible_worker,
                              handshake_kind=kind, timeout=args.timeout)
@@ -750,6 +858,11 @@ def main(argv):
                 elif need.get("id") != 1:
                     failures.append("%s: obs need id %r, expected 1"
                                     % (label, need.get("id")))
+                if kind == "test-rip" and need.get("pages", 0) < 1:
+                    failures.append(
+                        "%s: the endgame tombstone window published no pages"
+                        " (the rip renders through the text window)"
+                        % label)
                 if obs[0].get("seq") != 1:
                     failures.append("%s: obs seq %r, expected 1"
                                     % (label, obs[0].get("seq")))
@@ -793,6 +906,29 @@ def main(argv):
         rows.append(("transport-cloexec", "normal", "empty",
                      str(res.exit_code),
                      "ok" if not any("transport-cloexec" in f
+                                     for f in failures) else "FAIL"))
+
+        # Restored-flags validator (the M1-noted missing seam): a save whose
+        # flags carry wizard mode must be rejected by agent_validate_restored_
+        # flags() before any publication.  The probe drives the real seam with
+        # the same in-memory input restore() would present it.
+        res = run_worker(args, "restored-wizard-flags",
+                         worker=args.impossible_worker,
+                         handshake_kind="test-wizsave", timeout=args.timeout)
+        parse_records(res, schema, "restored-wizard-flags", failures)
+        if res.public:
+            failures.append("restored-wizard-flags: expected zero public "
+                            "bytes, saw %r" % res.public[:80])
+        if res.exit_code != 70:
+            failures.append("restored-wizard-flags: exit %d, expected "
+                            "private 70" % res.exit_code)
+        if "restored save enables wizard mode" not in res.diag:
+            failures.append("restored-wizard-flags: the validator did not "
+                            "reject the wizard flag; diag %r"
+                            % res.diag[:160])
+        rows.append(("restored-wizard-flags", "reject", "empty",
+                     str(res.exit_code),
+                     "ok" if not any("restored-wizard-flags" in f
                                      for f in failures) else "FAIL"))
     else:
         msg = ("impossible-worker cases SKIPPED: the impossible() producer "

@@ -34,6 +34,7 @@ KEY_L = 108
 KEY_HASH = 35
 KEY_Y = 121
 KEY_N = 110
+KEY_S = 83  # native save command (number_pad off)
 
 # The deterministic play script's expected character-selection menu titles and
 # its request-kind transcript.  These pin the native interaction sequence the
@@ -54,7 +55,19 @@ EXPECTED_PLAY_KINDS = [
     "command", "command",                   # the seven movement keys + '.'
     "extcmd", "line", "command", "extcmd",  # quit path
     "yn", "yn", "yn", "yn", "yn",           # native confirmations
+    "ack", "ack",                           # endgame: message window flush,
+                                            # then the endgame text window
 ]
+
+# The exact, RNG-independent part of the play transcript: everything through
+# the quit extended command.  After that the end-of-game DISCLOSURE runs, and
+# its yes/no confirmations depend on what the hero did: the vanquished and
+# genocide queries are only offered when the scripted moves actually killed
+# something, so the confirmation count is 5 or 6.  EXPECTED_PLAY_TAIL pins the
+# invariant that remains regardless: a non-empty run of confirmation yn's
+# followed by exactly the two endgame acknowledgements.
+EXPECTED_PLAY_HEAD_LEN = 20  # through the quit "extcmd"
+EXPECTED_PLAY_TAIL = ["ack", "ack"]
 
 # The breadth scenario's pinned interaction core, at need-kind offsets 16..29:
 # the shared selection prefix (8 kinds) and the movement keys + the first
@@ -216,6 +229,15 @@ class Runner(object):
             argv += ["--sysconf", args.sysconf]
         if args.config:
             argv += ["--config", args.config]
+        mode = getattr(args, "mode", None)
+        if mode:
+            argv += ["--mode", mode]
+        save_out = getattr(args, "save_out", None)
+        if save_out:
+            argv += ["--save-out", save_out]
+        restore_in = getattr(args, "restore_in", None)
+        if restore_in:
+            argv += ["--restore-in", restore_in]
         if args.deadline:
             argv += ["--deadline", str(args.deadline)]
         self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE,
@@ -628,6 +650,35 @@ class PlayPolicy(Episode):
         self.send_act(need, {"text": "M2 line entry"})
 
 
+class SavePolicy(PlayPolicy):
+    """Play the deterministic opening, then issue the NATIVE save command
+    (the 'S' key) through the ordinary command path.  The engine asks
+    "Really save?" through a yes/no boundary and then displays its "Saving..."
+    message through the message window before exiting, so the save episode
+    presents ordinary player output and closes generically; the launcher hands
+    the produced save artifact to the caller-owned directory."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("quit", False)
+        PlayPolicy.__init__(self, *args, **kwargs)
+        self.save_requested = False
+
+    def answer_key(self, need):
+        if not self.gameplay_started:
+            self.gameplay_started = True
+        if self.time_first is None:
+            self.time_first = self.client.time_value()
+        self.time_last = self.client.time_value()
+        if self.move_index < len(self.moves):
+            key = self.moves[self.move_index]
+            self.move_index += 1
+        else:
+            key = KEY_S
+            self.save_requested = True
+        self.keys_sent.append(key)
+        self.send_act(need, {"key": key})
+
+
 # ------------------------------------------------------------------
 # subcommands
 # ------------------------------------------------------------------
@@ -719,10 +770,22 @@ def cmd_play(args):
                      "for %d acts" % (pol.obs_seen, pol.seen_closed,
                                       pol.acts_sent))
 
-    # the request-kind transcript of the deterministic script
-    if pol.need_kinds != EXPECTED_PLAY_KINDS:
-        return _fail("request-kind transcript differs:\n  got      %r\n"
-                     "  expected %r" % (pol.need_kinds, EXPECTED_PLAY_KINDS))
+    # the request-kind transcript of the deterministic script: the RNG-free
+    # head is exact, and the disclosure tail is a non-empty run of yn
+    # confirmations followed by the two endgame acknowledgements.
+    if pol.need_kinds[:EXPECTED_PLAY_HEAD_LEN] \
+            != EXPECTED_PLAY_KINDS[:EXPECTED_PLAY_HEAD_LEN]:
+        return _fail("request-kind transcript head differs:\n  got      %r\n"
+                     "  expected %r"
+                     % (pol.need_kinds[:EXPECTED_PLAY_HEAD_LEN],
+                        EXPECTED_PLAY_KINDS[:EXPECTED_PLAY_HEAD_LEN]))
+    tail = pol.need_kinds[EXPECTED_PLAY_HEAD_LEN:]
+    if (len(tail) < len(EXPECTED_PLAY_TAIL) + 1
+            or any(k != "yn" for k in tail[:-len(EXPECTED_PLAY_TAIL)])
+            or tail[-len(EXPECTED_PLAY_TAIL):] != EXPECTED_PLAY_TAIL):
+        return _fail("endgame disclosure tail differs (expected a run of yn"
+                     " confirmations then %r):\n  got %r"
+                     % (EXPECTED_PLAY_TAIL, tail))
     # the menu-title sequence of the character-selection menus
     if pol.menu_titles != EXPECTED_PLAY_MENUS:
         return _fail("menu-title sequence differs:\n  got      %r\n"
@@ -730,6 +793,16 @@ def cmd_play(args):
 
     if pol.seen_closed != 1:
         return _fail("expected exactly one closed, saw %d" % pol.seen_closed)
+
+    # The endgame renders through the ordinary native text window: the message
+    # window is flushed, then the closing epitaph block (and, on a death, the
+    # tombstone art) is published as one text-window acknowledgement.  A run
+    # that never reaches it has not exercised the endgame presentation.
+    last_ack = pol.ack_info.get(len(pol.need_kinds) - 1)
+    if not last_ack or last_ack.get("window_kind") != "text" \
+            or last_ack.get("rows", 0) < 1:
+        return _fail("the endgame text window was not published: %r"
+                     % (last_ack,))
 
     after = set(os.listdir(args.private_root))
     if after != before:
@@ -805,8 +878,12 @@ def cmd_breadth(args):
                      "  expected %r" % (pol.need_kinds[16:30],
                                        EXPECTED_BREADTH_KINDS))
     tail = pol.need_kinds[30:]
-    if not tail or any(k != "yn" for k in tail):
-        return _fail("quit-confirmation tail differs: %r" % (tail,))
+    if (len(tail) < len(EXPECTED_PLAY_TAIL) + 1
+            or any(k != "yn" for k in tail[:-len(EXPECTED_PLAY_TAIL)])
+            or tail[-len(EXPECTED_PLAY_TAIL):] != EXPECTED_PLAY_TAIL):
+        return _fail("quit-confirmation tail differs (expected a run of yn"
+                     " confirmations then %r): %r"
+                     % (EXPECTED_PLAY_TAIL, tail))
 
     # The help topic list must be answered out of a real help row, not by a
     # silent fallback to the first selectable row.
@@ -847,6 +924,262 @@ def cmd_breadth(args):
     return 0
 
 
+def _worker_survivors(worker):
+    """PIDs currently running the worker executable (Linux /proc)."""
+    hits = []
+    try:
+        pids = os.listdir("/proc")
+    except OSError:
+        return hits
+    for pid in pids:
+        if not pid.isdigit():
+            continue
+        try:
+            exe = os.readlink("/proc/%s/exe" % pid)
+        except OSError:
+            continue
+        if exe == worker:
+            hits.append(pid)
+    return hits
+
+
+def _open_fds():
+    try:
+        return len(os.listdir("/proc/self/fd"))
+    except OSError:
+        return -1
+
+
+def _run_policy(args, policy, **kwargs):
+    """Launch one episode with the given policy; return (policy, exit_code)."""
+    schema = json.load(open(schema_check.SCHEMA))
+    os.makedirs(args.private_root, exist_ok=True)
+    runner = Runner(args)
+    pol = policy(runner, schema, timeout=args.timeout, **kwargs)
+    try:
+        pol.run()
+        pol.verify_reconstruction()
+    except (AssertionError, TimeoutError) as exc:
+        runner.finish()
+        raise AssertionError(str(exc))
+    code, _out, _err = runner.finish()
+    return pol, code
+
+
+def _assert_closed(pol, label):
+    if pol.seen_hello != 1:
+        raise AssertionError("%s: expected one hello, saw %d"
+                             % (label, pol.seen_hello))
+    if pol.seen_closed != 1:
+        raise AssertionError("%s: expected one closed, saw %d"
+                             % (label, pol.seen_closed))
+    if pol.invalids:
+        raise AssertionError("%s: invalid records %r" % (label, pol.invalids))
+    closed = [r for r in pol.records if r.get("type") == "closed"]
+    if closed[0] != {"v": 1, "ch": "control", "type": "closed"}:
+        raise AssertionError("%s: closed is not the bare object: %r"
+                             % (label, closed[0]))
+
+
+def _do_save(args):
+    """Run the native-save episode; the launcher copies the save artifact into
+    args.save_out.  Returns (policy, saved_map, saved_title)."""
+    os.makedirs(args.save_out, exist_ok=True)
+    os.makedirs(args.private_root, exist_ok=True)
+    before = set(os.listdir(args.private_root))
+    pol, code = _run_policy(args, SavePolicy)
+    if code != 0:
+        raise AssertionError("save episode: runner exited %d" % code)
+    _assert_closed(pol, "save")
+    if not pol.save_requested:
+        raise AssertionError("save episode: the native save command was"
+                             " never issued")
+    if pol.saw_quit_yn is False and not any(
+            "save" in (r.get("need") or {}).get("prompt", "").lower()
+            for r in pol.records if r.get("type") == "obs"):
+        raise AssertionError("save episode: no native save confirmation")
+    after = set(os.listdir(args.private_root))
+    if after != before:
+        raise AssertionError("save episode: private root not cleaned: %s"
+                             % sorted(after - before))
+    artifacts = [f for f in os.listdir(args.save_out)
+                 if os.path.isfile(os.path.join(args.save_out, f))]
+    if not artifacts:
+        raise AssertionError("save episode: no native save artifact produced")
+    return pol, dict(pol.client.map), pol.client.s.get("title"), artifacts
+
+
+def _do_restore(args, saved_map, saved_title):
+    """Restore the save in a fresh worker and continue play."""
+    os.makedirs(args.private_root, exist_ok=True)
+    before = set(os.listdir(args.private_root))
+    pol, code = _run_policy(args, PlayPolicy, moves=(KEY_L,), quit=True)
+    if code != 0:
+        raise AssertionError("restore episode: runner exited %d" % code)
+    _assert_closed(pol, "restore")
+    obs = [r for r in pol.records if r.get("type") == "obs"]
+    if not obs:
+        raise AssertionError("restore episode: no observation was published")
+    first = obs[0]
+    if first.get("base") is not None:
+        raise AssertionError("restore episode: the first observation is not a"
+                             " full snapshot")
+    if first.get("seq") != 1:
+        raise AssertionError("restore episode: first seq is %r, expected a"
+                             " fresh namespace at 1" % (first.get("seq"),))
+    if not any(o.get("hist") for o in obs):
+        raise AssertionError("restore episode: no restored history was tagged"
+                             " hist")
+    if not first.get("map"):
+        raise AssertionError("restore episode: the restored map is empty")
+    # same game essence: the restored first snapshot reproduces the saved map
+    # and status title.
+    if saved_map and first_map(pol) != saved_map:
+        raise AssertionError("restore episode: restored map differs from the"
+                             " saved map")
+    if saved_title and first.get("s", {}).get("title") != saved_title:
+        raise AssertionError("restore episode: restored status title %r != %r"
+                             % (first.get("s", {}).get("title"), saved_title))
+    # continued play: one move after the restore advances the displayed time.
+    if pol.time_first is None or pol.time_last is None \
+            or pol.time_last <= pol.time_first:
+        raise AssertionError("restore episode: displayed time did not advance"
+                             " (%s -> %s)" % (pol.time_first, pol.time_last))
+    after = set(os.listdir(args.private_root))
+    if after != before:
+        raise AssertionError("restore episode: private root not cleaned: %s"
+                             % sorted(after - before))
+    return pol
+
+
+def first_map(pol):
+    for r in pol.records:
+        if r.get("type") == "obs":
+            pal = {e[0]: (e[1], e[2], e[3], e[4]) for e in r["pal"]}
+            return {(t[0], t[1]): pal[t[2]] for t in r["map"]}
+    return {}
+
+
+def cmd_save(args):
+    try:
+        pol, saved_map, title, artifacts = _do_save(args)
+    except AssertionError as exc:
+        return _fail(str(exc))
+    print("driver: save ok: %d records; artifact=%r; title=%r"
+          % (len(pol.records), artifacts, (title or {}).get("text")))
+    return 0
+
+
+def cmd_restore(args):
+    try:
+        pol = _do_restore(args, None, None)
+    except AssertionError as exc:
+        return _fail(str(exc))
+    print("driver: restore ok: %d records; time %s->%s"
+          % (len(pol.records), pol.time_first, pol.time_last))
+    return 0
+
+
+def cmd_lifecycle(args):
+    """Native save -> trusted artifact transfer -> restore into a fresh worker
+    -> assert same essence and continued play."""
+    savepriv = os.path.join(args.root, "save-episode")
+    restpriv = os.path.join(args.root, "restore-episode")
+    savedir = os.path.join(args.root, "save-artifact")
+    sa = argparse.Namespace(**vars(args))
+    sa.private_root, sa.mode, sa.save_out, sa.restore_in = \
+        savepriv, "new", savedir, None
+    ra = argparse.Namespace(**vars(args))
+    ra.private_root, ra.mode, ra.save_out, ra.restore_in = \
+        restpriv, "restore", None, savedir
+    try:
+        spol, saved_map, title, artifacts = _do_save(sa)
+        rpol = _do_restore(ra, saved_map, title)
+    except AssertionError as exc:
+        return _fail(str(exc))
+    print("driver: lifecycle ok: save=%d records artifact=%r; restore=%d"
+          " records time %s->%s"
+          % (len(spol.records), artifacts, len(rpol.records),
+             rpol.time_first, rpol.time_last))
+    return 0
+
+
+class AbortPolicy(PlayPolicy):
+    """Answer the shared selection prefix, then stop answering at a chosen
+    request (leaving it outstanding) so the worker observes transport EOF and
+    closes generically.  Models a trusted reset at a varying point."""
+
+    def __init__(self, *args, **kwargs):
+        self.stop_at = kwargs.pop("stop_at", 0)
+        PlayPolicy.__init__(self, *args, **kwargs)
+        self.answered = 0
+
+    def answer(self, need):
+        if self.answered >= self.stop_at:
+            self.runner.close_stdin()
+            return
+        self.answered += 1
+        PlayPolicy.answer(self, need)
+
+
+def cmd_plateau(args):
+    """>=100 sequential episodes, each reset at a varying point."""
+    schema = json.load(open(schema_check.SCHEMA))
+    os.makedirs(args.private_root, exist_ok=True)
+    points = [0, 8, 14, 21]   # first prompt, mid-move, mid-menu, quit confirm
+    n = args.count
+    base_workers = set(_worker_survivors(args.worker))
+    base_fds = _open_fds()
+    leftovers = []
+    first_seqs = []
+    for i in range(n):
+        stop_at = points[i % len(points)]
+        priv = os.path.join(args.private_root, "ep%d" % i)
+        os.makedirs(priv, exist_ok=True)
+        a = argparse.Namespace(**vars(args))
+        a.private_root = priv
+        runner = Runner(a)
+        pol = AbortPolicy(runner, schema, timeout=args.timeout,
+                          stop_at=stop_at)
+        try:
+            pol.run()
+            pol.verify_reconstruction()
+        except (AssertionError, TimeoutError) as exc:
+            runner.finish()
+            return _fail("plateau episode %d (stop_at=%d): %s"
+                         % (i, stop_at, exc))
+        code, _o, _e = runner.finish()
+        if code != 0:
+            return _fail("plateau episode %d: runner exited %d"
+                         % (i, code))
+        if pol.seen_hello != 1 or pol.seen_closed != 1:
+            return _fail("plateau episode %d: hello=%d closed=%d"
+                         % (i, pol.seen_hello, pol.seen_closed))
+        obs = [r for r in pol.records if r.get("type") == "obs"]
+        if obs and obs[0].get("seq") != 1:
+            return _fail("plateau episode %d: first seq %r, not a fresh"
+                         " namespace" % (i, obs[0].get("seq")))
+        first_seqs.append(obs[0].get("seq") if obs else None)
+        if os.listdir(priv):
+            leftovers.append(priv)
+        os.rmdir(priv)
+    if leftovers:
+        return _fail("plateau: private roots not cleaned: %s" % leftovers[:5])
+    survivors = set(_worker_survivors(args.worker)) - base_workers
+    if survivors:
+        return _fail("plateau: worker processes survived: %s"
+                     % sorted(survivors))
+    end_fds = _open_fds()
+    if base_fds >= 0 and end_fds > base_fds + 4:
+        return _fail("plateau: descriptor count grew %d -> %d"
+                     % (base_fds, end_fds))
+    os.rmdir(args.private_root)
+    print("driver: plateau ok: %d episodes; every episode a fresh namespace"
+          " (first seq=%r); fds %d->%d; no survivors"
+          % (n, sorted(set(first_seqs)), base_fds, end_fds))
+    return 0
+
+
 def main(argv):
     ap = argparse.ArgumentParser(prog="driver.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -872,6 +1205,26 @@ def main(argv):
     br = sub.add_parser("breadth")
     common(br)
     br.set_defaults(func=cmd_breadth)
+
+    sv = sub.add_parser("save")
+    common(sv)
+    sv.add_argument("--save-out", required=True)
+    sv.set_defaults(func=cmd_save)
+
+    rs = sub.add_parser("restore")
+    common(rs)
+    rs.add_argument("--restore-in", required=True)
+    rs.set_defaults(func=cmd_restore)
+
+    lc = sub.add_parser("lifecycle")
+    common(lc)
+    lc.add_argument("--root", required=True)
+    lc.set_defaults(func=cmd_lifecycle)
+
+    pl = sub.add_parser("plateau")
+    common(pl)
+    pl.add_argument("--count", type=int, default=100)
+    pl.set_defaults(func=cmd_plateau)
 
     args = ap.parse_args(argv)
     return args.func(args)
