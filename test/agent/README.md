@@ -66,6 +66,7 @@ prints only `win/agent/*.h` plus system headers.
 | `test/agent/hostile_matrix.py` | the M1 exit gate: hostile HOME/rc/env, hostile argv, bad/missing bootstrap handshake, and the test-only diagnostic injection, asserting no public leakage and the expected private rejection |
 | `test/agent/format_obs.py` | canonical client formatter: assembles chunk streams back into logical records (deriving `d` from `rid` and splicing `t` long-text slices) and prints a human-readable projection |
 | `test/agent/schema_check.py` | dependency-free JSON Schema subset validator plus 25 positive and 29 negative vectors; also validates real encoder output piped from `test_protocol --dump` |
+| `test/agent/spectate.py` | live spectate: a transparent byte-exact proxy that renders the flowing records to a side channel while relaying the wire, a transcript replay mode, and a runner-mode shim usable as the driver's `--runner` |
 
 ## Formatter
 
@@ -82,6 +83,66 @@ chunks stored by `(rid, i)` with contiguous indices from zero, exact repeats
 deduplicated, changed repeats and gaps rejected, header parts allowed only in
 chunk 0, and long-text slices required to name an existing element with
 contiguous offsets before the record is rebuilt atomically.
+
+## Watching an episode
+
+`test/agent/spectate.py` renders the wire as it flows — a compact frame per
+observation (an 80×21 coloured map, the status line, the last few messages, and
+the outstanding `need`) — so a human can watch while a scripted policy or an LLM
+harness plays. It is a **transparent proxy**: it spawns the real launcher and
+relays the player channel byte-for-byte in both directions, rendering a *copy*.
+Nothing is re-serialised or buffered, so a consumer sees exactly the bytes it
+would have seen without it.
+
+Watch a scripted play run (frames to the terminal, verbatim transcript saved):
+
+```sh
+SPECTATE_RENDER_FD=tty SPECTATE_TRANSCRIPT=/tmp/play.jsonl \
+python3 test/agent/driver.py play \
+    --runner test/agent/spectate.py \
+    --worker "$PWD/src/nethack" --data /tmp/agent-data \
+    --sysconf /tmp/agent-data/sysconf --private-root /tmp/spectate-play
+```
+
+Here `spectate.py` *is* the driver's `--runner`, so the driver builds the
+launcher argv and the tool's own options come from `SPECTATE_*` environment
+variables (`SPECTATE_LAUNCHER` overrides the launcher path, which defaults to
+`<repo>/src/nethack-agent`). `SPECTATE_RENDER_FD=tty` sends frames to the
+terminal even though the driver pipes the wrapper's stderr; with no controlling
+terminal the frames fall back to stderr. The same shape runs `breadth` or any
+other subcommand the driver drives.
+
+Insert it in front of an external player (an LLM harness that speaks the wire),
+giving the options explicitly on the command line:
+
+```sh
+mkdir -p /tmp/spec
+python3 test/agent/spectate.py wrap --launcher "$PWD/src/nethack-agent" \
+    --transcript /tmp/harness.jsonl --render-fd tty -- \
+    --worker "$PWD/src/nethack" --private-root /tmp/spec \
+    --data /tmp/agent-data --sysconf /tmp/agent-data/sysconf
+```
+
+A harness configured with the wrapper as its runner uses the same implicit
+form, `spectate.py <launcher args...>`.
+
+Replay a saved transcript with no runner at all — full speed by default, paced
+with `--replay-speed FRAMES-PER-SECOND`:
+
+```sh
+python3 test/agent/spectate.py replay /tmp/play.jsonl --no-color
+python3 test/agent/spectate.py replay /tmp/play.jsonl --replay-speed 8
+python3 test/agent/format_obs.py --raw /tmp/play.jsonl \
+    | python3 test/agent/spectate.py replay -
+```
+
+Options (wrap/replay, and the same names as `SPECTATE_*` in runner mode):
+`--transcript FILE` (verbatim runner-side JSONL), `--render-fd N|tty`,
+`--no-color` / `--color`, `--messages N` (default 3), `--min-frame-interval S`
+(default 0.15 — observations arriving faster than this coalesce to the newest
+frame, redrawn in place on a TTY and appended otherwise), `--replay-speed S`
+(frames per second, or `instant`, the default) and `--quiet`. Replay assembles
+chunked records through the same strict decoder as `format_obs.py`.
 
 Sessions own heap allocations. Release every session with `agent_session_free`
 on shutdown and before reinitializing it, or the retained response stream and

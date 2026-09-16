@@ -588,8 +588,8 @@ test/agent:
 (files for the engine-free agent port fixtures)
 .gitignore          Makefile            README.md           driver.py
 format_obs.py       gen_profile.py      hostile_matrix.py   reference_state.c
-reference_state.h   schema_check.py     sysconf             test_menu.c
-test_protocol.c     test_state.c        test_view.c
+reference_state.h   schema_check.py     spectate.py         sysconf
+test_menu.c         test_protocol.c     test_state.c        test_view.c
 
 util:
 (files for all versions)

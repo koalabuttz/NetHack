@@ -67,7 +67,8 @@ manifest-check:
 	    exit 1; \
 	fi
 
-check: manifest-check header-check schema-check formatter-check $(TESTS)
+check: manifest-check header-check schema-check formatter-check \
+       spectate-check $(TESTS)
 	@fail=0; for t in $(TESTS); do \
 	    printf '%s: ' "$$t"; ./$$t || fail=1; \
 	done; \
@@ -85,6 +86,12 @@ schema-check: test_protocol
 formatter-check: test_protocol
 	@./test_protocol --dump | python3 format_obs.py --json > /dev/null
 	@python3 format_obs.py --selftest
+
+# The live spectate/replay tool reuses the formatter's chunk assembler, so its
+# renderer must decode a chunk stream identically to a plain record, coalesce
+# fast frames to the newest, and survive a line it cannot parse.
+spectate-check:
+	@python3 spectate.py selftest
 
 # The generated enforcement header consumed by the agent-only build
 # (win/agent/agent_profile.h) is emitted by the same generator with --emit-c.

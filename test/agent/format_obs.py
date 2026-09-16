@@ -36,7 +36,7 @@ class ChunkError(Exception):
 
 
 def canonical(parts):
-    """A stable serialisation of one chunk's parts, for exact-repeat checks."""
+    """A stable serialisation of one chunk's parts, for repeat checks."""
     return json.dumps(parts, sort_keys=True, separators=(",", ":"))
 
 
@@ -54,8 +54,8 @@ def assemble(lines):
 
         rid = rec["rid"]
         i = rec["i"]
-        slot = pending.setdefault(rid, {"rid": rid, "chunks": {}, "last": None,
-                                        "done": False})
+        slot = pending.setdefault(rid, {"rid": rid, "chunks": {},
+                                        "last": None, "done": False})
 
         if slot["done"]:
             # a repeat of a chunk from a completed stream is a retry
@@ -97,11 +97,11 @@ def assemble(lines):
 def rebuild(rid, chunks):
     """Turn a complete, validated chunk stream into one logical obs record.
 
-    The stream carries no header d: the logical record's delivery counter is
-    rid, the delivery counter of its first chunk.  Long text arrives as ordered
-    t slices addressed by (kind, event-or-window, field); the target element
-    must exist and the offsets must be contiguous, checked here before the
-    record is produced.
+    The stream carries no header d: the logical record's delivery counter
+    is rid, the delivery counter of its first chunk.  Long text arrives as
+    ordered t slices addressed by (kind, event-or-window, field); the target
+    element must exist and the offsets must be contiguous, checked here
+    before the record is produced.
     """
     parts = {}
     elements = {}   # (kind, e-or-w, field) -> [slices]
@@ -175,6 +175,28 @@ def rebuild(rid, chunks):
     return rec
 
 
+def map_grid(rec):
+    """Build the 80x21 cell grid and cursor from an obs record.
+
+    Returns (grid, cur) where grid[y][x] is the palette cell tuple
+    (char, color, style, frame) -- BLANK for a cell no triple covers -- and
+    cur is the [x, y] cursor pair or None.  The human projection below and the
+    live spectate renderer both decode the map through this, so they cannot
+    drift.
+    """
+    grid = [[BLANK for _ in range(MAP_W)] for _ in range(MAP_H)]
+    for triple in rec.get("map") or []:
+        x, y, pid = triple
+        cell = BLANK
+        for entry in rec.get("pal") or []:
+            if entry[0] == pid:
+                cell = entry[1:5]
+                break
+        if 0 <= y < MAP_H and 0 <= x < MAP_W:
+            grid[y][x] = cell
+    return grid, rec.get("cur")
+
+
 def render(rec, out):
     t = rec.get("type")
     if t == "hello":
@@ -216,18 +238,7 @@ def render(rec, out):
     if cond:
         out.write("  cond: " + " ".join(c["text"] for c in cond) + "\n")
 
-    grid = [[BLANK for _ in range(MAP_W)] for _ in range(MAP_H)]
-    for triple in rec.get("map") or []:
-        x, y, pid = triple
-        cell = BLANK
-        for entry in rec.get("pal") or []:
-            if entry[0] == pid:
-                cell = entry[1:5]
-                break
-        if 0 <= y < MAP_H and 0 <= x < MAP_W:
-            grid[y][x] = cell
-
-    cur = rec.get("cur")
+    grid, cur = map_grid(rec)
     for y in range(MAP_H):
         row = []
         for x in range(MAP_W):
