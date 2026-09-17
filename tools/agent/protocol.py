@@ -26,6 +26,7 @@ MAP_MIN_X, MAP_MAX_X = 1, 79
 MAP_MIN_Y, MAP_MAX_Y = 0, 20
 KEY_MIN, KEY_MAX = 1, 255
 LINE_INPUT_MAX = 255
+PROMPT_MAX_LEN = 1048576           # schema maxLength for a need's prompt text
 COUNT_MAX = 2147483647
 MAX_MENU_ROWS = 65535
 
@@ -390,10 +391,21 @@ def validate_need(need: Any) -> Optional[str]:
 def _check_need_fields(kind, need) -> Optional[str]:
     if not (_is_int(need["id"]) and 1 <= need["id"] <= MAX_COUNTER):
         return "id is not a public counter in 1..%d" % MAX_COUNTER
-    for name in ("prompt", "choices"):
-        if name in need and need[name] is not None \
-                and not isinstance(need[name], str):
-            return "%s must be a string or null" % name
+    # prompt is a string wherever it appears: the frozen schema types it
+    # "string" (never null) and marks it required for every kind but
+    # command/key/direction, where it is still a string when present.  The
+    # engine always publishes one, empty when there is none, so a null must
+    # fail here rather than be stored for a later reader.
+    if "prompt" in need:
+        prompt = need["prompt"]
+        if not isinstance(prompt, str):
+            return "prompt must be a string"
+        if len(prompt) > PROMPT_MAX_LEN:
+            return "prompt is longer than %d characters" % PROMPT_MAX_LEN
+    # choices is the one need field the schema types as string-or-null
+    if "choices" in need and need["choices"] is not None \
+            and not isinstance(need["choices"], str):
+        return "choices must be a string or null"
     if "default" in need:
         d = need["default"]
         if d is not None and not (_is_int(d) and KEY_MIN <= d <= KEY_MAX):
@@ -499,10 +511,13 @@ def validate_action(need: Optional[dict], action: Any) -> Optional[str]:
         text = action["text"]
         if not isinstance(text, str):
             return "text must be a string"
-        limit = need.get("max", LINE_INPUT_MAX) or LINE_INPUT_MAX
+        # an explicit zero max is preserved (it forbids any non-empty text);
+        # only a *missing* max falls back to the full line budget, so a
+        # need that advertises zero is never silently widened to 255
+        limit = need["max"] if "max" in need else LINE_INPUT_MAX
         # a malformed need that advertises a non-integer or out-of-range max
         # is a shape error here, never a TypeError or a silent pass
-        if not _is_int(limit) or not (0 < limit <= LINE_INPUT_MAX):
+        if not _is_int(limit) or not (0 <= limit <= LINE_INPUT_MAX):
             return "the need advertises an invalid max"
         if len(text.encode("utf-8")) > limit:
             return "text exceeds the advertised byte budget"

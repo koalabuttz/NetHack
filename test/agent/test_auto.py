@@ -625,6 +625,56 @@ class TestNeedValidation(unittest.TestCase):
         self.assertIsNone(protocol.validate_action(
             {"kind": "line", "max": 3}, {"text": "ok"}))
 
+    def test_prompt_must_be_a_string_and_bounded(self):
+        # re-review residual 2a (low): the schema types prompt as a string,
+        # never null, and the engine always publishes one -- empty when there
+        # is none -- so a null must fail on every kind that can carry a
+        # prompt, including the optional-prompt command family.
+        for kind, extra in (("command", {}), ("key", {}), ("direction", {}),
+                            ("position", {"x0": 1, "y0": 0, "x1": 79,
+                                          "y1": 20}),
+                            ("yn", {"choices": None, "default": None,
+                                    "numeric": False}),
+                            ("line", {"max": 32}),
+                            ("extcmd", {"max": 255})):
+            need = {"id": 1, "kind": kind, "prompt": None}
+            need.update(extra)
+            self.assertIsNotNone(protocol.validate_need(need),
+                                 "null prompt accepted for %s" % kind)
+        # the engine's own empty-string prompt is fine, and the schema's
+        # maxLength bound is enforced on both sides of the limit
+        self.assertIsNone(protocol.validate_need(
+            {"id": 1, "kind": "command", "prompt": ""}))
+        self.assertIsNone(protocol.validate_need(
+            {"id": 1, "kind": "command", "prompt": "x" * 1048576}))
+        self.assertIsNotNone(protocol.validate_need(
+            {"id": 1, "kind": "command", "prompt": "x" * 1048577}))
+        # menu/ack have no prompt property at all: one is an unknown field,
+        # so even "prompt": null is rejected there
+        self.assertIsNotNone(protocol.validate_need(
+            {"id": 1, "kind": "menu", "menu": "m1", "mode": "one",
+             "content": "c1", "pages": 1, "prompt": None}))
+
+    def test_zero_line_max_is_preserved(self):
+        # re-review residual 2b (low): an advertised max of 0 must stay 0 (it
+        # forbids any non-empty text), never widen to the 255 default.  Empty
+        # text is valid at max 0; a single byte is not.
+        self.assertIsNone(protocol.validate_action(
+            {"kind": "line", "max": 0}, {"text": ""}))
+        self.assertIsNone(protocol.validate_action(
+            {"kind": "extcmd", "max": 0}, {"cancel": True}))
+        self.assertIsNotNone(protocol.validate_action(
+            {"kind": "line", "max": 0}, {"text": "x"}))
+        # a multibyte character counts as its decoded byte length, so it is
+        # still over a zero budget
+        self.assertIsNotNone(protocol.validate_action(
+            {"kind": "line", "max": 0}, {"text": "\u00e9"}))
+        # a legal non-zero budget is the boundary it advertises
+        self.assertIsNone(protocol.validate_action(
+            {"kind": "line", "max": 1}, {"text": "x"}))
+        self.assertIsNotNone(protocol.validate_action(
+            {"kind": "line", "max": 1}, {"text": "xy"}))
+
 
 class TestSnapshot(unittest.TestCase):
     def test_full_snapshot_clears_previous_cells(self):
@@ -1364,6 +1414,7 @@ class TestSessionValidation(WireHarness):
                                 if k != "content"},
             "content-mistyped": dict(menu, content=3),
             "ack-content-missing": {"kind": "ack", "id": 2, "pages": 1},
+            "prompt-null": {"kind": "command", "id": 1, "prompt": None},
         }
         for label, need in cases.items():
             with self.subTest(case=label):
