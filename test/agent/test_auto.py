@@ -1026,6 +1026,45 @@ class TestSessionValidation(WireHarness):
         self.assertTrue(results[1].closed)
         self.assertIsNone(results[1].protocol_failure)
 
+    def test_closed_before_hello_is_a_protocol_failure(self):
+        # Medium 3: closure is only meaningful after a validated handshake,
+        # so a closed-only stream fails rather than succeeding.
+        result, _ = self.run_scenario(self._scen(CLOSED))
+        self.assertIsNotNone(result.protocol_failure)
+        self.assertIn("before hello", result.protocol_failure)
+        self.assertFalse(result.closed)
+        self.assertFalse(agent_main.episode_ok(result))
+
+    def test_malformed_shapes_end_only_that_episode(self):
+        # Medium 3: a JSON array, a broken palette/map/window/cursor or a
+        # non-object need must terminate episode 1 and leave episode 2
+        # running, instead of aborting the whole campaign.
+        hello_line = _line(HELLO)
+        good = hello_line + _line(obs(1, {"kind": "command", "id": 1})) \
+            + _line(CLOSED)
+        cmd = {"kind": "command", "id": 1}
+        shapes = {
+            "array": b"[]\n",
+            "pal": _line(obs(1, cmd, pal=[[]])),
+            "triple": _line(obs(1, cmd, map_=[[1, 0]])),
+            "windows": _line(obs(1, cmd, windows=[[]])),
+            "cur": _line(obs(1, cmd, cur=[1])),
+            "need": _line(obs(1, "not an object")),
+        }
+        for label, raw in shapes.items():
+            with self.subTest(shape=label):
+                ctl = self._controller(timeout=5.0)
+                stream = [FakeProc(hello_line + raw), FakeProc(good)]
+                ctl._spawn = lambda priv: stream.pop(0)
+                results = ctl.run_campaign(2)
+                self.assertIsNotNone(
+                    results[0].protocol_failure,
+                    "%s slipped through: %r" % (label,
+                                                results[0].protocol_failure))
+                self.assertFalse(results[0].closed)
+                self.assertTrue(results[1].closed)
+                self.assertIsNone(results[1].protocol_failure)
+
 
 class TestTransport(WireHarness):
     """High 1: one page in flight and deadline-bounded writes."""

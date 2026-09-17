@@ -551,6 +551,11 @@ class _EpisodeRunner(object):
         if not isinstance(rec, dict):
             raise _ProtocolFailure("record is not an object")
         t = rec.get("type")
+        # A validated hello must precede *every* non-hello record -- closed
+        # included: a closed-only stream (or a page/invalid before the
+        # handshake) is a protocol failure, not a completed episode.
+        if t != "hello" and not self.hello_seen:
+            raise _ProtocolFailure("%r record before hello" % (t,))
         if t == "hello":
             self._on_hello(rec)
         elif t == "obs":
@@ -573,7 +578,7 @@ class _EpisodeRunner(object):
             raw = json.loads(line)
         except ValueError:
             return
-        if raw.get("type") != "chunk":
+        if not isinstance(raw, dict) or raw.get("type") != "chunk":
             return
         key = (raw.get("rid"), raw.get("i"))
         if key in self.acked_chunks:
@@ -593,8 +598,6 @@ class _EpisodeRunner(object):
         self.hello = rec
 
     def _on_obs(self, rec):
-        if not self.hello_seen:
-            raise _ProtocolFailure("player payload before hello")
         seq = rec.get("seq")
         if not _is_int(seq):
             raise _ProtocolFailure("obs without an integer seq")
@@ -602,12 +605,23 @@ class _EpisodeRunner(object):
             raise _ProtocolFailure("non-monotonic seq %r after %r"
                                    % (seq, self.last_seq))
         self.last_seq = seq
+        # A malformed full snapshot must end this episode, not the whole
+        # campaign: expected decode/shape faults (a bad palette entry, map
+        # triple, window, cursor or message) are converted here, at the
+        # episode boundary, into a per-episode protocol failure.  Only
+        # ProtocolError and the shape errors of well-typed-but-broken data
+        # are caught -- never control-flow or system exceptions.
         try:
             self.snap.apply(rec)
+            self.mem.observe(self.snap)
         except protocol.ProtocolError as exc:
             raise _ProtocolFailure("invalid snapshot: %s" % exc)
-        self.mem.observe(self.snap)
+        except (IndexError, KeyError, TypeError, ValueError,
+                AttributeError) as exc:
+            raise _ProtocolFailure("malformed snapshot: %s" % exc)
         need = rec.get("need")
+        if need is not None and not isinstance(need, dict):
+            raise _ProtocolFailure("need is not an object")
         self.req.begin(need, seq)
         self.pending = need is not None
         self.pending_need = need

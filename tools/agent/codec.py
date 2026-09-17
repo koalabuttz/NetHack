@@ -101,6 +101,10 @@ class IncrementalAssembler(object):
             self._limit("physical line exceeds %d bytes"
                         % self.max_line_bytes)
         rec = json.loads(line)
+        if not isinstance(rec, dict):
+            # a JSON array/scalar is not a record; fail as a clean decode
+            # error rather than an AttributeError deep in the caller
+            raise ValueError("record is not a JSON object")
         if rec.get("type") != "chunk":
             return [rec]
 
