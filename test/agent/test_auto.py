@@ -1008,6 +1008,60 @@ class TestScriptedReflexSafety(unittest.TestCase):
                                        title="What do you want to eat?"))
         self.assertEqual(res.action["commit"], [[2, -1]])
 
+    def test_canonical_engine_food_names_are_recognised(self):
+        # re-review residual 1 (medium): the allowlist names are the engine's
+        # own object names, so a carried lembas wafer or cram ration -- which
+        # used to be rejected because they are not the bare "lembas"/"cram"
+        # -- is not starved past.
+        for text in ("a lembas wafer", "2 lembas wafers", "a cram ration",
+                     "3 cram rations", "a tripe ration", "a kelp frond",
+                     "2 kelp fronds", "a food ration", "an orange",
+                     "a cream pie", "a candy bar", "a fortune cookie",
+                     "a meatball", "some food rations"):
+            self.assertTrue(state.is_known_safe_food(text), text)
+
+    def test_doname_metadata_is_stripped_before_matching(self):
+        # re-review residual 1 (medium): a real inventory row wraps the name
+        # in a count/article, a BUC or "partly eaten" qualifier and a shop
+        # annotation, all of which must be peeled off before the base name is
+        # matched.  "partly eaten" stays edible (src/eat.c continues a
+        # partly eaten meal).
+        for text in ("a food ration named lunch",
+                     "an uncursed food ration (unpaid, 45 zorkmids)",
+                     "a blessed partly eaten food ration",
+                     "a cursed partly eaten lembas wafer",
+                     "2 uncursed food rations (unpaid, 90 zorkmids)",
+                     "d - a blessed partly eaten food ration",
+                     "a - 2 lembas wafers"):
+            self.assertTrue(state.is_known_safe_food(text), text)
+
+    def test_named_suffix_is_removed_whole_before_matching(self):
+        # re-review residual 1 (medium): the base name, never the user
+        # " named ..." text, decides -- so a safe base named with a lethal
+        # word stays edible while a lethal base named with a safe word does
+        # not, and a lookalike that merely contains a safe word is rejected.
+        self.assertTrue(state.is_known_safe_food(
+            "a food ration named cockatrice egg"))
+        for text in ("a cockatrice egg named lunch",
+                     "a cockatrice egg named lembas wafer",
+                     "apple pie", "banana slug", "applesauce",
+                     "banana peel", "a food ration of doom",
+                     "an enormous meatball"):
+            self.assertFalse(state.is_known_safe_food(text), text)
+
+    def test_inventory_rows_with_doname_metadata_are_edible(self):
+        # re-review residual 1 (medium): the inventory row path (and its
+        # letters) sees through doname()'s metadata.
+        self.mem.inventory.refresh(
+            [row(0, "a - a lembas wafer"),
+             row(1, "b - a food ration named lunch"),
+             row(2, "c - an uncursed food ration (unpaid, 45 zorkmids)"),
+             row(3, "d - a cockatrice egg"),
+             row(4, "e - a kobold corpse")], 0, 0)
+        self.assertEqual([r["r"] for r in self.mem.inventory.food_rows()],
+                         [0, 1, 2])
+        self.assertEqual(self.mem.inventory.food_letters(), ["a", "b", "c"])
+
     def test_low_hp_on_upstairs_returns_a_valid_ascend_action(self):
         # Medium 6: the upstairs withdrawal is a structurally valid action,
         # so arbitration cannot silently replace ascend with a wait.

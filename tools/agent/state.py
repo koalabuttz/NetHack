@@ -45,37 +45,48 @@ HUNGER_STAGES = ("Hungry", "Weak", "Fainting", "Fainted", "Starved")
 # edible (corpse safety is uncertain, and unseen quantities are unknown), and
 # a qualified item that only *contains* a safe word is rejected (a
 # "cockatrice egg" is lethal, and is not the bare "egg" this list names).
-KNOWN_SAFE_FOOD = ("food ration", "ration", "apple", "banana", "orange",
-                   "melon", "kelp frond", "kelp", "cram", "lembas",
-                   "fortune cookie", "candy bar", "cream pie", "meatball",
-                   "tripe", "egg")
+#
+# The names are the *exact canonical engine object names* from the FOOD_CLASS
+# block of include/objects.h, never an abbreviation of them: the engine prints
+# "lembas wafer", not "lembas", "cram ration", not "cram", and "kelp frond",
+# not "kelp".  Matching the engine's own spelling is what keeps a hungry hero
+# from refusing the only safe food it carries.
+KNOWN_SAFE_FOOD = ("food ration", "tripe ration", "cram ration",
+                   "lembas wafer", "kelp frond", "apple", "banana", "orange",
+                   "melon", "fortune cookie", "candy bar", "cream pie",
+                   "meatball", "egg")
 UNSAFE_FOOD_MARKERS = ("corpse", "tinned", "unknown", "glop")
 
-# A leading inventory-letter / selection prefix ("d - ", "a) ", "f: "), a
-# displayed stack count ("2 ") and a leading article are stripped before an
-# item name is compared, so the row text the engine prints still matches the
-# bare name.  Matching is then exact (or a whole trailing phrase), never a
-# substring: "cockatrice egg" must not be accepted just because it ends in a
-# safe word.
-_FOOD_PREFIX_RE = re.compile(r"^[A-Za-z0-9][\s\.\-\)\*:]+")
+# An inventory row is built by the engine's doname(): an optional inventory
+# selector ("d - ", "a) ", "f: "), a quantity or article, the blessed/cursed/
+# uncursed and "partly eaten" qualifiers, the canonical name, an optional user
+# " named <text>" suffix and an optional parenthesised shop annotation
+# (" (unpaid, 45 zorkmids)").  Only these *recognised* wrappers are peeled
+# off; whatever is left must then be exactly a canonical name or its exact
+# plural.  The user text after " named " is removed whole before matching, so
+# a name is never accepted because a *personal* name happens to contain a safe
+# word, while a known-safe base keeps matching even when it is so named.
+_FOOD_SELECTOR_RE = re.compile(r"^[A-Za-z0-9][\s.\-)*:]{1,3}")
 _FOOD_COUNT_RE = re.compile(r"^\d+\s+")
-_FOOD_ARTICLES = ("a ", "an ", "the ")
+_FOOD_ARTICLES = ("a ", "an ", "the ", "some ")
+_FOOD_QUALIFIERS = ("blessed ", "cursed ", "uncursed ", "partly eaten ")
+_FOOD_NAMED_RE = re.compile(r"\s+named\s+.*\Z")
+_FOOD_PAREN_RE = re.compile(r"\s*\([^()]*\)\s*\Z")
 
 
 def _food_forms() -> frozenset:
-    """The allowlist extended with each item's displayed plural stack name.
+    """The allowlist extended with each item's exact displayed plural.
 
-    Only the *exact* plural of an allowlisted name is added ("food rations",
-    "apples"), so a genuine counted stack is recognised while a name is never
-    singularised by a suffix rule -- an arbitrary string that merely ends in a
-    safe word still stays rejected.  The egg stays singular on purpose: only
-    the bare "egg" is ever assumed edible.
+    Every canonical name pluralises with a plain trailing "s" in the engine's
+    makeplural() ("food rations", "lembas wafers"), so only that exact form is
+    added and a name is never singularised by a suffix rule -- an arbitrary
+    string that merely contains a safe word still stays rejected.  The egg
+    stays singular on purpose: only the bare "egg" is ever assumed edible.
     """
     forms = set(KNOWN_SAFE_FOOD)
     for name in KNOWN_SAFE_FOOD:
-        if name in ("egg", "lembas"):
-            continue
-        forms.add(name + "s")
+        if name != "egg":
+            forms.add(name + "s")
     return frozenset(forms)
 
 
@@ -83,14 +94,28 @@ _KNOWN_SAFE_FORMS = _food_forms()
 
 
 def _food_name(text) -> str:
-    """The bare item name: no row prefix, no stack count, no article."""
+    """The bare canonical name: no row prefix, quantity, qualifier or suffix.
+
+    The recognised engine wrappers are peeled off in the order doname() builds
+    them -- a trailing shop annotation, then the " named <text>" suffix, then
+    the leading selector, quantity, article and blessed/cursed/partly-eaten
+    qualifiers -- and the survivors are matched exactly against the allowlist.
+    """
     low = (text or "").strip().lower()
-    low = _FOOD_PREFIX_RE.sub("", low, count=1)
-    low = _FOOD_COUNT_RE.sub("", low, count=1)
-    for article in _FOOD_ARTICLES:
-        if low.startswith(article):
-            return low[len(article):].strip()
-    return low.strip()
+    while _FOOD_PAREN_RE.search(low):
+        low = _FOOD_PAREN_RE.sub("", low, count=1).strip()
+    low = _FOOD_NAMED_RE.sub("", low, count=1).strip()
+    low = _FOOD_SELECTOR_RE.sub("", low, count=1).strip()
+    while True:
+        shorter = _FOOD_COUNT_RE.sub("", low, count=1)
+        for word in _FOOD_ARTICLES + _FOOD_QUALIFIERS:
+            if shorter.startswith(word):
+                shorter = shorter[len(word):]
+                break
+        shorter = shorter.strip()
+        if shorter == low:
+            return low
+        low = shorter
 
 
 def is_known_safe_food(text) -> bool:
@@ -105,12 +130,9 @@ def is_known_safe_food(text) -> bool:
     # edible, and even the bare item is not matched in its plural form
     if "egg" in name:
         return name == "egg"
-    if name in _KNOWN_SAFE_FORMS:
-        return True
-    # a whole trailing phrase still counts (e.g. "tripe ration" ends in
-    # "ration"), but a bare substring does not
-    return any(known != "egg" and name.endswith(" " + known)
-               for known in _KNOWN_SAFE_FORMS)
+    # what is left after the recognised metadata is peeled off must be exactly
+    # a canonical name or its exact plural -- never a mere substring
+    return name in _KNOWN_SAFE_FORMS
 
 
 def passable(ch: str) -> bool:

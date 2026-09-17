@@ -152,10 +152,18 @@ capability):
     inventory letter parsed out of the prompt text (the engine passes no
     machine-readable `choices` for that prompt), or opens the inventory
     menu, and after two equivalent rejected intents refreshes and changes
-    plan.  Only an allowlist of known-safe items is edible, with a displayed
-    stack count and the exact plural form of an allowlisted name recognised
-    ("2 food rations", "2 apples"); a qualified egg, a corpse or tin, and a
-    lookalike that merely ends in a safe word stay unsafe;
+    plan.  Only an allowlist of known-safe items is edible, keyed to the
+    engine's exact canonical object names ("lembas wafer", "food ration") and
+    their exact plurals.  The inventory row's own metadata is stripped first
+    -- a displayed stack count, an article, the uncursed/blessed/cursed and
+    "partly eaten" qualifiers, a user " named <text>" suffix and a shop
+    "(unpaid, ...)" annotation -- so a counted, qualified, named or priced row
+    still matches ("2 lembas wafers", "a food ration named lunch", "an
+    uncursed food ration (unpaid, 45 zorkmids)").  The stripped base name, not
+    the suffix, is what must match, so "a food ration named cockatrice egg"
+    stays edible while "a cockatrice egg named lunch" does not; a qualified
+    egg, a corpse or a tin, and a lookalike that merely contains a safe word
+    all stay unsafe;
   * **loop breakers** — a move that never changes the hero's square
     escalates through search, a random move, then an unblock/rest step.
 
