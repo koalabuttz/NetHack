@@ -917,9 +917,20 @@ class _EpisodeRunner(object):
                 res.usage)
 
     def _safe_fallback(self, need) -> dict:
+        """A structurally valid, non-blocking answer for any need kind.
+
+        The command fallback is deliberately *non-resting*.  It is reached
+        only when the reflex failed, timed out or proposed something invalid,
+        and it is context-free by construction, so it cannot prove a rest
+        safe.  The policy's own choice when rest cannot be proven safe is a
+        search, which spends the turn without moving into unknown space or
+        into an adjacent hazard -- so a fallback can never hold position
+        beside a monster, while hungry, at low HP, or with the hero square
+        unknown.
+        """
         kind = need.get("kind")
         if kind in ("command", "key", "direction"):
-            return {"key": protocol.KEY_WAIT}
+            return {"key": protocol.KEY_SEARCH}
         if kind == "yn":
             return {"yn": protocol.KEY_ESC}
         if kind == "position":

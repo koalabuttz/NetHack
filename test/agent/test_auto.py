@@ -1361,15 +1361,18 @@ class TestTransport(WireHarness):
         with mock.patch.object(controller, "ScriptedReflex", _BadReflex):
             result, actions = self.run_scenario(scen)
         self.assertTrue(result.closed)
-        # the wire only ever saw a valid action
+        # the wire only ever saw a valid action, and the universal fallback is
+        # deliberately non-resting (it cannot prove a rest safe)
         acts = [a for a in actions if a.get("type") == "act"]
-        self.assertEqual(acts[-1]["action"], {"key": protocol.KEY_WAIT})
+        self.assertEqual(acts[-1]["action"], {"key": protocol.KEY_SEARCH})
+        self.assertNotEqual(acts[-1]["action"],
+                            {"key": protocol.KEY_WAIT})
         decs = _read_jsonl(os.path.join(self.dir, "ep-1.decisions.jsonl"))
         chosen = [d for d in decs if d["selected"] is not None]
         self.assertTrue(chosen)
         last = chosen[-1]
         self.assertEqual(last["proposal"], {"key": 999})
-        self.assertEqual(last["selected"], {"key": protocol.KEY_WAIT})
+        self.assertEqual(last["selected"], {"key": protocol.KEY_SEARCH})
         self.assertIn("validation fallback", last["reason"])
 
     def test_write_all_is_bounded_when_stdin_is_full(self):
@@ -1490,7 +1493,9 @@ class TestDeadlines(WireHarness):
         self.assertLess(elapsed, 1.2)          # never waited for the sleep
         self.assertGreaterEqual(result.reflex_timeouts, 1)
         acts = [a for a in actions if a.get("type") == "act"]
-        self.assertEqual(acts[-1]["action"], {"key": protocol.KEY_WAIT})
+        # a timeout does not buy a rest: the fallback is non-resting
+        self.assertEqual(acts[-1]["action"], {"key": protocol.KEY_SEARCH})
+        self.assertNotEqual(acts[-1]["action"], {"key": protocol.KEY_WAIT})
         decs = _read_jsonl(os.path.join(self.dir, "ep-1.decisions.jsonl"))
         self.assertTrue(any("reflex deadline exceeded" in (d["reason"] or "")
                             for d in decs))
@@ -1528,6 +1533,120 @@ class TestDeadlines(WireHarness):
         self.assertLess(elapsed, 1.4)
         self.assertGreaterEqual(result.invalids, 1)
         self.assertLessEqual(result.invalids, 8)
+
+
+class TestFallbackSafety(WireHarness):
+    """Medium 7: the controller fallback is never an unproven rest."""
+
+    PAL = [[0, " ", "none", 0, "none"], [1, "@", "white", 32, "none"],
+           [2, ".", "gray", 0, "none"], [3, "&", "red", 0, "none"]]
+
+    class _TimeoutReflex(object):
+        """A reflex that never answers inside its allowance."""
+
+        def __init__(self, config):
+            self.config = config
+            self.max_ticks = config.max_ticks
+            self.quitting = False
+            self.quit_reason = ""
+
+        def decide(self, ctx):
+            time.sleep(1.0)
+            return ReflexResult(action={"key": protocol.KEY_SEARCH},
+                                provider="slow")
+
+        def fallback(self, ctx):
+            return self.decide(ctx)
+
+        def on_closed(self):
+            pass
+
+    class _InvalidReflex(object):
+        """A reflex that proposes a structurally invalid key."""
+
+        def __init__(self, config):
+            self.config = config
+            self.max_ticks = config.max_ticks
+            self.quitting = False
+            self.quit_reason = ""
+
+        def decide(self, ctx):
+            return ReflexResult(action={"key": 999}, provider="bad",
+                                reason="out of range proposal")
+
+        def fallback(self, ctx):
+            return self.decide(ctx)
+
+        def on_closed(self):
+            pass
+
+    @staticmethod
+    def _status(hp="20", hp_max="20", hunger=None):
+        s = {"hitpoints": {"text": hp, "color": "none", "style": 0},
+             "hitpoints-max": {"text": hp_max, "color": "none",
+                               "style": 0}}
+        if hunger is not None:
+            s["hunger"] = {"text": hunger, "color": "none", "style": 0}
+        return s
+
+    def _contexts(self):
+        """(label, map triples, snapshot status) for every context the
+        fallback must survive: four where a rest is unsafe, plus one where a
+        rest would be provable (the universal fallback is non-resting
+        regardless, so it never has to prove anything)."""
+        return (
+            ("adjacent demon", [[10, 10, 1], [11, 10, 3]], self._status()),
+            ("hungry", [[10, 10, 1]], self._status(hunger="Hungry")),
+            ("low HP", [[10, 10, 1]], self._status(hp="2")),
+            ("no hero", [[2, 0, 2]], self._status()),
+            ("restable", [[10, 10, 1]], self._status()),
+        )
+
+    def _scenario(self, map_, status):
+        rec = obs(1, {"kind": "command", "id": 1}, map_=map_, pal=self.PAL)
+        rec["s"] = status
+        return b"".join([_line(HELLO), _line(rec), _line(CLOSED)])
+
+    def _assert_never_rests(self, actions):
+        acts = [a for a in actions if a.get("type") == "act"]
+        self.assertTrue(acts)
+        self.assertEqual(acts[-1]["action"], {"key": protocol.KEY_SEARCH})
+        self.assertNotEqual(acts[-1]["action"], {"key": protocol.KEY_WAIT})
+
+    def test_universal_command_fallback_is_never_a_rest(self):
+        runner = object.__new__(controller._EpisodeRunner)
+        for kind in ("command", "key", "direction"):
+            self.assertEqual(
+                controller._EpisodeRunner._safe_fallback(
+                    runner, {"kind": kind, "id": 1}),
+                {"key": protocol.KEY_SEARCH})
+        # the other kinds keep their own structurally valid fallbacks
+        self.assertEqual(controller._EpisodeRunner._safe_fallback(
+            runner, {"kind": "yn", "id": 1}), {"yn": protocol.KEY_ESC})
+        self.assertEqual(controller._EpisodeRunner._safe_fallback(
+            runner, {"kind": "menu", "id": 1}), {"cancel": True})
+
+    def test_timeout_fallback_never_rests(self):
+        cfg = ProviderConfig(max_ticks=50, reflex_deadline=0.15)
+        with mock.patch.object(controller, "ScriptedReflex",
+                               self._TimeoutReflex):
+            for label, map_, status in self._contexts():
+                with self.subTest(context=label):
+                    result, actions = self.run_scenario(
+                        self._scenario(map_, status), config=cfg)
+                    self.assertTrue(result.closed)
+                    self.assertGreaterEqual(result.reflex_timeouts, 1)
+                    self._assert_never_rests(actions)
+
+    def test_invalid_proposal_fallback_never_rests(self):
+        with mock.patch.object(controller, "ScriptedReflex",
+                               self._InvalidReflex):
+            for label, map_, status in self._contexts():
+                with self.subTest(context=label):
+                    result, actions = self.run_scenario(
+                        self._scenario(map_, status))
+                    self.assertTrue(result.closed)
+                    self._assert_never_rests(actions)
 
 
 class TestClosure(WireHarness):
