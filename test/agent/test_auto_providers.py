@@ -2208,46 +2208,173 @@ class TestLowConfidenceEscalation(WireHarness):
 
 # ====================================================== token bound (M1)
 
-class TestStrategyTokenBound(WireHarness):
-    """Medium 1: the prompt bound counts UTF-8 bytes, not characters."""
+class TestStrategyRendering(unittest.TestCase):
+    """Section 1: a fixed, stable-to-volatile block order."""
 
     def _ctx(self, **over):
-        base = dict(episode=1, tick=1, level="Dlvl:1",
+        base = dict(episode=7, tick=12, level="Dlvl:2", role="Valkyrie",
+                    status_text="HP 10/20", map_text="MAP",
+                    recent_messages=["m1"], inventory=["a sword"],
+                    remaining_budget=5)
+        base.update(over)
+        return StrategyContext(**base)
+
+    def test_block_order_and_labels(self):
+        lines = providers._render_strategy_prompt(self._ctx()).split("\n")
+        self.assertEqual(lines[0], "GAME STATE (untrusted data):")
+        self.assertEqual(lines[1], "mode: gameplay")
+        self.assertEqual(lines[2], "role: Valkyrie")
+        self.assertEqual(lines[3], "active directives: none")
+        self.assertEqual(lines[4], "inventory:")
+        idx = {line: i for i, line in enumerate(lines)}
+        self.assertLess(idx["boundary history:"], idx["recent messages:"])
+        self.assertLess(idx["pending boundaries: none"],
+                        idx["recent messages:"])
+        self.assertLess(idx["recent messages:"], idx["map:"])
+        self.assertLess(idx["map:"], idx["displayed level: Dlvl:2"])
+        self.assertLess(idx["displayed level: Dlvl:2"],
+                        idx["status: HP 10/20"])
+        self.assertLess(idx["status: HP 10/20"], idx["tick: 12"])
+        self.assertEqual(lines[-1], "remaining strategy calls: 5")
+
+    def test_identical_input_gives_identical_bytes(self):
+        self.assertEqual(providers._render_strategy_prompt(self._ctx()),
+                         providers._render_strategy_prompt(self._ctx()))
+
+    def test_volatile_tail_change_leaves_the_stable_prefix(self):
+        a = providers._render_strategy_prompt(self._ctx())
+        b = providers._render_strategy_prompt(
+            self._ctx(tick=99, status_text="HP 3/20", map_text="OTHER"))
+        a_lines, b_lines = a.split("\n"), b.split("\n")
+        cut = a_lines.index("map:")
+        self.assertEqual(a_lines[:cut], b_lines[:cut])
+        self.assertNotEqual(a, b)
+
+    def test_no_episode_identifier_in_model_text(self):
+        ctx = self._ctx(episode=987654)
+        text = providers._render_strategy_prompt(ctx)
+        self.assertNotIn("987654", text)
+        self.assertNotIn("episode:", text)
+
+    def test_inventory_is_capped_at_40_and_messages_at_6(self):
+        ctx = self._ctx(inventory=["i%d" % i for i in range(60)],
+                        recent_messages=["m%d" % i for i in range(10)])
+        lines = providers._render_strategy_prompt(ctx).split("\n")
+        self.assertIn("  - i39", lines)
+        self.assertNotIn("  - i40", lines)
+        self.assertIn("  - m9", lines)
+        self.assertNotIn("  - m0", lines)
+
+    def test_boundary_history_is_bounded_and_pending_survives(self):
+        history = [{"eid": "e%d" % i, "reason": "r", "tick": i,
+                    "level": "Dlvl:1"} for i in range(30)]
+        ctx = self._ctx(history=history, boundaries=["pending-A",
+                                                     "pending-B"])
+        text = providers._render_strategy_prompt(ctx)
+        self.assertNotIn("e13", text)      # dropped by the 16-record cap
+        self.assertIn("e14", text)
+        self.assertIn("pending boundaries: pending-A, pending-B", text)
+
+    def test_active_directive_json_is_deterministic(self):
+        d = directives.DirectiveSet(goals=("survive",), ttl=30)
+        text = providers._render_strategy_prompt(self._ctx(directives=[d]))
+        self.assertIn("active directives: "
+                      + json.dumps(d.to_dict(), sort_keys=True), text)
+
+    def test_postmortem_renders_mode_and_summary(self):
+        ctx = self._ctx(postmortem=True,
+                        summary={"outcome": "quit", "ticks": 5})
+        lines = providers._render_strategy_prompt(ctx).split("\n")
+        self.assertEqual(lines[1], "mode: postmortem")
+        self.assertEqual(lines[2], "role: Valkyrie")
+        self.assertEqual(lines[3], "episode summary: "
+                         + json.dumps({"outcome": "quit", "ticks": 5},
+                                      sort_keys=True))
+        self.assertNotIn("active directives:", "\n".join(lines))
+        self.assertNotIn("boundary history:", "\n".join(lines))
+        self.assertEqual(lines[-1], "remaining strategy calls: 5")
+
+    def test_direct_call_without_a_prepared_request_is_two_messages(self):
+        payload = providers.deepseek_payload("m", self._ctx(), 123)
+        self.assertEqual([m["role"] for m in payload["messages"]],
+                         ["system", "user"])
+        self.assertEqual(payload["model"], "m")
+        self.assertEqual(payload["max_tokens"], 123)
+
+    def test_prepared_payload_is_used_verbatim(self):
+        cfg = ProviderConfig()
+        ctx = self._ctx()
+        prepared = providers.prepare_strategy_request(cfg, ctx)
+        ctx.prepared_request = prepared
+        payload = providers.deepseek_payload("ignored", ctx, 999)
+        self.assertEqual(payload, prepared.payload())
+        self.assertEqual(payload["max_tokens"], cfg.deepseek_max_tokens)
+        self.assertEqual(payload["model"], cfg.deepseek_model)
+
+
+class TestStrategyTokenBound(WireHarness):
+    """Medium 1: the bound is derived from the frozen request's bytes."""
+
+    def _ctx(self, **over):
+        base = dict(episode=1, tick=1, level="Dlvl:1", role="Valkyrie",
                     status_text="HP 10/20", map_text="", recent_messages=[],
                     inventory=[])
         base.update(over)
         return StrategyContext(**base)
 
-    def _rendered(self, ctx):
-        return (providers._SYSTEM_PROMPT + "\n"
-                + providers._render_strategy_prompt(ctx))
+    def _expected(self, cfg, messages):
+        """An independent oracle over the *actual frozen messages*."""
+        prompt = sum(len(r.encode("utf-8")) + len(c.encode("utf-8"))
+                     for r, c in messages)
+        prompt += (providers._CHAT_FRAMING_TOKENS
+                   + providers._PER_MESSAGE_FRAMING_TOKENS * len(messages))
+        return prompt, cfg.deepseek_max_tokens
 
-    def test_bound_is_the_byte_count_plus_framing(self):
+    def test_bound_is_the_byte_count_plus_per_message_framing(self):
+        cfg = ProviderConfig()
         ctx = self._ctx(status_text="HP 10/20 饥饿 空腹 \U0001f600!!!")
-        text = self._rendered(ctx)
-        prompt, completion = providers.strategy_token_bound(
-            ProviderConfig(), ctx)
-        self.assertEqual(prompt, len(text.encode("utf-8"))
-                         + providers._CHAT_FRAMING_TOKENS)
-        self.assertEqual(completion, ProviderConfig().deepseek_max_tokens)
+        prepared = providers.prepare_strategy_request(cfg, ctx)
+        prompt, completion = providers.strategy_token_bound(cfg, ctx)
+        self.assertEqual(prompt, self._expected(cfg, prepared.messages)[0])
+        self.assertEqual(prompt, prepared.prompt_bound)
+        self.assertEqual(completion, cfg.deepseek_max_tokens)
+
+    def test_framing_grows_with_the_message_count(self):
+        cfg = ProviderConfig()
+        ctx = self._ctx()
+        two = providers.prepare_strategy_request(cfg, ctx)
+        history = [providers.StrategyExchange(user="u%d" % i,
+                                             assistant="a%d" % i)
+                   for i in range(3)]
+        many = providers.prepare_strategy_request(cfg, ctx, retained=history)
+        self.assertEqual(len(two.messages), 2)
+        self.assertEqual(len(many.messages), 8)
+        self.assertGreaterEqual(
+            many.prompt_bound - two.prompt_bound,
+            3 * providers._PER_MESSAGE_FRAMING_TOKENS)
 
     def test_cjk_and_emoji_break_the_chars_over_four_estimate(self):
+        cfg = ProviderConfig()
         ctx = self._ctx(
             status_text="HP 1/1" + "、" * 40,
             map_text="\n".join("界" * 79 for _ in range(21)),
             recent_messages=["You see a 金塊。"] * 6,
             inventory=["50 金貨 (gold piece)"])
-        text = self._rendered(ctx)
+        prepared = providers.prepare_strategy_request(cfg, ctx)
+        text = "".join(c for _r, c in prepared.messages)
         nbytes = len(text.encode("utf-8"))
-        prompt, _ = providers.strategy_token_bound(ProviderConfig(), ctx)
+        prompt, _ = providers.strategy_token_bound(cfg, ctx)
         # tokens <= bytes for any byte-level tokenizer, so the bound covers
         # the pathological one-token-per-byte case too
         self.assertGreaterEqual(prompt, nbytes)
         # the old chars/4 estimate under-reserves for exactly this text
-        chars_over_four = (len(text) + 3) // 4 + 16
+        chars_over_four = (len(text) + 3) // 4
         self.assertLess(chars_over_four, nbytes)
 
     def test_cjk_context_refuses_dispatch_under_a_tight_cap(self):
+        # independent oracle: build a *chars/4* candidate from the same frozen
+        # message set and framing, set the cap at that wrong bound plus the
+        # output, and assert the true UTF-8 byte bound refuses before dispatch
         fake = FakeStrategy(_ok_directives())
         cfg = ProviderConfig(max_ticks=200, postmortem_reserve=0,
                              low_confidence_needs=1000)
@@ -2267,24 +2394,219 @@ class TestStrategyTokenBound(WireHarness):
         runner.boundary_queue.submit([b], 0, "Dlvl:1")
         pending = runner.boundary_queue.pending
         ctx = runner._build_strategy_context(pending)
-        text = self._rendered(ctx)
-        prompt, completion = providers.strategy_token_bound(
-            runner.c.config, ctx)
-        # the chars/4 estimate with the REAL framing constant: this is the
-        # discriminator -- under a chars/4 bound the dispatch below fits the
-        # cap; under the byte bound it must be refused
-        old_prompt = len(text) // 4 + providers._CHAT_FRAMING_TOKENS
-        self.assertLess(old_prompt, prompt)      # cjk inflates the bound
-        # a cap the chars/4 estimate would have fitted inside...
-        runner.ledger.token_cap = old_prompt + completion
+        prepared = providers.prepare_strategy_request(cfg, ctx)
+        frames = (providers._CHAT_FRAMING_TOKENS
+                  + providers._PER_MESSAGE_FRAMING_TOKENS
+                  * len(prepared.messages))
+        chars_over_four = sum(len(r) + len(c)
+                              for r, c in prepared.messages) // 4
+        wrong_prompt = chars_over_four + frames
+        completion = prepared.completion_bound
+        self.assertLess(wrong_prompt, prepared.prompt_bound)
+        runner.ledger.token_cap = wrong_prompt + completion
         self.assertTrue(runner.ledger.strategy_available(
-            prompt_tokens=old_prompt, completion_tokens=completion))
+            prompt_tokens=wrong_prompt, completion_tokens=completion))
         runner._dispatch_strategy(pending, time.monotonic())
         # ...but the true byte bound cannot: refused before any work
         self.assertIsNone(runner._strategy_call)
         self.assertEqual(runner.ledger.boundaries_suppressed, 1)
         self.assertEqual(fake.calls, [])
         rec.finalize({})
+
+    def test_context_that_overflows_the_worker_job_is_refused_locally(self):
+        # non-ASCII escapes to more *bytes* than characters, so a payload that
+        # looks small in characters can exceed the worker job ceiling; the
+        # provider refuses it without spawning a worker
+        env = mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-test"})
+        env.start()
+        self.addCleanup(env.stop)
+        provider = providers.DeepSeekStrategy(
+            ProviderConfig(strategy="deepseek", max_ticks=200))
+        big = StrategyContext(
+            episode=1, tick=1, level="Dlvl:1", role="V", status_text="s",
+            map_text="\u754c" * (providers.MAX_JOB_BYTES // 3),
+            remaining_budget=1)
+        prepared = providers.prepare_strategy_request(provider.config, big)
+        self.assertGreater(
+            len(json.dumps(prepared.payload()).encode("utf-8")),
+            providers.MAX_JOB_BYTES)
+        res = provider.deliberate(big, time.monotonic() + 1.0)
+        self.assertIsNotNone(res)
+        self.assertFalse(res.ok)
+        self.assertEqual(res.reason, "strategy-context-too-large")
+        self.assertFalse(res.dispatched)
+
+
+class TestContextEviction(unittest.TestCase):
+    """Sections 2/3: bounded history and deterministic eviction."""
+
+    def _cfg(self, **over):
+        base = dict(deepseek_history_pairs=8, deepseek_max_tokens=64)
+        base.update(over)
+        return ProviderConfig(**base)
+
+    def _ctx(self, map_text=""):
+        return StrategyContext(episode=1, tick=1, level="Dlvl:1",
+                               role="Valkyrie", status_text="HP 1/1",
+                               map_text=map_text)
+
+    def _exchanges(self, n):
+        return [providers.StrategyExchange(user="user-%d" % i,
+                                          assistant="a-%d" % i)
+                for i in range(n)]
+
+    def test_zero_pairs_is_stateless(self):
+        cfg = self._cfg(deepseek_history_pairs=0)
+        p = providers.prepare_strategy_request(
+            cfg, self._ctx(), retained=self._exchanges(5))
+        self.assertEqual(len(p.messages), 2)
+        self.assertEqual(p.retained, ())
+
+    def test_k_one_keeps_the_newest_pair(self):
+        cfg = self._cfg(deepseek_history_pairs=1)
+        p = providers.prepare_strategy_request(
+            cfg, self._ctx(), retained=self._exchanges(5))
+        self.assertEqual(len(p.messages), 4)
+        self.assertEqual(p.messages[1], ("user", "user-4"))
+        self.assertEqual(p.messages[2], ("assistant", "a-4"))
+
+    def test_default_k_eight_retains_a_full_episode(self):
+        cfg = self._cfg()
+        p = providers.prepare_strategy_request(
+            cfg, self._ctx(), retained=self._exchanges(7))
+        self.assertEqual(len(p.retained), 7)
+        self.assertEqual(len(p.messages), 2 + 2 * 7)
+
+    def test_k_eight_evicts_the_oldest_for_a_ninth(self):
+        cfg = self._cfg()
+        p = providers.prepare_strategy_request(
+            cfg, self._ctx(), retained=self._exchanges(9))
+        self.assertEqual(len(p.retained), 8)
+        self.assertEqual(p.retained[0].user, "user-1")
+        self.assertEqual(p.retained[-1].user, "user-8")
+
+    def test_byte_ceiling_evicts_complete_pairs_only(self):
+        cfg = self._cfg(deepseek_context_max_bytes=10 ** 9)
+        hist = self._exchanges(6)
+        two = providers.prepare_strategy_request(cfg, self._ctx(),
+                                                 retained=hist[-2:])
+        ceiling = providers._payload_bytes(cfg, two.messages)
+        cfg2 = self._cfg(deepseek_context_max_bytes=ceiling)
+        p = providers.prepare_strategy_request(cfg2, self._ctx(),
+                                               retained=hist)
+        self.assertEqual(len(p.retained), 2)
+        self.assertTrue(p.fits)
+        # eviction is by whole pairs: a user never appears without its answer
+        self.assertEqual([r for r, _ in p.messages],
+                         ["system", "user", "assistant", "user", "assistant",
+                          "user"])
+
+    def test_irreducible_oversize_does_not_fit(self):
+        cfg = self._cfg(deepseek_context_max_bytes=8)
+        p = providers.prepare_strategy_request(
+            cfg, self._ctx(), retained=self._exchanges(3))
+        self.assertEqual(p.retained, ())
+        self.assertEqual(len(p.messages), 2)
+        self.assertFalse(p.fits)
+
+    def test_payload_bytes_counts_ascii_escaped_bytes(self):
+        cfg = self._cfg()
+        p = providers.prepare_strategy_request(cfg, self._ctx(map_text="界"))
+        raw = sum(len(c.encode("utf-8")) for _r, c in p.messages)
+        self.assertGreater(providers._payload_bytes(cfg, p.messages), raw)
+
+
+class TestConversationContinuity(WireHarness):
+    """Section 2: the harness owns a bounded, prefix-stable conversation."""
+
+    # deliberately unusual whitespace and key order, still valid JSON
+    RAW = ('{\n  "goals": ["survive"],\n    "ttl": 50, "schema_version": 1,\n'
+           ' "explanation": "fake"\n}')
+
+    def setUp(self):
+        super().setUp()
+        self.ep = FakeEndpoint(
+            lambda path, body: (200, _chat_body(self.RAW,
+                                                prompt_tokens=40,
+                                                completion_tokens=8)))
+        self.addCleanup(self.ep.close)
+        env = mock.patch.dict(os.environ,
+                              {"DEEPSEEK_API_KEY": "sk-test-secret"})
+        env.start()
+        self.addCleanup(env.stop)
+        self.cfg = ProviderConfig(strategy="deepseek",
+                                  deepseek_base_url=self.ep.base_url,
+                                  max_ticks=200, strategy_call_cap=8,
+                                  postmortem_reserve=0,
+                                  deepseek_history_pairs=8,
+                                  low_confidence_needs=1000)
+
+    def _ctx(self, tick):
+        return StrategyContext(episode=1, tick=tick, level="Dlvl:1",
+                               role="Valkyrie", status_text="HP 10/20",
+                               map_text="", recent_messages=[], inventory=[],
+                               remaining_budget=6)
+
+    def _turn(self, provider, conv, tick):
+        ctx = self._ctx(tick)
+        prepared = providers.prepare_strategy_request(self.cfg, ctx, conv)
+        ctx.prepared_request = prepared
+        res = provider.deliberate(ctx, time.monotonic() + 5.0)
+        if res is not None and res.ok and res.directives:
+            conv.install(
+                prepared.retained,
+                providers.StrategyExchange(user=prepared.user_text,
+                                           assistant=res.assistant_content))
+        return prepared, res
+
+    def _sent(self, index):
+        body = json.loads(self.ep.requests[index]["body"].decode("utf-8"))
+        return body["messages"]
+
+    def test_prefix_bytes_are_reused_across_calls(self):
+        provider = providers.DeepSeekStrategy(self.cfg)
+        conv = providers.StrategyConversation(max_pairs=8)
+        self._turn(provider, conv, 1)
+        self._turn(provider, conv, 2)
+        self._turn(provider, conv, 3)
+        m1, m2, m3 = self._sent(0), self._sent(1), self._sent(2)
+        self.assertEqual([m["role"] for m in m1], ["system", "user"])
+        self.assertEqual([m["role"] for m in m2],
+                         ["system", "user", "assistant", "user"])
+        self.assertEqual([m["role"] for m in m3],
+                         ["system", "user", "assistant", "user", "assistant",
+                          "user"])
+        # every request's messages are an exact byte prefix of the next
+        self.assertEqual(json.dumps(m2[:len(m1)]), json.dumps(m1))
+        self.assertEqual(json.dumps(m3[:len(m2)]), json.dumps(m2))
+
+    def test_assistant_history_is_the_verbatim_validated_response(self):
+        provider = providers.DeepSeekStrategy(self.cfg)
+        conv = providers.StrategyConversation(max_pairs=8)
+        self._turn(provider, conv, 1)
+        self._turn(provider, conv, 2)
+        m2 = self._sent(1)
+        self.assertEqual(m2[2]["content"], self.RAW)
+        # never a canonicalized re-serialization
+        self.assertNotEqual(m2[2]["content"],
+                            json.dumps(_ok_directives(), sort_keys=True))
+
+    def test_a_failed_call_adds_no_history(self):
+        provider = providers.DeepSeekStrategy(self.cfg)
+        conv = providers.StrategyConversation(max_pairs=8)
+        self._turn(provider, conv, 1)
+        # a second turn whose response fails validation must not commit
+        self.ep.responder = lambda path, body: (200, _chat_body(
+            {"schema_version": 1, "goals": ["not_a_goal"]}))
+        ctx = self._ctx(2)
+        prepared = providers.prepare_strategy_request(self.cfg, ctx, conv)
+        ctx.prepared_request = prepared
+        res = provider.deliberate(ctx, time.monotonic() + 5.0)
+        self.assertFalse(res.ok)
+        self.assertEqual(len(conv.snapshot()), 1)
+        m2 = self._sent(1)
+        self.assertEqual([m["role"] for m in m2],
+                         ["system", "user", "assistant", "user"])
 
 
 # ================================================= config validation (M2)
