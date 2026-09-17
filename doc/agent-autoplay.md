@@ -85,6 +85,15 @@ environment alone never starts paid calls:
 `--strategy-cooldown S` (default 2)
     a pause after a strategy timeout before another call may start.
 
+### Reflex confidence
+
+`--confidence-threshold C` (default 0.8)
+    the minimum confidence for a *paid* reflex answer to be accepted; a
+    paid answer below it falls back to scripted play.  Valid range `0..1`.
+    It applies to the calibrated paid reflex confidence only -- the scripted
+    heuristic score is never compared to it, so an ordinary scripted decision
+    is not treated as uncertain.
+
 ### Strategy budget
 
 `--strategy-call-cap N` (default 8)
@@ -98,8 +107,13 @@ environment alone never starts paid calls:
 `--token-cap N`, `--usd-cap USD`
     optional ceilings.  A USD cap is only enforceable when a tariff is
     configured (`--deepseek-price-in` / `--deepseek-price-out`, USD per
-    million tokens).  No price is invented: with no tariff the estimate stays
-    zero and the unknown-price exposure is counted instead.
+    million tokens), and the CLI requires the **complete** tariff (both
+    prices) when `--usd-cap` is given rather than silently ignoring the cap.
+    No price is invented: with no tariff the estimate stays zero and the
+    unknown-price exposure is counted instead.  Every cap is a *conservative
+    ceiling*: a call is admitted only when the estimated prompt plus the
+    configured maximum output fits in what is left, and a call that returns
+    no usage keeps that exposure recorded (never silently dropped).
 
 `--reflex-call-cap N` (default 0)
     a separate bound on **paid reflex** (Jev) calls; `0` disables Jev work.
@@ -261,14 +275,29 @@ Detected kinds:
 
 Simultaneous reasons **coalesce** into a single request.  An event moves
 through observable states -- `detected`, `queued`, `dispatched`,
-`suppressed`, `expired`, `applied` -- all counted in the budget ledger and
-visible in the decisions sidecar and the episode meta.
+`suppressed`, `expired`, `applied` -- all counted in the budget ledger, all
+visible in the decisions sidecar and the episode meta, and each event's full
+lifecycle persisted in the `ep-N.events.jsonl` ledger.
 
 At most **one** strategy call is in flight, with at most one coalesced
 pending set.  Late responses are not wire actions: a returned directive set
 is activated only at the next **command** boundary, and is discarded as
 stale if the displayed level changed since the call was dispatched, if its
 tick TTL ran out, or if a precondition no longer holds.
+
+Every started strategy operation settles exactly once.  When an episode ends
+with a call still outstanding (a failure, an episode timeout, or a clean
+closure), the call is committed as **dispatched** -- with its reported usage
+if it returned one, and as counted unknown exposure if it did not; it is
+never released as undelivered -- and its boundary set is terminated so every
+dispatched event has exactly one terminal state.  A result that completed in
+the cancellation race is preserved rather than dropped.
+
+A postmortem is requested only after a **clean** closure: a validated
+`closed` with no request left unanswered, a healthy recording and a
+postmortem slot still reserved.  An EOF, a protocol failure, an episode or
+content deadline, and a `closed` that arrived with a request still
+unanswered are all ineligible -- none of them is a completion to reflect on.
 
 A directive set is a small closed-world object (`schema_version`, ordered
 `goals`, an optional observed `target`, a bounded `risk`, a `ttl`,
@@ -329,20 +358,28 @@ position, `line` and `extcmd` are never sent to Jev.
 
 Secrets come only from `DEEPSEEK_API_KEY` / `JEV_API_KEY` or a **0600 key
 file**.  The key never appears in a log line, a recording, a structured
-error or an exception message, and it is stripped from the game child's
-environment by construction (an allowlist, not a deny list).  Logging records
-allowlisted configuration and error *categories*, never request headers or
-provider bodies.
+error or an exception message.  It is stripped from the game child's
+environment by construction, and the provider **worker** likewise inherits
+only a minimal runtime environment (PATH and locale): the selected key
+travels to the worker *only* in the stdin job, never in an environment
+variable and never in argv.  Logging records allowlisted configuration and
+error *categories*, never request headers or provider bodies.
 
 ## Recordings
 
-Each episode writes four sidecars under `--output-dir`:
+Each episode writes five sidecars under `--output-dir`:
 
   * `ep-N.wire.jsonl` — the inbound physical bytes, verbatim, in order;
   * `ep-N.actions.jsonl` — outbound actions/auxiliaries with their ordinal,
     the preceding input offset, the `NeedKey` and the send status;
   * `ep-N.decisions.jsonl` — proposals, the selected provider, fallback
-    reasons, boundaries, active directives, latency and usage;
+    reasons, the *dispatched* boundary ids, the complete validated directive
+    set, latency and usage;
+  * `ep-N.events.jsonl` — the schema-versioned event-lifecycle ledger: one
+    record per boundary EID (`detected` -> `queued` -> `dispatched` -> one
+    terminal state, with the tick and displayed level of each step, the
+    coalesced members, and wall timing kept in a separate field) and one per
+    directive activation/expiry;
   * `ep-N.meta.json` — schema versions, allowlisted configuration, the stop
     reason, the visible outcome and the **budget ledger**.
 
