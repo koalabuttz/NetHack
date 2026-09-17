@@ -50,12 +50,23 @@ def ensure_private_dir(path: str) -> None:
 
 
 def _open_private(path, flags) -> int:
-    """Open *path* at 0600 and force the mode even for a pre-existing file."""
+    """Open *path* at 0600 and force the mode even for a pre-existing file.
+
+    A filesystem that rejects the mode change is a *recording error*: a
+    private transcript that silently became group- or world-readable is worse
+    than a failed recording, so this fails closed rather than proceeding
+    permissive.  A platform with no ``fchmod`` at all relies on the mode
+    passed to :func:`os.open`.
+    """
     fd = os.open(path, flags, _FILE_MODE)
     try:
         os.fchmod(fd, _FILE_MODE)
-    except (AttributeError, OSError):
+    except AttributeError:
+        # no fchmod on this platform: os.open's mode is the only guarantee
         pass
+    except OSError:
+        os.close(fd)
+        raise
     return fd
 
 
@@ -140,8 +151,14 @@ class EpisodeRecorder(object):
         self.decisions_path = base + ".decisions.jsonl"
         self.meta_path = base + ".meta.json"
         self._wire = _Writer(self.wire_path, maxsize)
-        self._acts = _Writer(self.actions_path, maxsize)
-        self._decs = _Writer(self.decisions_path, maxsize)
+        try:
+            self._acts = _Writer(self.actions_path, maxsize)
+            self._decs = _Writer(self.decisions_path, maxsize)
+        except OSError:
+            # a writer that could not be opened at 0600 fails closed: release
+            # the one already opened rather than recording permissively
+            self._wire.shutdown()
+            raise
         for w in (self._wire, self._acts, self._decs):
             w.start()
         self.incomplete = False

@@ -246,16 +246,16 @@ class Request(object):
         self.in_flight = None
 
     def note_page(self, rec: dict) -> None:
+        """Deliver the response for the one outstanding page request.
+
+        Only the exact page that is in flight is accepted; a response for any
+        other page is ignored here (a strict caller rejects it first), so the
+        request can never be marked delivered by a page it never asked for.
+        """
         idx = rec.get("page")
-        if idx is None:
+        if idx != self.in_flight:
             return
-        # a page for content we are not waiting on is ignored
-        if rec.get("content") != self.content and self.content is not None:
-            return
-        if rec.get("pages") not in (None, self.pages_declared):
-            return
-        if idx == self.in_flight:
-            self.in_flight = None
+        self.in_flight = None
         self.pages_delivered.setdefault(idx, rec.get("rows") or [])
 
     def pages_complete(self) -> bool:

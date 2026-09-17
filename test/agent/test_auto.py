@@ -928,6 +928,27 @@ class TestController(WireHarness):
         self.assertEqual(commits[0]["action"]["commit"], [[14, -1]])
         self.assertTrue(any(a.get("action", {}).get("ack") for a in actions))
 
+    def test_page_response_must_match_the_outstanding_request(self):
+        # Fix 5: only the exact outstanding page, with a matching page count,
+        # is accepted; a wrong index or total is an immediate protocol fault.
+        cases = {
+            "wrong-index": _line(page("c9", 1, 2, [row(1, "x")])),
+            "wrong-total": _line(page("c9", 0, 5, [row(1, "x")])),
+        }
+        for label, raw in cases.items():
+            with self.subTest(case=label):
+                scen = b"".join([
+                    _line(HELLO),
+                    _line(obs_menu(1, 9, "m9", "c9",
+                                   "Pick a role or profession", pages=2)),
+                    raw,
+                    _line(CLOSED),
+                ])
+                result, _ = self.run_scenario(scen)
+                self.assertIsNotNone(result.protocol_failure,
+                                     "%s slipped through" % label)
+                self.assertEqual(result.stop_reason, "protocol-failure")
+
     def test_chunked_snapshot_is_assembled_and_acked(self):
         parts = [
             [{"p": "h", "k": "v", "val": 1},
@@ -1512,6 +1533,41 @@ class TestRecording(WireHarness):
         mode = os.stat(rec.actions_path).st_mode & 0o777
         self.assertEqual(mode, 0o600)
         rec.finalize({})
+
+    def test_fchmod_failure_is_a_recording_error(self):
+        # the small residual: a filesystem that rejects chmod must not
+        # silently proceed with a permissive transcript
+        path = os.path.join(self.dir, "perm.txt")
+
+        def boom(fd, mode):
+            raise OSError("chmod rejected by the filesystem")
+
+        with mock.patch.object(os, "fchmod", boom):
+            with self.assertRaises(OSError):
+                recording._open_private(
+                    path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+        # failed closed: nothing was left group- or world-accessible
+        self.assertEqual(os.stat(path).st_mode & 0o077, 0)
+
+    def test_recorder_fchmod_failure_fails_the_episode(self):
+        # a recorder that cannot enforce 0600 is a recording failure for that
+        # episode, not a crash of the whole campaign
+        def boom(fd, mode):
+            raise OSError("chmod rejected by the filesystem")
+
+        scen = _line(HELLO) + _line(obs(1, {"kind": "command", "id": 1})) \
+            + _line(CLOSED)
+        ctl = self._controller(timeout=5.0)
+        proc = FakeProc(scen)
+        ctl._spawn = lambda priv: proc
+        with mock.patch.object(os, "fchmod", boom):
+            results = ctl.run_campaign(1)
+        proc.close()
+        result = results[0]
+        self.assertTrue(result.recorder_failed)
+        self.assertEqual(result.stop_reason, "recorder-failure")
+        self.assertIsNone(result.protocol_failure)
+        self.assertFalse(result.recording_complete)
 
 
 class TestWriter(unittest.TestCase):

@@ -171,45 +171,58 @@ class Controller(object):
     def run_episode(self, index: int) -> EpisodeResult:
         result = EpisodeResult(index=index)
         priv = tempfile.mkdtemp(prefix="nh-auto-ep.")
-        rec = recording.EpisodeRecorder(self.output_dir, index)
+        rec = None
         proc = None
         try:
+            rec = recording.EpisodeRecorder(self.output_dir, index)
             proc = self._spawn(priv)
             result.spawn_ok = True
             runner = _EpisodeRunner(self, proc, rec, result)
             runner.run()
             result.recorder_failed = rec.failed
         except OSError as exc:
-            result.failure_reason = "spawn failed: %s" % exc
-            result.stop_reason = "spawn-failure"
+            if rec is None:
+                # a recorder that could not open its files at 0600 is a
+                # recording failure, not a spawn failure: fail closed without
+                # aborting the campaign
+                result.recorder_failed = True
+                result.failure_reason = "recorder failed: %s" % exc
+                result.stop_reason = "recorder-failure"
+            else:
+                result.failure_reason = "spawn failed: %s" % exc
+                result.stop_reason = "spawn-failure"
         finally:
             self._reap(proc, result)
             shutil.rmtree(priv, ignore_errors=True)
-            result.recorder_failed = result.recorder_failed or rec.failed
-            meta = {
-                "config": _safe_config(self.config),
-                "episode_timeout": self.episode_timeout,
-                "answer_deadline": self.answer_deadline,
-                "content_deadline": self.content_deadline,
-                "stop_reason": result.stop_reason,
-                "game_outcome": result.outcome,
-                "closed": result.closed,
-                "eof": result.eof,
-                "forced_kill": result.forced_kill,
-                "teardown_failure": result.teardown_failure,
-                "unanswered": result.unanswered,
-                "recorder_failed": result.recorder_failed,
-                "protocol_failure": result.protocol_failure,
-                "failure_reason": result.failure_reason,
-                "ticks": result.ticks,
-                "needs": result.needs,
-                "invalids": result.invalids,
-                "reflex_timeouts": result.reflex_timeouts,
-                "returncode": result.returncode,
-            }
-            rec.finalize(meta)
-            result.recording_complete = not rec.incomplete
+            if rec is not None:
+                self._finalize_recording(rec, result)
         return result
+
+    def _finalize_recording(self, rec, result: EpisodeResult) -> None:
+        result.recorder_failed = result.recorder_failed or rec.failed
+        meta = {
+            "config": _safe_config(self.config),
+            "episode_timeout": self.episode_timeout,
+            "answer_deadline": self.answer_deadline,
+            "content_deadline": self.content_deadline,
+            "stop_reason": result.stop_reason,
+            "game_outcome": result.outcome,
+            "closed": result.closed,
+            "eof": result.eof,
+            "forced_kill": result.forced_kill,
+            "teardown_failure": result.teardown_failure,
+            "unanswered": result.unanswered,
+            "recorder_failed": result.recorder_failed,
+            "protocol_failure": result.protocol_failure,
+            "failure_reason": result.failure_reason,
+            "ticks": result.ticks,
+            "needs": result.needs,
+            "invalids": result.invalids,
+            "reflex_timeouts": result.reflex_timeouts,
+            "returncode": result.returncode,
+        }
+        rec.finalize(meta)
+        result.recording_complete = not rec.incomplete
 
     # -- process ---------------------------------------------------------
     def _child_env(self) -> dict:
@@ -746,10 +759,20 @@ class _EpisodeRunner(object):
         if rec.get("content") != self.req.content:
             raise _ProtocolFailure("page for unexpected content %r"
                                    % (rec.get("content"),))
+        outstanding = self.req.in_flight
+        if outstanding is None:
+            raise _ProtocolFailure(
+                "page delivered with no outstanding request")
         idx = rec.get("page")
-        if not _is_int(idx) or not (0 <= idx < self.req.pages_declared):
-            raise _ProtocolFailure("page index %r out of the declared range"
-                                   % (idx,))
+        if idx != outstanding:
+            raise _ProtocolFailure(
+                "page %r is not the outstanding page %r"
+                % (idx, outstanding))
+        total = rec.get("pages")
+        if total != self.req.pages_declared:
+            raise _ProtocolFailure(
+                "page declares %r pages but the need declares %r"
+                % (total, self.req.pages_declared))
         self.req.note_page(rec)
 
     def _on_invalid(self, rec):
