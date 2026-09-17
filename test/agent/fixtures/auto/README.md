@@ -22,7 +22,10 @@ episodes are never checked in):
 | `short.decisions.jsonl` | 10085 |
 | `legacy-ep3.wire.jsonl` | 39341 |
 
-Total: **165703 bytes** (161.8 KiB).
+Total: **165703 bytes** (161.8 KiB) of fixture data.  With this README the
+directory is still well under 172 KiB, and
+`test_auto_replay.FixtureIntegrityTest.test_total_budget_is_bounded` asserts
+the whole directory stays within the 256 KiB budget.
 
 sha256 (integrity of the committed snapshots; the upstream ephemeral
 recordings are not in the repository):
