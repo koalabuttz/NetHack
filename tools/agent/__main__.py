@@ -100,6 +100,13 @@ def build_parser():
                       help="bounded output budget; a reasoning model needs "
                            "headroom beyond its reasoning tokens or it "
                            "returns empty content")
+    auto.add_argument("--deepseek-history-pairs", type=int, default=8,
+                      help="bounded episode-local conversation continuity "
+                           "(0..64); 0 restores stateless requests")
+    auto.add_argument("--deepseek-context-max-bytes", type=int,
+                      default=262144,
+                      help="harness payload byte ceiling for one prepared "
+                           "request (not a model context-window claim)")
     # -- Jev (ships disabled) --------------------------------------------
     auto.add_argument("--jev-key-file", default=None)
     auto.add_argument("--jev-base-url", default=None)
@@ -126,6 +133,8 @@ def _config_from_args(a) -> ProviderConfig:
         deepseek_base_url=a.deepseek_base_url,
         deepseek_key_file=a.deepseek_key_file,
         deepseek_max_tokens=a.deepseek_max_tokens,
+        deepseek_history_pairs=a.deepseek_history_pairs,
+        deepseek_context_max_bytes=a.deepseek_context_max_bytes,
         jev_key_file=a.jev_key_file,
         jev_base_url=a.jev_base_url,
         jev_accept_terms=a.jev_accept_terms,
@@ -212,6 +221,18 @@ def cmd_auto(a) -> int:
         if r.stderr_tail.strip():
             print("  stderr tail: %s" % r.stderr_tail.strip()
                   .replace("\n", " | ")[-300:])
+        u = (r.budget or {}).get("usage", {}) if r.budget else {}
+        classified = (u.get("cache_hit_tokens", 0)
+                      + u.get("cache_miss_tokens", 0))
+        if classified > 0:
+            rate = "%.1f%%" % (100.0 * u.get("cache_hit_tokens", 0)
+                               / float(classified))
+        else:
+            rate = "n/a"
+        print("  cache hit: %s (%d hit / %d miss; %d unclassified)" %
+              (rate, u.get("cache_hit_tokens", 0),
+               u.get("cache_miss_tokens", 0),
+               u.get("cache_unclassified_tokens", 0)))
     print("campaign: %d episode(s), %d failure(s)" % (len(results), failures))
     # The episode results above are authoritative even when the rollup could
     # not be written; report the failure explicitly and never claim a path

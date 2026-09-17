@@ -117,11 +117,16 @@ evaluation" below.
     configured (`--deepseek-price-in` / `--deepseek-price-out`, USD per
     million tokens), and the CLI requires the **complete** tariff (both
     prices) when `--usd-cap` is given rather than silently ignoring the cap.
-    No price is invented: with no tariff the estimate stays zero and the
-    unknown-price exposure is counted instead.  Every cap is a *conservative
-    ceiling*: a call is admitted only when the estimated prompt plus the
-    configured maximum output fits in what is left, and a call that returns
-    no usage keeps that exposure recorded (never silently dropped).
+    The optional `--deepseek-price-cache-hit` (USD per million prompt
+    cache-hit tokens) only lowers the *reported* cost of a cache hit; it never
+    completes a tariff and is rejected when it exceeds `--deepseek-price-in`,
+    because the full input price is the conservative fallback every
+    reservation relies on.  No price is invented: with no tariff the estimate
+    stays zero and the unknown-price exposure is counted instead.  Every cap
+    is a *conservative ceiling*: a call is admitted only when the estimated
+    prompt plus the configured maximum output fits in what is left, and a call
+    that returns no usage keeps that exposure recorded (never silently
+    dropped).
 
 `--reflex-call-cap N` (default 0)
     a separate bound on **paid reflex** (Jev) calls; `0` disables Jev work.
@@ -159,6 +164,19 @@ evaluation" below.
     reasoning tokens returns empty content (an unusable response); the
     reasoning length is variable, so the default leaves headroom for the JSON
     plan after it.
+
+`--deepseek-history-pairs N` (default 8; range 0..64)
+    how many committed user/assistant exchanges the harness retains as
+    episode-local conversation continuity for the cache-aware prefix.  `0` is
+    the explicit rollback to stateless requests.  See
+    "Prompt-cache utilization" below.
+
+`--deepseek-context-max-bytes N` (default 262144)
+    a harness **payload-safety ceiling** for one prepared request, measured
+    against the UTF-8 JSON serialization of the whole API payload.  It is not
+    a claim about a model's context window; an irreducible oversize request
+    is refused locally (`strategy-context-too-large`) without spawning a
+    worker.
 
 `--jev-key-file`, `--jev-base-url`, `--i-accept-jev-terms`
     the Jev trio; all three are needed before `--reflex jev` will start.
@@ -297,13 +315,19 @@ is activated only at the next **command** boundary, and is discarded as
 stale if the displayed level changed since the call was dispatched, if its
 tick TTL ran out, or if a precondition no longer holds.
 
-Every started strategy operation settles exactly once.  When an episode ends
-with a call still outstanding (a failure, an episode timeout, or a clean
-closure), the call is committed as **dispatched** -- with its reported usage
-if it returned one, and as counted unknown exposure if it did not; it is
-never released as undelivered -- and its boundary set is terminated so every
-dispatched event has exactly one terminal state.  A result that completed in
-the cancellation race is preserved rather than dropped.
+Every started strategy operation settles exactly once.  A call that may have
+reached the wire is committed as **dispatched** -- with its reported usage if
+it returned one, and as counted unknown exposure if it did not; an ambiguous
+missing result after the thread started is *never* treated as proof that no
+dispatch happened.  A result that proves a **known local refusal** -- a missing
+key, a cooldown, a spawn failure or an oversize payload -- never crossed the
+dispatch boundary and is *released* rather than booked as phantom exposure,
+matching the postmortem's treatment.  Either way the boundary set is
+terminated so every dispatched event has exactly one terminal state, and a
+result that completed in the cancellation race is preserved rather than
+dropped.  A successful validated result is also the only thing that extends
+the episode's conversation (see "Prompt-cache utilization"): a failed,
+cancelled or refused call appends nothing.
 
 A postmortem is requested only after a **clean** closure: a validated
 `closed` with no request left unanswered, a healthy recording and a
@@ -342,7 +366,11 @@ Every episode carries a ledger in `ep-N.meta.json`:
     expired / applied, plus calls dispatched and the postmortem count;
   * usage: prompt and completion tokens as actually reported, an estimated
     USD figure **only** where an operator tariff is configured, and a count
-    of unknown-price calls otherwise.
+    of unknown-price calls otherwise.  When the provider reports a
+    prompt-cache partition, `cache_hit_tokens`, `cache_miss_tokens`,
+    `cache_unclassified_tokens` and `cache_hit_rate` are also carried, plus
+    `reasoning_tokens` as a diagnostic subset of the completion tokens
+    (never billed twice).
 
 The cap is authoritative: a call is reserved before dispatch, failed calls
 are not refunded, and once the remaining cap cannot conservatively cover one
@@ -432,6 +460,68 @@ full queue or disk failure marks the recording **incomplete**
 Directories are `0700` and files `0600`.  No secrets are recorded.  Note that
 game names and game text may themselves be private.
 
+## Prompt-cache utilization
+
+DeepSeek caches a request's *prefix* automatically and reports how much of the
+prompt was served from cache (`prompt_cache_hit_tokens` /
+`prompt_cache_miss_tokens`).  The harness exploits this by keeping a bounded,
+**episode-local** conversation and rendering each turn so the previous prefix
+stays byte-identical.
+
+  * **Ownership.**  One conversation per episode (live) or per replay pass --
+    never one spanning several campaign episodes.  The harness owns it, not
+    the provider: a worker or provider respawn does not own or clear it, and
+    a direct `DeepSeekStrategy.deliberate` call outside the harness is
+    stateless (it prepares a fresh two-message request).
+  * **Render order.**  Each user turn is a complete bounded snapshot: the
+    `GAME STATE (untrusted data):` label first, then `mode`/`role`, active
+    directives, inventory, boundary history, pending boundaries, recent
+    messages, map, displayed level, status, tick, and the
+    `remaining strategy calls:` line last.  An earlier turn is never
+    re-rendered with a newer budget or state.  No episode id, campaign path,
+    UUID or wall time enters model-facing text.
+  * **Boundary history** is a bounded 16-record harness-owned window with
+    stable eid/reason/tick/level fields; the current request's pending
+    boundaries are rendered separately and always survive the truncation.
+  * **Transaction.**  A user/assistant pair is committed only when the result
+    is ok, carries validated directives and was not cancelled -- the retained
+    slice the frozen request carried plus the new pair, capped to
+    `--deepseek-history-pairs`.  The assistant text is the model's **verbatim
+    validated** response (canonicalizing it would change the generated
+    prefix); a dict-shaped or injected response without verbatim text falls
+    back to a stable serialization.  A failed, timed-out, cancelled or
+    locally-refused call appends nothing and leaves the prior history intact.
+  * **Eviction.**  Deterministic: oldest complete pairs are dropped until both
+    the pair-count cap and the byte ceiling fit, always keeping the system
+    message and the current user message.  Eviction is *not* used to make room
+    for another paid call -- an oversize reservation follows the normal
+    cap-refusal path.  A reset happens on a new episode (or, for a change of
+    model/base URL, a new runner); it does **not** happen at a level change.
+
+Reservation stays conservative: `strategy_token_bound` covers the *exact*
+frozen request -- every message role and content in UTF-8 bytes, a fixed
+request allowance and a per-message allowance, plus the configured max
+completion tokens -- and never discounts cached tokens.  Later strategy calls
+can therefore be refused *sooner* as history accumulates; a reported cache
+partition lowers only the settled USD, and only once the usage is known.
+
+Prompt-cache accounting is deliberately conservative.  A discount is granted
+only for a **complete, consistent** partition (`hit + miss == prompt`); an
+absent, partial, contradictory, negative, floating or boolean cache report
+prices the prompt at the full input price and counts it as unclassified.  The
+reported `cache_hit_rate` is measured over classified tokens only, so a high
+rate over thin reporting coverage is not mistaken for a wide one; the campaign
+rollup computes the rate from the summed hit and miss totals, never as an
+average of episode percentages.  `reasoning_tokens` is a diagnostic subset of
+the completion tokens and is never added to them a second time.
+
+The **postmortem** always gets a separate, empty conversation and a fresh
+provider; it never transfers gameplay history and never touches the gameplay
+provider's sticky cancellation flag.  Its prompt is `mode: postmortem` plus an
+allowlisted deterministic episode summary (outcome/stop reason, final tick,
+visible level and HP, action/invalid/boundary counts, strategy dispatch count,
+applicable advice), bounded terminal messages and final visible state.
+
 ## Offline evaluation (`tools/agent.evaluate`)
 
 Replay a recording **without a game and, by default, without a network**,
@@ -458,6 +548,21 @@ repeatable `--provider scripted|jev` adds more candidates to compare; each
 candidate is replayed in **its own isolated pass**, with its own episode
 memory and budget ledger, so one provider's decisions can never influence
 another's.
+
+An explicitly `--allow-network --strategy deepseek` pass keeps the **same**
+continuity policy as live play -- the same K/byte eviction, render and
+preparation helper, whole-request bound, and successful-settlement commit rule
+-- and starts each pass from an **empty** conversation.  Comparison passes with
+the strategy off stay off and unchanged.  The evaluator's own
+`--deepseek-history-pairs`, `--deepseek-context-max-bytes` and
+`--deepseek-price-cache-hit` flags mirror the live CLI.
+
+Determinism is scoped deliberately: the same wire and configuration produce
+byte-identical **requests** and byte-identical cleaned artifacts, because
+preparation is deterministic and uses no random ids, real clocks or
+wall-timed eviction; network calls were never reproducible merely because
+preparation is.  The new usage fields are deterministic zeros/`null` in
+offline runs.
 
 ### Output
 

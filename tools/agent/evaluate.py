@@ -44,23 +44,29 @@ import json
 import os
 import re
 import sys
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import protocol, recording, state
 from .budget import BudgetLedger
 from .codec import AssemblerLimit, ChunkError, IncrementalAssembler
-from .controller import _EpisodeRunner
+from .controller import _EpisodeRunner, _crossed_dispatch_boundary
 from .directives import DirectiveBook, PreconditionState
 from .events import BoundaryQueue, EventLedger, directive_event, hunger_index
 from .policy import INV_STALE_TICKS, ScriptedReflex
 from .protocol import NeedKey, Request, Snapshot
 from .providers import (NullStrategy, ProviderConfig, ReflexContext,
                         ScriptedReflexProvider, StrategyContext,
-                        reflex_provider, strategy_provider,
-                        strategy_token_bound, tariff_from_config)
+                        StrategyConversation, StrategyExchange,
+                        prepare_strategy_request, reflex_provider,
+                        strategy_provider, tariff_from_config)
 
 EVAL_SCHEMA = 1
+
+# Boundary history window kept for the strategy prompt, mirroring the live
+# controller so a replay's prepared requests match what play would send.
+_BOUNDARY_HISTORY_MAX = 16
 
 # Physical/retention bounds mirror the live controller's, so a recording that
 # the live path accepted cannot fail a replay for a different reason.
@@ -465,6 +471,13 @@ class ReplayPass(object):
         self._pending: Optional[_Need] = None
         self._strategy_pending = None
         self._strategy_level = None
+        self._strategy_prepared = None
+        # Every pass starts empty; the conversation and boundary history are
+        # pass-local, exactly like the live episode's.
+        self._conversation = StrategyConversation(
+            identity=(config.deepseek_model, config.deepseek_base_url),
+            max_pairs=config.deepseek_history_pairs)
+        self._boundary_history = deque(maxlen=_BOUNDARY_HISTORY_MAX)
         # Ground-truth correlation: the wire-rejected attempts per need are
         # known up front, the live count of invalid records seen so far labels
         # each rejected attempt, and the delivered page rows are kept so an
@@ -702,6 +715,9 @@ class ReplayPass(object):
         for b in detected:
             self.event_ledger.detect(b, self.tick,
                                      self.mem.status.dlvl or "")
+            self._boundary_history.append(
+                {"eid": b.eid, "reason": b.reason, "tick": self.tick,
+                 "level": self.mem.status.dlvl or ""})
 
     def _submit_boundaries(self, detected) -> None:
         if not detected:
@@ -717,11 +733,20 @@ class ReplayPass(object):
         if pending is None:
             return
         ctx = self._build_strategy_context(pending)
-        prompt, completion = strategy_token_bound(self.config, ctx)
-        if not self.ledger.reserve_strategy(prompt_tokens=prompt,
-                                            completion_tokens=completion):
+        prepared = prepare_strategy_request(self.config, ctx,
+                                            self._conversation)
+        ctx.prepared_request = prepared
+        if not prepared.fits:
+            self._strategy_prepared = None
+            self.boundary_queue.suppress("strategy-context-too-large")
+            return
+        if not self.ledger.reserve_strategy(
+                prompt_tokens=prepared.prompt_bound,
+                completion_tokens=prepared.completion_bound):
+            self._strategy_prepared = None
             self.boundary_queue.suppress("strategy-cap")
             return
+        self._strategy_prepared = prepared
         self.boundary_queue.mark_dispatched(self.tick, self.clock())
         self._strategy_level = self.mem.status.dlvl
         try:
@@ -730,9 +755,16 @@ class ReplayPass(object):
         except Exception:                    # noqa: BLE001 - bounded policy
             res = None
         usage = res.usage if res is not None else None
-        self.ledger.commit_strategy(usage)
+        # The same settlement rule as live play: a result that may have
+        # reached the wire is committed, a known local refusal is released,
+        # and an ambiguous None keeps its conservative exposure.
+        if res is None or _crossed_dispatch_boundary(res):
+            self.ledger.commit_strategy(usage)
+        else:
+            self.ledger.release_strategy()
         if res is not None and res.ok and res.directives:
             self._strategy_pending = res.directives[0]
+            self._commit_history(prepared, res)
         else:
             self.boundary_queue.finish(False, "strategy-failed")
         self.decisions.append({
@@ -745,6 +777,26 @@ class ReplayPass(object):
                            (res.directives if res is not None else [])],
         })
 
+    def _commit_history(self, prepared, res) -> None:
+        """Install the retained slice plus the new pair, capped to K.
+
+        The committed assistant text is the verbatim validated content when
+        present, else a stable serialization of the validated set -- the same
+        rule as the live controller's, so a canned-response replay produces
+        the same request bytes as play.
+        """
+        verbatim = getattr(res, "assistant_content", "")
+        if not verbatim:
+            first = res.directives[0]
+            to_dict = getattr(first, "to_dict", None)
+            if to_dict is not None:
+                verbatim = json.dumps(to_dict(), sort_keys=True)
+            elif isinstance(first, dict):
+                verbatim = json.dumps(first, sort_keys=True)
+        self._conversation.install(
+            prepared.retained,
+            StrategyExchange(user=prepared.user_text, assistant=verbatim))
+
     def _build_strategy_context(self, pending):
         st = self.mem.status
         bits = []
@@ -754,6 +806,7 @@ class ReplayPass(object):
             bits.append("Hunger %s" % st.hunger)
         if st.dlvl:
             bits.append("Dlvl %s" % st.dlvl)
+        view = self.book.view(self.tick, st.dlvl, self._precondition_state())
         return StrategyContext(
             episode=1, tick=self.tick,
             summary={"hp": st.hp, "hp_max": st.hp_max, "dlvl": st.dlvl},
@@ -763,7 +816,10 @@ class ReplayPass(object):
             recent_messages=self.mem.recent_messages(6),
             inventory=[(r.get("text") or "")
                        for r in self.mem.inventory.rows],
-            remaining_budget=self._remaining_budget(), level=st.dlvl)
+            history=list(self._boundary_history),
+            remaining_budget=self._remaining_budget(), level=st.dlvl,
+            role=self.config.role,
+            directives=[view.dset] if view.active else [])
 
     def _remaining_budget(self):
         spendable = self.ledger.strategy_cap - self.ledger.postmortem_reserve
@@ -1013,6 +1069,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--deepseek-key-file", default=None)
     p.add_argument("--deepseek-base-url",
                    default="https://api.deepseek.com")
+    p.add_argument("--deepseek-history-pairs", type=int, default=8,
+                   help="bounded episode-local conversation pairs (0..64; 0 "
+                        "is the stateless rollback)")
+    p.add_argument("--deepseek-context-max-bytes", type=int, default=262144,
+                   help="payload byte ceiling for the prepared request")
+    p.add_argument("--deepseek-price-in", type=float, default=None,
+                   help="operator-configured USD per Mtok prompt tokens")
+    p.add_argument("--deepseek-price-out", type=float, default=None,
+                   help="operator-configured USD per Mtok completion tokens")
+    p.add_argument("--deepseek-price-cache-hit", type=float, default=None,
+                   help="operator-configured USD per Mtok prompt cache hits")
+    p.add_argument("--token-cap", type=int, default=0)
+    p.add_argument("--usd-cap", type=float, default=None)
     return p
 
 
@@ -1024,7 +1093,13 @@ def _config_from_args(a) -> ProviderConfig:
         postmortem_reserve=a.postmortem_reserve,
         deepseek_model=a.deepseek_model,
         deepseek_base_url=a.deepseek_base_url,
-        deepseek_key_file=a.deepseek_key_file)
+        deepseek_key_file=a.deepseek_key_file,
+        deepseek_history_pairs=a.deepseek_history_pairs,
+        deepseek_context_max_bytes=a.deepseek_context_max_bytes,
+        deepseek_price_in=a.deepseek_price_in,
+        deepseek_price_out=a.deepseek_price_out,
+        deepseek_price_cache_hit=a.deepseek_price_cache_hit,
+        token_cap=a.token_cap, usd_cap=a.usd_cap)
 
 
 def _read_wire(path: str) -> List[bytes]:

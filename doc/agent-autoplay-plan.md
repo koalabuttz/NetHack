@@ -294,7 +294,11 @@ plan. Treat game text as untrusted quoted data, not instructions.
 Proposed CLI: `auto --episodes N --reflex scripted|jev --strategy off|deepseek
 --role Samurai --max-ticks 2000 --episode-timeout 300 --output-dir DIR`, plus
 answer/provider/content timeouts, confidence threshold, strategy-call cap,
-token/USD caps, cooldowns, API model/base URL and price configuration. Default
+token/USD caps, cooldowns, API model/base URL and price configuration
+(`--deepseek-price-in` / `--deepseek-price-out` and the optional
+`--deepseek-price-cache-hit`), and the bounded-continuity controls
+`--deepseek-history-pairs` (0..64, default 8) and
+`--deepseek-context-max-bytes` (default 262144). Default
 scripted/off is completely network-free; presence of a key alone does not opt users
 into paid calls. CLI overrides nonsecret env/default settings. Preserve AGENT_DATA
 behavior.
@@ -316,7 +320,10 @@ calls; do not refund timeout exposure merely because no usage was returned. Disa
 additional paid calls if the remaining cap cannot conservatively cover one request.
 Unknown price means no asserted hard USD enforcement; require tariff configuration
 when a USD cap is requested. DeepSeek input/output/reasoning/cache usage needs
-model-specific accounting. Default example strategy cap 8 total, reserving one for
+model-specific accounting: prompt-cache hit/miss tokens are reported separately
+and only a complete consistent partition earns a discount, while every
+reservation stays at the full input price. Default example strategy cap 8 total,
+reserving one for
 postmortem (7 during play); postmortem counts against the same cap and can be
 skipped. Also bound paid reflex calls/tokens: a strategy-only cap does not bound
 Jev spending.

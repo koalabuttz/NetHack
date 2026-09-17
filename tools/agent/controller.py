@@ -1712,6 +1712,14 @@ def _safe_config(config: ProviderConfig) -> dict:
         "postmortem_reserve": getattr(config, "postmortem_reserve", None),
         "deepseek_max_tokens": getattr(config, "deepseek_max_tokens", None),
         "deepseek_max_bytes": getattr(config, "deepseek_max_bytes", None),
+        "deepseek_history_pairs": getattr(config,
+                                          "deepseek_history_pairs", None),
+        "deepseek_context_max_bytes": getattr(
+            config, "deepseek_context_max_bytes", None),
+        "deepseek_price_in": getattr(config, "deepseek_price_in", None),
+        "deepseek_price_out": getattr(config, "deepseek_price_out", None),
+        "deepseek_price_cache_hit": getattr(config,
+                                            "deepseek_price_cache_hit", None),
         "boundary_cooldown_ticks": getattr(config,
                                            "boundary_cooldown_ticks", None),
         "boundary_cooldown_wall": getattr(config,
@@ -1773,6 +1781,15 @@ def _episode_summary(r: EpisodeResult) -> dict:
             "unknown_exposure_tokens": usage.get("unknown_exposure_tokens",
                                                  0),
             "unknown_exposure_usd": usage.get("unknown_exposure_usd", 0.0),
+            # reported prompt-cache accounting: a hit rate over *classified*
+            # tokens only, with the unclassified count carried separately so a
+            # high rate over thin reporting coverage is not misread
+            "cache_hit_tokens": usage.get("cache_hit_tokens", 0),
+            "cache_miss_tokens": usage.get("cache_miss_tokens", 0),
+            "cache_unclassified_tokens": usage.get(
+                "cache_unclassified_tokens", 0),
+            "cache_hit_rate": usage.get("cache_hit_rate"),
+            "reasoning_tokens": usage.get("reasoning_tokens", 0),
         },
     }
 
@@ -1785,7 +1802,10 @@ def campaign_summary(results, config, episode_timeout: float) -> dict:
               "prompt_tokens": 0, "completion_tokens": 0,
               "estimated_usd": 0.0, "unknown_price_calls": 0,
               "unknown_exposure_calls": 0, "unknown_exposure_tokens": 0,
-              "unknown_exposure_usd": 0.0}
+              "unknown_exposure_usd": 0.0,
+              "cache_hit_tokens": 0, "cache_miss_tokens": 0,
+              "cache_unclassified_tokens": 0, "reasoning_tokens": 0,
+              "cache_hit_rate": None}
     for e in episodes:
         for key in ("ticks", "needs", "actions", "invalids", "boundaries",
                     "strategy_calls", "directives_applied"):
@@ -1800,6 +1820,17 @@ def campaign_summary(results, config, episode_timeout: float) -> dict:
         totals["unknown_exposure_tokens"] += u["unknown_exposure_tokens"]
         totals["unknown_exposure_usd"] = round(
             totals["unknown_exposure_usd"] + u["unknown_exposure_usd"], 6)
+        totals["cache_hit_tokens"] += u["cache_hit_tokens"]
+        totals["cache_miss_tokens"] += u["cache_miss_tokens"]
+        totals["cache_unclassified_tokens"] += u["cache_unclassified_tokens"]
+        totals["reasoning_tokens"] += u["reasoning_tokens"]
+    # The campaign rate is computed from the *summed* H and M, never as an
+    # average of per-episode percentages: a short episode must not weigh as
+    # much as a long one.
+    classified = totals["cache_hit_tokens"] + totals["cache_miss_tokens"]
+    if classified > 0:
+        totals["cache_hit_rate"] = round(
+            totals["cache_hit_tokens"] / float(classified), 6)
     successes = sum(1 for e in episodes if e["ok"])
     return {
         "schema": 1,

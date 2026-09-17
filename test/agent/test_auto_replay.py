@@ -760,5 +760,206 @@ class CampaignSummaryTest(unittest.TestCase):
             self.assertNotIn("campaign.json", out.getvalue())
 
 
+# --------------------------------------------------------------- cache rollup
+
+class CacheCampaignTotalsTest(unittest.TestCase):
+    """Cache usage rolls up by summed tokens, never averaged percentages."""
+
+    def _result(self, idx, hit=0, miss=0, unclassified=0, reasoning=0):
+        from tools.agent.controller import EpisodeResult
+        r = EpisodeResult(index=idx)
+        r.spawn_ok = True
+        r.closed = True
+        r.returncode = 0
+        r.recording_complete = True
+        classified = hit + miss
+        r.budget = {"usage": {
+            "prompt_tokens": classified + unclassified,
+            "completion_tokens": 0, "estimated_usd": 0.0,
+            "unknown_price_calls": 0, "unknown_exposure_calls": 0,
+            "unknown_exposure_tokens": 0, "unknown_exposure_usd": 0.0,
+            "cache_hit_tokens": hit, "cache_miss_tokens": miss,
+            "cache_unclassified_tokens": unclassified,
+            "cache_hit_rate": (round(hit / float(classified), 6)
+                               if classified else None),
+            "reasoning_tokens": reasoning}}
+        return r
+
+    def test_campaign_rate_uses_summed_tokens(self):
+        from tools.agent import controller
+        # ep1 is 90% over 100 classified tokens, ep2 is 0% over 900: the
+        # weighted rate is 9%, not the naive 45% average of the two rates
+        a = self._result(1, hit=90, miss=10)
+        b = self._result(2, hit=0, miss=900)
+        summary = controller.campaign_summary([a, b], ProviderConfig(), 300.0)
+        totals = summary["totals"]
+        self.assertEqual(totals["cache_hit_tokens"], 90)
+        self.assertEqual(totals["cache_miss_tokens"], 910)
+        self.assertEqual(totals["cache_unclassified_tokens"], 0)
+        self.assertAlmostEqual(totals["cache_hit_rate"], 0.09)
+        self.assertNotAlmostEqual(totals["cache_hit_rate"], 0.45)
+
+    def test_zero_classified_tokens_is_a_null_campaign_rate(self):
+        from tools.agent import controller
+        summary = controller.campaign_summary(
+            [self._result(1, unclassified=500)], ProviderConfig(), 1.0)
+        self.assertIsNone(summary["totals"]["cache_hit_rate"])
+        per = summary["results"][0]["usage"]
+        self.assertEqual(per["cache_unclassified_tokens"], 500)
+        self.assertIsNone(per["cache_hit_rate"])
+
+    def test_reasoning_tokens_are_totalled(self):
+        from tools.agent import controller
+        summary = controller.campaign_summary(
+            [self._result(1, hit=10, miss=10, reasoning=7),
+             self._result(2, hit=10, miss=10, reasoning=3)],
+            ProviderConfig(), 1.0)
+        self.assertEqual(summary["totals"]["reasoning_tokens"], 10)
+
+    def test_legacy_usage_without_cache_fields_still_summarizes(self):
+        from tools.agent import controller
+        from tools.agent.controller import EpisodeResult
+        r = EpisodeResult(index=1)
+        r.budget = {"usage": {"prompt_tokens": 5, "completion_tokens": 2}}
+        summary = controller.campaign_summary([r], ProviderConfig(), 1.0)
+        per = summary["results"][0]["usage"]
+        self.assertEqual(per["cache_hit_tokens"], 0)
+        self.assertEqual(per["cache_miss_tokens"], 0)
+        self.assertEqual(per["cache_unclassified_tokens"], 0)
+        self.assertIsNone(per["cache_hit_rate"])
+        self.assertEqual(per["reasoning_tokens"], 0)
+
+    def test_safe_config_carries_the_cache_controls(self):
+        from tools.agent import controller
+        cfg = ProviderConfig(deepseek_history_pairs=4,
+                             deepseek_context_max_bytes=1024,
+                             deepseek_price_in=1.0, deepseek_price_out=2.0,
+                             deepseek_price_cache_hit=0.5)
+        summary = controller.campaign_summary([], cfg, 1.0)
+        c = summary["config"]
+        self.assertEqual(c["deepseek_history_pairs"], 4)
+        self.assertEqual(c["deepseek_context_max_bytes"], 1024)
+        self.assertEqual(c["deepseek_price_in"], 1.0)
+        self.assertEqual(c["deepseek_price_out"], 2.0)
+        self.assertEqual(c["deepseek_price_cache_hit"], 0.5)
+        for secret in ("deepseek_key_file", "jev_key_file"):
+            self.assertNotIn(secret, c)
+
+
+# -------------------------------------------------- canned strategy replay
+
+class _CannedStrategy(object):
+    """A deterministic in-process strategy double for a replay pass."""
+
+    name = "canned"
+
+    def __init__(self, payloads):
+        self.payloads = list(payloads)
+        self.calls = []
+
+    def deliberate(self, context, deadline=0.0):
+        from tools.agent import directives
+        from tools.agent.providers import StrategyResult
+        self.calls.append(context.prepared_request)
+        i = len(self.calls) - 1
+        payload = self.payloads[min(i, len(self.payloads) - 1)]
+        if payload is None:
+            return StrategyResult(provider="canned",
+                                  reason="canned-failure", ok=False)
+        dset, why = directives.validate_directive_set(payload)
+        if dset is None:
+            return StrategyResult(provider="canned",
+                                  reason="invalid: %s" % why, ok=False)
+        return StrategyResult(
+            directives=[dset], provider="canned", reason="directives",
+            ok=True,
+            usage={"prompt_tokens": 100, "completion_tokens": 20,
+                   "prompt_cache_hit_tokens": 60,
+                   "prompt_cache_miss_tokens": 40, "reported": True},
+            assistant_content=json.dumps(payload, sort_keys=True))
+
+    def cancel(self):
+        pass
+
+
+class StrategyReplayContinuityTest(WireHarness):
+    """A canned multi-turn replay is byte-identical across two runs."""
+
+    PAYLOADS = [
+        {"schema_version": 1, "goals": ["explore_frontier"], "ttl": 5},
+        {"schema_version": 1, "goals": ["survive"], "ttl": 5},
+        None,                                        # one canned failure
+        {"schema_version": 1, "goals": ["recover", "survive"], "ttl": 5},
+        {"schema_version": 1, "goals": ["descend_known_stairs"], "ttl": 5},
+        {"schema_version": 1, "goals": ["inspect_inventory"], "ttl": 5},
+    ]
+
+    def _wire(self):
+        from test_auto_providers import command_need, st_obs
+        recs = [HELLO]
+        for i in range(1, 8):
+            recs.append(st_obs(i, command_need(i), dlvl="Dlvl:%d" % i, hp=10,
+                               hp_max=20))
+        recs.append(CLOSED)
+        return [_line(r) for r in recs]
+
+    def _pass(self, strategy):
+        cfg = ProviderConfig(strategy="deepseek", deepseek_history_pairs=1,
+                             max_ticks=200, strategy_call_cap=8,
+                             postmortem_reserve=0, boundary_cooldown_ticks=0,
+                             boundary_cooldown_wall=0.0,
+                             boundary_emergency_wall=0.0)
+        p = evaluate.ReplayPass(self._wire(), cfg, "scripted", "deepseek",
+                                allow_network=True)
+        p.strategy = strategy
+        p.strategy_live = True
+        p.run()
+        return p
+
+    def test_two_runs_agree_on_requests_and_cleaned_artifacts(self):
+        sa = _CannedStrategy(self.PAYLOADS)
+        sb = _CannedStrategy(self.PAYLOADS)
+        pa, pb = self._pass(sa), self._pass(sb)
+        self.assertGreaterEqual(len(sa.calls), 4)
+        # identical request sequence, message for message
+        self.assertEqual([c.messages for c in sa.calls],
+                         [c.messages for c in sb.calls])
+        # identical cleaned strategy decisions and ledger
+        self.assertEqual(
+            [d for d in pa.decisions if d.get("record") == "strategy"],
+            [d for d in pb.decisions if d.get("record") == "strategy"])
+        self.assertEqual(pa.ledger.as_dict(), pb.ledger.as_dict())
+        self.assertEqual(pa.event_records_clean(),
+                         pb.event_records_clean())
+
+    def test_history_is_bounded_and_a_failure_commits_nothing(self):
+        strategy = _CannedStrategy(self.PAYLOADS)
+        p = self._pass(strategy)
+        counts = [len(c.messages) for c in strategy.calls]
+        # K=1: the first call is stateless, a successful call adds one pair
+        self.assertEqual(counts[0], 2)
+        self.assertEqual(counts[1], 4)
+        # the committed assistant history is the canned verbatim JSON
+        self.assertEqual(strategy.calls[1].messages[2],
+                         ("assistant",
+                          json.dumps(self.PAYLOADS[0], sort_keys=True)))
+        # the canned *failure* commits nothing: the failed exchange never
+        # appears as a user turn of any later request
+        failed_user = strategy.calls[2].messages[-1][1]
+        self.assertGreaterEqual(len(strategy.calls), 4)
+        for later in strategy.calls[3:]:
+            self.assertNotIn(("user", failed_user), later.messages)
+        reasons = [d["reason"] for d in p.decisions
+                   if d.get("record") == "strategy"]
+        self.assertIn("canned-failure", reasons)
+
+    def test_eviction_keeps_only_the_tail_pair(self):
+        strategy = _CannedStrategy(self.PAYLOADS)
+        self._pass(strategy)
+        # with K=1 every multi-turn request carries exactly one prior pair
+        for prepared in strategy.calls:
+            self.assertLessEqual(len(prepared.retained), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
