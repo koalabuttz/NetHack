@@ -1,13 +1,19 @@
 """Per-episode call, token and cost accounting.
 
 The ledger is the single authority for "may we spend another paid call?".
-Two rules from ``doc/agent-autoplay-plan.md`` (section "Configuration,
+Three rules from ``doc/agent-autoplay-plan.md`` (section "Configuration,
 budgets and security") are enforced here rather than at the call site:
 
   * **reserve before dispatch.**  A call is charged when it is *started*, so a
     request that times out with no returned usage is still billed -- the
     exposure is real and is never refunded merely because the provider
     answered nothing;
+  * **reserve the conservative bound.**  A call is admitted only when every
+    cap can still cover its per-request *upper bound* -- the estimated prompt
+    plus the configured maximum output, priced with the tariff.  A request
+    whose bound exceeds what remains is refused *before* a worker is spawned;
+    the reported usage settles the true figure afterwards, and a call that
+    returned no usage keeps its bound as *unknown exposure*;
   * **reserve the postmortem slot.**  The default strategy cap is 8 calls per
     episode, of which one is held back for the postmortem, so at most 7 are
     spent while playing.  When the remaining cap cannot conservatively cover
@@ -18,7 +24,7 @@ no USD figure is asserted and the unknown-price exposure is counted instead.
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -41,7 +47,10 @@ class BudgetLedger(object):
                  tariff: Optional[Tariff] = None,
                  reflex_cap: int = 0, token_cap: int = 0) -> None:
         self.strategy_cap = int(strategy_cap)
-        self.postmortem_reserve = int(postmortem_reserve)
+        # A *negative* reserve would silently enlarge the play budget
+        # (cap - reserve), so it is clamped here as well as rejected at the
+        # CLI: the ledger never trusts its own inputs.
+        self.postmortem_reserve = max(0, int(postmortem_reserve))
         self.usd_cap = usd_cap
         self.tariff = tariff
         self.reflex_cap = int(reflex_cap)
@@ -69,6 +78,13 @@ class BudgetLedger(object):
         self.completion_tokens = 0
         self.estimated_usd = 0.0
         self.unknown_price_calls = 0
+        # Exposure from committed calls that returned *no usage at all*: the
+        # conservative bound is carried rather than dropped.
+        self._reserved_bounds: List[Tuple[int, int]] = []
+        self.unknown_exposure_calls = 0
+        self.unknown_prompt_tokens = 0
+        self.unknown_completion_tokens = 0
+        self.unknown_estimated_usd = 0.0
 
     # -- boundaries ------------------------------------------------------
     def note_boundary(self, state: str, n: int = 1) -> None:
@@ -79,8 +95,41 @@ class BudgetLedger(object):
         setattr(self, attr, getattr(self, attr) + int(n))
 
     # -- strategy reservations ------------------------------------------
-    def strategy_available(self, postmortem: bool = False) -> bool:
-        """True when one more paid strategy call may conservatively start."""
+    def _price(self, prompt_tokens: int, completion_tokens: int) -> float:
+        """The USD cost of a token count under the configured tariff."""
+        if self.tariff is None:
+            return 0.0
+        return (prompt_tokens / 1000000.0 * self.tariff.prompt_per_mtok
+                + completion_tokens / 1000000.0
+                * self.tariff.completion_per_mtok)
+
+    @property
+    def unknown_exposure_tokens(self) -> int:
+        """Total tokens carried as unknown exposure (no usage returned)."""
+        return self.unknown_prompt_tokens + self.unknown_completion_tokens
+
+    def _effective_tokens(self) -> int:
+        """Tokens already billed, carried as unknown, or still reserved."""
+        reserved = sum(p + c for p, c in self._reserved_bounds)
+        return (self.prompt_tokens + self.completion_tokens
+                + self.unknown_prompt_tokens + self.unknown_completion_tokens
+                + reserved)
+
+    def _effective_usd(self) -> float:
+        """USD already billed, carried as unknown, or still reserved."""
+        reserved = sum(self._price(p, c) for p, c in self._reserved_bounds)
+        return self.estimated_usd + self.unknown_estimated_usd + reserved
+
+    def strategy_available(self, postmortem: bool = False,
+                           prompt_tokens: int = 0,
+                           completion_tokens: int = 0) -> bool:
+        """True when one more paid strategy call may conservatively start.
+
+        ``prompt_tokens``/``completion_tokens`` are the *conservative upper
+        bound* of the call under consideration.  Every cap -- call count,
+        tokens and USD -- must be able to cover that bound out of what is
+        still left, not merely out of the totals reported so far.
+        """
         spent = self.strategy_dispatched + self.strategy_reserved
         if postmortem:
             budget = self.strategy_cap
@@ -89,20 +138,32 @@ class BudgetLedger(object):
             budget = max(0, self.strategy_cap - self.postmortem_reserve)
         if spent >= budget:
             return False
-        if self.usd_cap is not None and self.tariff is not None \
-                and self.estimated_usd >= self.usd_cap:
-            return False
-        if self.token_cap and \
-                (self.prompt_tokens + self.completion_tokens) \
-                >= self.token_cap:
-            return False
+        if self.usd_cap is not None and self.tariff is not None:
+            bound = self._price(prompt_tokens, completion_tokens)
+            if self._effective_usd() + bound > self.usd_cap:
+                return False
+        if self.token_cap:
+            bound = int(prompt_tokens) + int(completion_tokens)
+            if self._effective_tokens() + bound > self.token_cap:
+                return False
         return True
 
-    def reserve_strategy(self, postmortem: bool = False) -> bool:
-        """Charge one strategy call up front; False when the cap is spent."""
-        if not self.strategy_available(postmortem=postmortem):
+    def reserve_strategy(self, postmortem: bool = False,
+                         prompt_tokens: int = 0,
+                         completion_tokens: int = 0) -> bool:
+        """Charge one strategy call and its conservative bound up front.
+
+        Returns False -- charging nothing -- when the cap is spent or the
+        bound cannot be covered by the remainder, so a request that could not
+        conservatively fit is refused *before* any worker is spawned.
+        """
+        if not self.strategy_available(
+                postmortem=postmortem, prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens):
             return False
         self.strategy_reserved += 1
+        self._reserved_bounds.append((int(prompt_tokens),
+                                      int(completion_tokens)))
         return True
 
     def commit_strategy(self, usage: Optional[Dict[str, Any]] = None,
@@ -111,14 +172,22 @@ class BudgetLedger(object):
 
         The reservation was made before dispatch, so this always consumes it
         -- including a timeout that returned no usage.  Reported tokens are
-        added and, when a tariff is configured, priced.
+        added and, when a tariff is configured, priced.  A call that returned
+        no usage at all keeps its reserved bound as *unknown exposure*: the
+        spend was real even though no figure came back, so it is never
+        silently dropped.
         """
         if self.strategy_reserved > 0:
             self.strategy_reserved -= 1
+        bound = self._reserved_bounds.pop(0) if self._reserved_bounds \
+            else (0, 0)
         self.strategy_dispatched += 1
         if postmortem:
             self.postmortem_dispatched += 1
-        self.add_usage(usage)
+        if usage:
+            self.add_usage(usage)
+        else:
+            self._note_unknown_exposure(bound)
 
     def release_strategy(self) -> None:
         """Drop a reservation that never reached the wire.
@@ -130,6 +199,15 @@ class BudgetLedger(object):
         """
         if self.strategy_reserved > 0:
             self.strategy_reserved -= 1
+        if self._reserved_bounds:
+            self._reserved_bounds.pop(0)
+
+    def _note_unknown_exposure(self, bound) -> None:
+        prompt, completion = bound
+        self.unknown_prompt_tokens += int(prompt)
+        self.unknown_completion_tokens += int(completion)
+        self.unknown_estimated_usd += self._price(prompt, completion)
+        self.unknown_exposure_calls += 1
 
     def add_usage(self, usage: Optional[Dict[str, Any]]) -> None:
         if not usage:
@@ -140,10 +218,7 @@ class BudgetLedger(object):
         self.completion_tokens += completion
         if prompt or completion or usage.get("reported"):
             if self.tariff is not None:
-                self.estimated_usd += (
-                    prompt / 1000000.0 * self.tariff.prompt_per_mtok
-                    + completion / 1000000.0
-                    * self.tariff.completion_per_mtok)
+                self.estimated_usd += self._price(prompt, completion)
             else:
                 self.unknown_price_calls += 1
 
@@ -191,6 +266,11 @@ class BudgetLedger(object):
                 "completion_tokens": self.completion_tokens,
                 "estimated_usd": round(self.estimated_usd, 6),
                 "unknown_price_calls": self.unknown_price_calls,
+                "unknown_exposure_calls": self.unknown_exposure_calls,
+                "unknown_exposure_tokens": (self.unknown_prompt_tokens
+                                            + self.unknown_completion_tokens),
+                "unknown_exposure_usd": round(self.unknown_estimated_usd, 6),
+                "reserved_bounds": [list(b) for b in self._reserved_bounds],
                 "tariff": self.tariff.to_dict() if self.tariff else None,
                 "usd_cap": self.usd_cap,
                 "token_cap": self.token_cap,

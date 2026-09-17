@@ -27,7 +27,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import protocol, state
 from .budget import Tariff
@@ -930,3 +930,29 @@ def tariff_from_config(config: ProviderConfig) -> Optional[Tariff]:
         return None
     return Tariff(prompt_per_mtok=float(config.deepseek_price_in or 0.0),
                   completion_per_mtok=float(config.deepseek_price_out or 0.0))
+
+
+def tariff_complete(config: ProviderConfig) -> bool:
+    """True only when *both* prompt and completion prices are configured.
+
+    A USD cap is enforceable only against a complete tariff: with one price
+    missing the estimate would silently ignore the other half of the spend,
+    so the CLI rejects the combination rather than pretending to enforce it.
+    """
+    return (config.deepseek_price_in is not None
+            and config.deepseek_price_out is not None)
+
+
+def strategy_token_bound(config: ProviderConfig,
+                         ctx: StrategyContext) -> Tuple[int, int]:
+    """A conservative (prompt, completion) token upper bound for one call.
+
+    The prompt figure over-estimates the rendered system + user text at a
+    fixed 4-chars-per-token and adds a small fixed overhead; the completion
+    figure is the configured ``deepseek_max_tokens`` -- the provider is told
+    not to exceed it.  The bound is what the budget ledger reserves *before*
+    dispatch and the reported usage settles afterwards.
+    """
+    text = _SYSTEM_PROMPT + "\n" + _render_strategy_prompt(ctx)
+    prompt = (len(text) + 3) // 4 + 16
+    return prompt, int(config.deepseek_max_tokens)
