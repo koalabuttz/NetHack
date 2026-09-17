@@ -188,7 +188,14 @@ def preconditions_met(dset: DirectiveSet,
 class DirectiveBook(object):
     """Activation, TTL/level/precondition enforcement for one episode."""
 
-    def __init__(self) -> None:
+    # Bounded in-memory window of lifecycle events.  Each event is emitted to
+    # ``sink`` as it is logged, so this list is only the replay-visible trace
+    # for inspection and is capped rather than grown over a long episode.
+    EVENT_CAP = 4096
+
+    def __init__(self, sink=None, cap: int = EVENT_CAP) -> None:
+        self.sink = sink
+        self.cap = int(cap)
         self.reset()
 
     def reset(self) -> None:
@@ -260,6 +267,10 @@ class DirectiveBook(object):
         if directive is not None:
             ev["directive"] = directive
         self.events.append(ev)
+        if len(self.events) > self.cap:
+            del self.events[:len(self.events) - self.cap]
+        if self.sink is not None:
+            self.sink(dict(ev))
 
 
 class DirectiveView(object):

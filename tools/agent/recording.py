@@ -88,9 +88,24 @@ class _Writer(threading.Thread):
         fd = _open_private(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
         self.fh = os.fdopen(fd, "wb", closefd=True)
 
-    def submit(self, data: bytes) -> bool:
+    def submit(self, data: bytes, block: bool = False,
+               timeout: float = 0.2) -> bool:
+        """Queue *data*; return False if it could not be accepted.
+
+        ``block`` gives a *bounded* wait for room, for a producer that can
+        momentarily outrun the writer (a lifecycle-event burst).  It never
+        waits once the writer has failed, and a failed write is always
+        reflected in ``error``, so a stall can never masquerade as success.
+        """
         if self.error is not None:
             return False
+        if block:
+            try:
+                self.q.put(data, timeout=timeout)
+                return True
+            except queue.Full:
+                self.dropped += 1
+                return False
         try:
             self.q.put_nowait(data)
             return True
@@ -242,9 +257,14 @@ class EpisodeRecorder(object):
         expiry.  Keeping this in its own sidecar leaves the deterministic
         lifecycle fields separate from the wall-clock ``t`` timestamps in the
         other streams, so a replay comparison can drop timing exactly.
+
+        Unlike the wire stream -- which must never block -- the event stream
+        takes a *bounded* wait for room: lifecycle records are emitted
+        incrementally, so a burst can briefly outrun the writer, and dropping
+        them would corrupt a complete-for-this-run ledger.
         """
         self.events += 1
-        if not self._evs.submit(_json_line(obj)):
+        if not self._evs.submit(_json_line(obj), block=True):
             self.incomplete = True
 
     # -- shutdown --------------------------------------------------------

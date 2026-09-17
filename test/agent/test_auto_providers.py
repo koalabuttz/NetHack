@@ -1050,30 +1050,65 @@ class TestJevAdapter(unittest.TestCase):
         prov.cancel()
 
     def test_confidence_nan_and_out_of_range_fall_back(self):
+        # a rejected answer still carries its usage: the call was paid
         for conf in (float("nan"), 1.5, -0.1, "high", None):
             with self.subTest(conf=conf):
                 self.ep.responder = lambda p, b, c=conf: (
-                    200, json.dumps({"option": 0, "confidence": c}).encode())
+                    200, json.dumps({"option": 0, "confidence": c,
+                                     "usage": {"prompt_tokens": 7,
+                                               "completion_tokens": 2}})
+                    .encode())
                 prov = providers.JevReflex(self.cfg())
                 res = prov.decide(self.ctx(command_need(1)),
                                   time.monotonic() + 2.0)
-                self.assertIsNone(res)
+                self.assertIsNotNone(res)
+                self.assertIsNone(res.action)
+                self.assertIn(res.reason,
+                              ("invalid-confidence", "low-confidence"))
+                self.assertEqual(res.usage, {"prompt_tokens": 7,
+                                             "completion_tokens": 2})
                 prov.cancel()
 
     def test_low_confidence_falls_back(self):
         self.ep.responder = lambda p, b: (
-            200, json.dumps({"option": 0, "confidence": 0.2}).encode())
+            200, json.dumps({"option": 0, "confidence": 0.2,
+                             "usage": {"prompt_tokens": 3}}).encode())
         prov = providers.JevReflex(self.cfg())
-        self.assertIsNone(prov.decide(self.ctx(command_need(1)),
-                                      time.monotonic() + 2.0))
+        res = prov.decide(self.ctx(command_need(1)),
+                          time.monotonic() + 2.0)
+        self.assertIsNotNone(res)
+        self.assertIsNone(res.action)
+        self.assertEqual(res.reason, "low-confidence")
+        self.assertEqual(res.usage.get("prompt_tokens"), 3)
         prov.cancel()
 
     def test_unknown_option_falls_back(self):
         self.ep.responder = lambda p, b: (
-            200, json.dumps({"option": 999, "confidence": 0.99}).encode())
+            200, json.dumps({"option": 999, "confidence": 0.99,
+                             "usage": {"prompt_tokens": 4}}).encode())
         prov = providers.JevReflex(self.cfg())
-        self.assertIsNone(prov.decide(self.ctx(command_need(1)),
-                                      time.monotonic() + 2.0))
+        res = prov.decide(self.ctx(command_need(1)),
+                          time.monotonic() + 2.0)
+        self.assertIsNotNone(res)
+        self.assertIsNone(res.action)
+        self.assertEqual(res.reason, "invalid-option")
+        self.assertEqual(res.usage.get("prompt_tokens"), 4)
+        prov.cancel()
+
+    def test_abstain_carries_usage(self):
+        # a paid abstention is still a paid call: its usage is preserved
+        self.ep.responder = lambda p, b: (
+            200, json.dumps({"option": None, "confidence": 0.99,
+                             "usage": {"prompt_tokens": 5,
+                                       "completion_tokens": 1}}).encode())
+        prov = providers.JevReflex(self.cfg())
+        res = prov.decide(self.ctx(command_need(1)),
+                          time.monotonic() + 2.0)
+        self.assertIsNotNone(res)
+        self.assertIsNone(res.action)
+        self.assertEqual(res.reason, "abstain")
+        self.assertEqual(res.usage, {"prompt_tokens": 5,
+                                     "completion_tokens": 1})
         prov.cancel()
 
     def test_unsupported_needs_never_call_jev(self):
@@ -1278,6 +1313,9 @@ class TestStrategyIntegration(WireHarness):
                 pass
 
             def record_decision(self, *a, **k):
+                pass
+
+            def record_event(self, obj):
                 pass
 
         fake = FakeStrategy(_ok_directives())
@@ -1830,6 +1868,469 @@ class TestLowConfidenceEscalation(WireHarness):
         self.assertEqual(runner.ledger.prompt_tokens, 1000000)
         self.assertAlmostEqual(runner.ledger.estimated_usd, 1.0)
         self.assertEqual(runner.ledger.reflex_paid_dispatched, 1)
+
+
+# ====================================================== token bound (M1)
+
+class TestStrategyTokenBound(WireHarness):
+    """Medium 1: the prompt bound counts UTF-8 bytes, not characters."""
+
+    def _ctx(self, **over):
+        base = dict(episode=1, tick=1, level="Dlvl:1",
+                    status_text="HP 10/20", map_text="", recent_messages=[],
+                    inventory=[])
+        base.update(over)
+        return StrategyContext(**base)
+
+    def _rendered(self, ctx):
+        return (providers._SYSTEM_PROMPT + "\n"
+                + providers._render_strategy_prompt(ctx))
+
+    def test_bound_is_the_byte_count_plus_framing(self):
+        ctx = self._ctx(status_text="HP 10/20 饥饿 空腹 \U0001f600!!!")
+        text = self._rendered(ctx)
+        prompt, completion = providers.strategy_token_bound(
+            ProviderConfig(), ctx)
+        self.assertEqual(prompt, len(text.encode("utf-8"))
+                         + providers._CHAT_FRAMING_TOKENS)
+        self.assertEqual(completion, ProviderConfig().deepseek_max_tokens)
+
+    def test_cjk_and_emoji_break_the_chars_over_four_estimate(self):
+        ctx = self._ctx(
+            status_text="HP 1/1" + "、" * 40,
+            map_text="\n".join("界" * 79 for _ in range(21)),
+            recent_messages=["You see a 金塊。"] * 6,
+            inventory=["50 金貨 (gold piece)"])
+        text = self._rendered(ctx)
+        nbytes = len(text.encode("utf-8"))
+        prompt, _ = providers.strategy_token_bound(ProviderConfig(), ctx)
+        # tokens <= bytes for any byte-level tokenizer, so the bound covers
+        # the pathological one-token-per-byte case too
+        self.assertGreaterEqual(prompt, nbytes)
+        # the old chars/4 estimate under-reserves for exactly this text
+        chars_over_four = (len(text) + 3) // 4 + 16
+        self.assertLess(chars_over_four, nbytes)
+
+    def test_cjk_context_refuses_dispatch_under_a_tight_cap(self):
+        fake = FakeStrategy(_ok_directives())
+        cfg = ProviderConfig(max_ticks=200, postmortem_reserve=0,
+                             low_confidence_needs=1000)
+        ctl = controller.Controller(
+            cfg, controller.ControllerPaths("w", "r", "d", "s"), self.dir,
+            episode_timeout=5.0)
+        ctl._new_strategy_provider = lambda: fake
+        result = controller.EpisodeResult(index=1)
+        rec = recording.EpisodeRecorder(self.dir, 1)
+        proc = paced([hello()], [0.0])
+        self.addCleanup(proc.close)
+        runner = controller._EpisodeRunner(ctl, proc, rec, result)
+        runner.mem.status.dlvl = "Dlvl:1"
+        runner.mem.messages = ["You see a 金塊。" * 40]
+        b = events.Boundary("initial-level", "level:Dlvl:1:1")
+        runner.event_ledger.detect(b, 0, "Dlvl:1")
+        runner.boundary_queue.submit([b], 0, "Dlvl:1")
+        pending = runner.boundary_queue.pending
+        ctx = runner._build_strategy_context(pending)
+        text = self._rendered(ctx)
+        prompt, completion = providers.strategy_token_bound(
+            runner.c.config, ctx)
+        # the chars/4 estimate with the REAL framing constant: this is the
+        # discriminator -- under a chars/4 bound the dispatch below fits the
+        # cap; under the byte bound it must be refused
+        old_prompt = len(text) // 4 + providers._CHAT_FRAMING_TOKENS
+        self.assertLess(old_prompt, prompt)      # cjk inflates the bound
+        # a cap the chars/4 estimate would have fitted inside...
+        runner.ledger.token_cap = old_prompt + completion
+        self.assertTrue(runner.ledger.strategy_available(
+            prompt_tokens=old_prompt, completion_tokens=completion))
+        runner._dispatch_strategy(pending, time.monotonic())
+        # ...but the true byte bound cannot: refused before any work
+        self.assertIsNone(runner._strategy_call)
+        self.assertEqual(runner.ledger.boundaries_suppressed, 1)
+        self.assertEqual(fake.calls, [])
+        rec.finalize({})
+
+
+# ================================================= config validation (M2)
+
+class TestProviderConfigValidation(unittest.TestCase):
+    """Medium 2: one validation authority shared by CLI and Controller."""
+
+    def test_default_config_is_valid(self):
+        self.assertIsNone(ProviderConfig().validate())
+
+    def test_usd_cap_requires_a_complete_tariff(self):
+        self.assertIn("complete tariff",
+                      ProviderConfig(usd_cap=1.0).validate())
+        self.assertIn("complete tariff", ProviderConfig(
+            usd_cap=1.0, deepseek_price_in=1.0).validate())
+        self.assertIsNone(ProviderConfig(
+            usd_cap=1.0, deepseek_price_in=1.0,
+            deepseek_price_out=2.0).validate())
+
+    def test_non_finite_and_out_of_range_are_rejected(self):
+        self.assertIn("finite", ProviderConfig(usd_cap=float("nan"))
+                      .validate())
+        self.assertIn("nonnegative", ProviderConfig(
+            deepseek_price_out=-1.0).validate())
+        self.assertIn("confidence-threshold", ProviderConfig(
+            confidence_threshold=2.0).validate())
+        self.assertIn("strategy-deadline", ProviderConfig(
+            strategy_deadline=-2.0).validate())
+
+    def test_max_tokens_must_be_at_least_one(self):
+        for bad in (0, -5):
+            with self.subTest(bad=bad):
+                self.assertIn("deepseek-max-tokens", ProviderConfig(
+                    deepseek_max_tokens=bad).validate())
+
+    def test_reserve_larger_than_the_cap_is_rejected(self):
+        cfg = ProviderConfig(strategy_call_cap=2, postmortem_reserve=3)
+        self.assertIn("cannot exceed", cfg.validate())
+
+    def test_campaign_fields_run_through_the_same_routine(self):
+        cfg = ProviderConfig()
+        self.assertIn("episodes", cfg.validate(episodes=0))
+        self.assertIn("episode-timeout",
+                      cfg.validate(episode_timeout=-1.0))
+        self.assertIsNone(cfg.validate(episodes=2, episode_timeout=300.0))
+
+
+class TestControllerConstructionValidation(WireHarness):
+    """Medium 2: a programmatic config cannot bypass the CLI's checks."""
+
+    def _build(self, config):
+        return controller.Controller(
+            config, controller.ControllerPaths("w", "r", "d", "s"), self.dir,
+            episode_timeout=5.0)
+
+    def test_incomplete_tariff_with_usd_cap_fails_loudly(self):
+        with self.assertRaises(ValueError) as cm:
+            self._build(ProviderConfig(usd_cap=1.0))
+        self.assertIn("complete tariff", str(cm.exception))
+
+    def test_nan_price_fails_loudly(self):
+        with self.assertRaises(ValueError):
+            self._build(ProviderConfig(deepseek_price_in=float("nan")))
+
+    def test_negative_max_tokens_fails_loudly(self):
+        with self.assertRaises(ValueError):
+            self._build(ProviderConfig(deepseek_max_tokens=-1))
+
+    def test_reserve_above_cap_fails_loudly(self):
+        with self.assertRaises(ValueError):
+            self._build(ProviderConfig(strategy_call_cap=1,
+                                       postmortem_reserve=2))
+
+    def test_valid_config_still_constructs(self):
+        self.assertIsNotNone(self._build(ProviderConfig()))
+
+
+class TestLedgerInvariants(unittest.TestCase):
+    """Medium 2: the ledger refuses what it cannot enforce."""
+
+    def test_usd_cap_without_a_tariff_is_rejected(self):
+        with self.assertRaises(ValueError):
+            budget.BudgetLedger(usd_cap=1.0, tariff=None)
+
+    def test_invalid_tariff_is_rejected(self):
+        for t in (budget.Tariff(float("nan"), 1.0),
+                  budget.Tariff(-1.0, 1.0),
+                  budget.Tariff(None, 1.0)):
+            with self.subTest(tariff=t):
+                with self.assertRaises(ValueError):
+                    budget.BudgetLedger(tariff=t)
+
+    def test_negative_caps_are_rejected_not_clamped(self):
+        with self.assertRaises(ValueError):
+            budget.BudgetLedger(token_cap=-1)
+        with self.assertRaises(ValueError):
+            budget.BudgetLedger(strategy_cap=-1)
+        with self.assertRaises(ValueError):
+            budget.BudgetLedger(reflex_cap=-1)
+
+    def test_negative_or_nan_bound_is_rejected(self):
+        led = budget.BudgetLedger()
+        with self.assertRaises(ValueError):
+            led.reserve_strategy(prompt_tokens=-1)
+        with self.assertRaises(ValueError):
+            led.reserve_strategy(completion_tokens=float("nan"))
+
+    def test_negative_postmortem_reserve_still_clamps(self):
+        # the one documented clamp: defence in depth, not a semantic change
+        led = budget.BudgetLedger(strategy_cap=4, postmortem_reserve=-1)
+        self.assertEqual(led.postmortem_reserve, 0)
+
+
+# ================================================ Jev fallback usage (M3)
+
+class TestJevFallbackUsage(WireHarness):
+    """Medium 3: a paid Jev answer is billed whether or not it is used."""
+
+    def _runner(self, fake):
+        cfg = ProviderConfig(max_ticks=200, reflex="jev", reflex_call_cap=5,
+                             postmortem_reserve=0, deepseek_price_in=1.0,
+                             deepseek_price_out=1.0)
+        ctl = controller.Controller(
+            cfg, controller.ControllerPaths("w", "r", "d", "s"), self.dir,
+            episode_timeout=5.0)
+        ctl._new_reflex_provider = lambda reflex: fake
+        result = controller.EpisodeResult(index=1)
+        rec = recording.EpisodeRecorder(self.dir, 1)
+        proc = paced([hello()], [0.0])
+        self.addCleanup(proc.close)
+        runner = controller._EpisodeRunner(ctl, proc, rec, result)
+        runner.pending_key = protocol.NeedKey(1, 1, 1)
+        runner.pending_seq = 1
+        runner.pending_need = {"kind": "command", "id": 1}
+        return runner, rec
+
+    def test_rejected_answer_is_billed_once_and_falls_back(self):
+        usage = {"prompt_tokens": 1000000, "completion_tokens": 0,
+                 "reported": True}
+        fake = _FakeJev(usage=usage)
+        fake.action = None                   # low confidence / abstain shape
+        runner, rec = self._runner(fake)
+        proposal, provider, reason, latency, u, low = runner._decide(
+            runner.pending_need)
+        rec.finalize({})
+        self.assertEqual(provider, "scripted")   # fell back
+        self.assertTrue(low)
+        self.assertEqual(runner.ledger.reflex_fallback, 1)
+        self.assertEqual(runner.ledger.reflex_successful, 0)
+        # exactly once: one full prompt is billed, not two
+        self.assertEqual(runner.ledger.prompt_tokens, 1000000)
+        self.assertAlmostEqual(runner.ledger.estimated_usd, 1.0)
+
+    def test_accepted_answer_is_billed_once(self):
+        usage = {"prompt_tokens": 1000000, "completion_tokens": 0,
+                 "reported": True}
+        fake = _FakeJev(usage=usage)          # action set, confidence 0.9
+        runner, rec = self._runner(fake)
+        proposal, provider, reason, latency, u, low = runner._decide(
+            runner.pending_need)
+        rec.finalize({})
+        self.assertEqual(provider, "jev")
+        self.assertFalse(low)
+        self.assertEqual(runner.ledger.reflex_successful, 1)
+        self.assertEqual(runner.ledger.prompt_tokens, 1000000)
+        self.assertAlmostEqual(runner.ledger.estimated_usd, 1.0)
+
+    def test_each_rejection_shape_carries_usage(self):
+        prov = providers.JevReflex(ProviderConfig(reflex="jev"))
+        for reason in ("low-confidence", "abstain", "invalid-option",
+                       "invalid-action", "invalid-confidence"):
+            with self.subTest(reason=reason):
+                res = prov._rejected(reason, {"prompt_tokens": 9}, 0.01)
+                self.assertIsNone(res.action)
+                self.assertEqual(res.reason, reason)
+                self.assertEqual(res.usage, {"prompt_tokens": 9})
+
+
+# ================================================== cancellation races (M4)
+
+class _BarrierSup(providers._WorkerSupervisor):
+    """A supervisor whose construction blocks, exposing the install window."""
+
+    constructed = threading.Event()
+    proceed = threading.Event()
+    starts = 0
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        type(self).constructed.set()
+        type(self).proceed.wait(5.0)
+
+    def start(self, job, deadline):
+        type(self).starts += 1
+        super().start(job, deadline)
+
+    @classmethod
+    def reset(cls):
+        cls.constructed = threading.Event()
+        cls.proceed = threading.Event()
+        cls.starts = 0
+
+
+class _GatedReaderSup(providers._WorkerSupervisor):
+    """Reader that drains the pipe but delays publishing its output.
+
+    This is the exact window in which an unconditional ``cancel()`` would
+    signal completion while ``_out`` is still empty and lose the completed
+    result (and its usage).
+    """
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.drained = threading.Event()
+        self.release = threading.Event()
+
+    def _read(self):
+        out = b""
+        try:
+            while len(out) <= self.max_bytes:
+                chunk = self.proc.stdout.read(4096)
+                if not chunk:
+                    break
+                out += chunk
+        except (OSError, ValueError):
+            pass
+        self.drained.set()              # pipe drained, NOT yet published
+        self.release.wait(5.0)
+        self._out = out                 # publish
+        self._close_pipes()
+        self._done.set()
+
+
+class TestCancellationRace(WireHarness):
+    """Medium 4: cancellation races supervisor startup / reader drain."""
+
+    def _script(self, body):
+        path = os.path.join(self.dir, "fake_worker.py")
+        with open(path, "w") as fh:
+            fh.write(body)
+        return [sys.executable, path]
+
+    def _ctx(self):
+        return providers.StrategyContext(episode=1, tick=1, level="Dlvl:1",
+                                         status_text="HP 10/20")
+
+    def _strategy(self, argv):
+        env = mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-test"})
+        env.start()
+        self.addCleanup(env.stop)
+        return providers.DeepSeekStrategy(
+            ProviderConfig(strategy="deepseek"), worker_argv=argv)
+
+    def test_cancel_before_install_spawns_no_worker(self):
+        _BarrierSup.reset()
+        real = providers._WorkerSupervisor
+        providers._WorkerSupervisor = _BarrierSup
+        self.addCleanup(setattr, providers, "_WorkerSupervisor", real)
+        prov = self._strategy(self._script("import time\ntime.sleep(30)\n"))
+        call = controller._ReflexCall(
+            lambda: prov.deliberate(self._ctx(), time.monotonic() + 5.0))
+        call.start()
+        self.assertTrue(_BarrierSup.constructed.wait(3.0))
+        # cancel arrives exactly before the supervisor would be installed
+        prov.cancel()
+        _BarrierSup.proceed.set()
+        self.assertTrue(call.wait(3.0))
+        self.assertEqual(_BarrierSup.starts, 0)      # nothing was spawned
+        self.assertFalse(call.result.ok)
+        self.assertEqual(call.result.reason, "cancelled")
+        prov.reap()
+
+    def test_cancel_after_install_reaps_the_running_worker(self):
+        prov = self._strategy(self._script("import time\ntime.sleep(30)\n"))
+        call = controller._ReflexCall(
+            lambda: prov.deliberate(self._ctx(), time.monotonic() + 10.0))
+        call.start()
+        sup = None
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            sup = prov._sup
+            if sup is not None and sup.proc is not None:
+                break
+            time.sleep(0.02)
+        self.assertIsNotNone(sup)
+        pid = sup.proc.pid
+        t0 = time.monotonic()
+        prov.cancel()
+        self.assertTrue(call.wait(6.0))          # thread terminates boundedly
+        self.assertLess(time.monotonic() - t0, 5.0)
+        self.assertTrue(_wait_gone(pid, 3.0))    # no survivor
+        prov.reap()
+
+    def test_cancel_preserves_a_completed_result_during_drain(self):
+        argv = self._script(
+            "import sys\n"
+            "sys.stdout.write('{\"v\":1,\"ok\":true,\"status\":200,"
+            "\"json\":{\"n\":5}}\\n')\n")
+        sup = _GatedReaderSup(argv)
+        sup.start({"v": 1}, time.monotonic() + 5.0)
+        self.assertTrue(sup.drained.wait(3.0))
+        self.assertFalse(sup._done.is_set())
+        t = threading.Thread(target=sup.cancel)
+        t.start()
+        time.sleep(0.2)
+        sup.release.set()                    # the reader publishes + drains
+        t.join(5.0)
+        self.assertFalse(t.is_alive())
+        res = sup.poll()
+        self.assertIsNotNone(res)
+        self.assertTrue(res.ok, res.error)   # preserved, not unknown exposure
+        self.assertEqual(res.json, {"n": 5})
+        sup.reap()
+
+
+# ============================================ lifecycle persistence (L5)
+
+class TestLifecyclePersistence(WireHarness):
+    """Low 5: lifecycle records persist incrementally and stay bounded."""
+
+    def test_large_lifecycle_burst_is_bounded_and_complete(self):
+        rec = recording.EpisodeRecorder(self.dir, 1)
+        led = events.EventLedger(sink=rec.record_event, cap=4096)
+        n = 4200
+        for i in range(n):
+            b = events.Boundary("novelty-class", "class:%d" % i)
+            led.detect(b, i, "Dlvl:1")
+            led.transition("queued", b.eid, "queued", i, "Dlvl:1")
+            led.transition("dispatched", b.eid, "dispatch", i, "Dlvl:1")
+            led.transition("applied", b.eid, "applied", i, "Dlvl:1")
+        led.flush()
+        rec.finalize({})
+        self.assertLessEqual(len(led.as_list()), 4096)   # bounded memory
+        self.assertGreater(led.collapsed, 0)             # detail collapsed
+        self.assertFalse(rec.incomplete)                 # no burst loss
+        rows = _read_jsonl(os.path.join(self.dir, "ep-1.events.jsonl"))
+        boundary = [r for r in rows if r.get("record") == "boundary"]
+        self.assertEqual(len(boundary), n)               # every record kept
+        self.assertTrue(all(r["terminal"] is not None for r in boundary))
+
+    def test_incremental_flush_emits_each_eid_exactly_once(self):
+        scen = (_line(hello())
+                + _line(st_obs(1, command_need(1), dlvl="Dlvl:1",
+                               hp=10, hp_max=20))
+                + _line(st_obs(2, command_need(2), dlvl="Dlvl:2",
+                               hp=10, hp_max=20))
+                + _line(CLOSED))
+        result, _ = self.run_scenario(
+            scen, config=ProviderConfig(max_ticks=50))
+        self.assertTrue(result.closed)
+        rows = _read_jsonl(os.path.join(self.dir, "ep-1.events.jsonl"))
+        eids = [r["eid"] for r in rows if r.get("record") == "boundary"]
+        self.assertEqual(len(eids), len(set(eids)))      # no duplicates
+        self.assertIn("closed", eids)
+
+
+# ========================================== coalescing provenance (L6)
+
+class TestCoalescingProvenance(unittest.TestCase):
+    """Low 6: coalescing is stamped from the complete pending set."""
+
+    def test_later_submission_restamps_every_member(self):
+        led = events.EventLedger()
+        q = events.BoundaryQueue(event_ledger=led)
+        a = events.Boundary("initial-level", "level:Dlvl:1:1")
+        b = events.Boundary("hunger-weak", "hunger:Weak")
+        q.submit([a], 0, "Dlvl:1")
+        q.submit([b], 1, "Dlvl:1")          # B joins A's pending set
+        pending = q.pending
+        self.assertEqual(sorted(pending.eids),
+                         ["hunger:Weak", "level:Dlvl:1:1"])
+        q.mark_dispatched(1, 100.0)
+        q.finish(True)
+        recs = {r["eid"]: r for r in led.as_list()}
+        self.assertEqual(recs["level:Dlvl:1:1"]["coalesced_with"],
+                         ["hunger:Weak"])
+        self.assertEqual(recs["hunger:Weak"]["coalesced_with"],
+                         ["level:Dlvl:1:1"])
+        # both members name the same dispatched set
+        for eid in pending.eids:
+            self.assertEqual(sorted(recs[eid]["coalesced_with"]
+                                    + [eid]), sorted(pending.eids))
 
 
 if __name__ == "__main__":

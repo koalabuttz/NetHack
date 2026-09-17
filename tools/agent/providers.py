@@ -59,6 +59,14 @@ class Availability(object):
     reason: str = ""
 
 
+def _finite(v) -> bool:
+    """True for a real (non-bool) finite number, False for NaN/inf/other."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return False
+    f = float(v)
+    return f == f and f not in (float("inf"), float("-inf"))
+
+
 @dataclass
 class ProviderConfig(object):
     reflex: str = "scripted"          # scripted | jev
@@ -97,6 +105,82 @@ class ProviderConfig(object):
     deepseek_price_in: Optional[float] = None
     deepseek_price_out: Optional[float] = None
     reflex_call_cap: int = 0
+
+    def validate(self, episodes: Optional[int] = None,
+                 episode_timeout: Optional[float] = None) \
+            -> Optional[str]:
+        """Return an error string, or None when the configuration is valid.
+
+        This is the *single* validation authority for a run.  The CLI
+        (:func:`tools.agent.__main__.validate_args`) and
+        :class:`~tools.agent.controller.Controller` both call it, so a
+        ``ProviderConfig`` built programmatically cannot bypass the checks a
+        ``cmd_auto`` invocation enforces, and there is one place for the rules
+        to live rather than two copies that can drift.
+
+        Every numeric option must be finite and in range;
+        ``deepseek_max_tokens`` must be at least 1; the postmortem reserve
+        must fit inside the strategy cap (a larger reserve would make the
+        held-back slot meaningless); and a USD cap requires a *complete*
+        tariff, because a cap that is silently ignored is worse than one that
+        is rejected.  ``episodes`` and ``episode_timeout`` are campaign-level
+        fields the config does not itself carry -- the CLI passes them in so
+        its own checks run through the same routine.
+        """
+        ints = (("max-ticks", self.max_ticks, 0, 10 ** 9),
+                ("strategy-call-cap", self.strategy_call_cap, 0, 10 ** 9),
+                ("postmortem-reserve", self.postmortem_reserve, 0, 10 ** 9),
+                ("token-cap", self.token_cap, 0, 10 ** 12),
+                ("reflex-call-cap", self.reflex_call_cap, 0, 10 ** 9),
+                ("boundary-cooldown-ticks", self.boundary_cooldown_ticks,
+                 0, 10 ** 9),
+                ("low-confidence-needs", self.low_confidence_needs,
+                 1, 10 ** 6),
+                ("deepseek-max-tokens", self.deepseek_max_tokens,
+                 1, 10 ** 7))
+        if episodes is not None:
+            ints = (("episodes", episodes, 1, 10 ** 9),) + ints
+        for name, val, lo, hi in ints:
+            if not isinstance(val, int) or isinstance(val, bool):
+                return "--%s must be an integer" % name
+            if val < lo or val > hi:
+                return "--%s must be in %d..%d (got %r)" % (name, lo, hi,
+                                                            val)
+        floats = (("reflex-deadline", self.reflex_deadline, 0.0, 1e4),
+                  ("answer-deadline", self.answer_deadline, 1e-3, 1e4),
+                  ("content-deadline", self.content_deadline, 1e-3, 1e4),
+                  ("strategy-deadline", self.strategy_deadline, 1e-3, 1e5),
+                  ("strategy-cooldown", self.strategy_cooldown, 0.0, 1e5),
+                  ("boundary-cooldown-wall", self.boundary_cooldown_wall,
+                   0.0, 1e5),
+                  ("boundary-emergency-wall", self.boundary_emergency_wall,
+                   0.0, 1e5),
+                  ("confidence-threshold", self.confidence_threshold,
+                   0.0, 1.0))
+        if episode_timeout is not None:
+            floats = (("episode-timeout", episode_timeout, 1e-3, 1e6),) \
+                + floats
+        for name, val, lo, hi in floats:
+            if not _finite(val):
+                return "--%s must be a finite number" % name
+            if val < lo or val > hi:
+                return "--%s must be in %g..%g (got %r)" % (name, lo, hi,
+                                                            val)
+        if self.postmortem_reserve > self.strategy_call_cap:
+            return ("--postmortem-reserve (%d) cannot exceed "
+                    "--strategy-call-cap (%d)"
+                    % (self.postmortem_reserve, self.strategy_call_cap))
+        for name, val in (("usd-cap", self.usd_cap),
+                          ("deepseek-price-in", self.deepseek_price_in),
+                          ("deepseek-price-out", self.deepseek_price_out)):
+            if val is None:
+                continue
+            if not _finite(val) or val < 0:
+                return "--%s must be a finite, nonnegative number" % name
+        if self.usd_cap is not None and not tariff_complete(self):
+            return ("--usd-cap requires a complete tariff: set both "
+                    "--deepseek-price-in and --deepseek-price-out")
+        return None
 
 
 @dataclass
@@ -314,6 +398,7 @@ class _WorkerSupervisor(object):
         self._err: List[str] = []
         self._done = threading.Event()
         self._lock = threading.Lock()
+        self._reader: Optional[threading.Thread] = None
         self._t0 = 0.0
         self._timer = None
 
@@ -447,6 +532,16 @@ class _WorkerSupervisor(object):
         return res
 
     def cancel(self) -> None:
+        """Stop the worker, then let the reader publish what it already read.
+
+        ``_done`` is *not* set here unconditionally.  A worker that has
+        already exited may have a completed result (and its usage) sitting in
+        the pipe; the reader thread publishes ``_out`` and only then sets
+        ``_done``.  Signalling completion before that drain would lose the
+        completed result to unknown exposure, so the reader is joined (with a
+        bound) first, and only a reader that never publishes falls back to
+        setting ``_done`` itself.
+        """
         with self._lock:
             proc = self.proc
             if proc is not None:
@@ -459,7 +554,13 @@ class _WorkerSupervisor(object):
                         if not _group_gone(pgid, 2.0):
                             self.kill_failed = True
         self._cancel_timer()
-        self._done.set()
+        reader = self._reader
+        if reader is not None and reader.is_alive():
+            reader.join(self.grace + 1.0)
+        if not self._done.is_set():
+            # bounded fallback: the reader never published its output, so
+            # there is no completed result left to preserve
+            self._done.set()
 
     def reap(self) -> None:
         self._cancel_timer()
@@ -672,6 +773,13 @@ class DeepSeekStrategy(StrategyProvider):
         self._sup: Optional[_WorkerSupervisor] = None
         self.cooldown_until = 0.0
         self.last_error = ""
+        # The lifecycle lock makes cancellation atomic with worker
+        # installation: cancel() either sets the sticky flag before the worker
+        # is installed (and the spawn is refused) or sees the installed
+        # supervisor (and cancels it).  There is no window in which a worker
+        # is spawned after a cancellation.
+        self._lock = threading.Lock()
+        self._cancelled = False
 
     # -- availability ----------------------------------------------------
     def available(self, config: Optional[ProviderConfig] = None) \
@@ -691,8 +799,18 @@ class DeepSeekStrategy(StrategyProvider):
         return self._sup is not None and self._sup.busy
 
     def cancel(self) -> None:
-        if self._sup is not None:
-            self._sup.cancel()
+        """Cancel in-flight paid work and refuse to start any more.
+
+        The flag is set *before* the supervisor is inspected and is sticky, so
+        a cancel that races the provider thread -- arriving before the worker
+        is installed, or between install and spawn -- cannot let a freshly
+        spawned worker outlive its episode.
+        """
+        with self._lock:
+            self._cancelled = True
+            sup = self._sup
+        if sup is not None:
+            sup.cancel()
 
     def reap(self) -> None:
         if self._sup is not None:
@@ -741,14 +859,25 @@ class DeepSeekStrategy(StrategyProvider):
                "max_bytes": self.config.deepseek_max_bytes}
         sup = _WorkerSupervisor(self.worker_argv,
                                 max_bytes=self.config.deepseek_max_bytes)
-        self._sup = sup
-        try:
-            sup.start(job, ddl)
-        except OSError as exc:
-            self._sup = None
-            self.last_error = "spawn"
-            return StrategyResult(provider=self.name,
-                                  reason="worker spawn failed", ok=False)
+        # Install and start the supervisor under the lifecycle lock, checking
+        # the sticky cancellation flag first.  A cancel() that arrives before
+        # this block sets the flag and the spawn is refused; one that arrives
+        # after sees the installed supervisor and cancels it.  Either way the
+        # provider thread terminates boundedly and no worker survives the
+        # episode.
+        with self._lock:
+            if self._cancelled:
+                self.last_error = "cancelled"
+                return StrategyResult(provider=self.name, reason="cancelled",
+                                      ok=False)
+            self._sup = sup
+            try:
+                sup.start(job, ddl)
+            except OSError:
+                self._sup = None
+                self.last_error = "spawn"
+                return StrategyResult(provider=self.name,
+                                      reason="worker spawn failed", ok=False)
         finished = sup.wait(max(0.0, ddl - time.monotonic()))
         if not finished:
             sup.cancel()
@@ -843,6 +972,8 @@ class JevReflex(ReflexProvider):
         self.now = now
         self._sup: Optional[_WorkerSupervisor] = None
         self.last_error = ""
+        self._lock = threading.Lock()
+        self._cancelled = False
 
     def available(self, config: Optional[ProviderConfig] = None) \
             -> Availability:
@@ -860,8 +991,17 @@ class JevReflex(ReflexProvider):
         return Availability(True, "Jev adapter (fake-endpoint testing only)")
 
     def cancel(self) -> None:
-        if self._sup is not None:
-            self._sup.cancel()
+        """Cancel in-flight paid work and refuse to start any more (sticky).
+
+        See :meth:`DeepSeekStrategy.cancel`: the flag is set under the same
+        lock the spawn path holds, so a cancel racing the provider thread
+        cannot let a freshly spawned worker outlive its episode.
+        """
+        with self._lock:
+            self._cancelled = True
+            sup = self._sup
+        if sup is not None:
+            sup.cancel()
 
     def build_choices(self, context: ReflexContext):
         """Return ``(options, mapping)`` or ``None`` when Jev cannot help.
@@ -918,13 +1058,20 @@ class JevReflex(ReflexProvider):
                "max_bytes": self.config.provider_max_bytes}
         sup = _WorkerSupervisor(self.worker_argv,
                                 max_bytes=self.config.provider_max_bytes)
-        self._sup = sup
-        try:
-            sup.start(job, ddl)
-        except OSError:
-            self._sup = None
-            self.last_error = "spawn"
-            return None
+        # Install-and-start under the lifecycle lock (see
+        # DeepSeekStrategy.deliberate): a cancel before this block refuses the
+        # spawn, a cancel after it cancels the installed supervisor.
+        with self._lock:
+            if self._cancelled:
+                self.last_error = "cancelled"
+                return None
+            self._sup = sup
+            try:
+                sup.start(job, ddl)
+            except OSError:
+                self._sup = None
+                self.last_error = "spawn"
+                return None
         finished = sup.wait(max(0.0, ddl - time.monotonic()))
         if not finished:
             sup.cancel()
@@ -942,39 +1089,54 @@ class JevReflex(ReflexProvider):
 
     def _result_from(self, res: WorkerResult, context: ReflexContext,
                      options, mapping) -> Optional[ReflexResult]:
+        """Turn one worker response into a reflex result.
+
+        Once a body comes back the paid call has already happened, so every
+        path that has a body returns a ``ReflexResult`` carrying its
+        ``usage`` -- with ``action`` set on acceptance and ``None`` on
+        rejection.  Returning bare ``None`` for a low-confidence, abstaining,
+        out-of-range or action-less answer would drop the spend, so the
+        method contract is "accepted or not" and the caller accounts usage
+        regardless.  ``None`` is returned only when *no body arrived at all*
+        (worker error or timeout), where there is no usage to preserve.
+        """
         if not res.ok or res.json is None:
             self.last_error = res.error or "error"
             return None
         body = res.json
+        usage = body.get("usage")
+        usage = usage if isinstance(usage, dict) else {}
         choice = body.get("option")
         conf = body.get("confidence")
         if conf is None:
             conf = 0.0
         if isinstance(conf, bool) or not isinstance(conf, (int, float)) \
                 or conf != conf or conf in (float("inf"), float("-inf")):
-            self.last_error = "invalid-confidence"
-            return None
+            return self._rejected("invalid-confidence", usage, res.latency)
         conf = float(conf)
         if not (0.0 <= conf <= 1.0):
-            self.last_error = "invalid-confidence"
-            return None
+            return self._rejected("invalid-confidence", usage, res.latency)
         if conf < self.config.confidence_threshold:
-            self.last_error = "low-confidence"
-            return None
+            return self._rejected("low-confidence", usage, res.latency)
         if choice is None:
-            self.last_error = "abstain"
-            return None
+            return self._rejected("abstain", usage, res.latency)
         if not isinstance(choice, int) or isinstance(choice, bool) \
                 or not (0 <= choice < len(options)):
-            self.last_error = "invalid-option"
-            return None
+            return self._rejected("invalid-option", usage, res.latency)
         action = self._action_for(mapping, options[choice], context)
         if action is None:
-            return None
+            return self._rejected("invalid-action", usage, res.latency)
         return ReflexResult(action=action, confidence=conf,
                             provider=self.name,
                             reason="jev choice", latency=res.latency,
-                            usage=res.json.get("usage") or {})
+                            usage=usage)
+
+    def _rejected(self, why: str, usage: Dict[str, Any],
+                  latency: float) -> ReflexResult:
+        """A paid answer that is not usable, still carrying its usage."""
+        self.last_error = why
+        return ReflexResult(action=None, confidence=None, provider=self.name,
+                            reason=why, latency=latency, usage=usage)
 
     @staticmethod
     def _action_for(mapping, option, context) -> Optional[dict]:
@@ -1019,16 +1181,31 @@ def tariff_complete(config: ProviderConfig) -> bool:
             and config.deepseek_price_out is not None)
 
 
+# Chat framing overhead: the server wraps each message in role/delimiter
+# tokens that are not part of the message *content*, so they are charged as a
+# fixed reserve rather than reconstructed from an unverified serialization.
+_CHAT_FRAMING_TOKENS = 64
+
+
 def strategy_token_bound(config: ProviderConfig,
                          ctx: StrategyContext) -> Tuple[int, int]:
-    """A conservative (prompt, completion) token upper bound for one call.
+    """A *formally* conservative (prompt, completion) token upper bound.
 
-    The prompt figure over-estimates the rendered system + user text at a
-    fixed 4-chars-per-token and adds a small fixed overhead; the completion
-    figure is the configured ``deepseek_max_tokens`` -- the provider is told
-    not to exceed it.  The bound is what the budget ledger reserves *before*
-    dispatch and the reported usage settles afterwards.
+    The prompt figure is the rendered system + user text measured in UTF-8
+    **bytes** plus a fixed chat-framing reserve.  The invariant that makes it
+    an upper bound: the text is encoded to bytes and a tokenizer then
+    partitions those bytes into tokens; for byte-level BPE -- the family the
+    OpenAI-compatible chat API this adapter targets uses -- every token covers
+    at least one byte of its input, so ``tokens <= utf8_bytes`` holds for
+    *every* input, including CJK, emoji and dense punctuation.
+
+    A chars/4 estimate is not an upper bound: three CJK characters are nine
+    UTF-8 bytes and can be three tokens (3 bytes/token), so ``chars/4``
+    under-reserves by a factor of ~2.4 exactly where a tight cap matters.
+    The completion figure is the configured ``deepseek_max_tokens``, which the
+    provider is told not to exceed.  The bound is what the budget ledger
+    reserves *before* dispatch; reported usage settles the true figure after.
     """
     text = _SYSTEM_PROMPT + "\n" + _render_strategy_prompt(ctx)
-    prompt = (len(text) + 3) // 4 + 16
+    prompt = len(text.encode("utf-8")) + _CHAT_FRAMING_TOKENS
     return prompt, int(config.deepseek_max_tokens)

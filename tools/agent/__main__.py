@@ -13,7 +13,6 @@ key alone never opts a user into paid calls.
 """
 
 import argparse
-import math
 import os
 import sys
 
@@ -148,65 +147,18 @@ def episode_ok(r) -> bool:
             and r.returncode == 0 and r.recording_complete)
 
 
-def _finite(v) -> bool:
-    return (isinstance(v, (int, float)) and not isinstance(v, bool)
-            and math.isfinite(v))
-
-
 def validate_args(a):
     """Reject an invalid configuration *before* any episode starts.
 
-    Returns an error string, or None when the configuration is acceptable.
-    Every numeric option must be finite and within range; the postmortem
-    reserve must fit inside the strategy cap (a negative reserve would
-    silently enlarge the play budget); and a USD cap requires a *complete*
-    tariff, because an ignored cap is worse than a rejected one.
+    Delegates to :meth:`~tools.agent.providers.ProviderConfig.validate` -- the
+    same authority :class:`~tools.agent.controller.Controller` calls on
+    construction -- so a ``ProviderConfig`` built programmatically cannot
+    bypass the checks a ``cmd_auto`` invocation enforces, and the rules live
+    in one place rather than two copies that can drift.  The two campaign
+    fields the config does not itself carry (``--episodes``,
+    ``--episode-timeout``) are passed through to the same routine.
     """
-    ints = (("episodes", a.episodes, 1, 10 ** 9),
-            ("max-ticks", a.max_ticks, 0, 10 ** 9),
-            ("strategy-call-cap", a.strategy_call_cap, 0, 10 ** 9),
-            ("postmortem-reserve", a.postmortem_reserve, 0, 10 ** 9),
-            ("token-cap", a.token_cap, 0, 10 ** 12),
-            ("reflex-call-cap", a.reflex_call_cap, 0, 10 ** 9),
-            ("boundary-cooldown-ticks", a.boundary_cooldown_ticks, 0,
-             10 ** 9),
-            ("low-confidence-needs", a.low_confidence_needs, 1, 10 ** 6),
-            ("deepseek-max-tokens", a.deepseek_max_tokens, 1, 10 ** 7))
-    for name, val, lo, hi in ints:
-        if not isinstance(val, int) or isinstance(val, bool):
-            return "--%s must be an integer" % name
-        if val < lo or val > hi:
-            return "--%s must be in %d..%d (got %r)" % (name, lo, hi, val)
-    floats = (("episode-timeout", a.episode_timeout, 1e-3, 1e6),
-              ("reflex-deadline", a.reflex_deadline, 0.0, 1e4),
-              ("answer-deadline", a.answer_deadline, 1e-3, 1e4),
-              ("content-deadline", a.content_deadline, 1e-3, 1e4),
-              ("strategy-deadline", a.strategy_deadline, 1e-3, 1e5),
-              ("strategy-cooldown", a.strategy_cooldown, 0.0, 1e5),
-              ("boundary-cooldown-wall", a.boundary_cooldown_wall, 0.0, 1e5),
-              ("boundary-emergency-wall", a.boundary_emergency_wall, 0.0,
-               1e5),
-              ("confidence-threshold", a.confidence_threshold, 0.0, 1.0))
-    for name, val, lo, hi in floats:
-        if not _finite(val):
-            return "--%s must be a finite number" % name
-        if val < lo or val > hi:
-            return "--%s must be in %g..%g (got %r)" % (name, lo, hi, val)
-    if a.postmortem_reserve > a.strategy_call_cap:
-        return ("--postmortem-reserve (%d) cannot exceed --strategy-call-cap "
-                "(%d)" % (a.postmortem_reserve, a.strategy_call_cap))
-    for name, val in (("usd-cap", a.usd_cap),
-                      ("deepseek-price-in", a.deepseek_price_in),
-                      ("deepseek-price-out", a.deepseek_price_out)):
-        if val is None:
-            continue
-        if not _finite(val) or val < 0:
-            return "--%s must be a finite, nonnegative number" % name
-    if a.usd_cap is not None and (a.deepseek_price_in is None
-                                  or a.deepseek_price_out is None):
-        return ("--usd-cap requires a complete tariff: set both "
-                "--deepseek-price-in and --deepseek-price-out")
-    return None
+    return _config_from_args(a).validate(a.episodes, a.episode_timeout)
 
 
 def cmd_auto(a) -> int:

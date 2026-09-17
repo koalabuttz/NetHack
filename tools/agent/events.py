@@ -30,6 +30,7 @@ timing lives under a separate ``wall`` map so a replay comparison can drop it.
 
 import re
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -258,6 +259,13 @@ class PendingBoundary(object):
         self.tick = tick
 
 
+# How many finalised lifecycle records are kept in memory for inspection.  A
+# longer episode still *emits* every record (to the recording writer) as it
+# is finalised; only the in-memory detail window is capped, so a burst cannot
+# grow the ledger without bound.
+_RETAIN_CAP = 4096
+
+
 class EventLedger(object):
     """Per-EID boundary lifecycle, schema-versioned and replay-stable.
 
@@ -267,22 +275,47 @@ class EventLedger(object):
     deterministic displayed ``tick`` and dungeon ``level``; the raw wall
     clock is confined to a separate ``wall`` map so a replay comparison over
     the deterministic fields stays exact.
+
+    A record is *finalised* -- and handed to ``sink`` -- the moment it can no
+    longer change: on a terminal transition, or when the detection round that
+    produced it queued nothing (:meth:`flush_unqueued`).  Emitting
+    incrementally keeps the episode's memory bounded and avoids the
+    end-of-episode burst that could overflow the recording writer queue.  A
+    bounded window of finalised records is retained for inspection
+    (:meth:`as_list`); once ``cap`` is exceeded the oldest detail is dropped
+    and :attr:`collapsed` counts it, but emission continues unaffected.
     """
 
-    def __init__(self) -> None:
-        self.records: Dict[str, Dict[str, Any]] = {}
-        self.order: List[str] = []
+    def __init__(self, sink=None, cap: int = _RETAIN_CAP) -> None:
+        self.sink = sink
+        self.cap = int(cap)
+        self._open: Dict[str, Dict[str, Any]] = {}
+        self._retained: List[Dict[str, Any]] = []
+        self.emitted = 0
+        self.collapsed = 0
 
     def _rec(self, eid: str) -> Dict[str, Any]:
-        rec = self.records.get(eid)
+        rec = self._open.get(eid)
         if rec is None:
             rec = {"schema": EVENT_SCHEMA, "record": "boundary", "eid": eid,
                    "kind": "", "detail": "", "severe": False, "reasons": [],
                    "detected": None, "queued": None, "dispatched": None,
                    "terminal": None, "coalesced_with": [], "wall": {}}
-            self.records[eid] = rec
-            self.order.append(eid)
+            self._open[eid] = rec
         return rec
+
+    def _finalize(self, eid: str) -> None:
+        """Emit a record that can no longer change and bound the window."""
+        rec = self._open.pop(eid, None)
+        if rec is None:
+            return
+        self.emitted += 1
+        if self.sink is not None:
+            self.sink(dict(rec))
+        self._retained.append(rec)
+        while len(self._retained) > self.cap:
+            self._retained.pop(0)
+            self.collapsed += 1
 
     def detect(self, boundary: "Boundary", tick: int,
                level: str = "") -> None:
@@ -308,15 +341,40 @@ class EventLedger(object):
         elif state in ("applied", "expired", "suppressed"):
             rec["terminal"] = {"state": state, "tick": tick, "level": level,
                                "reason": reason}
+            self._finalize(eid)
 
     def coalesce(self, eids: Sequence[str]) -> None:
-        """Record that *eids* were merged into one pending request."""
+        """Record that *eids* were merged into one pending request.
+
+        Called with the *complete* pending set, not just the newest arrivals:
+        a member merged into an already-pending request is restamped too, so
+        every member names the same coalesced set.
+        """
         group = list(eids)
         for eid in group:
-            self._rec(eid)["coalesced_with"] = [e for e in group if e != eid]
+            rec = self._open.get(eid)
+            if rec is None:
+                continue
+            rec["coalesced_with"] = [e for e in group if e != eid]
+
+    def flush_unqueued(self) -> None:
+        """Finalise every open record that was detected but not queued.
+
+        The queue only ever receives the boundaries detected in the same
+        observation, so once that round has run an EID left unqueued can
+        never be queued later: its "detected only" record is final.
+        """
+        for eid in [e for e, r in self._open.items() if r["queued"] is None]:
+            self._finalize(eid)
+
+    def flush(self) -> None:
+        """Finalise every remaining open record (episode end)."""
+        for eid in list(self._open):
+            self._finalize(eid)
 
     def as_list(self) -> List[Dict[str, Any]]:
-        return [self.records[eid] for eid in self.order]
+        """The retained window of finalised records, oldest first."""
+        return list(self._retained)
 
 
 def directive_event(ev: Dict[str, Any]) -> Dict[str, Any]:
@@ -329,6 +387,12 @@ def directive_event(ev: Dict[str, Any]) -> Dict[str, Any]:
 class BoundaryQueue(object):
     """Coalesce detected boundaries and rate-limit dispatch to the
     strategy."""
+
+    # Bounded in-memory window of lifecycle steps.  The persistent record is
+    # the EventLedger (emitted incrementally); this list is only the queue's
+    # own replay-visible trace for :meth:`states`, so it is capped rather than
+    # grown without bound over a long episode.
+    EVENT_CAP = 4096
 
     def __init__(self, cooldown_ticks: int = 50, cooldown_wall: float = 5.0,
                  emergency_wall: float = 2.0, ledger=None, event_ledger=None,
@@ -346,7 +410,7 @@ class BoundaryQueue(object):
         self.in_flight: Optional[PendingBoundary] = None
         self.last_dispatch_tick: Optional[int] = None
         self.last_dispatch_wall: Optional[float] = None
-        self.events: List[Dict[str, Any]] = []
+        self.events: deque = deque(maxlen=self.EVENT_CAP)
 
     # -- intake ----------------------------------------------------------
     def submit(self, boundaries: Sequence[Boundary], tick: int,
@@ -364,7 +428,11 @@ class BoundaryQueue(object):
             queued.append(b.eid)
             self._log("queued", b.eid, b.reason)
         if queued and self.event_ledger is not None:
-            self.event_ledger.coalesce(queued)
+            # Stamp coalescing from the COMPLETE pending set, not just this
+            # submission: a member merged into an already-pending request must
+            # learn about the later arrival too, and every member must name
+            # the same dispatched set.
+            self.event_ledger.coalesce(list(self.pending.eids))
         return queued
 
     # -- dispatch --------------------------------------------------------

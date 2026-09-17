@@ -155,6 +155,12 @@ class Controller(object):
                  read_slack: float = 30.0, max_retries: int = 3,
                  reap_grace: float = 5.0):
         self.config = config
+        # One validation authority: a programmatically built ProviderConfig
+        # cannot bypass the checks the CLI enforces (the validate() docstring
+        # documents this contract).
+        err = config.validate(episode_timeout=episode_timeout)
+        if err is not None:
+            raise ValueError(err)
         self.paths = paths
         self.output_dir = output_dir
         self.episode_timeout = episode_timeout
@@ -494,7 +500,7 @@ class _EpisodeRunner(object):
         self.strategy_provider = controller._new_strategy_provider()
         self.strategy_enabled = self.strategy_provider.available(
             controller.config).enabled
-        self.event_ledger = EventLedger()
+        self.event_ledger = EventLedger(sink=self._event_sink)
         self.ledger = BudgetLedger(
             strategy_cap=controller.config.strategy_call_cap,
             postmortem_reserve=controller.config.postmortem_reserve,
@@ -610,17 +616,26 @@ class _EpisodeRunner(object):
         self.result.outcome = recording.infer_outcome(self.mem.messages)
 
     # -- outbound (one send-and-record path) -----------------------------
-    def _flush_events(self):
-        """Persist the schema-versioned event-lifecycle ledger.
+    def _event_sink(self, rec) -> None:
+        """Incremental boundary-lifecycle persistence.
 
-        One record per boundary EID traces its detected/queued/dispatched
-        steps to a single terminal state; one record per directive activation
-        or expiry traces the advice's life.  Deterministic fields (tick,
-        level, state) are separate from wall timing, so a replay comparison
-        can drop timing exactly.
+        The ledger hands over every record the moment it is finalised, so a
+        long episode never accumulates an end-of-episode burst that could
+        overflow the recording writer queue.
         """
-        for rec in self.event_ledger.as_list():
-            self.rec.record_event(rec)
+        self.rec.record_event(rec)
+
+    def _flush_events(self):
+        """Finalise any open lifecycle records and persist directive events.
+
+        Boundary records are emitted incrementally through the sink as they
+        are finalised; this end-of-episode pass finalises whatever is still
+        open (never-queued boundaries such as the closed marker) and writes
+        the directive lifecycle events.  Deterministic fields (tick, level,
+        state) are separate from wall timing, so a replay comparison can drop
+        timing exactly.
+        """
+        self.event_ledger.flush()
         for ev in self.book.events:
             self.rec.record_event(directive_event(ev))
         self._note_recorder_health()
@@ -1388,15 +1403,16 @@ class _EpisodeRunner(object):
         if not finished:
             self.reflex_timeouts += 1
             self.ledger.reflex_timeout += 1
+        usage = res.usage if res is not None else {}
+        # exactly once: a paid body is billed whether or not it is accepted
+        self.ledger.add_usage(usage)
         if res is None or res.action is None:
             self.ledger.reflex_fallback += 1
             why = getattr(self.reflex_provider, "last_error", "") \
-                or "no answer"
+                or (res.reason if res is not None else "") or "no answer"
             return (fallback_action, "scripted", "jev fallback: %s" % why,
-                    latency, {}, True)
+                    latency, usage, True)
         self.ledger.reflex_successful += 1
-        # paid usage enters token/USD accounting exactly like strategy usage
-        self.ledger.add_usage(res.usage)
         conf = res.confidence
         numeric = (isinstance(conf, (int, float))
                    and not isinstance(conf, bool))

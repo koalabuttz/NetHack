@@ -39,6 +39,49 @@ class Tariff(object):
                 "completion_per_mtok": self.completion_per_mtok}
 
 
+def _finite_number(name: str, v) -> float:
+    """Return *v* as a float, raising for a bool, NaN or +/-inf value."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise ValueError("%s must be a number (got %r)" % (name, v))
+    f = float(v)
+    if f != f or f in (float("inf"), float("-inf")):
+        raise ValueError("%s must be finite (got %r)" % (name, v))
+    return f
+
+
+def _int_arg(name: str, v) -> int:
+    """Return *v* as an int, raising for a non-finite/non-integral value."""
+    f = _finite_number(name, v)
+    if f != int(f):
+        raise ValueError("%s must be an integer (got %r)" % (name, v))
+    return int(f)
+
+
+def _nonneg_int(name: str, v) -> int:
+    """Return *v* as a nonnegative int, raising rather than clamping.
+
+    A negative cap would change the *meaning* of the enforcement rather than
+    merely its size (``token_cap=-1`` refuses every call; a negative style
+    bound can never be covered), so the ledger rejects it loudly instead of
+    silently rewriting the operator's intent.
+    """
+    n = _int_arg(name, v)
+    if n < 0:
+        raise ValueError("%s must be nonnegative (got %r)" % (name, v))
+    return n
+
+
+def _check_tariff(tariff) -> None:
+    """Reject a missing, incomplete, non-finite or negative tariff."""
+    for field in ("prompt_per_mtok", "completion_per_mtok"):
+        value = getattr(tariff, field, None)
+        if value is None:
+            raise ValueError("tariff.%s is missing: a complete tariff is "
+                             "required" % field)
+        if _finite_number("tariff.%s" % field, value) < 0:
+            raise ValueError("tariff.%s must be nonnegative" % field)
+
+
 class BudgetLedger(object):
     """One episode's counters, reservations and estimated cost."""
 
@@ -46,15 +89,18 @@ class BudgetLedger(object):
                  usd_cap: Optional[float] = None,
                  tariff: Optional[Tariff] = None,
                  reflex_cap: int = 0, token_cap: int = 0) -> None:
-        self.strategy_cap = int(strategy_cap)
+        self.strategy_cap = _nonneg_int("strategy_cap", strategy_cap)
         # A *negative* reserve would silently enlarge the play budget
         # (cap - reserve), so it is clamped here as well as rejected at the
-        # CLI: the ledger never trusts its own inputs.
-        self.postmortem_reserve = max(0, int(postmortem_reserve))
+        # CLI: the ledger never trusts its own inputs.  (This is the one
+        # documented clamp; every other invalid figure is rejected.)
+        self.postmortem_reserve = max(0, _int_arg("postmortem_reserve",
+                                                  postmortem_reserve))
+        self._check_usd_cap(usd_cap, tariff)
         self.usd_cap = usd_cap
         self.tariff = tariff
-        self.reflex_cap = int(reflex_cap)
-        self.token_cap = int(token_cap)
+        self.reflex_cap = _nonneg_int("reflex_cap", reflex_cap)
+        self.token_cap = _nonneg_int("token_cap", token_cap)
         # -- reflex counters --------------------------------------------
         self.reflex_attempted = 0
         self.reflex_successful = 0
@@ -85,6 +131,41 @@ class BudgetLedger(object):
         self.unknown_prompt_tokens = 0
         self.unknown_completion_tokens = 0
         self.unknown_estimated_usd = 0.0
+
+    # -- defensive invariants --------------------------------------------
+    @staticmethod
+    def _check_usd_cap(usd_cap, tariff) -> None:
+        """Refuse an unenforceable USD cap at the ledger boundary.
+
+        A USD cap is enforceable only against a complete, valid tariff: with
+        no tariff (or a half/invalid one) every USD figure is an
+        under-estimate, so the cap would be *silently ignored* here -- the
+        exact failure the CLI rejects.  A ledger built directly must refuse
+        the combination rather than pretend to enforce it.
+        """
+        if tariff is not None:
+            _check_tariff(tariff)
+        if usd_cap is None:
+            return
+        if _finite_number("usd_cap", usd_cap) < 0:
+            raise ValueError("usd_cap must be nonnegative")
+        if tariff is None:
+            raise ValueError("a usd_cap requires a configured tariff")
+        if getattr(tariff, "prompt_per_mtok", None) is None \
+                or getattr(tariff, "completion_per_mtok", None) is None:
+            raise ValueError("a usd_cap requires a complete tariff")
+
+    @staticmethod
+    def _bound(prompt_tokens, completion_tokens) -> Tuple[int, int]:
+        """Validate a conservative (prompt, completion) bound.
+
+        A negative or NaN bound would change the meaning of the cap check --
+        a negative bound can never be covered, a NaN bound silently fails
+        every comparison -- so it is rejected loudly rather than clamped into
+        a smaller (and wrong) reserve.
+        """
+        return (_nonneg_int("prompt_tokens", prompt_tokens),
+                _nonneg_int("completion_tokens", completion_tokens))
 
     # -- boundaries ------------------------------------------------------
     def note_boundary(self, state: str, n: int = 1) -> None:
@@ -130,6 +211,8 @@ class BudgetLedger(object):
         tokens and USD -- must be able to cover that bound out of what is
         still left, not merely out of the totals reported so far.
         """
+        prompt_tokens, completion_tokens = self._bound(prompt_tokens,
+                                                       completion_tokens)
         spent = self.strategy_dispatched + self.strategy_reserved
         if postmortem:
             budget = self.strategy_cap
