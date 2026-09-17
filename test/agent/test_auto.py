@@ -2051,5 +2051,83 @@ class TestPerEpisodeReset(unittest.TestCase):
         self.assertEqual([r.index for r in results], [1, 2])
 
 
+class TestRecorderConstructionFailure(unittest.TestCase):
+    """Medium 10: a partially constructed recorder leaks nothing."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="auto-rec.")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def _patched(self, fail_on):
+        """Patch recording with a _Writer stand-in that keeps a strong
+        reference to every writer it builds -- so the test, not the garbage
+        collector, decides when a descriptor is released -- and an
+        _open_private that fails where *fail_on(n)* is true for the 1-based
+        call number *n*."""
+        created = []
+        real_writer = recording._Writer
+
+        class _TrackedWriter(real_writer):
+            def __init__(self, *args, **kwargs):
+                # tracked only once it is fully built: a writer whose own
+                # construction fails holds no descriptor to release
+                super().__init__(*args, **kwargs)
+                created.append(self)
+
+        real_open = recording._open_private
+        calls = []
+
+        def flaky(path, flags):
+            calls.append(path)
+            if fail_on(len(calls)):
+                raise OSError(24, "too many open files")
+            return real_open(path, flags)
+
+        return created, (mock.patch.object(recording, "_Writer",
+                                           _TrackedWriter),
+                         mock.patch.object(recording, "_open_private",
+                                           flaky))
+
+    def _assert_released(self, writers):
+        for w in writers:
+            # the descriptor is closed, not merely dereferenced: no fd leaks
+            self.assertTrue(w.fh.closed, "%s leaked" % w.path)
+            with self.assertRaises(ValueError):
+                w.fh.fileno()
+
+    def test_partial_construction_closes_every_writer(self):
+        # the third _open_private call (decisions) fails: both earlier
+        # writers must be shut down, not just the first
+        created, patches = self._patched(lambda n: n == 3)
+        with patches[0], patches[1]:
+            with self.assertRaises(OSError):
+                recording.EpisodeRecorder(self.dir, 1)
+        self.assertEqual(sorted(os.path.basename(w.path)
+                                for w in created),
+                         ["ep-1.actions.jsonl", "ep-1.wire.jsonl"])
+        self._assert_released(created)
+
+    def test_a_campaign_continues_and_leaks_no_descriptor(self):
+        scen = _line(HELLO) + _line(obs(1, {"kind": "command", "id": 1})) \
+            + _line(CLOSED)
+        ctl = controller.Controller(
+            ProviderConfig(max_ticks=50),
+            controller.ControllerPaths("w", "r", "d", "s"), self.dir,
+            episode_timeout=5.0)
+        ctl._spawn = lambda priv: FakeProc(scen)
+        # fail the third open of every episode (three writers per recorder)
+        created, patches = self._patched(lambda n: n % 3 == 0)
+        with patches[0], patches[1]:
+            results = ctl.run_campaign(3)
+        # the campaign kept going, each episode reported a recorder failure
+        self.assertEqual(len(results), 3)
+        self.assertTrue(all(r.recorder_failed for r in results))
+        self.assertTrue(all(r.stop_reason == "recorder-failure"
+                            for r in results))
+        # two writers per doomed recorder: all six, and no fd, leaked
+        self.assertEqual(len(created), 6)
+        self._assert_released(created)
+
+
 if __name__ == "__main__":
     unittest.main()

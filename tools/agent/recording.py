@@ -150,16 +150,23 @@ class EpisodeRecorder(object):
         self.actions_path = base + ".actions.jsonl"
         self.decisions_path = base + ".decisions.jsonl"
         self.meta_path = base + ".meta.json"
-        self._wire = _Writer(self.wire_path, maxsize)
+        # Construct all three writers before starting any of them.  A writer
+        # that cannot be opened at 0600 fails closed: every writer already
+        # constructed is released, in reverse order, so a per-episode
+        # construction failure cannot leak the descriptors it already holds.
+        opened = []
         try:
+            self._wire = _Writer(self.wire_path, maxsize)
+            opened.append(self._wire)
             self._acts = _Writer(self.actions_path, maxsize)
+            opened.append(self._acts)
             self._decs = _Writer(self.decisions_path, maxsize)
+            opened.append(self._decs)
         except OSError:
-            # a writer that could not be opened at 0600 fails closed: release
-            # the one already opened rather than recording permissively
-            self._wire.shutdown()
+            for w in reversed(opened):
+                w.shutdown()
             raise
-        for w in (self._wire, self._acts, self._decs):
+        for w in opened:
             w.start()
         self.incomplete = False
         self.wire_bytes = 0
