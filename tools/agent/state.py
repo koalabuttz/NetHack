@@ -1,0 +1,236 @@
+"""Per-episode public-state memory: terrain, status, inventory, boundaries.
+
+Everything here is derived from public snapshots only.  Current observations
+are complete ``base:null`` snapshots, so the *presentation* is rebuilt every
+observation by :class:`tools.agent.protocol.Snapshot`; this module keeps a
+separate, persistent *memory* of terrain the hero has already seen (the map is
+the whole level, and unseen cells arrive blank -- unknown blanks are not
+freely traversable floor).
+
+The boundary detector is deterministic and separate from any model call.  For
+Wave 1 the reflex uses it only for HP and hunger signals; the stable episode-
+local event ids are what a later strategy tier would coalesce and dispatch.
+"""
+
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Set, Tuple
+
+from . import protocol
+
+# Cells the hero provably cannot stand on.  Blank/unpainted is unknown, not
+# floor; monsters are excluded so pathfinding never walks into an attack;
+# boulders/statues ('`') and visible traps ('^') are avoided.
+NON_WALKABLE = set("|- ~@`^")
+for _ch in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ":
+    NON_WALKABLE.add(_ch)
+
+STAIRS_DOWN = ">"
+STAIRS_UP = "<"
+
+HUNGER_STAGES = ("Hungry", "Weak", "Fainting", "Fainted", "Starved")
+
+
+def passable(ch: str) -> bool:
+    return bool(ch) and ch not in NON_WALKABLE
+
+
+def monster_glyph(ch: str) -> bool:
+    return bool(ch) and ch.isalpha() and ch != "@"
+
+
+def glyph_is_pet(ch: str) -> bool:
+    """A deliberately conservative pet set.  Public appearance is ambiguous;
+    the reflex treats every monster as a hazard and never walks into one."""
+    return ch in ("d", "f", "u", "c")  # dog / feline / horse / pony-ish
+
+
+@dataclass(frozen=True)
+class Boundary(object):
+    reason: str
+    eid: str
+
+
+class Status(object):
+    def __init__(self) -> None:
+        self.hp: Optional[int] = None
+        self.hp_max: Optional[int] = None
+        self.hunger: str = ""
+        self.dlvl: str = ""
+        self.time: Optional[int] = None
+        self.gold: Optional[int] = None
+        self.level: Optional[int] = None
+
+
+def parse_status(snap: protocol.Snapshot) -> Status:
+    text = snap.status_text()
+    st = Status()
+    st.hp = _int(text.get("hitpoints"))
+    st.hp_max = _int(text.get("hitpoints-max"))
+    st.hunger = (text.get("hunger") or "").strip()
+    st.dlvl = (text.get("dungeon-level") or "").strip()
+    st.time = _int(text.get("time"))
+    gold = text.get("gold") or ""
+    if gold.startswith("$:"):
+        st.gold = _int(gold[2:])
+    st.level = _int(text.get("experience-level"))
+    return st
+
+
+def _int(s: Optional[str]) -> Optional[int]:
+    if not s:
+        return None
+    try:
+        return int(s.strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def hero_position(snap: protocol.Snapshot) -> Optional[Tuple[int, int]]:
+    """Locate the hero from the map ('@'), never from an arbitrary cursor."""
+    for (x, y), cell in snap.map.items():
+        if cell and cell[0] == "@":
+            return (x, y)
+    return None
+
+
+class Inventory(object):
+    """A cached, timestamped view of the last inventory rows the hero read."""
+
+    def __init__(self) -> None:
+        self.rows: List[dict] = []
+        self.seen_tick: Optional[int] = None
+        self.seen_time: Optional[int] = None
+
+    def refresh(self, rows: List[dict], tick: int, game_time: Optional[int]):
+        self.rows = list(rows)
+        self.seen_tick = tick
+        self.seen_time = game_time
+
+    def stale(self, tick: int, max_age: int) -> bool:
+        if self.seen_tick is None:
+            return True
+        return (tick - self.seen_tick) > max_age
+
+    def food_rows(self) -> List[dict]:
+        out = []
+        for r in self.rows:
+            text = (r.get("text") or "").lower()
+            if r.get("selectable") and ("ration" in text or "food" in text
+                                        or "apple" in text or "banana" in text
+                                        or "orange" in text or "melon" in text
+                                        or "corpse" in text):
+                out.append(r)
+        return out
+
+    def food_letters(self) -> List[str]:
+        """Inventory letters (the first token of each row) for food rows."""
+        letters = []
+        for r in self.food_rows():
+            text = r.get("text") or ""
+            if text and text[0].isalnum():
+                letters.append(text[0])
+        return letters
+
+
+class EpisodeMemory(object):
+    """All mutable per-episode public memory.  Reset wholesale per episode."""
+
+    def __init__(self) -> None:
+        self.reset()
+        self.tick = 0
+
+    def reset(self) -> None:
+        self.grid: Dict[Tuple[int, int], tuple] = {}
+        self.visits: Dict[Tuple[int, int], int] = {}
+        self.hero: Optional[Tuple[int, int]] = None
+        self.stairs_down: Set[Tuple[int, int]] = set()
+        self.stairs_up: Set[Tuple[int, int]] = set()
+        self.inventory = Inventory()
+        self.status = Status()
+        self.seen_msgs: Set[int] = set()
+        self.boundary = BoundaryDetector()
+        self.rejected_food = 0
+        self.failed_moves = 0
+        self.searches_since_progress = 0
+        self.last_hero: Optional[Tuple[int, int]] = None
+        self.no_progress = 0
+        self.messages: List[str] = []
+
+    def observe(self, snap: protocol.Snapshot) -> None:
+        """Fold one applied snapshot into durable memory."""
+        for pos, cell in snap.map.items():
+            self.grid[pos] = cell
+            if cell and cell[0] == STAIRS_DOWN:
+                self.stairs_down.add(pos)
+            elif cell and cell[0] == STAIRS_UP:
+                self.stairs_up.add(pos)
+        hero = hero_position(snap)
+        if hero is not None:
+            if hero == self.last_hero:
+                self.no_progress += 1
+            else:
+                self.no_progress = 0
+                self.searches_since_progress = 0
+            self.last_hero = hero
+            self.hero = hero
+            self.visits[hero] = self.visits.get(hero, 0) + 1
+        self.status = parse_status(snap)
+        for m in snap.msg or []:
+            e = m.get("e")
+            if e is not None and e not in self.seen_msgs:
+                self.seen_msgs.add(e)
+                self.messages.append(m.get("text") or "")
+        if len(self.messages) > 200:
+            self.messages = self.messages[-200:]
+
+    def recent_messages(self, n: int = 4) -> List[str]:
+        return self.messages[-n:]
+
+    def tile(self, pos: Tuple[int, int]) -> str:
+        cell = self.grid.get(pos)
+        return cell[0] if cell else " "
+
+    def known_passable(self, pos: Tuple[int, int]) -> bool:
+        return pos in self.grid and passable(self.tile(pos))
+
+
+class BoundaryDetector(object):
+    """Deterministic boundary events with stable episode-local ids."""
+
+    HP_CRISIS_LOW = 0.30
+    HP_CRISIS_HIGH = 0.50
+
+    def __init__(self) -> None:
+        self._armed_hp = True
+        self._last_level: Optional[str] = None
+        self._last_hunger = ""
+
+    def check(self, st: Status, closed: bool = False) -> List[Boundary]:
+        out: List[Boundary] = []
+        if st.dlvl and st.dlvl != self._last_level:
+            reason = "initial-level" if self._last_level is None \
+                else "level-change"
+            out.append(Boundary(reason, "level:%s" % st.dlvl))
+            self._last_level = st.dlvl
+        if st.hp is not None and st.hp_max:
+            frac = st.hp / float(st.hp_max)
+            if self._armed_hp and frac <= self.HP_CRISIS_LOW:
+                out.append(Boundary("hp-crisis", "hp-crisis:%d" % st.hp_max))
+                self._armed_hp = False
+            elif not self._armed_hp and frac > self.HP_CRISIS_HIGH:
+                self._armed_hp = True
+        stage = self._hunger_stage(st.hunger)
+        if stage and stage != self._last_hunger:
+            out.append(Boundary("hunger-%s" % stage.lower(),
+                                "hunger:%s" % stage))
+            self._last_hunger = stage
+        if closed:
+            out.append(Boundary("closed", "closed"))
+        return out
+
+    @staticmethod
+    def _hunger_stage(hunger: str) -> str:
+        for stage in HUNGER_STAGES:
+            if hunger.startswith(stage):
+                return stage
+        return ""
