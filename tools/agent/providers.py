@@ -41,6 +41,7 @@ class ProviderConfig(object):
     jev_key_file: Optional[str] = None
     reflex_deadline: float = 0.75
     answer_deadline: float = 1.0
+    content_deadline: float = 5.0
     strategy_deadline: float = 20.0
 
 

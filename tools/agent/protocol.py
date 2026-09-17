@@ -30,6 +30,24 @@ MAX_MENU_ROWS = 65535
 
 INVALID_CODES = ("schema", "stale", "kind", "range", "incomplete")
 
+# Frozen contract identity (doc/agent-interface.md sections 3 and 5.1).  A
+# session begins with exactly one hello that names these; anything else is a
+# protocol failure, not something to play through.
+EXPECTED_PROFILE = "normal-ascii-color-v1"
+EXPECTED_POLICY = "llm-final-v1"
+REQUIRED_CAPS = ("snapshot", "menu", "paging")
+EXPECTED_COORD = "engine-map"
+
+# Physical bounds.  A malicious or broken peer must not be able to make the
+# controller allocate without limit: the physical line, the assembler's
+# retained chunk state and the number of concurrent chunk streams are all
+# capped, and exceeding one is a per-episode protocol failure.
+MAX_PHYSICAL_LINE = 1 << 20        # bytes before json.loads ever sees a line
+MAX_RETAINED_BYTES = 1 << 20       # assembler retained chunk bytes
+MAX_CHUNKS = 4096                  # assembler retained logical chunks
+MAX_STREAMS = 64                   # concurrent chunk streams
+MAX_PAGES = 65535                  # protocol-legal page count per request
+
 # Native bindings (number_pad off); the same set the quickstart documents.
 KEY_H, KEY_J, KEY_K, KEY_L = ord("h"), ord("j"), ord("k"), ord("l")
 KEY_Y, KEY_U, KEY_B, KEY_N = ord("y"), ord("u"), ord("b"), ord("n")
@@ -158,13 +176,22 @@ class Snapshot(object):
 
 
 class Request(object):
-    """The one outstanding need and its delivery obligations."""
+    """The one outstanding need and its delivery obligations.
+
+    Page transfer keeps **exactly one** ``get_page`` in flight: a page request
+    is built only while no response is outstanding, and a page is marked
+    requested only after its complete request line reached the wire (the
+    controller calls :meth:`mark_page_requested` then).  This bounds the
+    outbound obligation to one small line per delivered page, so a peer that
+    advertises many pages and reads stdin slowly can never wedge the pipe.
+    """
 
     def __init__(self) -> None:
         self.need: Optional[dict] = None
         self.seq = 0
         self.pages_declared = 0
         self.pages_delivered: Dict[int, List[Any]] = {}
+        self.in_flight: Optional[int] = None
         self.requested: set = set()
         self.content: Optional[str] = None
         self.menu: Optional[str] = None
@@ -173,6 +200,7 @@ class Request(object):
         self.need = need
         self.seq = seq
         self.pages_delivered = {}
+        self.in_flight = None
         self.requested = set()
         if not need:
             self.pages_declared = 0
@@ -191,15 +219,31 @@ class Request(object):
     def id(self):
         return (self.need or {}).get("id")
 
-    def page_requests(self) -> List[dict]:
-        """The ``get_page`` requests still owed, in index order."""
-        out = []
+    def next_page_request(self) -> Optional[dict]:
+        """The single ``get_page`` still owed, or None.
+
+        Returns None while a response is outstanding so the caller can never
+        have two page requests in flight at once.
+        """
         if not self.need or self.pages_declared <= 0:
-            return out
+            return None
+        if self.in_flight is not None:
+            return None
         for k in range(self.pages_declared):
             if k not in self.pages_delivered and k not in self.requested:
-                out.append(make_get_page(self.need["id"], self.content, k))
-        return out
+                return make_get_page(self.need["id"], self.content, k)
+        return None
+
+    def mark_page_requested(self, page: int) -> None:
+        """Record that page *page*'s complete request line was written."""
+        self.requested.add(page)
+        self.in_flight = page
+
+    def reset_delivery(self) -> None:
+        """Re-arm the page obligation (used after ``invalid(incomplete)``)."""
+        self.pages_delivered = {}
+        self.requested = set()
+        self.in_flight = None
 
     def note_page(self, rec: dict) -> None:
         idx = rec.get("page")
@@ -210,6 +254,8 @@ class Request(object):
             return
         if rec.get("pages") not in (None, self.pages_declared):
             return
+        if idx == self.in_flight:
+            self.in_flight = None
         self.pages_delivered.setdefault(idx, rec.get("rows") or [])
 
     def pages_complete(self) -> bool:
@@ -245,6 +291,43 @@ def make_ack_chunk(rid, index: int) -> dict:
 
 def make_ack_seq(seq: int) -> dict:
     return {"v": 1, "type": "ack_seq", "seq": seq}
+
+
+# ------------------------------------------------------------- hello check
+
+def validate_hello(rec: dict, profile: str = EXPECTED_PROFILE,
+                   policy: str = EXPECTED_POLICY,
+                   caps=REQUIRED_CAPS,
+                   coord: str = EXPECTED_COORD) -> Optional[str]:
+    """Return None if *rec* is a compatible ``hello``, else a reason.
+
+    Compatibility is a value equality on the frozen contract identity, never
+    a substring or version-range guess: an unknown profile or delivery policy
+    is a different contract the controller does not speak.
+    """
+    if not isinstance(rec, dict):
+        return "hello is not an object"
+    if rec.get("v") != 1:
+        return "hello v is not 1"
+    if rec.get("ch") != "control":
+        return "hello channel is not control"
+    if rec.get("profile") != profile:
+        return "incompatible profile %r" % (rec.get("profile"),)
+    if rec.get("policy") != policy:
+        return "incompatible delivery policy %r" % (rec.get("policy"),)
+    if rec.get("coord") != coord:
+        return "unexpected coordinate system %r" % (rec.get("coord"),)
+    have = rec.get("caps")
+    if not isinstance(have, list):
+        return "hello caps is not a list"
+    missing = [c for c in caps if c not in have]
+    if missing:
+        return "hello is missing capabilities %r" % (missing,)
+    size = rec.get("size")
+    if (not isinstance(size, (list, tuple)) or len(size) != 2
+            or not all(_is_int(v) for v in size)):
+        return "hello size is not a [w,h] pair"
+    return None
 
 
 # --------------------------------------------------------------- validation

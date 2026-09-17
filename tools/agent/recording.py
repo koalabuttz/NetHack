@@ -36,6 +36,28 @@ SCHEMA_META = 1
 
 _STOP = object()
 
+# Directory/file modes: recording is private by construction, and an existing
+# looser directory or file is tightened rather than trusted.
+_DIR_MODE = 0o700
+_FILE_MODE = 0o600
+
+
+def ensure_private_dir(path: str) -> None:
+    """Create *path* if needed and tighten it to owner-only (or raise)."""
+    os.makedirs(path, mode=_DIR_MODE, exist_ok=True)
+    if os.stat(path).st_mode & 0o077:
+        os.chmod(path, _DIR_MODE)
+
+
+def _open_private(path, flags) -> int:
+    """Open *path* at 0600 and force the mode even for a pre-existing file."""
+    fd = os.open(path, flags, _FILE_MODE)
+    try:
+        os.fchmod(fd, _FILE_MODE)
+    except (AttributeError, OSError):
+        pass
+    return fd
+
 
 class _Writer(threading.Thread):
     def __init__(self, path, maxsize=4096):
@@ -44,10 +66,14 @@ class _Writer(threading.Thread):
         self.q = queue.Queue(maxsize=maxsize)
         self.error = None
         self.dropped = 0
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        self.alive = False
+        self.drained = False
+        fd = _open_private(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
         self.fh = os.fdopen(fd, "wb", closefd=True)
 
     def submit(self, data: bytes) -> bool:
+        if self.error is not None:
+            return False
         try:
             self.q.put_nowait(data)
             return True
@@ -73,17 +99,30 @@ class _Writer(threading.Thread):
             self.error = self.error or str(exc)
 
     def shutdown(self, timeout=5.0):
-        if getattr(self, "_running", False):
-            try:
-                self.q.put(_STOP, timeout=timeout)
-            except queue.Full:
-                pass
-            self.join(timeout=timeout)
-        else:
+        """Stop the writer and report how it ended.
+
+        Returns one of ``drained`` (sentinel queued and the thread joined),
+        ``not-drained`` (the sentinel could not be queued), ``terminated``
+        (still alive after the join timed out) or ``closed`` (never started).
+        """
+        if not getattr(self, "_running", False):
             try:
                 self.fh.close()
-            except OSError:
-                pass
+            except OSError as exc:
+                self.error = self.error or str(exc)
+            return "closed"
+        status = "drained"
+        try:
+            self.q.put(_STOP, timeout=timeout)
+        except queue.Full:
+            status = "not-drained"
+        self.join(timeout=timeout)
+        if self.is_alive():
+            self.alive = True
+            status = "terminated"
+        else:
+            self.drained = status == "drained"
+        return status
 
     def start(self):
         self._running = True
@@ -94,7 +133,7 @@ class EpisodeRecorder(object):
     def __init__(self, output_dir, episode, maxsize=4096):
         self.output_dir = output_dir
         self.episode = episode
-        os.makedirs(output_dir, mode=0o700, exist_ok=True)
+        ensure_private_dir(output_dir)
         base = os.path.join(output_dir, "ep-%d" % episode)
         self.wire_path = base + ".wire.jsonl"
         self.actions_path = base + ".actions.jsonl"
@@ -112,6 +151,21 @@ class EpisodeRecorder(object):
         self.decisions = 0
         self.started = time.time()
 
+    @property
+    def failed(self) -> bool:
+        """True the moment the recording can no longer be trusted as lossless.
+
+        The controller reads this after every outbound line so a recorder
+        failure surfaces immediately (Wave 2 hooks its disable-paid-work /
+        graceful-stop policy here).
+        """
+        if self.incomplete:
+            return True
+        for w in (self._wire, self._acts, self._decs):
+            if w.error is not None or w.dropped:
+                return True
+        return False
+
     # -- writers ---------------------------------------------------------
     def record_wire(self, line: bytes) -> None:
         if not line.endswith(b"\n"):
@@ -121,10 +175,12 @@ class EpisodeRecorder(object):
         if not self._wire.submit(line):
             self.incomplete = True
 
-    def record_action(self, ordinal, input_offset, need_key, action, status):
+    def record_action(self, ordinal, input_offset, need_key, kind, action,
+                      status):
         obj = {"schema": SCHEMA_ACTIONS, "ordinal": ordinal,
                "input_offset": input_offset,
-               "need": _need_key_obj(need_key), "action": action,
+               "need": _need_key_obj(need_key), "kind": kind,
+               "action": action,
                "status": status, "t": round(time.time() - self.started, 6)}
         self.actions += 1
         if not self._acts.submit(_json_line(obj)):
@@ -146,14 +202,18 @@ class EpisodeRecorder(object):
 
     # -- shutdown --------------------------------------------------------
     def finalize(self, meta):
+        statuses = []
         for w in (self._wire, self._acts, self._decs):
-            w.shutdown()
-            if w.error is not None or w.dropped:
+            statuses.append(w.shutdown())
+            if w.error is not None or w.dropped or w.alive \
+                    or statuses[-1] != "drained":
                 self.incomplete = True
+        # "complete" is claimed only when all three streams actually drained
         full = {
             "schema": SCHEMA_META,
             "episode": self.episode,
             "recording_complete": not self.incomplete,
+            "writer_status": statuses,
             "wire_lines": self.wire_lines,
             "wire_bytes": self.wire_bytes,
             "actions": self.actions,
@@ -165,8 +225,8 @@ class EpisodeRecorder(object):
             },
         }
         full.update(meta or {})
-        fd = os.open(self.meta_path,
-                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = _open_private(self.meta_path,
+                           os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
         with os.fdopen(fd, "w") as fh:
             json.dump(full, fh, indent=2, sort_keys=True)
             fh.write("\n")
