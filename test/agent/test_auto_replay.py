@@ -172,6 +172,54 @@ class OfflineGuaranteeTest(unittest.TestCase):
             self.assertFalse(os.path.exists(out))
 
 
+# --------------------------------------------------- validation authority
+
+class EvaluatorValidationTest(unittest.TestCase):
+    """Low 3: the evaluator shares the validation authority with live play.
+
+    An out-of-range continuity setting, a zero byte ceiling or a malformed
+    tariff is rejected with exit 2 and a concise stderr message *before* any
+    pass is constructed or output written -- mirroring live autoplay.
+    """
+
+    def _reject(self, *flags):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "e.jsonl")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = _run([STARTUP, "--reflex", "scripted",
+                           "--strategy", "off"] + list(flags)
+                          + ["--output", out])
+            self.assertEqual(rc, 2)
+            self.assertFalse(os.path.exists(out))
+            return err.getvalue()
+
+    def test_out_of_range_history_pairs_is_rejected(self):
+        for bad in ("-1", "65"):
+            with self.subTest(bad=bad):
+                err = self._reject("--deepseek-history-pairs", bad)
+                self.assertIn("deepseek-history-pairs", err)
+
+    def test_zero_context_ceiling_is_rejected(self):
+        err = self._reject("--deepseek-context-max-bytes", "0")
+        self.assertIn("deepseek-context-max-bytes", err)
+
+    def test_malformed_tariff_combo_is_rejected(self):
+        err = self._reject("--deepseek-price-in", "1",
+                           "--deepseek-price-cache-hit", "2")
+        self.assertIn("cache-hit", err)
+
+    def test_a_partial_tariff_is_accepted(self):
+        # a partial (no USD cap) tariff is a valid configuration: the run
+        # proceeds offline and writes its artifact
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "e.jsonl")
+            rc = _run([STARTUP, "--reflex", "scripted", "--strategy", "off",
+                       "--deepseek-price-in", "1", "--output", out])
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.exists(out))
+
+
 # ------------------------------------------------------------ startup fixture
 
 class StartupFixtureTest(unittest.TestCase):

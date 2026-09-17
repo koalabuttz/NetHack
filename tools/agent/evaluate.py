@@ -1125,6 +1125,15 @@ def run_evaluation(a) -> int:
     actions_index = load_actions_index(a.actions)
     decisions_file = load_decisions(a.decisions)
     config = _config_from_args(a)
+    # The evaluator shares the single validation authority with live autoplay
+    # (``ProviderConfig.validate``, which handles the campaign fields it does
+    # not own as ``None``): an out-of-range history pair count, a zero byte
+    # ceiling or a malformed tariff is rejected here, before any pass is
+    # constructed or any provider call is made, with no output artifact.
+    problem = config.validate()
+    if problem:
+        print("error: %s" % problem, file=sys.stderr)
+        return 2
     providers = _providers_for(a)
 
     passes: Dict[str, ReplayPass] = {}
