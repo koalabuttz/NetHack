@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional
 
 from . import protocol, state
 from .budget import Tariff
-from .directives import DirectiveSet, validate_directive_set
+from .directives import validate_directive_set
 from .worker import INVOCATION_MARKER
 
 

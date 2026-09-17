@@ -17,7 +17,7 @@ Pricing is *operator-configured*.  No tariff is invented: when none is set,
 no USD figure is asserted and the unknown-price exposure is counted instead.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 

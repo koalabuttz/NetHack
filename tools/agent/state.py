@@ -17,8 +17,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
 from . import protocol
-from .events import (Boundary, BoundaryDetector, HUNGER_STAGES,
-                     hunger_index, novel_descriptions)
+from .events import Boundary, BoundaryDetector, HUNGER_STAGES
 
 # Monster classes drawn with punctuation rather than a letter.  Taken from the
 # engine's public glyph table (include/defsym.h MONSYM entries): golem ('),
