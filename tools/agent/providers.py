@@ -248,6 +248,38 @@ def default_worker_argv() -> List[str]:
             "--invoke", INVOCATION_MARKER]
 
 
+# Environment names a provider worker may inherit.  This is an allowlist by
+# construction, mirroring the game child's: a sticky credential in the
+# operator's shell cannot reach the worker, and the selected API key travels
+# *only* in the stdin job (never argv, never an env var of the worker).
+_WORKER_ENV_ALLOW = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
+                     "SYSTEMROOT", "TZ")
+_WORKER_ENV_DEFAULTS = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8",
+                        "LC_ALL": "C.UTF-8"}
+_SECRET_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+
+
+def worker_env(source=None) -> Dict[str, str]:
+    """The minimal, allowlisted environment for a provider worker.
+
+    Only the runtime names in :data:`_WORKER_ENV_ALLOW` survive, anything
+    whose name still looks like a credential is dropped, and a missing PATH
+    or locale falls back to a fixed default.  The credential the worker needs
+    for one call is passed in the stdin job, not the environment.
+    """
+    source = os.environ if source is None else source
+    env = {}
+    for name in _WORKER_ENV_ALLOW:
+        if name in source:
+            env[name] = source[name]
+    for name, value in _WORKER_ENV_DEFAULTS.items():
+        env.setdefault(name, value)
+    for name in list(env):
+        if any(marker in name.upper() for marker in _SECRET_MARKERS):
+            del env[name]
+    return env
+
+
 def _project_root() -> str:
     here = os.path.dirname(os.path.abspath(__file__))          # tools/agent
     return os.path.dirname(os.path.dirname(here))
@@ -257,9 +289,14 @@ class _WorkerSupervisor(object):
     """Own one provider worker process: deadline, kill, reap, cooldown.
 
     The parent owns the wall deadline.  A watchdog fires at the deadline and
-    escalates TERM -> KILL across the worker's process group; ``poll`` then
+    escalates TERM -> KILL across the worker's *process group*; ``poll`` then
     collects whatever the worker managed to write.  The process is always
     reaped, so a hung DNS lookup or a slow-drip read cannot accumulate.
+
+    The group id is captured at spawn, not re-derived from the leader at
+    signal time: a worker that forks a child and then exits on TERM leaves no
+    leader to resolve the group from, so escalation assesses the *group*
+    independently and KILLs any survivor before declaring teardown.
     """
 
     def __init__(self, argv: List[str], cwd: Optional[str] = None,
@@ -269,6 +306,7 @@ class _WorkerSupervisor(object):
         self.max_bytes = int(max_bytes)
         self.grace = grace
         self.proc = None
+        self._pgid = None
         self.timed_out = False
         self.kill_failed = False
         self.latency = 0.0
@@ -285,12 +323,14 @@ class _WorkerSupervisor(object):
 
     def start(self, job: dict, deadline: float) -> None:
         payload = (json.dumps(job) + "\n").encode("utf-8")
-        env = dict(os.environ)
+        env = worker_env()
         self._t0 = time.monotonic()
         self.proc = subprocess.Popen(
             self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, cwd=self.cwd, env=env,
             start_new_session=True)
+        # Capture the owned group now: the leader may be gone by signal time.
+        self._pgid = _pgid_of(self.proc.pid)
         reader = threading.Thread(target=self._read, daemon=True)
         reader.start()
         self._reader = reader
@@ -321,10 +361,7 @@ class _WorkerSupervisor(object):
         except (OSError, ValueError):
             self._err = []
         self._close_pipes()
-        try:
-            self.proc.wait(timeout=5)
-        except Exception:                    # noqa: BLE001
-            pass
+        self._reap_child(self.proc, 5)
         self._done.set()
 
     def _close_pipes(self) -> None:
@@ -338,23 +375,30 @@ class _WorkerSupervisor(object):
             except (OSError, ValueError):
                 pass
 
+    @staticmethod
+    def _reap_child(proc, timeout: float) -> None:
+        try:
+            proc.wait(timeout=timeout)
+        except Exception:                    # noqa: BLE001 - bounded reap
+            pass
+
     def _watchdog(self) -> None:
         with self._lock:
             proc = self.proc
-            if proc is None or proc.poll() is not None:
+            if proc is None:
+                return
+            pgid = self._pgid
+            if proc.poll() is not None and _group_gone(pgid):
                 return
             self.timed_out = True
-            _kill_group(proc, signal.SIGTERM)
-            try:
-                proc.wait(timeout=self.grace)
-                return
-            except subprocess.TimeoutExpired:
-                pass
-            _kill_group(proc, signal.SIGKILL)
-            try:
-                proc.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                self.kill_failed = True
+            _signal_group(pgid, proc, signal.SIGTERM)
+            self._reap_child(proc, self.grace)
+            if not _group_gone(pgid):
+                # a descendant survived the leader: kill the group, not the
+                # (already-exited) leader
+                _signal_group(pgid, proc, signal.SIGKILL)
+                if not _group_gone(pgid, 2.0):
+                    self.kill_failed = True
 
     def wait(self, timeout: Optional[float] = None) -> bool:
         return self._done.wait(None if timeout is None else max(0.0, timeout))
@@ -405,31 +449,29 @@ class _WorkerSupervisor(object):
     def cancel(self) -> None:
         with self._lock:
             proc = self.proc
-            if proc is None:
-                return
-            if proc.poll() is None:
-                _kill_group(proc, signal.SIGTERM)
-                try:
-                    proc.wait(timeout=self.grace)
-                except subprocess.TimeoutExpired:
-                    _kill_group(proc, signal.SIGKILL)
-                    try:
-                        proc.wait(timeout=2.0)
-                    except subprocess.TimeoutExpired:
-                        self.kill_failed = True
+            if proc is not None:
+                pgid = self._pgid
+                if proc.poll() is None or not _group_gone(pgid):
+                    _signal_group(pgid, proc, signal.SIGTERM)
+                    self._reap_child(proc, self.grace)
+                    if not _group_gone(pgid):
+                        _signal_group(pgid, proc, signal.SIGKILL)
+                        if not _group_gone(pgid, 2.0):
+                            self.kill_failed = True
         self._cancel_timer()
         self._done.set()
 
     def reap(self) -> None:
         self._cancel_timer()
         with self._lock:
-            if self.proc is not None and self.proc.poll() is None \
-                    and not self.kill_failed:
-                _kill_group(self.proc, signal.SIGKILL)
-                try:
-                    self.proc.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    self.kill_failed = True
+            proc = self.proc
+            if proc is not None:
+                pgid = self._pgid
+                if proc.poll() is None or not _group_gone(pgid):
+                    _signal_group(pgid, proc, signal.SIGKILL)
+                    self._reap_child(proc, 2.0)
+                    if not _group_gone(pgid, 2.0):
+                        self.kill_failed = True
         self._close_pipes()
 
     def _cancel_timer(self) -> None:
@@ -438,14 +480,48 @@ class _WorkerSupervisor(object):
             self._timer = None
 
 
-def _kill_group(proc, sig) -> None:
+def _pgid_of(pid) -> int:
+    """The owned process-group id for a spawned worker (or its pid)."""
     try:
-        os.killpg(os.getpgid(proc.pid), sig)
-    except (OSError, ProcessLookupError):
+        return os.getpgid(pid)
+    except (ProcessLookupError, PermissionError, OSError):
+        return pid
+
+
+def _group_gone(pgid, timeout: float = 0.0) -> bool:
+    """True once no process remains in *pgid* (assessed independently of the
+    leader, which may have exited long ago)."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        if pgid is None:
+            return True
         try:
-            proc.send_signal(sig)
-        except (OSError, ProcessLookupError, ValueError):
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        except OSError:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+
+
+def _signal_group(pgid, proc, sig) -> None:
+    """Signal the whole owned group; fall back to the direct worker."""
+    if pgid is not None:
+        try:
+            os.killpg(pgid, sig)
+            return
+        except ProcessLookupError:
+            return
+        except OSError:
             pass
+    try:
+        proc.send_signal(sig)
+    except (OSError, ProcessLookupError, ValueError):
+        pass
 
 
 # --------------------------------------------------------------- secrets
