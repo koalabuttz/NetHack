@@ -202,6 +202,14 @@ class Controller(object):
         results = []
         for i in range(1, episodes + 1):
             results.append(self.run_episode(i))
+        # A compact, secret-free rollup of the campaign, written next to the
+        # per-episode recordings.  Failure to write it must not lose the
+        # episode results, so it is best-effort after the run.
+        try:
+            write_campaign_summary(self.output_dir, results, self.config,
+                                   self.episode_timeout)
+        except OSError:
+            pass
         return results
 
     def run_episode(self, index: int) -> EpisodeResult:
@@ -1503,3 +1511,90 @@ def _safe_config(config: ProviderConfig) -> dict:
         "usd_cap": getattr(config, "usd_cap", None),
         "token_cap": getattr(config, "token_cap", None),
     }
+
+
+def episode_ok(r: EpisodeResult) -> bool:
+    """The campaign success predicate for one episode.
+
+    ``closed`` alone is best-effort evidence, not proof: success also requires
+    a clean spawn, no forced kill or teardown failure, no unanswered request,
+    no protocol/transport/deadline failure, a zero launcher exit status and a
+    complete recording.  This is the single authority the CLI
+    (``tools.agent.__main__``) re-exports, so the campaign summary and the CLI
+    verdict cannot disagree.
+    """
+    return (r.spawn_ok and r.closed and not r.forced_kill and not r.eof
+            and not r.unanswered and not r.teardown_failure
+            and r.protocol_failure is None and r.failure_reason is None
+            and r.returncode == 0 and r.recording_complete)
+
+
+def _episode_summary(r: EpisodeResult) -> dict:
+    usage = (r.budget or {}).get("usage", {}) if r.budget else {}
+    return {
+        "index": r.index,
+        "ok": episode_ok(r),
+        "stop_reason": r.stop_reason,
+        "outcome": r.outcome,
+        "closed": r.closed, "eof": r.eof, "forced_kill": r.forced_kill,
+        "unanswered": r.unanswered,
+        "recording_complete": r.recording_complete,
+        "returncode": r.returncode,
+        "protocol_failure": r.protocol_failure,
+        "failure_reason": r.failure_reason,
+        "ticks": r.ticks, "needs": r.needs, "actions": r.actions,
+        "invalids": r.invalids,
+        "boundaries": r.boundaries, "strategy_calls": r.strategy_calls,
+        "directives_applied": r.directives_applied,
+        "usage": {
+            "prompt_tokens": usage.get("prompt_tokens", 0),
+            "completion_tokens": usage.get("completion_tokens", 0),
+            "estimated_usd": usage.get("estimated_usd", 0.0),
+            "unknown_price_calls": usage.get("unknown_price_calls", 0),
+        },
+    }
+
+
+def campaign_summary(results, config, episode_timeout: float) -> dict:
+    """A compact, secret-free rollup of one campaign's episodes."""
+    episodes = [_episode_summary(r) for r in results]
+    totals = {"ticks": 0, "needs": 0, "actions": 0, "invalids": 0,
+              "boundaries": 0, "strategy_calls": 0, "directives_applied": 0,
+              "prompt_tokens": 0, "completion_tokens": 0,
+              "estimated_usd": 0.0}
+    for e in episodes:
+        for key in ("ticks", "needs", "actions", "invalids", "boundaries",
+                    "strategy_calls", "directives_applied"):
+            totals[key] += e[key]
+        totals["prompt_tokens"] += e["usage"]["prompt_tokens"]
+        totals["completion_tokens"] += e["usage"]["completion_tokens"]
+        totals["estimated_usd"] = round(
+            totals["estimated_usd"] + e["usage"]["estimated_usd"], 6)
+    successes = sum(1 for e in episodes if e["ok"])
+    return {
+        "schema": 1,
+        "episodes": len(episodes),
+        "episodes_success": successes,
+        "episodes_failed": len(episodes) - successes,
+        "episode_timeout": episode_timeout,
+        "config": _safe_config(config),
+        "totals": totals,
+        "results": episodes,
+    }
+
+
+def write_campaign_summary(output_dir: str, results, config,
+                           episode_timeout: float) -> str:
+    """Write ``campaign.json`` into *output_dir* at 0600; return its path."""
+    ensure_private_dir(output_dir)
+    path = os.path.join(output_dir, "campaign.json")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except (AttributeError, OSError):
+        pass
+    with os.fdopen(fd, "w") as fh:
+        json.dump(campaign_summary(results, config, episode_timeout), fh,
+                  indent=2, sort_keys=True)
+        fh.write("\n")
+    return path

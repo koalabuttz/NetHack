@@ -16,7 +16,7 @@ import argparse
 import os
 import sys
 
-from .controller import Controller, ControllerPaths
+from .controller import Controller, ControllerPaths, episode_ok
 from .providers import ProviderConfig, reflex_provider, strategy_provider
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(
@@ -133,20 +133,6 @@ def _config_from_args(a) -> ProviderConfig:
         low_confidence_needs=a.low_confidence_needs)
 
 
-def episode_ok(r) -> bool:
-    """The campaign success predicate for one episode.
-
-    ``closed`` alone is best-effort evidence, not proof: success also requires
-    a clean spawn, no forced kill or teardown failure, no unanswered request,
-    no protocol/transport/deadline failure, a zero launcher exit status and a
-    complete recording.
-    """
-    return (r.spawn_ok and r.closed and not r.forced_kill and not r.eof
-            and not r.unanswered and not r.teardown_failure
-            and r.protocol_failure is None and r.failure_reason is None
-            and r.returncode == 0 and r.recording_complete)
-
-
 def validate_args(a):
     """Reject an invalid configuration *before* any episode starts.
 
@@ -219,6 +205,8 @@ def cmd_auto(a) -> int:
             print("  stderr tail: %s" % r.stderr_tail.strip()
                   .replace("\n", " | ")[-300:])
     print("campaign: %d episode(s), %d failure(s)" % (len(results), failures))
+    print("campaign summary: %s"
+          % os.path.join(a.output_dir, "campaign.json"))
     return 1 if failures else 0
 
 
