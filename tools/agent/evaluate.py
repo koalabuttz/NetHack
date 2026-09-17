@@ -1076,9 +1076,15 @@ def run_evaluation(a) -> int:
     ordered_keys: List[Tuple[int, int]] = []
     for d in primary.decisions:
         rec = dict(d)
+        # Only *answered* rows index a need: rejected retry attempts share
+        # the same (seq,id) and would otherwise overwrite the answered row,
+        # losing its comparison/recorded-decision attachments.
         if d.get("record") == "need" \
+                and d.get("selected") is not None \
                 and d.get("need", {}).get("id") is not None:
             key = (d["need"]["seq"], d["need"]["id"])
+            if key in by_key:
+                continue        # one answered row per need
             rec["candidates"] = {}
             by_key[key] = rec
             ordered_keys.append(key)
@@ -1088,7 +1094,7 @@ def run_evaluation(a) -> int:
         if name == providers[0]:
             continue
         for d in p.decisions:
-            if d.get("record") != "need":
+            if d.get("record") != "need" or d.get("selected") is None:
                 continue
             key = (d.get("need", {}).get("seq"), d.get("need", {}).get("id"))
             rec = by_key.get(key)

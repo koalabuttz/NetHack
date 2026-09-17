@@ -475,6 +475,69 @@ class RetryGroundTruthTest(unittest.TestCase):
         self.assertEqual(ag["total"], 1)
         self.assertEqual(ag["agree"], 0)
 
+    def test_retry_rows_do_not_shadow_the_answered_row(self):
+        """Medium: rejected retry rows must not overwrite the answered row
+        in the per-need merge, for comparison providers and recorded
+        decisions alike."""
+        sel = self._probe()
+        other = self._other_key(sel)
+        with tempfile.TemporaryDirectory() as d:
+            wire = os.path.join(d, "ep.wire.jsonl")
+            acts = os.path.join(d, "ep.actions.jsonl")
+            decs = os.path.join(d, "ep.decisions.jsonl")
+            out = os.path.join(d, "e.jsonl")
+            with open(wire, "wb") as fh:
+                fh.writelines(self._wire())
+            with open(acts, "w") as fh:
+                for a in (sel, other):
+                    fh.write(json.dumps({
+                        "kind": "act", "status": "sent",
+                        "need": {"episode": 1, "seq": 1, "id": 1},
+                        "action": a}) + "\n")
+            with open(decs, "w") as fh:
+                fh.write(json.dumps({
+                    "record": "decision", "provider": "scripted",
+                    "need": {"episode": 1, "seq": 1, "id": 1},
+                    "selected": other}) + "\n")
+            rc = _run([wire, "--reflex", "scripted", "--strategy", "off",
+                       "--actions", acts, "--decisions", decs,
+                       "--provider", "jev", "--output", out])
+            self.assertEqual(rc, 0)
+            records = _read(out)
+        # two needs on this wire (id 1 rejected then re-issued as id 2):
+        # both answered, neither shadowed by the rejected retry row
+        answered = {r["need"]["id"]: r for r in records
+                    if r.get("record") == "need"
+                    and r.get("selected") is not None}
+        rejected = [r for r in records if r.get("record") == "need"
+                    and str(r.get("reason", "")).startswith("invalid:")]
+        self.assertEqual(len(answered), 2)
+        self.assertEqual(len(rejected), 1)
+        a1 = answered[1]                         # the retried need
+        a2 = answered[2]
+        r = rejected[0]
+        # (1) need 1's ground truth is the accepted (second) attempt
+        self.assertEqual(a1["actual_action"], other)
+        self.assertEqual(a1["actual_action_source"], "sidecar")
+        # (2) the answered rows -- not the invalid row -- carry the
+        # comparison candidate; need 1 also carries the recorded decision
+        self.assertIn("jev", a1.get("candidates", {}))
+        self.assertIn("jev", a2.get("candidates", {}))
+        self.assertIn("recorded", a1)
+        # the recorded decision (the accepted 46) honestly disagrees with
+        # the scripted candidate's search (115) on this synthetic wire
+        self.assertEqual(a1["recorded"]["selected"], other)
+        self.assertFalse(a1["recorded"]["agreement"])
+        self.assertNotIn("recorded", a2)         # no sidecar truth for id 2
+        # (3) the rejected row keeps its own metadata, no attachments
+        self.assertEqual(r["rejected_action"], sel)
+        self.assertNotIn("candidates", r)
+        self.assertNotIn("recorded", r)
+        # (4) aggregates: one known actual (need 1), one agreement entry
+        summary = [x for x in records if x.get("record") == "summary"][-1]
+        self.assertEqual(summary["actual_known"], 1)
+        self.assertEqual(summary["agreement"]["scripted"]["total"], 1)
+
 
 # ------------------------------------------------- page strictness (L5)
 
