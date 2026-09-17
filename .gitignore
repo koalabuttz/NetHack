@@ -101,3 +101,7 @@ sys/amiga/regex/
 
 # the trusted agent launcher, built alongside src/nethack
 src/nethack-agent
+
+# local build/run artifacts from agent development
+build.log
+playground/
