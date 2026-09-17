@@ -11,6 +11,11 @@ evaluation"):
   * ``ep-N.decisions.jsonl`` -- what the policy proposed, the provider that
                                 answered, fallback reasons, boundaries,
                                 latency and usage;
+  * ``ep-N.events.jsonl``    -- the schema-versioned event-lifecycle ledger:
+                                one record per boundary EID (detected ->
+                                queued -> dispatched -> one terminal state,
+                                with ticks and levels) and per directive
+                                activation/expiry;
   * ``ep-N.meta.json``       -- schema versions, allowlisted configuration,
                                 completeness and outcome/stop-reason.
 
@@ -32,6 +37,7 @@ import time
 SCHEMA_WIRE = 1
 SCHEMA_ACTIONS = 1
 SCHEMA_DECISIONS = 1
+SCHEMA_EVENTS = 1
 SCHEMA_META = 1
 
 _STOP = object()
@@ -149,8 +155,9 @@ class EpisodeRecorder(object):
         self.wire_path = base + ".wire.jsonl"
         self.actions_path = base + ".actions.jsonl"
         self.decisions_path = base + ".decisions.jsonl"
+        self.events_path = base + ".events.jsonl"
         self.meta_path = base + ".meta.json"
-        # Construct all three writers before starting any of them.  A writer
+        # Construct all four writers before starting any of them.  A writer
         # that cannot be opened at 0600 fails closed: every writer already
         # constructed is released, in reverse order, so a per-episode
         # construction failure cannot leak the descriptors it already holds.
@@ -162,6 +169,8 @@ class EpisodeRecorder(object):
             opened.append(self._acts)
             self._decs = _Writer(self.decisions_path, maxsize)
             opened.append(self._decs)
+            self._evs = _Writer(self.events_path, maxsize)
+            opened.append(self._evs)
         except OSError:
             for w in reversed(opened):
                 w.shutdown()
@@ -173,6 +182,7 @@ class EpisodeRecorder(object):
         self.wire_lines = 0
         self.actions = 0
         self.decisions = 0
+        self.events = 0
         self.started = time.time()
 
     @property
@@ -185,7 +195,7 @@ class EpisodeRecorder(object):
         """
         if self.incomplete:
             return True
-        for w in (self._wire, self._acts, self._decs):
+        for w in (self._wire, self._acts, self._decs, self._evs):
             if w.error is not None or w.dropped:
                 return True
         return False
@@ -224,15 +234,28 @@ class EpisodeRecorder(object):
         if not self._decs.submit(_json_line(obj)):
             self.incomplete = True
 
+    def record_event(self, obj) -> None:
+        """Append one schema-versioned event-lifecycle record.
+
+        The controller writes one record per boundary EID (its detected /
+        queued / dispatched / terminal steps) and per directive activation or
+        expiry.  Keeping this in its own sidecar leaves the deterministic
+        lifecycle fields separate from the wall-clock ``t`` timestamps in the
+        other streams, so a replay comparison can drop timing exactly.
+        """
+        self.events += 1
+        if not self._evs.submit(_json_line(obj)):
+            self.incomplete = True
+
     # -- shutdown --------------------------------------------------------
     def finalize(self, meta):
         statuses = []
-        for w in (self._wire, self._acts, self._decs):
+        for w in (self._wire, self._acts, self._decs, self._evs):
             statuses.append(w.shutdown())
             if w.error is not None or w.dropped or w.alive \
                     or statuses[-1] != "drained":
                 self.incomplete = True
-        # "complete" is claimed only when all three streams actually drained
+        # "complete" is claimed only when all four streams actually drained
         full = {
             "schema": SCHEMA_META,
             "episode": self.episode,
@@ -242,10 +265,12 @@ class EpisodeRecorder(object):
             "wire_bytes": self.wire_bytes,
             "actions": self.actions,
             "decisions": self.decisions,
+            "events": self.events,
             "files": {
                 "wire": os.path.basename(self.wire_path),
                 "actions": os.path.basename(self.actions_path),
                 "decisions": os.path.basename(self.decisions_path),
+                "events": os.path.basename(self.events_path),
             },
         }
         full.update(meta or {})

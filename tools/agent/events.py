@@ -21,11 +21,20 @@ States an event can be in -- all observable in tests:
   ``suppressed``  dropped by cooldown/cap/policy before it was dispatched
   ``expired``     stale before it could be applied (level changed, etc.)
   ``applied``     its directives were activated by the reflex tier
+
+:class:`EventLedger` persists that lifecycle per event id -- one record per
+detected boundary, with the deterministic tick/level of each transition, the
+coalesced members of its pending set and every reason it carried.  Wall-clock
+timing lives under a separate ``wall`` map so a replay comparison can drop it.
 """
 
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+# Schema version of a persisted event-lifecycle record (``EP-EVENTS``).
+EVENT_SCHEMA = 1
 
 # The engine's hunger ladder, weakest to worst.  "Worsening" is an increase
 # in this index, so a snapshot that merely repeats the same word is not an
@@ -249,16 +258,90 @@ class PendingBoundary(object):
         self.tick = tick
 
 
+class EventLedger(object):
+    """Per-EID boundary lifecycle, schema-versioned and replay-stable.
+
+    Every detected boundary gets exactly one record tracing its transitions.
+    ``detected`` -> ``queued`` -> ``dispatched`` -> one *terminal* state
+    (``applied``/``expired``/``suppressed``).  Each transition carries the
+    deterministic displayed ``tick`` and dungeon ``level``; the raw wall
+    clock is confined to a separate ``wall`` map so a replay comparison over
+    the deterministic fields stays exact.
+    """
+
+    def __init__(self) -> None:
+        self.records: Dict[str, Dict[str, Any]] = {}
+        self.order: List[str] = []
+
+    def _rec(self, eid: str) -> Dict[str, Any]:
+        rec = self.records.get(eid)
+        if rec is None:
+            rec = {"schema": EVENT_SCHEMA, "record": "boundary", "eid": eid,
+                   "kind": "", "detail": "", "severe": False, "reasons": [],
+                   "detected": None, "queued": None, "dispatched": None,
+                   "terminal": None, "coalesced_with": [], "wall": {}}
+            self.records[eid] = rec
+            self.order.append(eid)
+        return rec
+
+    def detect(self, boundary: "Boundary", tick: int,
+               level: str = "") -> None:
+        """Record one boundary the detector emitted this observation."""
+        rec = self._rec(boundary.eid)
+        if not rec["kind"]:
+            rec["kind"] = boundary.reason
+        rec["detail"] = boundary.detail
+        rec["severe"] = bool(boundary.severe)
+        rec["detected"] = {"tick": tick, "level": level}
+        rec["reasons"].append(boundary.reason)
+
+    def transition(self, state: str, eid: str, reason: str, tick: int,
+                   level: str = "", wall: float = 0.0) -> None:
+        """Record one lifecycle step for *eid* (creating it if unseen)."""
+        rec = self._rec(eid)
+        if state == "queued" and not rec["kind"]:
+            rec["kind"] = reason
+        rec["reasons"].append(reason)
+        rec["wall"][state] = round(wall, 6)
+        if state in ("queued", "dispatched"):
+            rec[state] = {"tick": tick, "level": level}
+        elif state in ("applied", "expired", "suppressed"):
+            rec["terminal"] = {"state": state, "tick": tick, "level": level,
+                               "reason": reason}
+
+    def coalesce(self, eids: Sequence[str]) -> None:
+        """Record that *eids* were merged into one pending request."""
+        group = list(eids)
+        for eid in group:
+            self._rec(eid)["coalesced_with"] = [e for e in group if e != eid]
+
+    def as_list(self) -> List[Dict[str, Any]]:
+        return [self.records[eid] for eid in self.order]
+
+
+def directive_event(ev: Dict[str, Any]) -> Dict[str, Any]:
+    """Wrap one :class:`DirectiveBook` lifecycle event as a ledger record."""
+    out = {"schema": EVENT_SCHEMA, "record": "directive"}
+    out.update(ev)
+    return out
+
+
 class BoundaryQueue(object):
     """Coalesce detected boundaries and rate-limit dispatch to the
     strategy."""
 
     def __init__(self, cooldown_ticks: int = 50, cooldown_wall: float = 5.0,
-                 emergency_wall: float = 2.0, ledger=None) -> None:
+                 emergency_wall: float = 2.0, ledger=None, event_ledger=None,
+                 clock=time.monotonic) -> None:
         self.cooldown_ticks = int(cooldown_ticks)
         self.cooldown_wall = float(cooldown_wall)
         self.emergency_wall = float(emergency_wall)
         self.ledger = ledger
+        self.event_ledger = event_ledger
+        self.clock = clock
+        self._t0 = clock()
+        self.tick = 0
+        self.level = ""
         self.pending: Optional[PendingBoundary] = None
         self.in_flight: Optional[PendingBoundary] = None
         self.last_dispatch_tick: Optional[int] = None
@@ -270,6 +353,9 @@ class BoundaryQueue(object):
                level: str = "") -> List[str]:
         """Coalesce *boundaries* into the pending set; return queued eids."""
         queued: List[str] = []
+        self.tick = tick
+        if level:
+            self.level = level
         for b in boundaries:
             if self.pending is None:
                 self.pending = PendingBoundary(tick=tick, level=level)
@@ -277,6 +363,8 @@ class BoundaryQueue(object):
             self.pending.level = level or self.pending.level
             queued.append(b.eid)
             self._log("queued", b.eid, b.reason)
+        if queued and self.event_ledger is not None:
+            self.event_ledger.coalesce(queued)
         return queued
 
     # -- dispatch --------------------------------------------------------
@@ -308,17 +396,18 @@ class BoundaryQueue(object):
         self.pending = None
         self.last_dispatch_tick = tick
         self.last_dispatch_wall = now
+        self.tick = tick
         for eid in self.in_flight.eids:
             self._log("dispatched", eid, "dispatch")
         return self.in_flight
 
-    def finish(self, applied: bool) -> None:
+    def finish(self, applied: bool, reason: str = "strategy result") -> None:
         """Settle the in-flight set (applied) or discard it."""
         if self.in_flight is None:
             return
         state = "applied" if applied else "expired"
         for eid in self.in_flight.eids:
-            self._log(state, eid, "strategy result")
+            self._log(state, eid, reason)
         self.in_flight = None
 
     # -- suppression / expiry -------------------------------------------
@@ -346,9 +435,13 @@ class BoundaryQueue(object):
 
     # -- bookkeeping -----------------------------------------------------
     def _log(self, state: str, eid: str, reason: str) -> None:
-        self.events.append({"state": state, "eid": eid, "reason": reason})
+        self.events.append({"state": state, "eid": eid, "reason": reason,
+                            "tick": self.tick, "level": self.level})
         if self.ledger is not None:
             self.ledger.note_boundary(state)
+        if self.event_ledger is not None:
+            self.event_ledger.transition(state, eid, reason, self.tick,
+                                         self.level, self.clock() - self._t0)
 
     def states(self) -> Dict[str, List[str]]:
         out: Dict[str, List[str]] = {}

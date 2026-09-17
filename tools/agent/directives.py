@@ -208,14 +208,19 @@ class DirectiveBook(object):
         self._active = dset
         self.activated_tick = tick
         self.level = level
-        self._log("applied", reason)
+        self._log("applied", reason, tick, level, dset.to_dict())
 
-    def expire(self, reason: str) -> None:
+    def expire(self, reason: str, tick: Optional[int] = None,
+               level: Optional[str] = None) -> None:
         if self._active is not None:
+            if tick is None:
+                tick = self.activated_tick
+            if level is None:
+                level = self.level
             self._active = None
             self.activated_tick = None
             self.level = None
-            self._log("expired", reason)
+            self._log("expired", reason, tick, level)
 
     def active(self, tick: int, level: Optional[str],
                st: PreconditionState) -> Optional[DirectiveSet]:
@@ -230,15 +235,15 @@ class DirectiveBook(object):
             return None
         if self.level is not None and level is not None \
                 and level != self.level:
-            self.expire("level-changed")
+            self.expire("level-changed", tick, level)
             return None
         if self.activated_tick is not None:
             age = tick - self.activated_tick
             if age > self._active.ttl:
-                self.expire("ttl-expired")
+                self.expire("ttl-expired", tick, level)
                 return None
         if not preconditions_met(self._active, st):
-            self.expire("precondition-failed")
+            self.expire("precondition-failed", tick, level)
             return None
         return self._active
 
@@ -247,9 +252,14 @@ class DirectiveBook(object):
         dset = self.active(tick, level, st)
         return DirectiveView(dset, self.generation if dset else 0)
 
-    def _log(self, state: str, reason: str) -> None:
-        self.events.append({"state": state, "reason": reason,
-                            "generation": self.generation})
+    def _log(self, state: str, reason: str, tick: Optional[int] = None,
+             level: Optional[str] = None,
+             directive: Optional[Dict[str, Any]] = None) -> None:
+        ev = {"state": state, "reason": reason, "generation": self.generation,
+              "tick": tick, "level": level}
+        if directive is not None:
+            ev["directive"] = directive
+        self.events.append(ev)
 
 
 class DirectiveView(object):
