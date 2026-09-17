@@ -977,6 +977,37 @@ class TestScriptedReflexSafety(unittest.TestCase):
                                        title="What do you want to eat?"))
         self.assertEqual(res.action["commit"], [[2, -1]])
 
+    def test_counted_and_plural_food_stacks_are_recognised(self):
+        # Medium 9: a displayed leading count and the exact plural of an
+        # allowlisted name are recognised, so a real stack stays edible.
+        for text in ("2 food rations", "d - 2 food rations", "2 apples",
+                     "3 bananas", "f: 12 oranges", "a - 2 food rations",
+                     "an egg", "egg"):
+            self.assertTrue(state.is_known_safe_food(text), text)
+        # ... while a qualified egg, a corpse or tin, and a lookalike stay
+        # unsafe even when counted
+        for text in ("2 cockatrice eggs", "cockatrice egg", "kobold egg",
+                     "2 eggs", "a kobold corpse", "a tin of spinach",
+                     "banana peel", "applesauce"):
+            self.assertFalse(state.is_known_safe_food(text), text)
+
+    def test_inventory_food_rows_include_counted_stacks(self):
+        # Medium 9: the inventory row path (and its letters) sees the stack.
+        self.mem.inventory.refresh([row(0, "a - 2 food rations"),
+                                    row(1, "b - 2 apples"),
+                                    row(2, "c - 2 cockatrice eggs")], 0, 0)
+        self.assertEqual([r["r"] for r in self.mem.inventory.food_rows()],
+                         [0, 1])
+        self.assertEqual(self.mem.inventory.food_letters(), ["a", "b"])
+
+    def test_eat_menu_commits_a_counted_stack_row(self):
+        # Medium 9: the eat-intent menu path commits the real stack row.
+        self.ref.intent = "eat"
+        rows = [row(7, "a kobold corpse"), row(2, "2 food rations")]
+        res = self.ref.decide(self.ctx(menu_need(1, "m1", "c1"), rows,
+                                       title="What do you want to eat?"))
+        self.assertEqual(res.action["commit"], [[2, -1]])
+
     def test_low_hp_on_upstairs_returns_a_valid_ascend_action(self):
         # Medium 6: the upstairs withdrawal is a structurally valid action,
         # so arbitration cannot silently replace ascend with a wait.

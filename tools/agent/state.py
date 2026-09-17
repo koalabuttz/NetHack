@@ -51,23 +51,46 @@ KNOWN_SAFE_FOOD = ("food ration", "ration", "apple", "banana", "orange",
                    "tripe", "egg")
 UNSAFE_FOOD_MARKERS = ("corpse", "tinned", "unknown", "glop")
 
-# A leading inventory-letter / selection prefix ("d - ", "a) ", "f: ") and a
-# leading article are stripped before an item name is compared, so the row
-# text the engine prints still matches the bare name.  Matching is then exact
-# (or a whole trailing phrase), never a substring: "cockatrice egg" must not
-# be accepted just because it ends in a safe word.
+# A leading inventory-letter / selection prefix ("d - ", "a) ", "f: "), a
+# displayed stack count ("2 ") and a leading article are stripped before an
+# item name is compared, so the row text the engine prints still matches the
+# bare name.  Matching is then exact (or a whole trailing phrase), never a
+# substring: "cockatrice egg" must not be accepted just because it ends in a
+# safe word.
 _FOOD_PREFIX_RE = re.compile(r"^[A-Za-z0-9][\s\.\-\)\*:]+")
+_FOOD_COUNT_RE = re.compile(r"^\d+\s+")
 _FOOD_ARTICLES = ("a ", "an ", "the ")
 
 
+def _food_forms() -> frozenset:
+    """The allowlist extended with each item's displayed plural stack name.
+
+    Only the *exact* plural of an allowlisted name is added ("food rations",
+    "apples"), so a genuine counted stack is recognised while a name is never
+    singularised by a suffix rule -- an arbitrary string that merely ends in a
+    safe word still stays rejected.  The egg stays singular on purpose: only
+    the bare "egg" is ever assumed edible.
+    """
+    forms = set(KNOWN_SAFE_FOOD)
+    for name in KNOWN_SAFE_FOOD:
+        if name in ("egg", "lembas"):
+            continue
+        forms.add(name + "s")
+    return frozenset(forms)
+
+
+_KNOWN_SAFE_FORMS = _food_forms()
+
+
 def _food_name(text) -> str:
-    """The bare item name: no inventory prefix, no leading article."""
+    """The bare item name: no row prefix, no stack count, no article."""
     low = (text or "").strip().lower()
     low = _FOOD_PREFIX_RE.sub("", low, count=1)
+    low = _FOOD_COUNT_RE.sub("", low, count=1)
     for article in _FOOD_ARTICLES:
         if low.startswith(article):
-            return low[len(article):]
-    return low
+            return low[len(article):].strip()
+    return low.strip()
 
 
 def is_known_safe_food(text) -> bool:
@@ -79,15 +102,15 @@ def is_known_safe_food(text) -> bool:
         return False
     # an egg is safe only as the bare item: any egg qualified by a monster
     # name (a cockatrice egg, say) is potentially lethal and never assumed
-    # edible
+    # edible, and even the bare item is not matched in its plural form
     if "egg" in name:
         return name == "egg"
-    if name in KNOWN_SAFE_FOOD:
+    if name in _KNOWN_SAFE_FORMS:
         return True
     # a whole trailing phrase still counts (e.g. "tripe ration" ends in
     # "ration"), but a bare substring does not
     return any(known != "egg" and name.endswith(" " + known)
-               for known in KNOWN_SAFE_FOOD)
+               for known in _KNOWN_SAFE_FORMS)
 
 
 def passable(ch: str) -> bool:
