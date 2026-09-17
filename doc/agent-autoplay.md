@@ -43,15 +43,19 @@ environment alone never starts paid calls:
 ## Command line
 
 `--episodes N` (default 1)
-    how many independent episodes to run.
+    how many independent episodes to run.  Must be a positive integer; a
+    zero, negative or non-integer count is rejected rather than silently
+    running nothing.
 
 `--reflex scripted|jev` (default scripted)
     the reflex tier.  `scripted` is always available; `jev` requires
     `JEV_API_KEY`, `--i-accept-jev-terms` and `--jev-base-url`, and even then
-    only routes to the fake-endpoint-testable adapter (see "Providers").
+    only routes to the fake-endpoint-testable adapter (see "Providers").  Any
+    other value is rejected.
 
 `--strategy off|deepseek` (default off)
-    the strategy tier.  `off` is completely network-free.
+    the strategy tier.  `off` is completely network-free.  Any other value is
+    rejected.
 
 `--role ROLE` (default Valkyrie)
     the role the reflex selects at startup.
@@ -328,7 +332,10 @@ more call, paid dispatch is disabled for the rest of the episode.
 A **recorder failure** (full queue or disk error) triggers the graceful-stop
 policy: paid dispatch stops immediately, any in-flight worker is cancelled,
 and scripted play continues so the request obligation is still met -- the
-recording is marked incomplete rather than silently truncated.
+recording is marked incomplete rather than silently truncated.  Recorder
+health is re-checked after every write, including the event-ledger sink, so a
+failure first seen while persisting a lifecycle record disables paid dispatch
+before the next decision is made.
 
 ## Providers
 
@@ -379,7 +386,11 @@ Each episode writes five sidecars under `--output-dir`:
     record per boundary EID (`detected` -> `queued` -> `dispatched` -> one
     terminal state, with the tick and displayed level of each step, the
     coalesced members, and wall timing kept in a separate field) and one per
-    directive activation/expiry;
+    directive activation/expiry.  Records are written **incrementally** as
+    they finalise, so a long episode never bursts at the end: a boundary that
+    is detected but never queued (the shipped `--strategy off` default) is
+    finalised in the round that produced it with `terminal: null`, and the
+    in-memory detail window is capped while emission continues.
   * `ep-N.meta.json` — schema versions, allowlisted configuration, the stop
     reason, the visible outcome and the **budget ledger**.
 
