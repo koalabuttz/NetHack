@@ -117,7 +117,16 @@ reason: seeing `closed` alone does not prove death or victory.
     the original need — an `invalid` does not restart its deadline.
   * A malformed record (a JSON array, or a broken palette, map triple,
     window, cursor or need) ends **that** episode as a protocol failure; the
-    campaign continues with the next episode.
+    campaign continues with the next episode.  A need is validated in full --
+    per-kind required fields, types, bounds and reference patterns -- before
+    any of it is stored, so a dict-shaped need that is missing a field or out
+    of range fails one episode rather than the whole campaign.
+  * The controller's fallback for a gameplay command is never a rest: it is
+    reached only when the reflex fails, overruns its allowance or proposes
+    something invalid, and it carries no snapshot context, so it cannot prove
+    a rest safe.  It searches instead — the policy's own choice when rest is
+    unproven — so a fallback never holds position beside a monster, while
+    hungry, at low HP, or with the hero square unknown.
   * A game message such as `You don't have that object.` is distinct from
     wire `invalid`; the reflex carries a separate repeated-food breaker.
 
@@ -137,12 +146,16 @@ capability):
     unblocked means searching, routing around or changing plan, never a
     last-resort attack or a pet swap.  Visible traps, boulders and the
     punctuation monster classes (`'`, `&`, `;`, `:`, `~`, `]`) are avoided
-    too;
+    too, as is an `@` that is not on the hero's own known square -- the human
+    class is the hero *and* other humans, so identity is per cell;
   * **hunger** — answers the engine's `getobj` eat prompt with a valid
     inventory letter parsed out of the prompt text (the engine passes no
     machine-readable `choices` for that prompt), or opens the inventory
     menu, and after two equivalent rejected intents refreshes and changes
-    plan;
+    plan.  Only an allowlist of known-safe items is edible, with a displayed
+    stack count and the exact plural form of an allowlisted name recognised
+    ("2 food rations", "2 apples"); a qualified egg, a corpse or tin, and a
+    lookalike that merely ends in a safe word stay unsafe;
   * **loop breakers** — a move that never changes the hero's square
     escalates through search, a random move, then an unblock/rest step.
 
