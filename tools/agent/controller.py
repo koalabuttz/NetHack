@@ -963,12 +963,18 @@ class _EpisodeRunner(object):
         self.detected_boundaries = detected
         self.need_boundaries = detected
         self._note_detected(detected, st.dlvl)
-        if not detected:
-            return
-        self.ledger.note_boundary("detected", len(detected))
-        if not self._strategy_live():
-            return
-        self.boundary_queue.submit(detected, self.tick, st.dlvl)
+        if detected:
+            self.ledger.note_boundary("detected", len(detected))
+            if self._strategy_live():
+                self.boundary_queue.submit(detected, self.tick, st.dlvl)
+        # The queue only ever receives this round's set, so a boundary left
+        # unqueued here can never be queued later: finalise it now through the
+        # incremental sink (terminal=None -- detected-only, no invented
+        # terminal state) instead of holding it in EventLedger._open until the
+        # end-of-episode flush.  This is the shipped default (strategy="off")
+        # path, where nothing is ever queued.  Records that *were* queued are
+        # untouched: they finalise on dispatch/settlement as before.
+        self.event_ledger.flush_unqueued()
 
     def _note_detected(self, detected, level):
         """Record every detected boundary in the persisted lifecycle ledger.

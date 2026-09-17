@@ -2304,6 +2304,45 @@ class TestLifecyclePersistence(WireHarness):
         self.assertEqual(len(eids), len(set(eids)))      # no duplicates
         self.assertIn("closed", eids)
 
+    def test_detected_only_records_finalise_each_round(self):
+        # The shipped default (strategy="off") never queues a boundary, so a
+        # detected record must still be emitted incrementally -- not held in
+        # EventLedger._open until the end-of-episode flush.
+        cfg = ProviderConfig(max_ticks=2000, strategy="off",
+                             postmortem_reserve=0)
+        ctl = controller.Controller(
+            cfg, controller.ControllerPaths("w", "r", "d", "s"), self.dir,
+            episode_timeout=5.0)
+        result = controller.EpisodeResult(index=1)
+        rec = recording.EpisodeRecorder(self.dir, 1)
+        proc = paced([hello()], [0.0])
+        self.addCleanup(proc.close)
+        runner = controller._EpisodeRunner(ctl, proc, rec, result)
+        self.assertFalse(runner._strategy_live())
+        rounds, per_round = 8, 600           # 4800 > the 4096 retain cap
+        seen = []
+        for r in range(rounds):
+            batch = [events.Boundary("novelty-class",
+                                     "class:%d:%d" % (r, i))
+                     for i in range(per_round)]
+            seen.extend(b.eid for b in batch)
+            runner.mem.boundary.check = lambda *a, **k: list(batch)
+            runner.tick = r
+            runner._detect_boundaries()
+            # every detected record finalises in the round that produced it
+            self.assertEqual(runner.event_ledger._open, {})
+            self.assertLessEqual(len(runner.event_ledger._retained), 4096)
+        rec.finalize({})
+        self.assertGreater(runner.event_ledger.collapsed, 0)
+        recs = [r for r in _read_jsonl(
+                os.path.join(self.dir, "ep-1.events.jsonl"))
+                if r.get("record") == "boundary"]
+        eids = [r["eid"] for r in recs]
+        self.assertEqual(len(eids), rounds * per_round)
+        self.assertEqual(set(eids), set(seen))       # each eid exactly once
+        # detected-only semantics: no invented terminal state
+        self.assertTrue(all(r["terminal"] is None for r in recs))
+
 
 # ========================================== coalescing provenance (L6)
 
