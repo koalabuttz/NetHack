@@ -29,14 +29,33 @@ from typing import Any, Dict, List, Optional, Tuple
 
 @dataclass
 class Tariff(object):
-    """Operator-supplied per-million-token prices (USD)."""
+    """Operator-supplied per-million-token prices (USD).
+
+    ``cache_hit_per_mtok`` is *optional* and appended last so existing
+    two-positional-argument callers keep working.  When it is unset the
+    effective cache-hit price falls back to the full input price, which is the
+    conservative upper bound: a reservation that never discounts cached
+    tokens can never under-count the spend.  A configured cache-hit price
+    above the input price would break that invariant, so it is rejected rather
+    than silently clamped (see :func:`_check_tariff`).
+    """
 
     prompt_per_mtok: float
     completion_per_mtok: float
+    cache_hit_per_mtok: Optional[float] = None
+
+    def effective_cache_hit_per_mtok(self) -> float:
+        """The cache-hit price actually applied: configured, else input."""
+        if self.cache_hit_per_mtok is None:
+            return self.prompt_per_mtok
+        return self.cache_hit_per_mtok
 
     def to_dict(self) -> Dict[str, float]:
         return {"prompt_per_mtok": self.prompt_per_mtok,
-                "completion_per_mtok": self.completion_per_mtok}
+                "completion_per_mtok": self.completion_per_mtok,
+                "cache_hit_per_mtok": self.cache_hit_per_mtok,
+                "effective_cache_hit_per_mtok":
+                    self.effective_cache_hit_per_mtok()}
 
 
 def _finite_number(name: str, v) -> float:
@@ -72,7 +91,14 @@ def _nonneg_int(name: str, v) -> int:
 
 
 def _check_tariff(tariff) -> None:
-    """Reject a missing, incomplete, non-finite or negative tariff."""
+    """Reject a missing, incomplete, non-finite or negative tariff.
+
+    The cache-hit price is optional; when present it must be finite,
+    nonnegative and no greater than the input price.  That last rule is what
+    keeps the input price a valid upper bound for reservations -- a cache-hit
+    price above it would let a discount inflate a reservation, so the operator
+    is told rather than silently clamped.
+    """
     for field in ("prompt_per_mtok", "completion_per_mtok"):
         value = getattr(tariff, field, None)
         if value is None:
@@ -80,6 +106,19 @@ def _check_tariff(tariff) -> None:
                              "required" % field)
         if _finite_number("tariff.%s" % field, value) < 0:
             raise ValueError("tariff.%s must be nonnegative" % field)
+    hit = getattr(tariff, "cache_hit_per_mtok", None)
+    if hit is None:
+        return
+    hit = _finite_number("tariff.cache_hit_per_mtok", hit)
+    if hit < 0:
+        raise ValueError("tariff.cache_hit_per_mtok must be nonnegative")
+    if hit > _finite_number("tariff.prompt_per_mtok",
+                            tariff.prompt_per_mtok):
+        raise ValueError(
+            "tariff.cache_hit_per_mtok (%r) must not exceed "
+            "tariff.prompt_per_mtok (%r): the full input price is the "
+            "conservative fallback that keeps every reservation an upper "
+            "bound" % (hit, tariff.prompt_per_mtok))
 
 
 class BudgetLedger(object):
@@ -124,6 +163,16 @@ class BudgetLedger(object):
         self.completion_tokens = 0
         self.estimated_usd = 0.0
         self.unknown_price_calls = 0
+        # -- reported prompt-cache accounting ------------------------------
+        # A discount is granted only for a *complete, consistent* cache
+        # partition (H + M == P).  Anything else -- no cache metadata, a
+        # partial or contradictory report, a negative/bool/float field -- is
+        # priced at the full input price and counted as unclassified, so a
+        # high hit rate over thin reporting coverage cannot mislead.
+        self.cache_hit_tokens = 0
+        self.cache_miss_tokens = 0
+        self.cache_unclassified_tokens = 0
+        self.reasoning_tokens = 0
         # Exposure from committed calls that returned *no usage at all*: the
         # conservative bound is carried rather than dropped.
         self._reserved_bounds: List[Tuple[int, int]] = []
@@ -201,6 +250,19 @@ class BudgetLedger(object):
         reserved = sum(self._price(p, c) for p, c in self._reserved_bounds)
         return self.estimated_usd + self.unknown_estimated_usd + reserved
 
+    def cache_hit_rate(self) -> Optional[float]:
+        """Hit rate over *classified* tokens, or None when none are.
+
+        Measured as ``H / (H + M)``: unclassified prompt tokens are excluded
+        rather than fabricated as misses, so a high rate over thin reporting
+        coverage is not mistaken for a high rate over the whole prompt.  The
+        companion ``cache_unclassified_tokens`` field carries that coverage.
+        """
+        denom = self.cache_hit_tokens + self.cache_miss_tokens
+        if denom <= 0:
+            return None
+        return round(self.cache_hit_tokens / float(denom), 6)
+
     def strategy_available(self, postmortem: bool = False,
                            prompt_tokens: int = 0,
                            completion_tokens: int = 0) -> bool:
@@ -255,10 +317,12 @@ class BudgetLedger(object):
 
         The reservation was made before dispatch, so this always consumes it
         -- including a timeout that returned no usage.  Reported tokens are
-        added and, when a tariff is configured, priced.  A call that returned
-        no usage at all keeps its reserved bound as *unknown exposure*: the
-        spend was real even though no figure came back, so it is never
-        silently dropped.
+        added and, when a tariff is configured, priced.  A call whose reported
+        usage does not establish *both* prompt and completion totals retains
+        the conservative bound as *unknown exposure* for whichever component
+        is missing: the spend was real even though no figure came back for it,
+        so it is never silently dropped merely because some other field
+        arrived.
         """
         if self.strategy_reserved > 0:
             self.strategy_reserved -= 1
@@ -267,10 +331,13 @@ class BudgetLedger(object):
         self.strategy_dispatched += 1
         if postmortem:
             self.postmortem_dispatched += 1
-        if usage:
-            self.add_usage(usage)
-        else:
-            self._note_unknown_exposure(bound)
+        prompt_known, completion_known = self._settle_reported(usage)
+        if not (prompt_known and completion_known):
+            # carry the bound for the missing component(s) only; a component
+            # that *was* reported is already billed above
+            self._note_unknown_exposure(
+                (0 if prompt_known else bound[0],
+                 0 if completion_known else bound[1]))
 
     def release_strategy(self) -> None:
         """Drop a reservation that never reached the wire.
@@ -293,17 +360,80 @@ class BudgetLedger(object):
         self.unknown_exposure_calls += 1
 
     def add_usage(self, usage: Optional[Dict[str, Any]]) -> None:
+        """Record reported usage (wraps :meth:`_settle_reported`).
+
+        Kept as the public entry point for callers that only have usage to
+        report (a reflex answer); settling a *reserved* strategy call goes
+        through :meth:`commit_strategy`, which also carries any missing
+        component's bound as unknown exposure.
+        """
+        self._settle_reported(usage)
+
+    def _settle_reported(self, usage: Optional[Dict[str, Any]]) \
+            -> Tuple[bool, bool]:
+        """Add reported usage; return ``(prompt_known, completion_known)``.
+
+        Every cache field is re-normalized here as well as at the provider, so
+        a fake or programmatic provider cannot smuggle a negative, floating,
+        boolean or contradictory figure in to reduce the billed exposure.  A
+        reported *zero* is genuinely known and distinct from a missing field;
+        only a complete consistent partition (``H + M == P``) earns the cache
+        discount, and everything else is priced at the full input price and
+        counted as unclassified.
+        """
         if not usage:
-            return
-        prompt = _num(usage.get("prompt_tokens"))
-        completion = _num(usage.get("completion_tokens"))
-        self.prompt_tokens += prompt
-        self.completion_tokens += completion
-        if prompt or completion or usage.get("reported"):
+            return (False, False)
+        prompt = _opt_int(usage.get("prompt_tokens"))
+        completion = _opt_int(usage.get("completion_tokens"))
+        hit = _opt_int(usage.get("prompt_cache_hit_tokens"))
+        miss = _opt_int(usage.get("prompt_cache_miss_tokens"))
+        reasoning = _opt_int(usage.get("reasoning_tokens"))
+        # derive the aggregate prompt from a complete cache partition when the
+        # aggregate is missing but both parts are valid
+        if prompt is None and hit is not None and miss is not None:
+            prompt = hit + miss
+        classified_hit = 0
+        if prompt is not None:
+            if hit is not None and miss is not None and hit + miss == prompt:
+                classified_hit = hit
+                self.cache_hit_tokens += hit
+                self.cache_miss_tokens += miss
+            else:
+                self.cache_unclassified_tokens += prompt
+            self.prompt_tokens += prompt
+        if completion is not None:
+            self.completion_tokens += completion
+        if reasoning is not None:
+            # a diagnostic subset of completion_tokens, never billed twice
+            self.reasoning_tokens += reasoning
+        if prompt is not None or completion is not None \
+                or usage.get("reported"):
             if self.tariff is not None:
-                self.estimated_usd += self._price(prompt, completion)
+                self.estimated_usd += self._reported_price(
+                    classified_hit, prompt or 0, completion or 0)
             else:
                 self.unknown_price_calls += 1
+        return (prompt is not None, completion is not None)
+
+    def _reported_price(self, hit_tokens: int, prompt_tokens: int,
+                        completion_tokens: int) -> float:
+        """Cache-aware USD cost of one *reported* call.
+
+        Cached prompt tokens are billed at the effective cache-hit price, the
+        rest of the prompt (misses and unclassified) at the full input price,
+        and completion -- which the API already includes reasoning in -- at
+        the output price.  This is deliberately a *separate* function from
+        :meth:`_price`, which stays the conservative full-price figure used
+        for reservations and unknown exposure.
+        """
+        if self.tariff is None:
+            return 0.0
+        hit = self.tariff.effective_cache_hit_per_mtok()
+        missed = max(0, prompt_tokens - hit_tokens)
+        return (hit_tokens / 1000000.0 * hit
+                + missed / 1000000.0 * self.tariff.prompt_per_mtok
+                + completion_tokens / 1000000.0
+                * self.tariff.completion_per_mtok)
 
     # -- reflex paid bound (Jev) ----------------------------------------
     def reflex_paid_available(self) -> bool:
@@ -353,6 +483,11 @@ class BudgetLedger(object):
                 "unknown_exposure_tokens": (self.unknown_prompt_tokens
                                             + self.unknown_completion_tokens),
                 "unknown_exposure_usd": round(self.unknown_estimated_usd, 6),
+                "cache_hit_tokens": self.cache_hit_tokens,
+                "cache_miss_tokens": self.cache_miss_tokens,
+                "cache_unclassified_tokens": self.cache_unclassified_tokens,
+                "cache_hit_rate": self.cache_hit_rate(),
+                "reasoning_tokens": self.reasoning_tokens,
                 "reserved_bounds": [list(b) for b in self._reserved_bounds],
                 "tariff": self.tariff.to_dict() if self.tariff else None,
                 "usd_cap": self.usd_cap,
@@ -362,9 +497,15 @@ class BudgetLedger(object):
         return out
 
 
-def _num(v) -> int:
-    if isinstance(v, bool) or not isinstance(v, (int, float)):
-        return 0
-    if v != v or v in (float("inf"), float("-inf")):
-        return 0
+def _opt_int(v) -> Optional[int]:
+    """A nonnegative, non-bool integer, or None for anything else.
+
+    Returning ``None`` (rather than coercing to 0) is what keeps a missing
+    field distinct from a reported zero, and keeps a negative, floating or
+    boolean figure from silently *reducing* the billed exposure.
+    """
+    if isinstance(v, bool) or not isinstance(v, int):
+        return None
+    if v < 0:
+        return None
     return int(v)

@@ -681,6 +681,147 @@ class TestBudgetLedger(unittest.TestCase):
         self.assertEqual(out["boundaries"]["queued"], 2)
         self.assertIn("usage", out)
 
+    # -- reported cache accounting ---------------------------------------
+    def test_a_cache_price_never_lowers_a_reservation(self):
+        # the *reservation* is priced at the full input rate regardless of a
+        # configured cache price, so admission stays conservative
+        led = budget.BudgetLedger(
+            tariff=budget.Tariff(prompt_per_mtok=2.0,
+                                 completion_per_mtok=1.0,
+                                 cache_hit_per_mtok=0.01))
+        led.reserve_strategy(prompt_tokens=1000, completion_tokens=500)
+        self.assertAlmostEqual(
+            sum(led._price(p, c) for p, c in led._reserved_bounds), 0.0025)
+        self.assertEqual(led.tariff.effective_cache_hit_per_mtok(), 0.01)
+
+    def test_cache_partition_is_discounted(self):
+        led = budget.BudgetLedger(
+            tariff=budget.Tariff(prompt_per_mtok=1.0,
+                                 completion_per_mtok=2.0,
+                                 cache_hit_per_mtok=0.1))
+        led.add_usage({"prompt_tokens": 1000000,
+                       "prompt_cache_hit_tokens": 800000,
+                       "prompt_cache_miss_tokens": 200000,
+                       "completion_tokens": 1000000, "reported": True})
+        # 0.8 Mtok hit * 0.1 + 0.2 Mtok miss * 1.0 + 1.0 Mtok * 2.0
+        self.assertAlmostEqual(led.estimated_usd, 0.08 + 0.2 + 2.0)
+        self.assertEqual(led.cache_hit_tokens, 800000)
+        self.assertEqual(led.cache_miss_tokens, 200000)
+        self.assertEqual(led.cache_unclassified_tokens, 0)
+        self.assertAlmostEqual(led.cache_hit_rate(), 0.8)
+
+    def test_all_hits_have_a_full_rate(self):
+        led = budget.BudgetLedger(tariff=budget.Tariff(1.0, 1.0, 0.25))
+        led.add_usage({"prompt_tokens": 100, "prompt_cache_hit_tokens": 100,
+                       "prompt_cache_miss_tokens": 0, "completion_tokens": 0,
+                       "reported": True})
+        self.assertEqual(led.cache_hit_rate(), 1.0)
+
+    def test_zero_classified_tokens_is_a_null_rate(self):
+        led = budget.BudgetLedger(tariff=budget.Tariff(1.0, 1.0, 0.5))
+        led.add_usage({"prompt_tokens": 0, "prompt_cache_hit_tokens": 0,
+                       "prompt_cache_miss_tokens": 0, "completion_tokens": 5,
+                       "reported": True})
+        self.assertIsNone(led.cache_hit_rate())
+
+    def test_absent_cache_price_falls_back_to_input(self):
+        led = budget.BudgetLedger(
+            tariff=budget.Tariff(prompt_per_mtok=3.0,
+                                 completion_per_mtok=1.0))
+        led.add_usage({"prompt_tokens": 1000000,
+                       "prompt_cache_hit_tokens": 500000,
+                       "prompt_cache_miss_tokens": 500000,
+                       "completion_tokens": 0, "reported": True})
+        self.assertAlmostEqual(led.estimated_usd, 3.0)
+        self.assertEqual(led.cache_hit_tokens, 500000)
+
+    def test_explicit_zero_cache_price_is_honoured(self):
+        led = budget.BudgetLedger(tariff=budget.Tariff(1.0, 1.0, 0.0))
+        led.add_usage({"prompt_tokens": 1000000,
+                       "prompt_cache_hit_tokens": 1000000,
+                       "prompt_cache_miss_tokens": 0, "completion_tokens": 0,
+                       "reported": True})
+        self.assertAlmostEqual(led.estimated_usd, 0.0)
+        self.assertEqual(led.cache_hit_rate(), 1.0)
+
+    def test_absent_cache_fields_are_unclassified_at_full_price(self):
+        led = budget.BudgetLedger(tariff=budget.Tariff(1.0, 1.0, 0.5))
+        led.add_usage({"prompt_tokens": 1000000, "completion_tokens": 0,
+                       "reported": True})
+        self.assertAlmostEqual(led.estimated_usd, 1.0)
+        self.assertEqual(led.cache_unclassified_tokens, 1000000)
+        self.assertEqual(led.cache_hit_tokens, 0)
+        self.assertIsNone(led.cache_hit_rate())
+
+    def test_contradictory_partition_is_unclassified(self):
+        for bad in ({"prompt_cache_hit_tokens": 10,
+                     "prompt_cache_miss_tokens": 5},        # 15 != 100
+                    {"prompt_cache_hit_tokens": 60,
+                     "prompt_cache_miss_tokens": 60}):       # 120 != 100
+            with self.subTest(bad=bad):
+                led = budget.BudgetLedger(tariff=budget.Tariff(1.0, 1.0, 0.5))
+                usage = {"prompt_tokens": 100, "completion_tokens": 0,
+                         "reported": True}
+                usage.update(bad)
+                led.add_usage(usage)
+                self.assertEqual(led.cache_hit_tokens, 0)
+                self.assertEqual(led.cache_unclassified_tokens, 100)
+                self.assertAlmostEqual(led.estimated_usd, 100 / 1e6)
+
+    def test_malformed_cache_fields_cannot_reduce_exposure(self):
+        led = budget.BudgetLedger(tariff=budget.Tariff(1.0, 1.0, 0.0))
+        led.add_usage({"prompt_tokens": 100,
+                       "prompt_cache_hit_tokens": -100,   # negative: dropped
+                       "prompt_cache_miss_tokens": 200,
+                       "completion_tokens": True,         # bool: dropped
+                       "reported": True})
+        self.assertEqual(led.cache_hit_tokens, 0)
+        self.assertEqual(led.cache_unclassified_tokens, 100)
+        self.assertAlmostEqual(led.estimated_usd, 100 / 1e6)
+
+    def test_prompt_is_derived_from_a_complete_partition(self):
+        led = budget.BudgetLedger(tariff=budget.Tariff(1.0, 1.0, 0.5))
+        led.add_usage({"prompt_cache_hit_tokens": 30,
+                       "prompt_cache_miss_tokens": 70, "completion_tokens": 0,
+                       "reported": True})
+        self.assertEqual(led.prompt_tokens, 100)
+        self.assertEqual(led.cache_hit_tokens, 30)
+        self.assertAlmostEqual(led.estimated_usd, (30 * 0.5 + 70 * 1.0) / 1e6)
+
+    def test_reported_zero_totals_are_known_not_exposure(self):
+        led = budget.BudgetLedger()
+        led.reserve_strategy(prompt_tokens=50, completion_tokens=10)
+        led.commit_strategy({"prompt_tokens": 0, "completion_tokens": 0,
+                             "reported": True})
+        self.assertEqual(led.unknown_exposure_calls, 0)
+        self.assertEqual(led.unknown_exposure_tokens, 0)
+
+    def test_missing_totals_keep_the_reservation_as_exposure(self):
+        # {reported: true} with no aggregate totals must not discard the bound
+        led = budget.BudgetLedger()
+        led.reserve_strategy(prompt_tokens=50, completion_tokens=10)
+        led.commit_strategy({"reported": True})
+        self.assertEqual(led.unknown_exposure_calls, 1)
+        self.assertEqual(led.unknown_prompt_tokens, 50)
+        self.assertEqual(led.unknown_completion_tokens, 10)
+
+    def test_partial_usage_carries_only_the_missing_component(self):
+        led = budget.BudgetLedger()
+        led.reserve_strategy(prompt_tokens=50, completion_tokens=10)
+        led.commit_strategy({"prompt_tokens": 40, "reported": True})
+        self.assertEqual(led.prompt_tokens, 40)
+        self.assertEqual(led.unknown_prompt_tokens, 0)
+        self.assertEqual(led.unknown_completion_tokens, 10)
+        self.assertEqual(led.unknown_exposure_calls, 1)
+
+    def test_reasoning_tokens_are_diagnostic_not_billed_twice(self):
+        led = budget.BudgetLedger(tariff=budget.Tariff(1.0, 1.0))
+        led.add_usage({"prompt_tokens": 0, "completion_tokens": 1000,
+                       "reasoning_tokens": 800, "reported": True})
+        self.assertEqual(led.reasoning_tokens, 800)
+        # completion is billed once, over 1000 tokens (reasoning is a subset)
+        self.assertAlmostEqual(led.estimated_usd, 1000 / 1e6)
+
 
 # ============================================================ worker module
 
@@ -994,6 +1135,34 @@ class TestDeepSeekWorkerSupervised(unittest.TestCase):
         self.assertFalse(payload["stream"])
         joined = json.dumps(payload)
         self.assertIn("untrusted", joined.lower())
+
+    def test_usage_preserves_cache_and_reasoning_fields(self):
+        body = {"usage": {
+            "prompt_tokens": 100, "completion_tokens": 50,
+            "total_tokens": 150, "prompt_cache_hit_tokens": 80,
+            "prompt_cache_miss_tokens": 20,
+            "completion_tokens_details": {"reasoning_tokens": 30}}}
+        u = providers._usage_of(body)
+        self.assertEqual(u["prompt_cache_hit_tokens"], 80)
+        self.assertEqual(u["prompt_cache_miss_tokens"], 20)
+        self.assertEqual(u["reasoning_tokens"], 30)
+        self.assertTrue(u["reported"])
+
+    def test_usage_drops_malformed_cache_fields(self):
+        body = {"usage": {
+            "prompt_tokens": 100, "prompt_cache_hit_tokens": -1,
+            "prompt_cache_miss_tokens": 1.5, "total_tokens": True,
+            "completion_tokens_details": {"reasoning_tokens": False}}}
+        u = providers._usage_of(body)
+        self.assertNotIn("prompt_cache_hit_tokens", u)
+        self.assertNotIn("prompt_cache_miss_tokens", u)
+        self.assertNotIn("reasoning_tokens", u)
+        self.assertNotIn("total_tokens", u)
+        self.assertEqual(u["prompt_tokens"], 100)
+
+    def test_usage_absent_is_empty(self):
+        self.assertEqual(providers._usage_of({}), {})
+        self.assertEqual(providers._usage_of({"usage": "nope"}), {})
 
 
 # ============================================================ Jev
@@ -2145,6 +2314,22 @@ class TestProviderConfigValidation(unittest.TestCase):
         self.assertIn("strategy-deadline", ProviderConfig(
             strategy_deadline=-2.0).validate())
 
+    def test_cache_hit_price_bounds(self):
+        self.assertIn("must not exceed", ProviderConfig(
+            deepseek_price_in=1.0, deepseek_price_out=1.0,
+            deepseek_price_cache_hit=2.0).validate())
+        self.assertIsNone(ProviderConfig(
+            deepseek_price_in=1.0, deepseek_price_out=1.0,
+            deepseek_price_cache_hit=0.25).validate())
+        for bad in (-0.1, float("nan")):
+            with self.subTest(bad=bad):
+                self.assertIn("finite, nonnegative", ProviderConfig(
+                    deepseek_price_cache_hit=bad).validate())
+
+    def test_cache_price_alone_does_not_complete_a_tariff(self):
+        cfg = ProviderConfig(usd_cap=1.0, deepseek_price_cache_hit=0.1)
+        self.assertIn("complete tariff", cfg.validate())
+
     def test_max_tokens_must_be_at_least_one(self):
         for bad in (0, -5):
             with self.subTest(bad=bad):
@@ -2264,6 +2449,18 @@ class TestLedgerInvariants(unittest.TestCase):
             with self.subTest(tariff=t):
                 with self.assertRaises(ValueError):
                     budget.BudgetLedger(tariff=t)
+
+    def test_cache_price_above_input_is_rejected(self):
+        with self.assertRaises(ValueError):
+            budget.BudgetLedger(tariff=budget.Tariff(
+                1.0, 1.0, cache_hit_per_mtok=2.0))
+
+    def test_malformed_cache_price_is_rejected(self):
+        for bad in (-1.0, float("nan"), float("inf"), True):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    budget.BudgetLedger(tariff=budget.Tariff(
+                        1.0, 1.0, cache_hit_per_mtok=bad))
 
     def test_negative_caps_are_rejected_not_clamped(self):
         with self.assertRaises(ValueError):

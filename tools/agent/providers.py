@@ -112,6 +112,11 @@ class ProviderConfig(object):
     usd_cap: Optional[float] = None
     deepseek_price_in: Optional[float] = None
     deepseek_price_out: Optional[float] = None
+    # USD per million prompt-cache-hit tokens.  Optional: when unset the
+    # effective hit price falls back to the full input price, which is the
+    # conservative bound a reservation relies on.  A value above the input
+    # price is rejected (see ProviderConfig.validate) rather than clamped.
+    deepseek_price_cache_hit: Optional[float] = None
     reflex_call_cap: int = 0
 
     def validate(self, episodes: Optional[int] = None,
@@ -192,11 +197,21 @@ class ProviderConfig(object):
                     % (self.postmortem_reserve, self.strategy_call_cap))
         for name, val in (("usd-cap", self.usd_cap),
                           ("deepseek-price-in", self.deepseek_price_in),
-                          ("deepseek-price-out", self.deepseek_price_out)):
+                          ("deepseek-price-out", self.deepseek_price_out),
+                          ("deepseek-price-cache-hit",
+                           self.deepseek_price_cache_hit)):
             if val is None:
                 continue
             if not _finite(val) or val < 0:
                 return "--%s must be a finite, nonnegative number" % name
+        if (self.deepseek_price_cache_hit is not None
+                and self.deepseek_price_in is not None
+                and self.deepseek_price_cache_hit > self.deepseek_price_in):
+            return ("--deepseek-price-cache-hit (%g) must not exceed "
+                    "--deepseek-price-in (%g): the full input price is the "
+                    "conservative fallback that keeps every reservation an "
+                    "upper bound" % (self.deepseek_price_cache_hit,
+                                     self.deepseek_price_in))
         if self.usd_cap is not None and not tariff_complete(self):
             return ("--usd-cap requires a complete tariff: set both "
                     "--deepseek-price-in and --deepseek-price-out")
@@ -773,14 +788,34 @@ def _parse_chat_response(body: dict) -> Any:
 
 
 def _usage_of(body: dict) -> Dict[str, Any]:
+    """Extract normalized usage from an OpenAI-compatible response body.
+
+    Aggregate prompt/completion/total are preserved alongside the DeepSeek
+    prompt-cache counts (``prompt_cache_hit_tokens`` /
+    ``prompt_cache_miss_tokens``), so the ledger can grant a discount for a
+    complete consistent partition.  Each field is kept only when it is a
+    nonnegative, non-bool integer: a negative, floating or boolean figure is
+    dropped rather than carried (the ledger re-normalizes defensively too, so
+    a fake provider cannot smuggle one in).  ``reasoning_tokens`` is kept from
+    ``completion_tokens_details`` as a *diagnostic* -- it is already included
+    in ``completion_tokens`` and is never billed a second time.  No reasoning
+    *text* is retained anywhere.
+    """
     usage = body.get("usage") if isinstance(body, dict) else None
     if not isinstance(usage, dict):
         return {}
     out = {"reported": True}
-    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens",
+                "prompt_cache_hit_tokens", "prompt_cache_miss_tokens"):
         v = usage.get(key)
-        if isinstance(v, int) and not isinstance(v, bool):
+        if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
             out[key] = v
+    details = usage.get("completion_tokens_details")
+    if isinstance(details, dict):
+        reasoning = details.get("reasoning_tokens")
+        if isinstance(reasoning, int) and not isinstance(reasoning, bool) \
+                and reasoning >= 0:
+            out["reasoning_tokens"] = reasoning
     return out
 
 
@@ -1193,11 +1228,22 @@ def strategy_provider(config: ProviderConfig, **kw) -> StrategyProvider:
 
 
 def tariff_from_config(config: ProviderConfig) -> Optional[Tariff]:
-    """Operator-configured DeepSeek pricing, or None (no invented prices)."""
-    if config.deepseek_price_in is None and config.deepseek_price_out is None:
+    """Operator-configured DeepSeek pricing, or None (no invented prices).
+
+    Only ``deepseek_price_in``/``deepseek_price_out`` decide whether a tariff
+    is *complete* (and therefore whether a USD cap is enforceable); the
+    optional cache-hit price is carried through so a reported cache partition
+    can be discounted without ever changing that completeness rule.
+    """
+    if (config.deepseek_price_in is None
+            and config.deepseek_price_out is None
+            and config.deepseek_price_cache_hit is None):
         return None
     return Tariff(prompt_per_mtok=float(config.deepseek_price_in or 0.0),
-                  completion_per_mtok=float(config.deepseek_price_out or 0.0))
+                  completion_per_mtok=float(config.deepseek_price_out or 0.0),
+                  cache_hit_per_mtok=(
+                      None if config.deepseek_price_cache_hit is None
+                      else float(config.deepseek_price_cache_hit)))
 
 
 def tariff_complete(config: ProviderConfig) -> bool:
@@ -1206,6 +1252,11 @@ def tariff_complete(config: ProviderConfig) -> bool:
     A USD cap is enforceable only against a complete tariff: with one price
     missing the estimate would silently ignore the other half of the spend,
     so the CLI rejects the combination rather than pretending to enforce it.
+
+    The optional cache-hit price is deliberately *not* part of completeness:
+    when it is unset the full input price is the conservative fallback, so
+    configuring a cache price alone neither completes a tariff nor makes a USD
+    cap enforceable.
     """
     return (config.deepseek_price_in is not None
             and config.deepseek_price_out is not None)

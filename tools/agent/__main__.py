@@ -79,6 +79,10 @@ def build_parser():
     auto.add_argument("--deepseek-price-out", type=float, default=None,
                       help="operator-configured USD per Mtok completion "
                            "tokens")
+    auto.add_argument("--deepseek-price-cache-hit", type=float, default=None,
+                      help="operator-configured USD per Mtok prompt "
+                           "cache-hit tokens; unset falls back to the input "
+                           "price (the conservative upper bound)")
     auto.add_argument("--reflex-call-cap", type=int, default=0,
                       help="bound on paid reflex (Jev) calls; 0 disables Jev")
     # -- boundaries -------------------------------------------------------
@@ -129,6 +133,7 @@ def _config_from_args(a) -> ProviderConfig:
         usd_cap=a.usd_cap,
         deepseek_price_in=a.deepseek_price_in,
         deepseek_price_out=a.deepseek_price_out,
+        deepseek_price_cache_hit=a.deepseek_price_cache_hit,
         reflex_call_cap=a.reflex_call_cap,
         boundary_cooldown_ticks=a.boundary_cooldown_ticks,
         boundary_cooldown_wall=a.boundary_cooldown_wall,
