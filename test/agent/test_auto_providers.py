@@ -738,7 +738,9 @@ class TestDeepSeekWorkerSupervised(unittest.TestCase):
         self.assertEqual(res.directives[0].goals, ("survive",))
         self.assertEqual(res.usage.get("prompt_tokens"), 10)
         self.assertEqual(len(self.ep.requests), 1)
-        self.assertTrue(self.ep.requests[0]["auth"].startswith("Bearer "))
+        # the *real* key reaches the wire: Secret redacts only its repr
+        self.assertEqual(self.ep.requests[0]["auth"],
+                         "Bearer sk-test-secret")
         prov.reap()
 
     def test_http_401_discards_the_plan(self):
