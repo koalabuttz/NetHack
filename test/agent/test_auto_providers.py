@@ -1781,6 +1781,18 @@ class _FakeJev(object):
         self.cancelled += 1
 
 
+class _CountingJev(_FakeJev):
+    """A fake Jev that counts how often it was actually asked to decide."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.decides = 0
+
+    def decide(self, ctx, deadline=0.0):
+        self.decides += 1
+        return super().decide(ctx, deadline)
+
+
 class TestLowConfidenceEscalation(WireHarness):
     """Low 6: escalation follows the FINAL selection outcome."""
 
@@ -2427,6 +2439,60 @@ class TestCoalescingProvenance(unittest.TestCase):
         for eid in pending.eids:
             self.assertEqual(sorted(recs[eid]["coalesced_with"]
                                     + [eid]), sorted(pending.eids))
+
+
+# ================================================ event-sink health (L3)
+
+class TestEventSinkHealth(WireHarness):
+    """Low 3: a failed event sink disables paid dispatch immediately."""
+
+    def _runner(self, fake):
+        cfg = ProviderConfig(max_ticks=200, reflex="jev", reflex_call_cap=5,
+                             strategy="deepseek", postmortem_reserve=0,
+                             low_confidence_needs=1000)
+        ctl = controller.Controller(
+            cfg, controller.ControllerPaths("w", "r", "d", "s"), self.dir,
+            episode_timeout=5.0)
+        ctl._new_reflex_provider = lambda reflex: fake
+        ctl._new_strategy_provider = lambda: FakeStrategy(_ok_directives())
+        result = controller.EpisodeResult(index=1)
+        rec = recording.EpisodeRecorder(self.dir, 1)
+        proc = paced([hello()], [0.0])
+        self.addCleanup(proc.close)
+        runner = controller._EpisodeRunner(ctl, proc, rec, result)
+        runner.pending_key = protocol.NeedKey(1, 1, 1)
+        runner.pending_seq = 1
+        runner.pending_need = {"kind": "command", "id": 1}
+        return runner, rec, proc
+
+    def test_sink_failure_disables_paid_dispatch_immediately(self):
+        fake = _CountingJev()
+        runner, rec, proc = self._runner(fake)
+        # the sink fails synchronously the moment it persists a record,
+        # exactly as a disk error inside record_event would
+        rec.record_event = lambda obj: setattr(rec._evs, "error", "disk full")
+        # a suppressed boundary finalises through the sink ...
+        b = events.Boundary("initial-level", "level:Dlvl:1:1")
+        runner.event_ledger.detect(b, 0, "Dlvl:1")
+        runner.boundary_queue.submit([b], 0, "Dlvl:1")
+        runner.boundary_queue.suppress("strategy-cap")
+        # ... and the paid decision in the SAME iteration must not start Jev
+        self.assertFalse(runner.rec_healthy)
+        self.assertTrue(runner.paid_disabled)
+        self.assertTrue(rec.failed)
+        proposal, provider, reason, _lat, _use, low = runner._decide(
+            runner.pending_need)
+        self.assertEqual(provider, "scripted")
+        self.assertEqual(fake.decides, 0)        # no paid call started
+        self.assertTrue(low)
+        self.assertIsNotNone(proposal)
+        # scripted wire handling continues for the rest of the episode
+        runner._answer_now(None)
+        acts = [a for a in _parse_actions(proc.stdin.data)
+                if a.get("type") == "act"]
+        self.assertEqual(len(acts), 1)
+        rec.finalize({})
+        self.assertTrue(rec.incomplete)          # final recording incomplete
 
 
 if __name__ == "__main__":

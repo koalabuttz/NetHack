@@ -631,6 +631,12 @@ class _EpisodeRunner(object):
         overflow the recording writer queue.
         """
         self.rec.record_event(rec)
+        # A recorder that fails synchronously here must disable paid dispatch
+        # at once: this sink runs inside the same loop iteration that may then
+        # start a paid Jev decision, before any other health check runs.  The
+        # note is reentrancy-safe -- it clears rec_healthy before it
+        # suppresses, and a nested sink call returns immediately.
+        self._note_recorder_health()
 
     def _flush_events(self):
         """Finalise any open lifecycle records and persist directive events.
@@ -1393,6 +1399,14 @@ class _EpisodeRunner(object):
         """
         scripted = self.reflex.fallback(ctx)
         fallback_action = scripted.action if scripted is not None else None
+        if not self.rec_healthy:
+            # A recorder that has already failed this episode disables all
+            # paid dispatch (Wave-1 graceful-stop policy).  Checked *before*
+            # the paid reservation so a failure observed by the event sink in
+            # this same iteration cannot start a paid call.
+            self.ledger.reflex_fallback += 1
+            return (fallback_action, "scripted",
+                    "jev disabled: recorder unhealthy", 0.0, {}, True)
         availability = self.reflex_provider.available(self.c.config)
         if not availability.enabled:
             self.ledger.reflex_fallback += 1
