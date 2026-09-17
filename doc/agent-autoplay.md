@@ -311,6 +311,17 @@ postmortem slot still reserved.  An EOF, a protocol failure, an episode or
 content deadline, and a `closed` that arrived with a request still
 unanswered are all ineligible -- none of them is a completion to reflect on.
 
+The postmortem runs through a **fresh provider lifecycle**.  The gameplay
+provider is cancelled with the episode (and that cancellation is sticky), so
+the reserved call would never reach the provider if it reused it; a new
+provider instance, with its own bounded worker and deadline, is built for the
+postmortem instead.  It is booked as *dispatched* only once work actually
+crossed the dispatch boundary -- a call refused before any worker existed
+(no key, a cooldown, a spawn failure) is released without booking a
+dispatched call or any billing exposure, and a call that reached the wire but
+returned no usage keeps its conservative bound as *unknown exposure* rather
+than being dropped.
+
 A directive set is a small closed-world object (`schema_version`, ordered
 `goals`, an optional observed `target`, a bounded `risk`, a `ttl`,
 `preconditions`, a short `explanation`).  Unknown fields, unknown goals,
@@ -405,8 +416,15 @@ Each episode writes five sidecars under `--output-dir`:
 A campaign also writes `campaign.json` into `--output-dir`: a compact,
 secret-free rollup of every episode (stop reason, visible outcome, protocol
 health, tick/need/boundary/strategy counts and token/USD usage), campaign
-totals, and the allowlisted configuration.  It is written after the episodes
-so a failure to write it cannot lose them, and the CLI prints its path.
+totals, and the allowlisted configuration -- including the non-secret
+`deepseek_max_tokens` and `deepseek_max_bytes` bounds.  Reported usage,
+`unknown_price_calls` (a real answer whose price is unset) and
+`unknown_exposure_calls`/`_tokens`/`_usd` (a call that reached the wire but
+returned no usage) are preserved and totalled **separately**: an unknown
+exposure is never converted into an asserted cost.  It is written after the
+episodes so a failure to write it cannot lose them; the CLI prints its path on
+success and reports the failure explicitly on stderr -- it never claims a path
+that does not exist.
 
 Writes run on a bounded background writer so the wire is never blocked; a
 full queue or disk failure marks the recording **incomplete**
@@ -463,14 +481,25 @@ The output JSONL has three record kinds:
   * **coverage** is *decided needs / needs* — an unanswered need would lower
     it below 1.0.
   * **agreement** compares action **semantics**, never JSON bytes: a menu
-    commit is its final *set* of rows (count and generation id ignored), and
-    `key`/`yn`/`position`/`text`/`cancel`/`ack` compare by shape and value.
+    commit is its final set of rows **with their counts** (a menu generation
+    id is ignored), and `key`/`yn`/`position`/`text`/`cancel`/`ack` compare by
+    shape and value.  `-1` ("the whole stack") and `1` ("one item") normalize
+    equal **only** when the delivered page rows prove the row is a single item
+    (no count prefix in its displayed text, no positive stack count); on a
+    stack, or with no delivered metadata, the counts stay distinct.
+  * **ground truth follows the accepted attempt.**  When the wire rejects an
+    action with `invalid`, the rejected attempt is labelled as such (its own
+    `record: "need"` row carries the `rejected_action`, and the retried need
+    lists it under `rejected_attempts`) and the *accepted* candidate — the
+    attempt the wire did not reject — is what `actual_action` and the
+    agreement/coverage figures use.  A first, rejected action is never
+    reported as the original.
   * **legality** is structural validity (the `validate_action` gate); it is
     not safety.  Confidence agreement with a recorded action is **not**
     evidence of calibration, and is never reported as such.
   * A recording with **no actions sidecar** (the older inbound-only corpus)
-    labels every `actual_action` `unknown` and reports agreement coverage 0 —
-    a movement key is never *guessed* from a state change.
+    labels every `actual_action` `unknown` and reports agreement coverage 0
+    (a movement key is never *guessed* from a state change).
 
 ### Caveats
 
@@ -481,6 +510,11 @@ The output JSONL has three record kinds:
   * **Deterministic**: a replay is a pure function of the wire bytes and the
     candidate configuration.  Wall timing is confined to a separate `wall`
     map (dropped here), so two runs of the same command are byte-identical.
+  * **Page collection is as strict as the live client.**  A page is only ever
+    the response to the owed `get_page`: an unsolicited, out-of-order or
+    duplicate page, a page for the wrong content, or one declaring a different
+    total than the need is an evaluation **protocol failure** (`closed`, with
+    `protocol_failure` set), exactly as in the live controller.
   * **Provider decisions are never injected** into the trajectory, and a
     hypothetical effect is never claimed.  The replay advances only along the
     recorded wire; you cannot read a counterfactual outcome from it.
