@@ -2515,6 +2515,17 @@ class TestContextEviction(unittest.TestCase):
         raw = sum(len(c.encode("utf-8")) for _r, c in p.messages)
         self.assertGreater(providers._payload_bytes(cfg, p.messages), raw)
 
+    def test_history_message_bytes_and_framing_count_toward_the_bound(self):
+        cfg = self._cfg(deepseek_history_pairs=8)
+        ctx = self._ctx()
+        plain = providers.prepare_strategy_request(
+            cfg, ctx, retained=[providers.StrategyExchange("u", "a")])
+        wide = providers.prepare_strategy_request(
+            cfg, ctx, retained=[providers.StrategyExchange("u", "界" * 50)])
+        # the CJK assistant message costs 150 *bytes* against the 1-byte
+        # plain one, so the bound grows by 149, not by 49 characters
+        self.assertEqual(wide.prompt_bound - plain.prompt_bound, 149)
+
 
 class TestConversationContinuity(WireHarness):
     """Section 2: the harness owns a bounded, prefix-stable conversation."""
@@ -2778,6 +2789,146 @@ class TestControllerConversation(WireHarness):
         self.assertNotIn("active directives:", user_text)
         # the gameplay conversation is untouched by the postmortem
         self.assertEqual(len(runner._conversation.snapshot()), 1)
+        rec.finalize({})
+
+    def test_history_inclusive_bound_refuses_while_the_tail_alone_fits(self):
+        # the continuity discriminator: the current tail alone fits the
+        # remaining cap, but the cumulative history + tail does not
+        cfg = ProviderConfig(max_ticks=200, postmortem_reserve=0,
+                             low_confidence_needs=1000,
+                             boundary_cooldown_ticks=0,
+                             boundary_cooldown_wall=0.0)
+        fake = FakeStrategy(_ok_directives())
+        runner, rec, _ = self._runner(fake, cfg)
+        self._dispatch(runner, 1)              # commits one pair
+        self._activate(runner)
+        runner.tick = 2
+        b = events.Boundary("initial-level", "level:Dlvl:1:2")
+        runner.event_ledger.detect(b, 2, "Dlvl:1")
+        runner.boundary_queue.submit([b], 2, "Dlvl:1")
+        pending = runner.boundary_queue.ready(2, time.monotonic())
+        ctx = runner._build_strategy_context(pending)
+        full = providers.prepare_strategy_request(cfg, ctx,
+                                                  runner._conversation)
+        tail = providers.prepare_strategy_request(cfg, ctx, retained=[])
+        self.assertLess(tail.prompt_bound, full.prompt_bound)
+        completion = full.completion_bound
+        runner.ledger.token_cap = (runner.ledger._effective_tokens()
+                                  + tail.prompt_bound + completion)
+        self.assertTrue(runner.ledger.strategy_available(
+            prompt_tokens=tail.prompt_bound,
+            completion_tokens=completion))
+        self.assertFalse(runner.ledger.strategy_available(
+            prompt_tokens=full.prompt_bound,
+            completion_tokens=completion))
+        calls_before = len(fake.calls)
+        snapshot_before = list(runner._conversation.snapshot())
+        runner._dispatch_strategy(pending, time.monotonic())
+        # no worker, no history mutation, no reserve leak
+        self.assertIsNone(runner._strategy_call)
+        self.assertEqual(len(fake.calls), calls_before)
+        self.assertEqual(runner._conversation.snapshot(), snapshot_before)
+        self.assertEqual(runner.ledger.strategy_reserved, 0)
+        self.assertEqual(runner._strategy_prepared, None)
+        rec.finalize({})
+
+    def test_a_lost_result_keeps_the_cumulative_bound_as_exposure(self):
+        gate = threading.Event()
+        gate.set()                             # the first call passes at once
+        fake = FakeStrategy(_ok_directives(), gate=gate)
+        runner, rec, _ = self._runner(fake)
+        self._dispatch(runner, 1)              # commits one pair
+        self._activate(runner)
+        gate.clear()                           # the second call never returns
+        runner.tick = 2
+        b = events.Boundary("initial-level", "level:Dlvl:1:2")
+        runner.event_ledger.detect(b, 2, "Dlvl:1")
+        runner.boundary_queue.submit([b], 2, "Dlvl:1")
+        pending = runner.boundary_queue.ready(2, time.monotonic())
+        ctx = runner._build_strategy_context(pending)
+        prepared = providers.prepare_strategy_request(runner.c.config, ctx,
+                                                      runner._conversation)
+        self.assertEqual(len(prepared.retained), 1)
+        runner._dispatch_strategy(pending, time.monotonic())
+        self.assertEqual(runner.ledger.strategy_reserved, 1)
+        runner._cancel_strategy()              # no result came back
+        gate.set()
+        self.assertEqual(runner.ledger.strategy_reserved, 0)
+        self.assertEqual(runner.ledger.unknown_exposure_calls, 1)
+        # the *cumulative* (history-inclusive) bound is carried
+        self.assertEqual(runner.ledger.unknown_prompt_tokens,
+                         prepared.prompt_bound)
+        self.assertEqual(runner._conversation.snapshot(),
+                         [runner._conversation.snapshot()[0]])
+        rec.finalize({})
+
+    def test_the_dispatched_payload_is_the_frozen_reserved_request(self):
+        gate = threading.Event()
+        fake = FakeStrategy(_ok_directives(), gate=gate)
+        runner, rec, _ = self._runner(fake)
+        self._dispatch(runner, 1, finalize=False)   # in flight
+        ctx = fake.calls[0]
+        frozen = ctx.prepared_request
+        # live state mutates while the call is in flight
+        runner.mem.status.dlvl = "Dlvl:9"
+        runner.mem.messages = ["changed"]
+        runner.mem.inventory.rows = []
+        runner.tick = 999
+        self.assertEqual(ctx.prepared_request, frozen)
+        self.assertEqual(providers.deepseek_payload("x", ctx, 1),
+                         frozen.payload())
+        runner._settle_strategy(None, cancelled=True)
+        gate.set()
+        rec.finalize({})
+
+    def test_an_invalid_response_is_billed_but_adds_no_history(self):
+        class _BilledInvalid(providers.StrategyProvider):
+            name = "billed"
+
+            def available(self, config):
+                return Availability(True, "billed")
+
+            def deliberate(self, context, deadline=0.0):
+                return StrategyResult(
+                    provider="billed", reason="invalid-directives", ok=False,
+                    usage={"prompt_tokens": 30, "completion_tokens": 7,
+                           "reported": True},
+                    dispatched=True)
+
+            def cancel(self):
+                pass
+
+        runner, rec, _ = self._runner(_BilledInvalid())
+        self._dispatch(runner, 1)
+        self.assertEqual(runner.ledger.strategy_dispatched, 1)
+        self.assertEqual(runner.ledger.prompt_tokens, 30)
+        self.assertEqual(runner._conversation.snapshot(), [])
+        rec.finalize({})
+
+    def test_a_new_episode_starts_from_an_empty_conversation(self):
+        fake = FakeStrategy(_ok_directives())
+        runner, rec, result = self._runner(fake)
+        self._dispatch(runner, 1)
+        self._activate(runner)
+        self.assertEqual(len(runner._conversation.snapshot()), 1)
+        result2 = controller.EpisodeResult(index=2)
+        rec2 = recording.EpisodeRecorder(self.dir, 2)
+        proc2 = paced([hello()], [0.0])
+        self.addCleanup(proc2.close)
+        other = controller._EpisodeRunner(runner.c, proc2, rec2, result2)
+        self.assertEqual(other._conversation.snapshot(), [])
+        rec.finalize({})
+        rec2.finalize({})
+
+    def test_a_provider_respawn_does_not_clear_the_conversation(self):
+        fake = FakeStrategy(_ok_directives())
+        runner, rec, _ = self._runner(fake)
+        self._dispatch(runner, 1)
+        self._activate(runner)
+        before = list(runner._conversation.snapshot())
+        # a respawned provider (and its worker) inherits the harness history
+        runner.strategy_provider = FakeStrategy(_ok_directives())
+        self.assertEqual(runner._conversation.snapshot(), before)
         rec.finalize({})
 
 
