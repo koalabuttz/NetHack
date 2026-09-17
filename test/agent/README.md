@@ -69,6 +69,7 @@ prints only `win/agent/*.h` plus system headers.
 | `test/agent/spectate.py` | live spectate: a transparent byte-exact proxy that renders the flowing records to a side channel while relaying the wire, a transcript replay mode, and a runner-mode shim usable as the driver's `--runner` |
 | `test/agent/test_spectate.py` | integration tests for the spectate revision: incremental/batch assembler agreement and every rejection vector, the deadline-scheduled render pipeline and its bounded shutdown, the writer helper and its acknowledgements, byte-exact relay/transcript back-pressure, argv identity, failure exit-status hygiene, replay equivalence, plus the opt-in performance (`--benchmark`) and byte-exact (`--byte-exact`) harnesses |
 | `test/agent/test_auto.py` | autonomous harness tests; see below |
+| `test/agent/test_auto_providers.py` | Wave-2 tier tests: directive validation and lifecycle, boundary detection/coalescing/cooldowns, the budget ledger, the worker process and its supervisor, DeepSeek against a fake loopback endpoint (slow/hung/drip/401/429/5xx/malformed/oversized), the Jev typed-choice adapter, controller integration (strategy is never polled per command, never emits a wire action, stale level advice is discarded), and a secret-free artifact audit |
 
 ## Formatter
 

@@ -590,14 +590,16 @@ test/agent:
 .gitignore          Makefile            README.md           driver.py
 format_obs.py       gen_profile.py      hostile_matrix.py   reference_state.c
 reference_state.h   schema_check.py     spectate.py         sysconf
-test_auto.py        test_menu.c         test_protocol.c     test_spectate.py
-test_state.c        test_view.c
+test_auto.py        test_auto_providers.py
+test_menu.c         test_protocol.c     test_spectate.py    test_state.c
+test_view.c
 
 tools/agent:
 (files for the autonomous play harness)
-.gitignore          __init__.py         __main__.py         codec.py
-controller.py       policy.py           protocol.py         providers.py
-recording.py        state.py
+.gitignore          __init__.py         __main__.py         budget.py
+codec.py            controller.py       directives.py       events.py
+policy.py           protocol.py         providers.py        recording.py
+state.py            worker.py
 
 util:
 (files for all versions)

@@ -111,12 +111,14 @@ when you have verified the bindings (`llm-final-v1` fixes the bindings).
 
 ## Autonomous play (no external harness)
 
-`./agent.sh auto` runs a built-in, scripted-only autonomous player that speaks
-this same wire while owning the pipe itself; see `doc/agent-autoplay.md`.  It
-needs no external policy and makes no network calls, and it is the reference
-for how a harness should fulfil the transport obligations below (answer every
-outstanding request, fetch all pages before committing, treat `invalid` as a
-retry).
+`./agent.sh auto` runs a built-in autonomous player that speaks this same wire
+while owning the pipe itself; see `doc/agent-autoplay.md`.  It needs no
+external policy and, in its default `--reflex scripted --strategy off`
+configuration, makes no network calls; it is the reference for how a harness
+should fulfil the transport obligations below (answer every outstanding
+request, fetch all pages before committing, treat `invalid` as a retry).  An
+optional strategy tier (DeepSeek) and an optional paid reflex tier (Jev, ships
+disabled) exist behind explicit flags.
 
 ## Ground rules the protocol enforces
 

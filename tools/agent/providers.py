@@ -68,7 +68,13 @@ class ProviderConfig(object):
     confidence_threshold: float = 0.8
     strategy_call_cap: int = 8
     postmortem_reserve: int = 1
-    deepseek_model: str = "deepseek-v4.1-flash"
+    # Confirmed against api-docs.deepseek.com/api/list-models: the documented
+    # ids are ``deepseek-v4-flash`` and ``deepseek-v4-pro`` (the legacy
+    # ``deepseek-chat``/``deepseek-reasoner`` aliases now point at v4-flash
+    # and retire 2026-07-24).  The handoff's ``deepseek-v4.1-flash`` is not a
+    # published id, so the default follows the documentation; override it
+    # with --deepseek-model.
+    deepseek_model: str = "deepseek-v4-flash"
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_key_file: Optional[str] = None
     jev_key_file: Optional[str] = None
@@ -654,7 +660,7 @@ class DeepSeekStrategy(StrategyProvider):
                                    self.config.deepseek_max_tokens)
         ddl = deadline or (now + self.config.strategy_deadline)
         job = {"v": 1, "provider": self.name, "url": url,
-               "payload": payload, "api_key": str(key),
+               "payload": payload, "api_key": key,
                "timeout": max(1.0, ddl - now + 2.0),
                "max_bytes": self.config.deepseek_max_bytes}
         sup = _WorkerSupervisor(self.worker_argv,
@@ -831,7 +837,7 @@ class JevReflex(ReflexProvider):
                            "need_kind": (context.need or {}).get("kind"),
                            "prompt": (context.need or {}).get("prompt") or "",
                            "options": options, "abstain": True},
-               "api_key": str(key),
+               "api_key": key,
                "timeout": max(0.5, ddl - now + 0.25),
                "max_bytes": self.config.provider_max_bytes}
         sup = _WorkerSupervisor(self.worker_argv,

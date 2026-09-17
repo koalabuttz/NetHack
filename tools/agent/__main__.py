@@ -84,7 +84,7 @@ def build_parser():
     auto.add_argument("--boundary-emergency-wall", type=float, default=2.0)
     auto.add_argument("--low-confidence-needs", type=int, default=3)
     # -- DeepSeek ---------------------------------------------------------
-    auto.add_argument("--deepseek-model", default="deepseek-v4.1-flash")
+    auto.add_argument("--deepseek-model", default="deepseek-v4-flash")
     auto.add_argument("--deepseek-base-url",
                       default="https://api.deepseek.com")
     auto.add_argument("--deepseek-key-file", default=None,
