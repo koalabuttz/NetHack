@@ -61,8 +61,11 @@ wave can add providers without changing the argv.
     exceeding it aborts the episode (`stop=content-deadline`).
 
 `--reflex-deadline S` (default 0.75)
-    the reflex decision allowance.  The synchronous scripted tier needs no
-    budget; a network reflex tier (a later wave) is bounded by it.
+    the absolute reflex decision allowance.  The deadline is passed to the
+    provider and the call is run on a bounded thread, so a provider that
+    overruns is abandoned and the scripted fallback answers instead of
+    holding the wire.  A truly blocking network provider still needs the
+    Wave-2 killable worker process; the contract and plumbing exist now.
 
 `--output-dir DIR`
     where the `ep-N.*` recordings are written.
@@ -101,13 +104,20 @@ reason: seeing `closed` alone does not prove death or victory.
 
   * One outstanding request at a time; every request is answered once.
   * All required pages are fetched (bounded, one in flight) before any menu
-    or acknowledgement is sent; a repeated `get_page` is a retry.
+    or acknowledgement is sent; a repeated `get_page` is a retry.  Only the
+    exact outstanding page, with a matching declared page count and content,
+    is accepted — any other page response ends that episode as a protocol
+    failure rather than being counted as delivery.
   * Chunk streams are assembled strictly and acknowledged cumulatively as
     they arrive.
   * `invalid` is a **retry state**: the same request id is re-answered,
     repaired once where applicable, then answered with a per-kind safe
     fallback, and the episode stops after a small total retry cap instead of
-    spinning forever.
+    spinning forever.  Retries consume the *same* aggregate content budget as
+    the original need — an `invalid` does not restart its deadline.
+  * A malformed record (a JSON array, or a broken palette, map triple,
+    window, cursor or need) ends **that** episode as a protocol failure; the
+    campaign continues with the next episode.
   * A game message such as `You don't have that object.` is distinct from
     wire `invalid`; the reflex carries a separate repeated-food breaker.
 
