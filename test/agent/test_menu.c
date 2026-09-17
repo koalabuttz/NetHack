@@ -531,6 +531,57 @@ main(void)
         CHECK(rows[2].has_initial == true && rows[2].initial == -1);
     }
 
+    /* ---- Phase-0 eat-prompt vector: a known-food row is selected by its
+     * public row id, never by visible position ------------------------- */
+    {
+        /* An inventory-style menu: a heading, a weapon, the food row in the
+         * middle, and a lamp.  A menu commit names a row id; selection must
+         * follow the id (not the row's position), and an id from another
+         * generation is rejected outright rather than matched by its text.
+         * This pins the menu half of the Phase-0 eat investigation: the
+         * failing episode's eat prompt was an unrestricted getobj `yn`
+         * prompt (choices:null), not a menu, so there is no adapter defect
+         * on this path -- this vector locks in that the menu path used when
+         * the client opens the inventory itself maps a non-first food row
+         * correctly. */
+        struct agent_menu_row irow[4];
+        struct agent_menu im;
+
+        memset(irow, 0, sizeof irow);
+        irow[0].r = 1;
+        snprintf(irow[0].text, sizeof irow[0].text, "Inventory");
+        irow[1].r = 2;
+        snprintf(irow[1].text, sizeof irow[1].text, "a +1 spear");
+        irow[1].selectable = true;
+        irow[2].r = 3;
+        snprintf(irow[2].text, sizeof irow[2].text,
+                 "2 uncursed food rations");
+        irow[2].selectable = true;
+        irow[3].r = 4;
+        snprintf(irow[3].text, sizeof irow[3].text, "an uncursed oil lamp");
+        irow[3].selectable = true;
+        memset(&im, 0, sizeof im);
+        im.id = "m9";
+        im.mode = AG_MENU_ANY;
+        im.rows = irow;
+        im.nrows = 4;
+        im.cap = 4;
+        CHECK(agent_menu_check(&im) == AG_OK);
+
+        memset(&a, 0, sizeof a);
+        commit[0].r = 3; /* the food row, not the first selectable row */
+        commit[0].count = -1;
+        a.rows = commit;
+        a.nrows = 1;
+        CHECK(agent_menu_validate(&im, &a, &sel) == AG_OK && sel.result == 1);
+        CHECK(sel.rows[0].r == 3 && sel.rows[0].count == -1);
+
+        /* an id that is not in this generation is rejected, never matched
+         * by the visible text */
+        commit[0].r = 9;
+        CHECK(agent_menu_validate(&im, &a, &sel) == AG_BAD_INPUT);
+    }
+
     if (failures) {
         printf("test_menu: %d failure(s)\n", failures);
         return 1;
