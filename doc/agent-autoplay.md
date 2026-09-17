@@ -122,9 +122,12 @@ capability):
   * **navigation** — Dijkstra over *remembered, publicly observed* terrain
     with a visit-count penalty, preferring known down-stairs, then reachable
     frontiers, with bounded searching; unknown blanks are not floor;
-  * **safety** — never walks into a monster except as a last-resort unblock
-    (a pet swaps places rather than being attacked); visible traps and
-    boulders are avoided;
+  * **safety** — never walks into a monster: public appearance is ambiguous,
+    so a monster is never assumed tame and is never stepped into.  Getting
+    unblocked means searching, routing around or changing plan, never a
+    last-resort attack or a pet swap.  Visible traps, boulders and the
+    punctuation monster classes (`'`, `&`, `;`, `:`, `~`, `]`) are avoided
+    too;
   * **hunger** — answers the engine's `getobj` eat prompt with a valid
     inventory letter parsed out of the prompt text (the engine passes no
     machine-readable `choices` for that prompt), or opens the inventory

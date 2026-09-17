@@ -743,6 +743,84 @@ class TestScriptedReflexSafety(unittest.TestCase):
         self.assertEqual(second.action["commit"], [[2, -1]])
         self.assertIsNone(protocol.validate_action(need, second.action))
 
+    def test_punctuation_monsters_are_hazards_not_floor(self):
+        # Medium 6: a monster is classified by the whole public glyph table,
+        # not only its letters.
+        for glyph in ("&", ";", ":", "'", "~", "]"):
+            self.assertTrue(state.monster_glyph(glyph),
+                            "%r must be a monster glyph" % glyph)
+            self.assertFalse(state.passable(glyph),
+                            "%r must not be walkable" % glyph)
+        # a boxed-in hero beside a demon never steps into it
+        self._hero(10, 10)
+        self.mem.grid[(9, 10)] = ("&", "red", 0, "none")
+        self.mem.no_progress = 20
+        self.mem.status.hp = 20
+        self.mem.status.hp_max = 20
+        res = self.ref.decide(self.ctx({"kind": "command", "id": 1}))
+        self.assertNotEqual(res.action.get("key"), protocol.DIR_KEYS[(-1, 0)])
+
+    def test_boxed_in_and_hungry_searches_instead_of_waiting(self):
+        # Medium 6: every wait is gated on _safe_to_rest, so a boxed-in,
+        # hungry hero searches rather than resting.
+        self._hero(10, 10)
+        self.mem.status.hp = 20
+        self.mem.status.hp_max = 20
+        self.mem.status.hunger = "Hungry"
+        self.ref.last_eat_tick = 0     # the eat intent is already on cooldown
+        self.mem.no_progress = 6
+        res = self.ref.decide(self.ctx({"kind": "command", "id": 1}, tick=0))
+        self.assertEqual(res.action, {"key": protocol.KEY_SEARCH})
+
+    def test_random_move_never_waits_when_resting_is_unsafe(self):
+        self._hero(10, 10)
+        self.mem.status.hp = 20
+        self.mem.status.hp_max = 20
+        # hungry and no known floor: a wait is not safe, so search instead
+        self.mem.status.hunger = "Weak"
+        key, why = self.ref._random_move(self.mem, (10, 10))
+        self.assertEqual(key, protocol.KEY_SEARCH)
+        self.assertIn("unsafe to rest", why)
+        # an adjacent monster is likewise not a moment to rest
+        self.mem.status.hunger = ""
+        self.mem.grid[(11, 10)] = ("&", "red", 0, "none")
+        key2, _ = self.ref._random_move(self.mem, (10, 10))
+        self.assertEqual(key2, protocol.KEY_SEARCH)
+
+    def test_missing_hero_never_moves_blind(self):
+        # Medium 6: without a known hero square every direction is unknown
+        # space, so hold the turn with a search rather than a blind step.
+        self.mem.hero = None
+        res = self.ref.decide(self.ctx({"kind": "command", "id": 1}))
+        self.assertEqual(res.action, {"key": protocol.KEY_SEARCH})
+        self.assertNotIn(res.action["key"], protocol.DIR_KEYS.values())
+
+    def test_cockatrice_egg_is_never_a_safe_food(self):
+        # Medium 6: food matching is exact enough to reject a dangerous
+        # qualified egg, while still accepting the bare egg and a ration.
+        self.assertFalse(state.is_known_safe_food("a cockatrice egg"))
+        self.assertFalse(state.is_known_safe_food("kobold egg"))
+        self.assertTrue(state.is_known_safe_food("an egg"))
+        self.assertTrue(state.is_known_safe_food("egg"))
+        self.assertTrue(state.is_known_safe_food("d - a food ration"))
+        self.ref.intent = "eat"
+        rows = [row(7, "a cockatrice egg"), row(2, "a food ration")]
+        res = self.ref.decide(self.ctx(menu_need(1, "m1", "c1"), rows,
+                                       title="What do you want to eat?"))
+        self.assertEqual(res.action["commit"], [[2, -1]])
+
+    def test_low_hp_on_upstairs_returns_a_valid_ascend_action(self):
+        # Medium 6: the upstairs withdrawal is a structurally valid action,
+        # so arbitration cannot silently replace ascend with a wait.
+        self._hero(10, 10)
+        self.mem.stairs_up.add((10, 10))
+        self.mem.status.hp = 2
+        self.mem.status.hp_max = 20
+        res = self.ref.decide(self.ctx({"kind": "command", "id": 1}))
+        self.assertEqual(res.action, {"key": ord("<")})
+        self.assertIsNone(
+            protocol.validate_action({"kind": "command"}, res.action))
+
 
 # ====================================================== integration tests
 

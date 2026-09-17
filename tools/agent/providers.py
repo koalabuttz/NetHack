@@ -5,7 +5,7 @@ calls by construction.  This module fixes the interfaces a later wave fills in
 so the wire path never has to change:
 
     Provider.available(config) -> Availability(enabled, reason)
-    ReflexProvider.decide(context, deadline) -> ReflexResult
+    ReflexProvider.decide(context) -> ReflexResult  # deadline in ctx
     StrategyProvider.deliberate(context, deadline) -> StrategyResult
     ScriptedReflex.fallback(context) -> ReflexResult          # in policy.py
 
@@ -19,6 +19,19 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from . import protocol, state
+
+
+class ReflexTimeout(Exception):
+    """A reflex provider exceeded its absolute per-decision deadline.
+
+    The controller passes an absolute monotonic deadline to every decision
+    (``ReflexContext.deadline``).  A cooperative in-process provider raises
+    this from a loop boundary; the controller answers with the bounded
+    scripted fallback instead of hanging.  A truly blocking provider (in
+    particular a network round trip) cannot be interrupted in-process, so it
+    must run in the Wave-2 killable worker process; the contract and plumbing
+    for the deadline exist now regardless of which provider fills the tier.
+    """
 
 
 @dataclass(frozen=True)

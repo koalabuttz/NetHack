@@ -12,15 +12,25 @@ Wave 1 the reflex uses it only for HP and hunger signals; the stable episode-
 local event ids are what a later strategy tier would coalesce and dispatch.
 """
 
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
 from . import protocol
 
+# Monster classes drawn with punctuation rather than a letter.  Taken from the
+# engine's public glyph table (include/defsym.h MONSYM entries): golem ('),
+# major demon (&), sea monster (;), lizard (:), long-worm tail (~) and mimic
+# (]).  The ghost class is a space (i.e. a blank/omitted cell) and the human
+# class is '@' (the hero or another human), so neither is a distinct monster
+# glyph here.
+MONSTER_PUNCTUATION = set("'&;:~]")
+
 # Cells the hero provably cannot stand on.  Blank/unpainted is unknown, not
-# floor; monsters are excluded so pathfinding never walks into an attack;
-# boulders/statues ('`') and visible traps ('^') are avoided.
-NON_WALKABLE = set("|- ~@`^")
+# floor; every monster class (letters and the punctuation classes above) is
+# excluded so pathfinding never walks into an attack; boulders/statues ('`')
+# and visible traps ('^') are avoided too.
+NON_WALKABLE = set("|- ~@`^") | MONSTER_PUNCTUATION
 for _ch in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ":
     NON_WALKABLE.add(_ch)
 
@@ -31,22 +41,52 @@ HUNGER_STAGES = ("Hungry", "Weak", "Fainting", "Fainted", "Starved")
 
 # Food the reflex is willing to eat.  This is a *known-safe allowlist*, not a
 # keyword soup: a corpse, a tinned or simply unrecognised item is not assumed
-# edible (corpse safety is uncertain, and unseen quantities are unknown).
+# edible (corpse safety is uncertain, and unseen quantities are unknown), and
+# a qualified item that only *contains* a safe word is rejected (a
+# "cockatrice egg" is lethal, and is not the bare "egg" this list names).
 KNOWN_SAFE_FOOD = ("food ration", "ration", "apple", "banana", "orange",
                    "melon", "kelp frond", "kelp", "cram", "lembas",
                    "fortune cookie", "candy bar", "cream pie", "meatball",
                    "tripe", "egg")
 UNSAFE_FOOD_MARKERS = ("corpse", "tinned", "unknown", "glop")
 
+# A leading inventory-letter / selection prefix ("d - ", "a) ", "f: ") and a
+# leading article are stripped before an item name is compared, so the row
+# text the engine prints still matches the bare name.  Matching is then exact
+# (or a whole trailing phrase), never a substring: "cockatrice egg" must not
+# be accepted just because it ends in a safe word.
+_FOOD_PREFIX_RE = re.compile(r"^[A-Za-z0-9][\s\.\-\)\*:]+")
+_FOOD_ARTICLES = ("a ", "an ", "the ")
+
+
+def _food_name(text) -> str:
+    """The bare item name: no inventory prefix, no leading article."""
+    low = (text or "").strip().lower()
+    low = _FOOD_PREFIX_RE.sub("", low, count=1)
+    for article in _FOOD_ARTICLES:
+        if low.startswith(article):
+            return low[len(article):]
+    return low
+
 
 def is_known_safe_food(text) -> bool:
-    """True only for a recognised, safe food name."""
-    low = (text or "").lower()
-    if not low:
+    """True only for a recognised, unqualified, safe food name."""
+    name = _food_name(text)
+    if not name:
         return False
-    if any(marker in low for marker in UNSAFE_FOOD_MARKERS):
+    if any(marker in name for marker in UNSAFE_FOOD_MARKERS):
         return False
-    return any(name in low for name in KNOWN_SAFE_FOOD)
+    # an egg is safe only as the bare item: any egg qualified by a monster
+    # name (a cockatrice egg, say) is potentially lethal and never assumed
+    # edible
+    if "egg" in name:
+        return name == "egg"
+    if name in KNOWN_SAFE_FOOD:
+        return True
+    # a whole trailing phrase still counts (e.g. "tripe ration" ends in
+    # "ration"), but a bare substring does not
+    return any(known != "egg" and name.endswith(" " + known)
+               for known in KNOWN_SAFE_FOOD)
 
 
 def passable(ch: str) -> bool:
@@ -54,7 +94,16 @@ def passable(ch: str) -> bool:
 
 
 def monster_glyph(ch: str) -> bool:
-    return bool(ch) and ch.isalpha() and ch != "@"
+    """True for any public monster-class glyph, letters or punctuation.
+
+    Public appearance is ambiguous, so the reflex treats every monster class
+    as a hazard: the alphabetic classes plus the punctuation classes in
+    :data:`MONSTER_PUNCTUATION`.  '@' is the hero (and other humans) and the
+    blank cell is not drawn, so neither is reported here.
+    """
+    if not ch or ch == "@":
+        return False
+    return ch.isalpha() or ch in MONSTER_PUNCTUATION
 
 
 def glyph_is_pet(ch: str) -> bool:

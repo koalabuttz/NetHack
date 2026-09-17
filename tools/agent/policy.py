@@ -32,10 +32,11 @@ probability.  Structural validity is separate from safety confidence.
 
 import heapq
 import random
+import time
 from typing import Dict, List, Optional, Tuple
 
 from . import protocol, state
-from .providers import ReflexContext, ReflexResult
+from .providers import ReflexContext, ReflexResult, ReflexTimeout
 
 KEY = protocol
 
@@ -101,9 +102,20 @@ class ScriptedReflex(object):
         self.stuck = 0
         self.rng = random.Random(0)
         self.max_ticks = 2000
+        # Absolute monotonic deadline for the decision in flight (0 = none).
+        # The controller sets it via ReflexContext.deadline; it is checked at
+        # every loop boundary so a single scripted decision cannot overrun its
+        # allowance.
+        self.deadline = 0.0
 
     # -- provider surface ------------------------------------------------
+    def _check_deadline(self) -> None:
+        if self.deadline and time.monotonic() >= self.deadline:
+            raise ReflexTimeout("scripted reflex exceeded its deadline")
+
     def decide(self, context: ReflexContext) -> ReflexResult:
+        self.deadline = float(getattr(context, "deadline", 0.0) or 0.0)
+        self._check_deadline()
         need = context.need or {}
         kind = need.get("kind")
         if kind == "menu":
@@ -257,8 +269,10 @@ class ScriptedReflex(object):
             return {"key": KEY.KEY_EAT}, "hungry: attempt to eat"
 
         if hero is None:
-            key = self._random_dir(mem, hero)
-            return {"key": key}, "no hero fix: random move"
+            # The hero's square is unknown, so every direction leads into
+            # unknown space and adjacency cannot be evaluated: never move
+            # blind, hold the turn with a search instead.
+            return {"key": KEY.KEY_SEARCH}, "no hero fix: search in place"
 
         # 3. loop breakers: progress without ever walking into a monster
         np = mem.no_progress
@@ -313,7 +327,7 @@ class ScriptedReflex(object):
             if d not in threats and mem.known_passable(dest):
                 return {"key": k}, "low HP: sidestep"
         if hero in mem.stairs_up:
-            return ord("<"), "low HP: withdraw upstairs"
+            return {"key": ord("<")}, "low HP: withdraw upstairs"
         target = self._nearest(mem.stairs_up, hero)
         if target is not None:
             step = self._first_step(mem, hero, target)
@@ -401,7 +415,10 @@ class ScriptedReflex(object):
 
         Unknown blanks are not freely traversable: a step into an unpainted
         cell is only ever taken by a deliberate navigation path that ends on a
-        remembered frontier cell, never by this fallback.
+        remembered frontier cell, never by this fallback.  When no known floor
+        is available this never simply waits -- a wait is only safe when the
+        hero is not hungry, not at low HP and has no adjacent monster -- so an
+        unsafe hold becomes a search instead.
         """
         dirs = list(KEY.DIR_KEYS)
         self.rng.shuffle(dirs)
@@ -409,7 +426,9 @@ class ScriptedReflex(object):
             dest = (hero[0] + d[0], hero[1] + d[1])
             if mem.known_passable(dest):
                 return KEY.DIR_KEYS[d], "random walk (known floor)"
-        return KEY.KEY_WAIT, "no known floor: wait"
+        if hero is not None and self._safe_to_rest(mem, mem.status, hero):
+            return KEY.KEY_WAIT, "no known floor: wait"
+        return KEY.KEY_SEARCH, "no known floor and unsafe to rest: search"
 
     def _is_frontier(self, mem: state.EpisodeMemory, pos) -> bool:
         x, y = pos
@@ -431,6 +450,7 @@ class ScriptedReflex(object):
         pq = [(0.0, hero)]
         found = False
         while pq:
+            self._check_deadline()
             d, pos = heapq.heappop(pq)
             if d > dist.get(pos, float("inf")):
                 continue
@@ -458,14 +478,6 @@ class ScriptedReflex(object):
         if parent.get(node) != hero:
             return None
         return (node[0] - hero[0], node[1] - hero[1])
-
-    def _random_dir(self, mem, hero):
-        dirs = list(KEY.DIR_KEYS)
-        self.rng.shuffle(dirs)
-        for dx, dy in dirs:
-            if hero is None:
-                return KEY.DIR_KEYS[(dx, dy)]
-        return KEY.DIR_KEYS[dirs[0]]
 
     # -- text / extcmd ---------------------------------------------------
     def _textish(self, context: ReflexContext):
