@@ -43,11 +43,17 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from . import protocol, recording
+from .budget import BudgetLedger
 from .codec import AssemblerLimit, ChunkError, IncrementalAssembler
-from .policy import ScriptedReflex
+from .directives import DirectiveBook, PreconditionState
+from .events import BoundaryQueue, hunger_index
+from .policy import INV_STALE_TICKS, ScriptedReflex
 from .protocol import NeedKey, Request, Snapshot
-from .providers import ProviderConfig, ReflexContext, ReflexTimeout
-from .state import EpisodeMemory
+from .providers import (NullStrategy, ProviderConfig, ReflexContext,
+                        ReflexTimeout, ScriptedReflexProvider,
+                        StrategyContext, strategy_provider,
+                        tariff_from_config)
+from .state import EpisodeMemory, render_map
 
 # Environment names the launcher is allowed to inherit.  Everything else --
 # in particular DEEPSEEK_API_KEY and JEV_API_KEY -- is dropped by
@@ -128,6 +134,10 @@ class EpisodeResult(object):
     returncode: Optional[int] = None
     recording_complete: bool = False
     stderr_tail: str = ""
+    budget: dict = field(default_factory=dict)
+    boundaries: int = 0
+    strategy_calls: int = 0
+    directives_applied: int = 0
 
 
 @dataclass
@@ -159,7 +169,19 @@ class Controller(object):
         # at the provider boundary; 0 disables the bound.
         self.reflex_deadline = float(
             getattr(config, "reflex_deadline", 0.75) or 0.0)
+        self.strategy_deadline = float(
+            getattr(config, "strategy_deadline", 20.0) or 0.0)
         ensure_private_dir(output_dir)
+
+    # -- provider construction (per episode) -----------------------------
+    def _new_strategy_provider(self):
+        return strategy_provider(self.config)
+
+    def _new_reflex_provider(self, reflex):
+        if self.config.reflex == "scripted":
+            return ScriptedReflexProvider(reflex)
+        from .providers import reflex_provider
+        return reflex_provider(self.config)
 
     # -- campaign --------------------------------------------------------
     def run_campaign(self, episodes: int) -> List[EpisodeResult]:
@@ -220,6 +242,10 @@ class Controller(object):
             "invalids": result.invalids,
             "reflex_timeouts": result.reflex_timeouts,
             "returncode": result.returncode,
+            "budget": result.budget,
+            "boundaries": result.boundaries,
+            "strategy_calls": result.strategy_calls,
+            "directives_applied": result.directives_applied,
         }
         rec.finalize(meta)
         result.recording_complete = not rec.incomplete
@@ -386,6 +412,11 @@ class _ReflexCall(object):
     def start(self):
         self._thread.start()
 
+    @property
+    def finished(self):
+        """True once the bounded call has returned (result or error)."""
+        return self._done.is_set()
+
     def wait(self, timeout):
         if timeout is None:
             return self._done.wait()
@@ -441,6 +472,32 @@ class _EpisodeRunner(object):
         self.mem = EpisodeMemory()
         self.reflex = ScriptedReflex(controller.config)
         self.reflex.max_ticks = controller.config.max_ticks
+        self.reflex_provider = controller._new_reflex_provider(self.reflex)
+        self.strategy_provider = controller._new_strategy_provider()
+        self.strategy_enabled = self.strategy_provider.available(
+            controller.config).enabled
+        self.ledger = BudgetLedger(
+            strategy_cap=controller.config.strategy_call_cap,
+            postmortem_reserve=controller.config.postmortem_reserve,
+            usd_cap=controller.config.usd_cap,
+            tariff=tariff_from_config(controller.config),
+            reflex_cap=controller.config.reflex_call_cap,
+            token_cap=controller.config.token_cap)
+        self.boundary_queue = BoundaryQueue(
+            cooldown_ticks=controller.config.boundary_cooldown_ticks,
+            cooldown_wall=controller.config.boundary_cooldown_wall,
+            emergency_wall=controller.config.boundary_emergency_wall,
+            ledger=self.ledger)
+        self.book = DirectiveBook()
+        self.detected_boundaries = []
+        self.need_boundaries = []
+        self.low_conf_streak = 0
+        self._strategy_call = None
+        self._strategy_pb = None
+        self._strategy_level = None
+        self._pending_directives = None
+        self._pending_directives_level = None
+        self.paid_disabled = False
         self.tick = 0
         self.retries = 0
         self._needs = 0
@@ -467,6 +524,7 @@ class _EpisodeRunner(object):
         self.deadline = time.monotonic() + self.c.episode_timeout
         try:
             while not self.closed:
+                self._service_strategy()
                 if self.pending:
                     need_dl = self._need_deadline()
                     if need_dl is not None and time.monotonic() >= need_dl:
@@ -496,6 +554,8 @@ class _EpisodeRunner(object):
             self.result.timed_out = True
             self.result.failure_reason = str(exc)
             self.result.stop_reason = "episode-timeout"
+        self._cancel_strategy()
+        self._maybe_postmortem()
         self._finish()
 
     def _finish(self):
@@ -505,6 +565,10 @@ class _EpisodeRunner(object):
         self.result.actions = self.action_ordinal
         self.result.reflex_timeouts = self.reflex_timeouts
         self.result.closed = self.closed
+        self.result.budget = self.ledger.as_dict()
+        self.result.boundaries = self.ledger.boundaries_detected
+        self.result.strategy_calls = self.ledger.strategy_dispatched
+        self.result.directives_applied = self.ledger.boundaries_applied
         # Closure is best-effort: `closed` while a request is still awaiting
         # pages or an action is an unanswered obligation, not a completion.
         if self.closed and self.pending and self.pending_need is not None:
@@ -591,10 +655,14 @@ class _EpisodeRunner(object):
         if not self.rec_healthy:
             return
         if self.rec.failed:
-            # Recorder failure surfaces here immediately.  Wave 1 has no paid
-            # dispatch; Wave 2 hooks its graceful-stop / disable-paid-work
-            # policy on this flag.
+            # A recorder failure can no longer be trusted as lossless, so the
+            # Wave-1 hook applies the graceful-stop policy here: paid dispatch
+            # is disabled for the rest of the episode (scripted play
+            # continues), and any pending strategy work is dropped.
             self.rec_healthy = False
+            self.paid_disabled = True
+            self.strategy_provider.cancel()
+            self.boundary_queue.suppress("recorder-failure")
 
     # -- pipe ------------------------------------------------------------
     def _need_deadline(self):
@@ -733,6 +801,11 @@ class _EpisodeRunner(object):
         except (IndexError, KeyError, TypeError, ValueError,
                 AttributeError) as exc:
             raise _ProtocolFailure("malformed snapshot: %s" % exc)
+        # Boundary detection runs once per applied snapshot, on public state
+        # only.  An id is emitted once, so re-presenting the same snapshot
+        # (or replaying history) yields no new events; simultaneous reasons
+        # coalesce into the single pending strategy request.
+        self._detect_boundaries()
         # Validate the *complete* need shape before any of it is stored on the
         # outstanding request: a malformed need must fail this episode here,
         # not raise later from pages_complete/next_page_request, which run
@@ -791,6 +864,7 @@ class _EpisodeRunner(object):
             raise _ProtocolFailure("invalid with no outstanding request")
         self._invalids.append(code)
         self.retries += 1
+        self.ledger.reflex_invalid += 1
         # record the rejected attempt: a decision with no selected action,
         # carrying the rejection reason
         self.rec.record_decision(
@@ -812,7 +886,218 @@ class _EpisodeRunner(object):
 
     def _on_closed(self, rec):
         self.closed = True
-        self.reflex.on_closed()
+        self.reflex_provider.on_closed()
+        # one closed/postmortem boundary: detected once, never re-emitted
+        self.need_boundaries = self.mem.boundary.check(self.mem.status,
+                                                       closed=True)
+        self.detected_boundaries = self.need_boundaries
+        self.ledger.note_boundary("detected", len(self.need_boundaries))
+        if self._pending_directives is not None:
+            # an episode that ends before the next command boundary never
+            # applies the pending set
+            self.boundary_queue.finish(False)
+            self._pending_directives = None
+
+    # -- boundary detection ----------------------------------------------
+    def _detect_boundaries(self):
+        """Fold one applied snapshot into the boundary machinery."""
+        st = self.mem.status
+        detected = self.mem.boundary.check(
+            st, classes=self.mem.visible_classes(),
+            messages=self.mem.recent_messages(10),
+            inventory_sig=self.mem.inventory_signature(),
+            failed_food=self.mem.failed_food_count(),
+            low_conf_streak=self.low_conf_streak,
+            low_conf_threshold=self.c.config.low_confidence_needs)
+        self.detected_boundaries = detected
+        self.need_boundaries = detected
+        if not detected:
+            return
+        self.ledger.note_boundary("detected", len(detected))
+        if not self._strategy_live():
+            return
+        self.boundary_queue.submit(detected, self.tick, st.dlvl)
+
+    def _strategy_live(self):
+        """Paid strategy dispatch is allowed for this episode."""
+        return self.strategy_enabled and not self.paid_disabled \
+            and not isinstance(self.strategy_provider, NullStrategy)
+
+    # -- strategy scheduling (never in the action path) -------------------
+    def _service_strategy(self):
+        """Advance the one bounded strategy call.  Never blocks the wire."""
+        if not self._strategy_live():
+            return
+        if self._strategy_call is not None:
+            if self._strategy_call.finished:
+                self._finalize_strategy()
+            return
+        now = time.monotonic()
+        pending = self.boundary_queue.ready(self.tick, now)
+        if pending is None:
+            return
+        self._dispatch_strategy(pending, now)
+
+    def _dispatch_strategy(self, pending, now):
+        # Reserve *before* any process is spawned: a call that times out with
+        # no usage is still billed, and the cap is what stops runaway spend.
+        if not self.ledger.reserve_strategy():
+            self.boundary_queue.suppress("strategy-cap")
+            return
+        ctx = self._build_strategy_context(pending)
+        self._strategy_pb = \
+            self.boundary_queue.mark_dispatched(self.tick, now)
+        # The level the advice was *produced* for, not the level at arrival:
+        # advice for another level is stale and is discarded on activation.
+        self._strategy_level = self.mem.status.dlvl
+        deadline = now + self.c.strategy_deadline
+        provider = self.strategy_provider
+        self._strategy_call = _ReflexCall(
+            lambda: provider.deliberate(ctx, deadline))
+        self._strategy_call.start()
+
+    def _finalize_strategy(self):
+        call = self._strategy_call
+        self._strategy_call = None
+        res = None
+        if call is not None and call.error is None:
+            res = call.result
+        usage = res.usage if res is not None else None
+        self.ledger.commit_strategy(usage)
+        pending = self._strategy_pb
+        self._strategy_pb = None
+        if res is not None and res.ok and res.directives:
+            self._pending_directives = res.directives[0]
+            self._pending_directives_level = self._strategy_level
+        elif pending is not None:
+            # a failed or discarded call still expires its boundary set
+            self.boundary_queue.finish(False)
+        reason = res.reason if res is not None else "no result"
+        provider = res.provider if res is not None else "strategy"
+        self.rec.record_decision(
+            proposal=None, selected=None, provider="strategy",
+            reason="strategy %s: %s" % (provider, reason),
+            boundaries=[b.eid for b in self.need_boundaries],
+            usage=usage or {})
+        self._note_recorder_health()
+
+    def _activate_pending_directives(self, need):
+        """Activate a returned directive set at the next command boundary."""
+        if self._pending_directives is None:
+            return
+        if need.get("kind") not in ("command", "key", "direction"):
+            return
+        dset = self._pending_directives
+        self._pending_directives = None
+        level = self.mem.status.dlvl
+        dispatched_level = self._pending_directives_level
+        if dispatched_level is not None and level is not None \
+                and level != dispatched_level:
+            self.boundary_queue.finish(False)
+            return
+        self.book.activate(dset, self.tick, level)
+        self.boundary_queue.finish(True)
+
+    def _remaining_budget(self):
+        spendable = self.ledger.strategy_cap - self.ledger.postmortem_reserve
+        spent = self.ledger.strategy_dispatched \
+            + self.ledger.strategy_reserved
+        return max(0, spendable - spent)
+
+    def _build_strategy_context(self, pending):
+        st = self.mem.status
+        bits = []
+        if st.hp is not None and st.hp_max:
+            bits.append("HP %d/%d" % (st.hp, st.hp_max))
+        if st.hunger:
+            bits.append("Hunger %s" % st.hunger)
+        if st.dlvl:
+            bits.append("Dlvl %s" % st.dlvl)
+        if st.level is not None:
+            bits.append("XL %d" % st.level)
+        inventory = [(r.get("text") or "") for r in self.mem.inventory.rows]
+        return StrategyContext(
+            episode=self.result.index, tick=self.tick,
+            summary={"hp": st.hp, "hp_max": st.hp_max, "dlvl": st.dlvl},
+            boundaries=list(pending.eids) if pending is not None else [],
+            map_text=render_map(self.mem),
+            status_text=", ".join(bits),
+            recent_messages=self.mem.recent_messages(6),
+            inventory=inventory, goals=[],
+            remaining_budget=self._remaining_budget(), level=st.dlvl)
+
+    def _precondition_state(self):
+        st = self.mem.status
+        frac = None
+        if st.hp is not None and st.hp_max:
+            frac = st.hp / float(st.hp_max)
+        fresh = self.mem.inventory.seen_tick is not None and \
+            (self.tick - self.mem.inventory.seen_tick) <= INV_STALE_TICKS
+        return PreconditionState(
+            hero_known=self.mem.hero is not None, hp_known=frac is not None,
+            hp_frac=frac, hungry=hunger_index(st.hunger) >= 0,
+            inventory_fresh=fresh)
+
+    def _note_low_conf(self, confidence, paid=False):
+        """Track sustained low confidence for escalation.
+
+        Only a *paid* tier's confidence is compared to the threshold: the
+        scripted score is a documented heuristic uncertainty score, not a
+        calibrated probability, so a normal scripted answer at its baseline is
+        not read as uncertainty.  A fallback, a timeout, or a paid answer
+        below the threshold is.
+        """
+        thr = self.c.config.confidence_threshold
+        numeric = (confidence is not None
+                   and isinstance(confidence, (int, float))
+                   and not isinstance(confidence, bool))
+        if numeric and (paid and confidence >= thr
+                        or not paid):
+            self.low_conf_streak = 0
+            return
+        self.low_conf_streak += 1
+        self.ledger.reflex_low_confidence += 1
+
+    def _maybe_postmortem(self):
+        """One bounded, optional strategy call after `closed`.
+
+        Enabled only when a postmortem slot is actually reserved
+        (``--postmortem-reserve > 0``); otherwise it is skipped and the whole
+        cap is available during play.
+        """
+        if self.ledger.postmortem_reserve <= 0:
+            return
+        if not self._strategy_live():
+            return
+        if not self.ledger.strategy_available(postmortem=True):
+            return
+        ctx = self._build_strategy_context(None)
+        ctx.postmortem = True
+        ctx.boundaries = [b.eid for b in self.need_boundaries]
+        if not self.ledger.reserve_strategy(postmortem=True):
+            return
+        deadline = time.monotonic() + self.c.strategy_deadline
+        try:
+            res = self.strategy_provider.deliberate(ctx, deadline)
+        except Exception:                    # noqa: BLE001 - bounded policy
+            res = None
+        self.ledger.commit_strategy(res.usage if res is not None else None,
+                                    postmortem=True)
+        self.rec.record_decision(
+            proposal=None, selected=None, provider="strategy",
+            reason="postmortem: %s" % (res.reason if res is not None
+                                       else "no result"),
+            boundaries=ctx.boundaries)
+
+    def _cancel_strategy(self):
+        try:
+            self.strategy_provider.cancel()
+        except Exception:                    # noqa: BLE001 - teardown
+            pass
+        if self._strategy_call is not None:
+            self._strategy_call.wait(1.0)
+            self._strategy_call = None
+        self._strategy_pb = None
 
     # -- decisions -------------------------------------------------------
     def _request_page(self, deadline) -> bool:
@@ -852,11 +1137,15 @@ class _EpisodeRunner(object):
             else:
                 selected = proposal
                 sel_reason = reason
-        boundaries = [b.eid for b in self.mem.boundary.check(self.mem.status)]
+        self._activate_pending_directives(need)
+        view = self.book.view(self.tick, self.mem.status.dlvl,
+                              self._precondition_state())
+        boundaries = [b.eid for b in self.need_boundaries]
+        directives = [list(view.goals)] if view.active else []
         self.rec.record_decision(
             proposal=proposal, selected=selected, provider=provider,
             reason=sel_reason, boundaries=boundaries, latency=latency,
-            usage=usage)
+            usage=usage, directives=directives)
         obj = protocol.make_act(self.pending_seq, need["id"], selected)
         self._emit("act", obj, need_key=self.pending_key,
                    write_deadline=write_dl)
@@ -876,6 +1165,7 @@ class _EpisodeRunner(object):
         bounded scripted fallback rather than hanging the wire.
         """
         if self.force_fallback:
+            self.ledger.reflex_fallback += 1
             return (self._safe_fallback(need), "controller",
                     "forced fallback", 0.0, {})
         reflex_dl = None
@@ -884,37 +1174,105 @@ class _EpisodeRunner(object):
         if need_deadline is not None:
             reflex_dl = (need_deadline if reflex_dl is None
                          else min(reflex_dl, need_deadline))
-        ctx = ReflexContext(
+        ctx = self._reflex_context(need, reflex_dl)
+        t0 = time.monotonic()
+        if self.reflex_provider.name == "scripted":
+            return self._decide_scripted(ctx, reflex_dl, t0)
+        return self._decide_jev(ctx, reflex_dl, t0)
+
+    def _reflex_context(self, need, reflex_dl):
+        st = self.mem.status
+        view = self.book.view(self.tick, st.dlvl, self._precondition_state())
+        return ReflexContext(
             episode=self.result.index, tick=self.tick, need=need,
             need_key=self.pending_key, snapshot=self.snap,
             pages=self.req.page_rows(), memory=self.mem,
+            directives=[view] if view.active else [],
             deadline=reflex_dl or 0.0)
-        t0 = time.monotonic()
-        call = _ReflexCall(lambda: self.reflex.decide(ctx))
+
+    def _decide_scripted(self, ctx, reflex_dl, t0):
+        """The always-available tier, bounded by the reflex deadline."""
+        self.ledger.reflex_attempted += 1
+        call = _ReflexCall(
+            lambda: self.reflex_provider.decide(ctx, reflex_dl or 0.0))
         call.start()
         wait = None if reflex_dl is None else reflex_dl - time.monotonic()
         finished = call.wait(wait)
         latency = time.monotonic() - t0
         if not finished:
             self.reflex_timeouts += 1
+            self.ledger.reflex_timeout += 1
+            self._note_low_conf(None)
             return (None, "scripted",
                     "reflex deadline exceeded (>%.2fs, provider still "
                     "running)" % self.c.reflex_deadline, latency, {})
         if call.error is not None:
             if isinstance(call.error, ReflexTimeout):
                 self.reflex_timeouts += 1
+                self.ledger.reflex_timeout += 1
+                self._note_low_conf(None)
                 return (None, "scripted", "reflex deadline exceeded: %s"
                         % call.error, latency, {})
             if isinstance(call.error, Exception):
+                self.ledger.reflex_fallback += 1
+                self._note_low_conf(None)
                 return (None, "scripted", "reflex provider error: %s"
                         % call.error, latency, {})
             raise call.error
         res = call.result
         if res is None:
+            self.ledger.reflex_fallback += 1
+            self._note_low_conf(None)
             return (None, "controller", "reflex returned no result",
                     latency, {})
+        self.ledger.reflex_successful += 1
+        self._note_low_conf(res.confidence)
         return (res.action, res.provider or "scripted", res.reason, latency,
                 res.usage)
+
+    def _decide_jev(self, ctx, reflex_dl, t0):
+        """Optional paid reflex: one immutable job, bounded, else scripted.
+
+        Scripted safety is computed first and answers immediately if the paid
+        tier is unavailable, capped or wrong -- never await a paid tier to
+        answer a crisis.
+        """
+        scripted = self.reflex.fallback(ctx)
+        fallback_action = scripted.action if scripted is not None else None
+        availability = self.reflex_provider.available(self.c.config)
+        if not availability.enabled:
+            self.ledger.reflex_fallback += 1
+            self._note_low_conf(None)
+            return (fallback_action, "scripted",
+                    "jev unavailable: %s" % availability.reason, 0.0, {})
+        if not self.ledger.reflex_paid_available():
+            self.ledger.reflex_fallback += 1
+            self._note_low_conf(None)
+            return (fallback_action, "scripted",
+                    "jev paid-reflex cap reached",
+                    0.0, {})
+        self.ledger.reserve_reflex_paid()
+        self.ledger.reflex_attempted += 1
+        call = _ReflexCall(
+            lambda: self.reflex_provider.decide(ctx, reflex_dl or 0.0))
+        call.start()
+        wait = None if reflex_dl is None else reflex_dl - time.monotonic()
+        finished = call.wait(wait)
+        latency = time.monotonic() - t0
+        res = call.result if (finished and call.error is None) else None
+        if not finished:
+            self.reflex_timeouts += 1
+            self.ledger.reflex_timeout += 1
+        if res is None or res.action is None:
+            self.ledger.reflex_fallback += 1
+            self._note_low_conf(None)
+            why = getattr(self.reflex_provider, "last_error", "") \
+                or "no answer"
+            return (fallback_action, "scripted", "jev fallback: %s" % why,
+                    latency, {})
+        self.ledger.reflex_successful += 1
+        self._note_low_conf(res.confidence, paid=True)
+        return (res.action, res.provider, res.reason, latency, res.usage)
 
     def _safe_fallback(self, need) -> dict:
         """A structurally valid, non-blocking answer for any need kind.
@@ -957,4 +1315,17 @@ def _safe_config(config: ProviderConfig) -> dict:
         "reflex_deadline": getattr(config, "reflex_deadline", None),
         "answer_deadline": getattr(config, "answer_deadline", None),
         "content_deadline": getattr(config, "content_deadline", None),
+        "strategy_deadline": getattr(config, "strategy_deadline", None),
+        "postmortem_reserve": getattr(config, "postmortem_reserve", None),
+        "boundary_cooldown_ticks": getattr(config,
+                                           "boundary_cooldown_ticks", None),
+        "boundary_cooldown_wall": getattr(config,
+                                          "boundary_cooldown_wall", None),
+        "low_confidence_needs": getattr(config, "low_confidence_needs", None),
+        "reflex_call_cap": getattr(config, "reflex_call_cap", None),
+        "jev_base_url": ("configured" if getattr(config, "jev_base_url", None)
+                         else None),
+        "jev_accept_terms": bool(getattr(config, "jev_accept_terms", False)),
+        "usd_cap": getattr(config, "usd_cap", None),
+        "token_cap": getattr(config, "token_cap", None),
     }
