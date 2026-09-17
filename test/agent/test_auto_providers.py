@@ -30,12 +30,14 @@ for _p in (_ROOT, _HERE):
 
 from test_auto import (BLANK, CLOSED, HELLO, WireHarness,  # noqa: E402
                        _FakeStderr, _FakeStdin, _FakeStdout, _line,
-                       _parse_actions, _read_jsonl, ack_need, hello)
+                       _parse_actions, _read_jsonl, _wait_gone, ack_need,
+                       hello)
 from tools.agent import (budget, controller, directives, events,  # noqa
-                         policy, protocol, providers, state, worker)
+                         policy, protocol, providers, recording, state,
+                         worker)
 from tools.agent.providers import (Availability, ProviderConfig,  # noqa
-                                   ReflexContext, StrategyContext,
-                                   StrategyResult)
+                                   ReflexContext, ReflexResult,
+                                   StrategyContext, StrategyResult)
 
 DSEV = directives
 
@@ -133,11 +135,13 @@ class FakeStrategy(providers.StrategyProvider):
 
     name = "fake"
 
-    def __init__(self, payload=None, available=True, delay=0.0, ok=True):
+    def __init__(self, payload=None, available=True, delay=0.0, ok=True,
+                 gate=None):
         self.payload = payload
         self._available = available
         self._delay = delay
         self._ok = ok
+        self.gate = gate
         self.calls = []
         self.cancelled = 0
 
@@ -147,6 +151,8 @@ class FakeStrategy(providers.StrategyProvider):
 
     def deliberate(self, context, deadline=0.0):
         self.calls.append(context)
+        if self.gate is not None:
+            self.gate.wait(5.0)
         if self._delay:
             time.sleep(self._delay)
         if not self._ok or self.payload is None:
@@ -187,6 +193,12 @@ class PacedProc(object):
         self.killed = True
 
     def close(self):
+        wr = getattr(self, "_wr", None)
+        if wr is not None and not wr.closed:
+            try:
+                wr.close()
+            except OSError:
+                pass
         try:
             os.close(self.r)
         except OSError:
@@ -212,6 +224,9 @@ def paced(records, gaps, eof=True):
 def _feed_paced(proc):
     try:
         wr = os.fdopen(proc.w, "wb", buffering=0)
+        # keep the write end referenced (and open) when eof is False: the
+        # controller must see a live, silent peer rather than a closed pipe
+        proc._wr = wr
         for rec in proc._records:
             wr.write(rec)
             time.sleep(proc._gaps.pop(0) if proc._gaps else 0.0)
@@ -600,6 +615,56 @@ class TestBudgetLedger(unittest.TestCase):
                        "reported": True})
         self.assertFalse(led.strategy_available())
 
+    def test_token_bound_is_refused_before_dispatch(self):
+        # usage one unit below the cap: a request whose conservative bound
+        # exceeds the remainder is refused *before* anything is charged
+        led = budget.BudgetLedger(strategy_cap=10, postmortem_reserve=0,
+                                  token_cap=100)
+        led.add_usage({"prompt_tokens": 99, "completion_tokens": 0,
+                       "reported": True})
+        self.assertFalse(led.reserve_strategy(prompt_tokens=5,
+                                              completion_tokens=0))
+        self.assertEqual(led.strategy_reserved, 0)
+        self.assertTrue(led.reserve_strategy(prompt_tokens=1,
+                                             completion_tokens=0))
+        led.commit_strategy({})
+        self.assertEqual(led.strategy_dispatched, 1)
+
+    def test_usd_bound_is_refused_before_dispatch(self):
+        led = budget.BudgetLedger(
+            strategy_cap=10, postmortem_reserve=0, usd_cap=0.5,
+            tariff=budget.Tariff(1.0, 1.0))
+        led.add_usage({"prompt_tokens": 400000, "completion_tokens": 0,
+                       "reported": True})            # $0.40 of the $0.50 cap
+        # a $0.20 bound cannot be covered by the $0.10 remainder
+        self.assertFalse(led.reserve_strategy(prompt_tokens=200000,
+                                              completion_tokens=0))
+        self.assertTrue(led.reserve_strategy(prompt_tokens=90000,
+                                             completion_tokens=0))
+        led.commit_strategy({})
+
+    def test_timeout_keeps_its_exposure(self):
+        led = budget.BudgetLedger(strategy_cap=10, postmortem_reserve=0,
+                                  token_cap=100)
+        self.assertTrue(led.reserve_strategy(prompt_tokens=60,
+                                             completion_tokens=30))
+        led.commit_strategy(None)                     # no usage returned
+        self.assertEqual(led.strategy_dispatched, 1)
+        self.assertEqual(led.strategy_reserved, 0)
+        self.assertEqual(led.unknown_exposure_calls, 1)
+        self.assertEqual(led.unknown_exposure_tokens, 90)
+        # the exposure is still represented, so a further call cannot fit
+        self.assertFalse(led.reserve_strategy(prompt_tokens=20,
+                                              completion_tokens=0))
+
+    def test_negative_postmortem_reserve_cannot_enlarge_play(self):
+        led = budget.BudgetLedger(strategy_cap=4, postmortem_reserve=-1)
+        self.assertEqual(led.postmortem_reserve, 0)
+        for _ in range(4):
+            self.assertTrue(led.reserve_strategy())
+            led.commit_strategy({})
+        self.assertFalse(led.strategy_available())
+
     def test_reflex_paid_bound_is_separate(self):
         led = budget.BudgetLedger(reflex_cap=2)
         self.assertTrue(led.reserve_reflex_paid())
@@ -706,6 +771,91 @@ class TestWorkerSupervisor(unittest.TestCase):
         self.assertTrue(res.ok)
         self.assertEqual(res.json, {"a": 1})
         sup.reap()
+
+    def test_worker_env_is_minimal_and_secret_free(self):
+        with mock.patch.dict(os.environ, {
+                "DEEPSEEK_API_KEY": "sentinel-ds",
+                "JEV_API_KEY": "sentinel-jev",
+                "OPENAI_API_KEY": "sentinel-oa",
+                "HOME": "/home/tester"}, clear=False):
+            env = providers.worker_env()
+        self.assertNotIn("DEEPSEEK_API_KEY", env)
+        self.assertNotIn("JEV_API_KEY", env)
+        self.assertNotIn("OPENAI_API_KEY", env)
+        self.assertEqual(env["HOME"], "/home/tester")
+        self.assertIn("PATH", env)
+
+    def test_worker_process_does_not_inherit_credentials(self):
+        dump = os.path.join(self.dir, "worker-env.json")
+        argv = self._script(
+            "import json, os, sys\n"
+            "json.dump(dict(os.environ), open(%r, 'w'))\n"
+            "sys.stdout.write('{\"v\":1,\"ok\":true,\"json\":{}}\\n')\n"
+            % dump)
+        with mock.patch.dict(os.environ, {
+                "DEEPSEEK_API_KEY": "sentinel-ds",
+                "JEV_API_KEY": "sentinel-jev"}, clear=False):
+            sup = providers._WorkerSupervisor(argv)
+            sup.start({"v": 1, "api_key": "unused-here"},
+                      time.monotonic() + 3.0)
+            self.assertTrue(sup.wait(4.0))
+            sup.poll()
+            sup.reap()
+        with open(dump) as fh:
+            child = json.load(fh)
+        self.assertNotIn("DEEPSEEK_API_KEY", child)
+        self.assertNotIn("JEV_API_KEY", child)
+        self.assertIn("PATH", child)
+
+    def test_job_key_travels_on_stdin_not_argv(self):
+        argv = self._script(
+            "import json, sys\n"
+            "job = json.loads(sys.stdin.readline())\n"
+            "sys.stdout.write(json.dumps({'v': 1, 'ok': True,\n"
+            "  'json': {'seen': job.get('api_key'),\n"
+            "            'argv': list(sys.argv)}}) + '\\n')\n")
+        sup = providers._WorkerSupervisor(argv)
+        sup.start({"v": 1, "api_key": "sk-stdin-secret"},
+                  time.monotonic() + 3.0)
+        self.assertTrue(sup.wait(4.0))
+        res = sup.poll()
+        sup.reap()
+        self.assertTrue(res.ok)
+        self.assertEqual(res.json["seen"], "sk-stdin-secret")
+        self.assertNotIn("sk-stdin-secret", " ".join(res.json["argv"]))
+
+    def test_group_is_killed_after_the_leader_exits_on_term(self):
+        # Low 5: a worker that forks a TERM-ignoring child and then exits on
+        # TERM leaves no leader to resolve the group from; escalation must
+        # assess the *group* and KILL the survivor.
+        pidfile = os.path.join(self.dir, "worker-child.pid")
+        argv = self._script(
+            "import os, signal, time\n"
+            "pid = os.fork()\n"
+            "if pid == 0:\n"
+            "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "    while True:\n"
+            "        time.sleep(0.5)\n"
+            "open(%r, 'w').write(str(pid))\n"
+            "while True:\n"
+            "    time.sleep(0.5)\n" % pidfile)
+        sup = providers._WorkerSupervisor(argv, grace=0.3)
+        sup.start({"v": 1}, time.monotonic() + 0.5)
+        child = None
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and child is None:
+            if os.path.exists(pidfile):
+                with open(pidfile) as fh:
+                    child = int(fh.read().strip())
+            else:
+                time.sleep(0.05)
+        self.assertIsNotNone(child, "the worker never forked a child")
+        self.assertTrue(sup.wait(5.0))
+        sup.poll()
+        sup.reap()
+        self.assertTrue(_wait_gone(child, 3.0),
+                        "the TERM-ignoring descendant survived teardown")
+        self.assertTrue(_wait_gone(sup.proc.pid, 3.0))
 
 
 # ============================================================ DeepSeek
@@ -1248,6 +1398,438 @@ class TestSecretsInArtifacts(WireHarness):
                 if b"sk-" in data:
                     leaks.append(name)
         self.assertEqual(leaks, [])
+
+
+# ============================================================ settlement
+
+class TestStrategySettlement(WireHarness):
+    """Medium 1: exactly-once settlement of a started strategy operation."""
+
+    def _runner(self, fake, config=None):
+        cfg = config or ProviderConfig(max_ticks=200, postmortem_reserve=0,
+                                       low_confidence_needs=1000)
+        ctl = controller.Controller(
+            cfg, controller.ControllerPaths("w", "r", "d", "s"), self.dir,
+            episode_timeout=5.0)
+        ctl._new_strategy_provider = lambda: fake
+        result = controller.EpisodeResult(index=1)
+        rec = recording.EpisodeRecorder(self.dir, 1)
+        proc = paced([hello()], [0.0])
+        self.addCleanup(proc.close)
+        runner = controller._EpisodeRunner(ctl, proc, rec, result)
+        return runner, rec, result
+
+    def _dispatch(self, runner):
+        b = events.Boundary("initial-level", "level:Dlvl:1:1")
+        runner.event_ledger.detect(b, 0, "Dlvl:1")
+        runner.boundary_queue.submit([b], 0, "Dlvl:1")
+        runner._dispatch_strategy(
+            runner.boundary_queue.ready(0, time.monotonic()),
+            time.monotonic())
+        return b
+
+    def _end(self, ending, runner):
+        if ending == "closed":
+            runner.closed = True
+        elif ending == "protocol-failure":
+            runner.result.protocol_failure = "boom"
+        elif ending == "episode-timeout":
+            runner.result.timed_out = True
+        elif ending == "content-deadline":
+            runner.result.failure_reason = "content deadline expired"
+        elif ending == "recorder-failure":
+            runner.rec._decs.error = "disk full"
+            runner._note_recorder_health()
+
+    def test_every_ending_settles_the_call_exactly_once(self):
+        for ending in ("closed", "protocol-failure", "episode-timeout",
+                       "content-deadline", "recorder-failure"):
+            with self.subTest(ending=ending):
+                fake = FakeStrategy(_ok_directives())
+                runner, rec, result = self._runner(fake)
+                eid = self._dispatch(runner).eid
+                self.assertEqual(runner.ledger.strategy_reserved, 1)
+                self._end(ending, runner)
+                runner._cancel_strategy()
+                runner._maybe_postmortem()
+                runner._finish()
+                rec.finalize({})
+                self.assertEqual(result.budget["strategy"]["reserved"], 0)
+                self.assertEqual(result.budget["strategy"]["dispatched"], 1)
+                # the completed result is preserved, never released
+                self.assertEqual(result.budget["usage"]["prompt_tokens"], 5)
+                recs = [r for r in runner.event_ledger.as_list()
+                        if r["eid"] == eid]
+                self.assertEqual(len(recs), 1)
+                self.assertIsNotNone(recs[0]["terminal"])
+                # a later settlement attempt is a guarded no-op
+                runner._cancel_strategy()
+                self.assertEqual(runner.ledger.strategy_dispatched, 1)
+                self.assertEqual(runner.ledger.strategy_reserved, 0)
+
+    def test_blocking_call_is_committed_with_unknown_usage(self):
+        gate = threading.Event()
+        fake = FakeStrategy(_ok_directives(), gate=gate)
+        runner, rec, result = self._runner(fake)
+        eid = self._dispatch(runner).eid
+        self.assertEqual(runner.ledger.strategy_reserved, 1)
+        t0 = time.monotonic()
+        runner._cancel_strategy()
+        self.assertLess(time.monotonic() - t0, 3.0)
+        gate.set()                       # release the abandoned worker thread
+        runner._finish()
+        rec.finalize({})
+        self.assertEqual(result.budget["strategy"]["reserved"], 0)
+        self.assertEqual(result.budget["strategy"]["dispatched"], 1)
+        # no usage was returned, so the exposure is carried, not dropped
+        self.assertEqual(result.budget["usage"]["unknown_exposure_calls"], 1)
+        self.assertEqual(result.budget["usage"]["prompt_tokens"], 0)
+        recs = [r for r in runner.event_ledger.as_list() if r["eid"] == eid]
+        self.assertEqual(recs[0]["terminal"]["state"], "expired")
+
+
+# ============================================================ provenance
+
+class TestRecordingProvenance(WireHarness):
+    """Medium 4: decisions, directive sets and the event ledger are exact."""
+
+    def _controller_with(self, fake, config=None):
+        config = config or ProviderConfig(max_ticks=200, postmortem_reserve=0,
+                                          low_confidence_needs=1000)
+        ctl = controller.Controller(
+            config, controller.ControllerPaths(worker="w", runner="r",
+                                               data="d", sysconf="s"),
+            self.dir, episode_timeout=10.0)
+        ctl._new_strategy_provider = lambda: fake
+        return ctl
+
+    def _decisions(self):
+        return _read_jsonl(os.path.join(self.dir, "ep-1.decisions.jsonl"))
+
+    def _events(self):
+        return _read_jsonl(os.path.join(self.dir, "ep-1.events.jsonl"))
+
+    def test_decision_records_only_the_dispatched_eids(self):
+        fake = FakeStrategy(_ok_directives(goals=("explore_frontier",)),
+                            delay=0.25)
+        ctl = self._controller_with(fake)
+        records = [
+            hello(),
+            st_obs(1, command_need(1), dlvl="Dlvl:1", hp=10, hp_max=20),
+            st_obs(2, command_need(2), dlvl="Dlvl:2", hp=10, hp_max=20),
+            st_obs(3, command_need(3), dlvl="Dlvl:2", hp=10, hp_max=20,
+                   msg=("You see here a gold piece.",)),
+            CLOSED,
+        ]
+        proc = paced(records, [0.05, 0.05, 0.6, 0.05, 0.05])
+        ctl._spawn = lambda priv: proc
+        result = ctl.run_episode(1)
+        proc.close()
+        # A was dispatched for the initial level; B (the level change) and C
+        # (the novelty item) coalesced into the pending set while A ran
+        strat = [d for d in self._decisions()
+                 if d["provider"] == "strategy"
+                 and d["reason"].startswith("strategy")]
+        self.assertEqual(len(strat), 1)
+        self.assertEqual(strat[0]["boundaries"], ["level:Dlvl:1:1"])
+        # ... and the coalesced set terminates in exactly one state
+        ledger = [r for r in self._events() if r.get("record") == "boundary"]
+        queued = [r for r in ledger if r["queued"] is not None]
+        self.assertTrue(queued)
+        for rec in queued:
+            self.assertIsNotNone(rec["terminal"], rec["eid"])
+        # B was never dispatched: one strategy call, and only A has one
+        self.assertEqual(result.strategy_calls, 1)
+        self.assertTrue(all(r["dispatched"] is None
+                            for r in ledger if r["eid"] != "level:Dlvl:1:1"))
+
+    def test_directive_set_round_trips_through_the_decision(self):
+        payload = {"schema_version": 1, "goals": ["survive", "acquire_food"],
+                   "target": [10, 5], "risk": 0.25, "ttl": 30,
+                   "preconditions": ["hero_known"],
+                   "explanation": "eat then run"}
+        fake = FakeStrategy(payload)
+        ctl = self._controller_with(fake)
+        records = [
+            hello(),
+            st_obs(1, command_need(1), dlvl="Dlvl:1", hp=10, hp_max=20),
+            st_obs(2, command_need(2), dlvl="Dlvl:1", hp=10, hp_max=20),
+            CLOSED,
+        ]
+        proc = paced(records, [0.05, 0.5, 0.05, 0.05])
+        ctl._spawn = lambda priv: proc
+        result = ctl.run_episode(1)
+        proc.close()
+        self.assertEqual(result.directives_applied, 1)
+        applied = [d for d in self._decisions() if d["directives"]]
+        self.assertTrue(applied)
+        rec = applied[-1]["directives"][0]
+        self.assertEqual(rec["goals"], ["survive", "acquire_food"])
+        self.assertEqual(rec["target"], [10, 5])
+        self.assertEqual(rec["risk"], 0.25)
+        self.assertEqual(rec["ttl"], 30)
+        self.assertEqual(rec["preconditions"], ["hero_known"])
+        self.assertEqual(rec["explanation"], "eat then run")
+        dset, why = DSEV.validate_directive_set(rec)
+        self.assertEqual(why, "")
+        self.assertEqual(dset.goals, ("survive", "acquire_food"))
+        # the directive lifecycle is ledgered too
+        directives = [r for r in self._events()
+                      if r.get("record") == "directive"]
+        self.assertTrue(any(r["state"] == "applied" for r in directives))
+
+    def test_event_ledger_has_exactly_one_terminal_per_queued_eid(self):
+        fake = FakeStrategy(_ok_directives(goals=("explore_frontier",)))
+        ctl = self._controller_with(fake)
+        records = [
+            hello(),
+            st_obs(1, command_need(1), dlvl="Dlvl:1", hp=10, hp_max=20),
+            st_obs(2, command_need(2), dlvl="Dlvl:2", hp=10, hp_max=20),
+            st_obs(3, command_need(3), dlvl="Dlvl:3", hp=10, hp_max=20),
+            CLOSED,
+        ]
+        proc = paced(records, [0.05, 0.5, 0.15, 0.15, 0.05])
+        ctl._spawn = lambda priv: proc
+        ctl.run_episode(1)
+        proc.close()
+        ledger = [r for r in self._events() if r.get("record") == "boundary"]
+        self.assertTrue(ledger)
+        for rec in ledger:
+            self.assertEqual(rec["schema"], 1)
+            if rec["queued"] is not None:
+                self.assertIsNotNone(rec["terminal"], rec["eid"])
+        closed = [r for r in ledger if r["eid"] == "closed"]
+        self.assertEqual(len(closed), 1)
+        # the closed boundary is *detected* only: it is never dispatched
+        self.assertIsNone(closed[0]["terminal"])
+
+    def test_postmortem_usage_reaches_decisions_and_totals(self):
+        fake = FakeStrategy(_ok_directives())
+        cfg = ProviderConfig(max_ticks=200, strategy_call_cap=4,
+                             postmortem_reserve=1, low_confidence_needs=1000)
+        ctl = self._controller_with(fake, config=cfg)
+        records = [
+            hello(),
+            st_obs(1, command_need(1), dlvl="Dlvl:1", hp=10, hp_max=20),
+            st_obs(2, command_need(2), dlvl="Dlvl:2", hp=10, hp_max=20),
+            CLOSED,
+        ]
+        proc = paced(records, [0.05, 0.5, 0.05, 0.05])
+        ctl._spawn = lambda priv: proc
+        result = ctl.run_episode(1)
+        proc.close()
+        pm = [d for d in self._decisions()
+              if d["reason"].startswith("postmortem")]
+        self.assertEqual(len(pm), 1)
+        self.assertEqual(pm[0]["usage"].get("prompt_tokens"), 5)
+        # play call (5) + postmortem (5) both reach the episode totals
+        self.assertEqual(result.budget["usage"]["prompt_tokens"], 10)
+
+
+# ============================================================ postmortem
+
+class TestPostmortemEligibility(WireHarness):
+    """Medium 3: a postmortem requires a clean, validated closure."""
+
+    def _run(self, records, gaps, config=None, eof=True, timeout=10.0):
+        fake = FakeStrategy(_ok_directives())
+        cfg = config or ProviderConfig(max_ticks=200, strategy_call_cap=4,
+                                       postmortem_reserve=1,
+                                       low_confidence_needs=1000)
+        ctl = controller.Controller(
+            cfg, controller.ControllerPaths("w", "r", "d", "s"), self.dir,
+            episode_timeout=timeout)
+        ctl._new_strategy_provider = lambda: fake
+        proc = paced(records, gaps, eof=eof)
+        ctl._spawn = lambda priv: proc
+        result = ctl.run_episode(1)
+        proc.close()
+        return fake, result
+
+    def _postmortems(self, fake):
+        return len([c for c in fake.calls if getattr(c, "postmortem", False)])
+
+    def test_clean_closed_runs_exactly_one_postmortem(self):
+        fake, result = self._run(
+            [hello(),
+             st_obs(1, command_need(1), dlvl="Dlvl:1", hp=10, hp_max=20),
+             CLOSED],
+            [0.05, 0.2, 0.05])
+        self.assertTrue(result.closed)
+        self.assertFalse(result.unanswered)
+        self.assertEqual(self._postmortems(fake), 1)
+        self.assertEqual(
+            result.budget["strategy"]["postmortem_dispatched"], 1)
+
+    def test_eof_runs_no_postmortem(self):
+        fake, result = self._run(
+            [hello(),
+             st_obs(1, command_need(1), dlvl="Dlvl:1", hp=10, hp_max=20)],
+            [0.05, 0.2], eof=True)
+        self.assertFalse(result.closed)
+        self.assertEqual(result.stop_reason, "transport-failure-eof")
+        self.assertEqual(self._postmortems(fake), 0)
+
+    def test_protocol_failure_runs_no_postmortem(self):
+        bad = dict(CLOSED)
+        bad["type"] = "not-a-record"
+        fake, result = self._run([hello(), bad], [0.05, 0.05])
+        self.assertEqual(result.stop_reason, "protocol-failure")
+        self.assertEqual(self._postmortems(fake), 0)
+
+    def test_episode_timeout_runs_no_postmortem(self):
+        fake, result = self._run(
+            [hello(),
+             st_obs(1, command_need(1), dlvl="Dlvl:1", hp=10, hp_max=20)],
+            [0.05, 0.05], eof=False, timeout=0.4)
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.stop_reason, "episode-timeout")
+        self.assertEqual(self._postmortems(fake), 0)
+
+    def test_content_deadline_runs_no_postmortem(self):
+        cfg = ProviderConfig(max_ticks=200, strategy_call_cap=4,
+                             postmortem_reserve=1, content_deadline=0.3,
+                             low_confidence_needs=1000)
+        paged = {"id": 1, "kind": "menu", "menu": "m1", "mode": "one",
+                 "content": "c1", "pages": 2}
+        fake, result = self._run(
+            [hello(), st_obs(1, paged, dlvl="Dlvl:1", hp=10, hp_max=20)],
+            [0.05, 0.05], config=cfg, eof=False, timeout=3.0)
+        self.assertEqual(result.stop_reason, "content-deadline")
+        self.assertEqual(self._postmortems(fake), 0)
+
+    def test_closed_unanswered_runs_no_postmortem(self):
+        paged = {"id": 1, "kind": "menu", "menu": "m9", "mode": "one",
+                 "content": "c9", "pages": 2}
+        fake, result = self._run(
+            [hello(), st_obs(1, paged, dlvl="Dlvl:1", hp=10, hp_max=20),
+             CLOSED],
+            [0.05, 0.2, 0.05])
+        self.assertTrue(result.closed)
+        self.assertTrue(result.unanswered)
+        self.assertEqual(result.stop_reason, "closed-unanswered")
+        self.assertEqual(self._postmortems(fake), 0)
+
+
+# ============================================================ low conf
+
+class _FakeJev(object):
+    """A typed-choice reflex double that never opens a socket."""
+
+    name = "jev"
+    version = "fake/1"
+    last_error = ""
+
+    def __init__(self, action=None, confidence=0.9, usage=None):
+        self.action = action or {"key": protocol.KEY_SEARCH}
+        self.confidence = confidence
+        self.usage = usage or {}
+        self.cancelled = 0
+
+    def available(self, config):
+        return Availability(True, "fake jev")
+
+    def decide(self, ctx, deadline=0.0):
+        return ReflexResult(action=self.action, confidence=self.confidence,
+                            provider="jev", reason="fake", usage=self.usage)
+
+    def fallback(self, ctx):
+        return None
+
+    def on_closed(self):
+        pass
+
+    def cancel(self):
+        self.cancelled += 1
+
+
+class TestLowConfidenceEscalation(WireHarness):
+    """Low 6: escalation follows the FINAL selection outcome."""
+
+    def _runner(self, decide=None, config=None):
+        cfg = config or ProviderConfig(max_ticks=200, postmortem_reserve=0,
+                                       low_confidence_needs=3)
+        ctl = controller.Controller(
+            cfg, controller.ControllerPaths("w", "r", "d", "s"), self.dir,
+            episode_timeout=5.0)
+        result = controller.EpisodeResult(index=1)
+        rec = recording.EpisodeRecorder(self.dir, 1)
+        proc = paced([hello()], [0.0])
+        self.addCleanup(proc.close)
+        runner = controller._EpisodeRunner(ctl, proc, rec, result)
+        runner.pending_key = protocol.NeedKey(1, 1, 1)
+        runner.pending_seq = 1
+        runner.pending_need = {"kind": "command", "id": 1}
+        if decide is not None:
+            runner._decide = decide
+        return runner, rec
+
+    def _answer(self, runner, n=1):
+        for _ in range(n):
+            runner.pending_need = {"kind": "command", "id": 1}
+            runner._answer_now(None)
+
+    def test_ordinary_scripted_decisions_never_escalate(self):
+        runner, rec = self._runner(
+            decide=lambda need, dl: ({"key": protocol.KEY_WAIT}, "scripted",
+                                     "ordinary", 0.0, {}, False))
+        self._answer(runner, 3)
+        rec.finalize({})
+        self.assertEqual(runner.low_conf_streak, 0)
+        runner._detect_boundaries()
+        self.assertFalse(any(b.reason == "low-confidence"
+                             for b in runner.detected_boundaries))
+
+    def test_three_forced_fallbacks_escalate(self):
+        runner, rec = self._runner()
+        for _ in range(3):
+            runner.force_fallback = True
+            runner._answer_now(None)
+        rec.finalize({})
+        self.assertEqual(runner.low_conf_streak, 3)
+        self.assertEqual(runner.ledger.reflex_low_confidence, 3)
+        runner._detect_boundaries()
+        self.assertEqual([b.reason for b in runner.detected_boundaries],
+                         ["low-confidence"])
+
+    def test_three_invalid_proposals_escalate(self):
+        # a scripted proposal that then fails local validation is a fallback:
+        # the streak must NOT have been reset by the discarded scripted score
+        runner, rec = self._runner(
+            decide=lambda need, dl: ({"bogus": 1}, "scripted", "r", 0.0,
+                                     {}, False))
+        self._answer(runner, 3)
+        rec.finalize({})
+        self.assertEqual(runner.low_conf_streak, 3)
+        runner._detect_boundaries()
+        self.assertEqual([b.reason for b in runner.detected_boundaries],
+                         ["low-confidence"])
+
+    def test_paid_usage_enters_the_budget(self):
+        cfg = ProviderConfig(max_ticks=200, reflex="jev",
+                             reflex_call_cap=5, postmortem_reserve=0,
+                             deepseek_price_in=1.0, deepseek_price_out=1.0)
+        usage = {"prompt_tokens": 1000000, "completion_tokens": 0,
+                 "reported": True}
+        fake = _FakeJev(usage=usage)
+        ctl = controller.Controller(
+            cfg, controller.ControllerPaths("w", "r", "d", "s"), self.dir,
+            episode_timeout=5.0)
+        ctl._new_reflex_provider = lambda reflex: fake
+        result = controller.EpisodeResult(index=1)
+        rec = recording.EpisodeRecorder(self.dir, 1)
+        proc = paced([hello()], [0.0])
+        self.addCleanup(proc.close)
+        runner = controller._EpisodeRunner(ctl, proc, rec, result)
+        runner.pending_key = protocol.NeedKey(1, 1, 1)
+        runner.pending_need = {"kind": "command", "id": 1}
+        proposal, provider, reason, latency, jusage, low = runner._decide(
+            runner.pending_need)
+        rec.finalize({})
+        self.assertEqual(provider, "jev")
+        self.assertEqual(runner.ledger.prompt_tokens, 1000000)
+        self.assertAlmostEqual(runner.ledger.estimated_usd, 1.0)
+        self.assertEqual(runner.ledger.reflex_paid_dispatched, 1)
 
 
 if __name__ == "__main__":

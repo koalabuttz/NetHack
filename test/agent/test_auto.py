@@ -16,6 +16,7 @@ pipe pair) so the deadline-governed write path, the single-in-flight page
 obligation and the closure-honesty rules are tested end to end.
 """
 
+import io
 import json
 import os
 import shutil
@@ -1892,7 +1893,7 @@ class TestRecording(WireHarness):
         meta = rec.finalize({"stop_reason": "closed"})
         self.assertTrue(meta["recording_complete"])
         self.assertEqual(meta["wire_lines"], 1)
-        self.assertEqual(meta["writer_status"], ["drained"] * 3)
+        self.assertEqual(meta["writer_status"], ["drained"] * 4)
         with open(os.path.join(self.dir, "ep-2.actions.jsonl")) as fh:
             line = json.loads(fh.readline())
         self.assertEqual(line["action"], {"key": 46})
@@ -2138,6 +2139,69 @@ class TestEnvAndProcess(WireHarness):
                         "the launcher was not reaped")
 
 
+class TestCliValidation(unittest.TestCase):
+    """Medium 2: invalid numeric configuration is rejected before start."""
+
+    def _args(self, argv):
+        return agent_main.build_parser().parse_args(argv)
+
+    def _bad(self, argv, needle):
+        problem = agent_main.validate_args(self._args(argv))
+        self.assertIsNotNone(problem, argv)
+        self.assertIn(needle, problem)
+
+    def _ok(self, argv):
+        self.assertIsNone(agent_main.validate_args(self._args(argv)), argv)
+
+    def test_usd_cap_requires_a_complete_tariff(self):
+        self._bad(["auto", "--output-dir", "/tmp/x", "--usd-cap", "1"],
+                  "complete tariff")
+        self._bad(["auto", "--output-dir", "/tmp/x", "--usd-cap", "1",
+                   "--deepseek-price-in", "1"], "complete tariff")
+        self._ok(["auto", "--output-dir", "/tmp/x", "--usd-cap", "1",
+                  "--deepseek-price-in", "1", "--deepseek-price-out", "2"])
+
+    def test_numeric_ranges_are_validated(self):
+        self._bad(["auto", "--output-dir", "/tmp/x",
+                   "--confidence-threshold", "2"], "confidence-threshold")
+        self._bad(["auto", "--output-dir", "/tmp/x",
+                   "--confidence-threshold", "nan"], "finite")
+        self._bad(["auto", "--output-dir", "/tmp/x", "--usd-cap", "nan"],
+                  "finite")
+        self._bad(["auto", "--output-dir", "/tmp/x", "--usd-cap", "-1"],
+                  "nonnegative")
+        self._bad(["auto", "--output-dir", "/tmp/x",
+                   "--deepseek-price-out", "-2"], "nonnegative")
+        self._bad(["auto", "--output-dir", "/tmp/x", "--token-cap", "-1"],
+                  "token-cap")
+        self._bad(["auto", "--output-dir", "/tmp/x",
+                   "--episode-timeout", "inf"], "finite")
+        self._bad(["auto", "--output-dir", "/tmp/x", "--strategy-deadline",
+                   "-2"], "strategy-deadline")
+        self._bad(["auto", "--output-dir", "/tmp/x", "--low-confidence-needs",
+                   "0"], "low-confidence-needs")
+
+    def test_postmortem_reserve_must_fit_the_cap(self):
+        # a negative reserve would silently enlarge the play budget
+        self._bad(["auto", "--output-dir", "/tmp/x", "--postmortem-reserve",
+                   "-1"], "postmortem-reserve")
+        self._bad(["auto", "--output-dir", "/tmp/x", "--strategy-call-cap",
+                   "2", "--postmortem-reserve", "3"], "cannot exceed")
+        self._ok(["auto", "--output-dir", "/tmp/x", "--strategy-call-cap",
+                  "2", "--postmortem-reserve", "1"])
+
+    def test_default_config_is_valid(self):
+        self._ok(["auto", "--output-dir", "/tmp/x"])
+
+    def test_cmd_auto_rejects_before_starting(self):
+        out = io.StringIO()
+        with mock.patch("sys.stderr", out):
+            rc = agent_main.cmd_auto(self._args(
+                ["auto", "--output-dir", "/tmp/x", "--usd-cap", "1"]))
+        self.assertEqual(rc, 2)
+        self.assertIn("complete tariff", out.getvalue())
+
+
 class TestPerEpisodeReset(unittest.TestCase):
     def test_two_episodes_have_independent_state(self):
         scen = _line(HELLO) + _line(obs(1, {"kind": "command", "id": 1})) \
@@ -2220,8 +2284,8 @@ class TestRecorderConstructionFailure(unittest.TestCase):
             controller.ControllerPaths("w", "r", "d", "s"), self.dir,
             episode_timeout=5.0)
         ctl._spawn = lambda priv: FakeProc(scen)
-        # fail the third open of every episode (three writers per recorder)
-        created, patches = self._patched(lambda n: n % 3 == 0)
+        # fail the fourth open of every episode (four writers per recorder)
+        created, patches = self._patched(lambda n: n % 4 == 0)
         with patches[0], patches[1]:
             results = ctl.run_campaign(3)
         # the campaign kept going, each episode reported a recorder failure
@@ -2229,8 +2293,8 @@ class TestRecorderConstructionFailure(unittest.TestCase):
         self.assertTrue(all(r.recorder_failed for r in results))
         self.assertTrue(all(r.stop_reason == "recorder-failure"
                             for r in results))
-        # two writers per doomed recorder: all six, and no fd, leaked
-        self.assertEqual(len(created), 6)
+        # three writers per doomed recorder: all nine, and no fd, leaked
+        self.assertEqual(len(created), 9)
         self._assert_released(created)
 
 
