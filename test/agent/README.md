@@ -70,6 +70,8 @@ prints only `win/agent/*.h` plus system headers.
 | `test/agent/test_spectate.py` | integration tests for the spectate revision: incremental/batch assembler agreement and every rejection vector, the deadline-scheduled render pipeline and its bounded shutdown, the writer helper and its acknowledgements, byte-exact relay/transcript back-pressure, argv identity, failure exit-status hygiene, replay equivalence, plus the opt-in performance (`--benchmark`) and byte-exact (`--byte-exact`) harnesses |
 | `test/agent/test_auto.py` | autonomous harness tests; see below |
 | `test/agent/test_auto_providers.py` | Wave-2 tier tests: directive validation and lifecycle, boundary detection/coalescing/cooldowns, the budget ledger, the worker process and its supervisor, DeepSeek against a fake loopback endpoint (slow/hung/drip/401/429/5xx/malformed/oversized), the Jev typed-choice adapter, controller integration (strategy is never polled per command, never emits a wire action, stale level advice is discarded), and a secret-free artifact audit |
+| `test/agent/test_auto_replay.py` | offline-evaluator tests over `test/agent/fixtures/auto`: canonical action semantics, the no-network default guarantee, startup-fixture determinism, `unknown`-action labels for inbound-only recordings, ground-truth agreement against a fresh action sidecar, the Jev offline fallback, the network gate, and the fixture budget/hash integrity |
+| `test/agent/fixtures/auto/` | bounded replay fixtures (<= 256 KiB uncompressed) with a provenance README and sha256 hashes |
 
 ## Formatter
 
@@ -96,6 +98,15 @@ tests are part of this fixture directory and run without spawning a game:
 
 ```sh
 python3 -m unittest discover -s test/agent -p 'test_auto*.py'
+```
+
+The offline evaluator replays a recording without a game or a network; its
+bounded fixtures live in `test/agent/fixtures/auto/` (see that directory's
+README for provenance and hashes):
+
+```sh
+python3 -m tools.agent.evaluate test/agent/fixtures/auto/startup.wire.jsonl \
+    --reflex scripted --strategy off --output /tmp/auto-eval.jsonl
 ```
 
 They import the harness package from the repository root (`tools/agent/`) and

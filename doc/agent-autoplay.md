@@ -40,6 +40,10 @@ environment alone never starts paid calls:
     --strategy-call-cap 8 --output-dir /tmp/auto-ds
 ```
 
+A recording can be replayed offline -- no game, no network -- and compared to
+its own actions with `python3 -m tools.agent.evaluate`; see "Offline
+evaluation" below.
+
 ## Command line
 
 `--episodes N` (default 1)
@@ -149,8 +153,12 @@ environment alone never starts paid calls:
     a 0600 file holding the key.  Otherwise `DEEPSEEK_API_KEY` is used.
     There is deliberately no `--deepseek-key` flag.
 
-`--deepseek-max-tokens N` (default 400)
-    a conservative output bound; responses are non-streaming and size-capped.
+`--deepseek-max-tokens N` (default 4096)
+    a bounded output budget; responses are non-streaming and size-capped.
+    `deepseek-v4-flash` is a **reasoning** model, so a budget smaller than its
+    reasoning tokens returns empty content (an unusable response); the
+    reasoning length is variable, so the default leaves headroom for the JSON
+    plan after it.
 
 `--jev-key-file`, `--jev-base-url`, `--i-accept-jev-terms`
     the Jev trio; all three are needed before `--reflex jev` will start.
@@ -394,11 +402,101 @@ Each episode writes five sidecars under `--output-dir`:
   * `ep-N.meta.json` — schema versions, allowlisted configuration, the stop
     reason, the visible outcome and the **budget ledger**.
 
+A campaign also writes `campaign.json` into `--output-dir`: a compact,
+secret-free rollup of every episode (stop reason, visible outcome, protocol
+health, tick/need/boundary/strategy counts and token/USD usage), campaign
+totals, and the allowlisted configuration.  It is written after the episodes
+so a failure to write it cannot lose them, and the CLI prints its path.
+
 Writes run on a bounded background writer so the wire is never blocked; a
 full queue or disk failure marks the recording **incomplete**
 (`recording_complete: false`) rather than silently dropping bytes.
 Directories are `0700` and files `0600`.  No secrets are recorded.  Note that
 game names and game text may themselves be private.
+
+## Offline evaluation (`tools/agent.evaluate`)
+
+Replay a recording **without a game and, by default, without a network**,
+through the same assembly, public-state, boundary and decision machinery the
+live controller uses, and compare the candidate providers' proposals to the
+recorded action:
+
+```sh
+# replay the startup fixture with scripted/off; writes a JSONL report
+python3 -m tools.agent.evaluate test/agent/fixtures/auto/startup.wire.jsonl \
+    --reflex scripted --strategy off --output /tmp/auto-eval.jsonl
+
+# compare a recording's actions to its own sidecar; assert menu semantics
+python3 -m tools.agent.evaluate test/agent/fixtures/auto/short.wire.jsonl \
+    --reflex scripted --strategy off --max-ticks 30 \
+    --actions test/agent/fixtures/auto/short.actions.jsonl \
+    --decisions test/agent/fixtures/auto/short.decisions.jsonl \
+    --output /tmp/short-eval.jsonl
+```
+
+The positional argument is a `ep-N.wire.jsonl` recording (or any inbound
+physical line stream).  `--reflex scripted|jev` selects the primary candidate;
+repeatable `--provider scripted|jev` adds more candidates to compare; each
+candidate is replayed in **its own isolated pass**, with its own episode
+memory and budget ledger, so one provider's decisions can never influence
+another's.
+
+### Output
+
+The output JSONL has three record kinds:
+
+  * `record: "need"` — one per need: the need key, the candidate(s)'
+    `proposal`, the `selected` action, the provider label, `legal` (the
+    selected action passes the wire shape gate), `fallback`, `low_confidence`,
+    the `actual_action` and its `actual_action_source` (`sidecar` or
+    `unknown`), the `agreement` against the original, the boundary `eids`
+    detected at that need, and any active directive set;
+  * `record: "boundary"` / `record: "directive"` — the deterministic
+    event-lifecycle ledger, with the wall-timing map **dropped**;
+  * `record: "summary"` — the rollup: per-need coverage, per-provider
+    agreement rate, legality rate and fallback count, boundary detections by
+    reason, directive applications, the visible outcome, and the budget
+    ledger.
+
+### Interpreting it
+
+  * **coverage** is *decided needs / needs* — an unanswered need would lower
+    it below 1.0.
+  * **agreement** compares action **semantics**, never JSON bytes: a menu
+    commit is its final *set* of rows (count and generation id ignored), and
+    `key`/`yn`/`position`/`text`/`cancel`/`ack` compare by shape and value.
+  * **legality** is structural validity (the `validate_action` gate); it is
+    not safety.  Confidence agreement with a recorded action is **not**
+    evidence of calibration, and is never reported as such.
+  * A recording with **no actions sidecar** (the older inbound-only corpus)
+    labels every `actual_action` `unknown` and reports agreement coverage 0 —
+    a movement key is never *guessed* from a state change.
+
+### Caveats
+
+  * **The replay configuration must match the recording's.**  `--max-ticks`
+    in particular changes the scripted tick-cap quit; replaying a run
+    recorded with `--max-ticks 30` under the default 2000 legitimately
+    disagrees on the quit, which is an evaluation error, not policy drift.
+  * **Deterministic**: a replay is a pure function of the wire bytes and the
+    candidate configuration.  Wall timing is confined to a separate `wall`
+    map (dropped here), so two runs of the same command are byte-identical.
+  * **Provider decisions are never injected** into the trajectory, and a
+    hypothetical effect is never claimed.  The replay advances only along the
+    recorded wire; you cannot read a counterfactual outcome from it.
+  * **Real provider evaluation is opt-in.**  `--strategy deepseek` refuses to
+    run without `--allow-network`; comparison passes stay network-free so an
+    N-provider comparison does not multiply paid calls.  The presence of a
+    key alone never opts a user in, mirroring the live harness.
+
+### Fixtures
+
+`test/agent/fixtures/auto/` holds the bounded corpus (see its README for
+provenance and hashes): `startup.wire.jsonl` and `legacy-ep3.wire.jsonl` are
+inbound-only excerpts that exercise the `unknown`-action path, and
+`short.wire/actions/decisions` is a fresh recording with real ground-truth
+actions (replaying it with the matching `--max-ticks 30` reproduces every
+original action).
 
 ## Verification
 
@@ -407,6 +505,15 @@ python3 test/agent/format_obs.py --selftest          # decoder (compat)
 python3 test/agent/spectate.py selftest              # renderer (compat)
 make -C test/agent check                             # fixtures + manifest
 python3 -m unittest discover -s test/agent -p 'test_auto*.py'   # harness
+
+# offline evaluator: deterministic (run twice, diff clean), no network
+python3 -m tools.agent.evaluate test/agent/fixtures/auto/startup.wire.jsonl \
+    --reflex scripted --strategy off --output /tmp/auto-eval.jsonl
+# ground-truth agreement against the fresh fixture (must match --max-ticks)
+python3 -m tools.agent.evaluate test/agent/fixtures/auto/short.wire.jsonl \
+    --reflex scripted --strategy off --max-ticks 30 \
+    --actions test/agent/fixtures/auto/short.actions.jsonl \
+    --output /tmp/short-eval.jsonl
 ```
 
 The provider tests run against a **fake loopback HTTP endpoint** driven by
