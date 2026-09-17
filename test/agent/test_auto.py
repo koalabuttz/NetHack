@@ -532,6 +532,100 @@ class TestHelloValidation(unittest.TestCase):
         self.assertIsNotNone(protocol.validate_hello(hello(v=2)))
 
 
+class TestNeedValidation(unittest.TestCase):
+    """Medium 6: the complete need shape is checked before it is stored."""
+
+    NEEDS = (
+        {"id": 1, "kind": "command"},
+        {"id": 2, "kind": "key", "prompt": ""},
+        {"id": 3, "kind": "direction"},
+        {"id": 4, "kind": "position", "prompt": "Where?",
+         "x0": 1, "y0": 0, "x1": 79, "y1": 20},
+        {"id": 5, "kind": "yn", "prompt": "Continue? [yn]",
+         "choices": "yn", "default": 121, "numeric": False},
+        {"id": 6, "kind": "line", "prompt": "Name?", "max": 32},
+        {"id": 7, "kind": "extcmd", "prompt": "#", "max": 255},
+        {"id": 8, "kind": "menu", "menu": "m1", "mode": "one",
+         "content": "c1", "pages": 2},
+        {"id": 9, "kind": "ack", "content": "c9", "pages": 1},
+    )
+
+    def test_complete_needs_of_every_kind_are_accepted(self):
+        for need in self.NEEDS:
+            self.assertIsNone(protocol.validate_need(need),
+                              "%s must be accepted" % (need,))
+
+    def test_missing_mistyped_and_misranged_fields_are_rejected(self):
+        menu = {"id": 1, "kind": "menu", "menu": "m1", "mode": "one",
+                "content": "c1", "pages": 1}
+        cases = [
+            ("not an object", "nope"),
+            ("unknown kind", {"id": 1, "kind": "wibble"}),
+            ("id missing", {"kind": "command"}),
+            ("id not an int", {"kind": "command", "id": "1"}),
+            ("id zero", {"kind": "command", "id": 0}),
+            ("id past the counter", {"kind": "command", "id": 2 ** 53}),
+            ("id is a bool", {"kind": "command", "id": True}),
+            ("pages string", dict(menu, pages="1")),
+            ("pages negative", dict(menu, pages=-1)),
+            ("pages oversized", dict(menu, pages=65536)),
+            ("pages is a bool", dict(menu, pages=True)),
+            ("menu ref missing",
+             {k: v for k, v in menu.items() if k != "menu"}),
+            ("menu ref malformed", dict(menu, menu="x1")),
+            ("mode unknown", dict(menu, mode="some")),
+            ("content missing",
+             {k: v for k, v in menu.items() if k != "content"}),
+            ("content not a string", dict(menu, content=3)),
+            ("content ref malformed", dict(menu, content="m1")),
+            ("ack content missing", {"id": 2, "kind": "ack", "pages": 1}),
+            ("unexpected field", dict(menu, extra=1)),
+            ("max not an int",
+             {"id": 3, "kind": "line", "prompt": "", "max": "9"}),
+            ("max oversized",
+             {"id": 3, "kind": "line", "prompt": "", "max": 256}),
+            ("yn default out of range",
+             {"id": 4, "kind": "yn", "prompt": "", "choices": None,
+              "default": 0, "numeric": False}),
+            ("yn numeric not a bool",
+             {"id": 4, "kind": "yn", "prompt": "", "choices": None,
+              "default": None, "numeric": "no"}),
+            ("position missing a corner",
+             {"id": 5, "kind": "position", "prompt": "",
+              "x0": 1, "y0": 0, "y1": 20}),
+            ("position out of range",
+             {"id": 5, "kind": "position", "prompt": "",
+              "x0": 0, "y0": 0, "x1": 79, "y1": 20}),
+        ]
+        for label, need in cases:
+            self.assertIsNotNone(protocol.validate_need(need), label)
+
+    def test_a_validated_need_keeps_the_page_obligation_safe(self):
+        # the page/chunk obligations read the stored need directly: every
+        # accepted shape must be safe to drive through them
+        for need in self.NEEDS:
+            self.assertIsNone(protocol.validate_need(need))
+            req = protocol.Request()
+            req.begin(need, 1)
+            self.assertIsInstance(req.pages_declared, int)
+            req.pages_complete()
+            preq = req.next_page_request()
+            if req.pages_declared:
+                self.assertIsInstance(preq, dict)
+                self.assertIsInstance(preq["id"], int)
+            else:
+                self.assertIsNone(preq)
+
+    def test_the_line_max_is_never_compared_to_a_string(self):
+        # a malformed advertised max is a shape error, never a TypeError
+        self.assertIsNotNone(protocol.validate_action(
+            {"kind": "line", "max": "9"}, {"text": "x"}))
+        self.assertIsNotNone(protocol.validate_action(
+            {"kind": "line", "max": -1}, {"text": "x"}))
+        self.assertIsNone(protocol.validate_action(
+            {"kind": "line", "max": 3}, {"text": "ok"}))
+
+
 class TestSnapshot(unittest.TestCase):
     def test_full_snapshot_clears_previous_cells(self):
         snap = protocol.Snapshot()
@@ -1134,6 +1228,47 @@ class TestSessionValidation(WireHarness):
                     results[0].protocol_failure,
                     "%s slipped through: %r" % (label,
                                                 results[0].protocol_failure))
+                self.assertFalse(results[0].closed)
+                self.assertTrue(results[1].closed)
+                self.assertIsNone(results[1].protocol_failure)
+
+    def test_dict_shaped_malformed_needs_end_only_that_episode(self):
+        # Medium 6: a well-typed but incomplete or out-of-range need used to
+        # be stored on the Request and only read later, by pages_complete /
+        # next_page_request -- outside run()'s boundary, so the KeyError or
+        # TypeError it raised aborted the whole campaign.  Every such need
+        # must now fail episode 1 alone and leave episode 2 running to closed.
+        hello_line = _line(HELLO)
+        good = hello_line + _line(obs(1, {"kind": "command", "id": 1})) \
+            + _line(CLOSED)
+        menu = {"kind": "menu", "id": 1, "menu": "m1", "mode": "one",
+                "content": "c1", "pages": 1}
+        cases = {
+            "pages-string": dict(menu, pages="1"),
+            "pages-negative": dict(menu, pages=-1),
+            "pages-oversized": dict(menu, pages=65536),
+            "id-missing": {"kind": "command"},
+            "id-missing-paged": {k: v for k, v in menu.items()
+                                 if k != "id"},
+            "id-not-int": {"kind": "command", "id": "1"},
+            "id-zero": {"kind": "command", "id": 0},
+            "menu-missing": {k: v for k, v in menu.items() if k != "menu"},
+            "content-missing": {k: v for k, v in menu.items()
+                                if k != "content"},
+            "content-mistyped": dict(menu, content=3),
+            "ack-content-missing": {"kind": "ack", "id": 2, "pages": 1},
+        }
+        for label, need in cases.items():
+            with self.subTest(case=label):
+                ctl = self._controller(timeout=5.0)
+                stream = [FakeProc(hello_line + _line(obs(1, need))),
+                          FakeProc(good)]
+                ctl._spawn = lambda priv: stream.pop(0)
+                results = ctl.run_campaign(2)
+                self.assertIsNotNone(
+                    results[0].protocol_failure,
+                    "%s slipped through" % label)
+                self.assertEqual(results[0].stop_reason, "protocol-failure")
                 self.assertFalse(results[0].closed)
                 self.assertTrue(results[1].closed)
                 self.assertIsNone(results[1].protocol_failure)

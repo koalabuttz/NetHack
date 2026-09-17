@@ -17,6 +17,7 @@ about *what the wire means* that does not depend on scheduling:
 Nothing here blocks, spawns, or touches the network.
 """
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -47,6 +48,7 @@ MAX_RETAINED_BYTES = 1 << 20       # assembler retained chunk bytes
 MAX_CHUNKS = 4096                  # assembler retained logical chunks
 MAX_STREAMS = 64                   # concurrent chunk streams
 MAX_PAGES = 65535                  # protocol-legal page count per request
+MAX_COUNTER = 9007199254740991     # public counter ceiling (2**53-1)
 
 # Native bindings (number_pad off); the same set the quickstart documents.
 KEY_H, KEY_J, KEY_K, KEY_L = ord("h"), ord("j"), ord("k"), ord("l")
@@ -336,6 +338,99 @@ def _is_int(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
 
 
+# ------------------------------------------------------------ need validation
+
+# The complete shape of one outstanding request, mirroring the frozen client
+# schema (``doc/agent-v1.schema.json``, the ``need`` ``oneOf``) and the
+# engine-side range gate in ``agent_protocol.c``.  The kind selects the
+# required field set, every field is type- and bound-checked, and an
+# unexpected field is rejected.  Validating the *whole* need here -- before
+# anything is stored on the :class:`Request` -- is what keeps a malformed
+# request from raising later inside ``pages_complete``/``next_page_request``,
+# which runs outside the controller's per-episode failure boundary and would
+# abort the entire campaign instead of one episode.
+_NEED_FIELDS = {
+    "command": (("id", "kind"), ("prompt",)),
+    "key": (("id", "kind"), ("prompt",)),
+    "direction": (("id", "kind"), ("prompt",)),
+    "position": (("id", "kind", "prompt", "x0", "y0", "x1", "y1"), ()),
+    "yn": (("id", "kind", "prompt", "choices", "default", "numeric"), ()),
+    "line": (("id", "kind", "prompt", "max"), ()),
+    "extcmd": (("id", "kind", "prompt", "max"), ()),
+    "menu": (("id", "kind", "menu", "mode", "content", "pages"), ()),
+    "ack": (("id", "kind", "content", "pages"), ()),
+}
+_MENU_MODES = ("none", "one", "any")
+
+
+def validate_need(need: Any) -> Optional[str]:
+    """Return None if *need* is a complete, well-shaped request, else why.
+
+    This is a shape and range check only, never game semantics: it pins the
+    required fields, types and bounds of the frozen contract so a peer cannot
+    hand the controller a need that only fails *later*, when the page/chunk
+    obligations read it.  The controller converts any reason into an
+    episode-local protocol failure.
+    """
+    if not isinstance(need, dict):
+        return "need is not an object"
+    kind = need.get("kind")
+    if kind not in _NEED_FIELDS:
+        return "unknown need kind %r" % (kind,)
+    required, optional = _NEED_FIELDS[kind]
+    for name in required:
+        if name not in need:
+            return "%s need is missing %r" % (kind, name)
+    for name in need:
+        if name not in required and name not in optional:
+            return "%s need has an unexpected field %r" % (kind, name)
+    return _check_need_fields(kind, need)
+
+
+def _check_need_fields(kind, need) -> Optional[str]:
+    if not (_is_int(need["id"]) and 1 <= need["id"] <= MAX_COUNTER):
+        return "id is not a public counter in 1..%d" % MAX_COUNTER
+    for name in ("prompt", "choices"):
+        if name in need and need[name] is not None \
+                and not isinstance(need[name], str):
+            return "%s must be a string or null" % name
+    if "default" in need:
+        d = need["default"]
+        if d is not None and not (_is_int(d) and KEY_MIN <= d <= KEY_MAX):
+            return "default must be null or a key byte"
+    if "numeric" in need and not isinstance(need["numeric"], bool):
+        return "numeric must be a boolean"
+    if "max" in need:
+        m = need["max"]
+        if not (_is_int(m) and 0 <= m <= LINE_INPUT_MAX):
+            return "max must be in 0..%d" % LINE_INPUT_MAX
+    if kind == "menu":
+        if need["mode"] not in _MENU_MODES:
+            return "mode must be none, one or any"
+        if not _ref_id(need["menu"], "m"):
+            return "menu must be a generation id like mN"
+    if "content" in need and not _ref_id(need["content"], "c"):
+        return "content must be a content id like cN"
+    if "pages" in need:
+        p = need["pages"]
+        if not (_is_int(p) and 0 <= p <= MAX_PAGES):
+            return "pages must be in 0..%d" % MAX_PAGES
+    for name, lo, hi in (("x0", MAP_MIN_X, MAP_MAX_X),
+                         ("x1", MAP_MIN_X, MAP_MAX_X),
+                         ("y0", MAP_MIN_Y, MAP_MAX_Y),
+                         ("y1", MAP_MIN_Y, MAP_MAX_Y)):
+        if name in need and not (_is_int(need[name])
+                                 and lo <= need[name] <= hi):
+            return "%s is outside the map rectangle" % name
+    return None
+
+
+def _ref_id(v, letter) -> bool:
+    """True for a generation/content reference like ``m1`` or ``c12``."""
+    return isinstance(v, str) and \
+        re.match(r"^%s[1-9][0-9]*\Z" % letter, v) is not None
+
+
 def _shape(action: dict) -> Optional[str]:
     """Return the single tagged shape of an action object, or None."""
     shapes = [k for k in ("key", "text", "position", "yn", "menu", "ack",
@@ -405,6 +500,10 @@ def validate_action(need: Optional[dict], action: Any) -> Optional[str]:
         if not isinstance(text, str):
             return "text must be a string"
         limit = need.get("max", LINE_INPUT_MAX) or LINE_INPUT_MAX
+        # a malformed need that advertises a non-integer or out-of-range max
+        # is a shape error here, never a TypeError or a silent pass
+        if not _is_int(limit) or not (0 < limit <= LINE_INPUT_MAX):
+            return "the need advertises an invalid max"
         if len(text.encode("utf-8")) > limit:
             return "text exceeds the advertised byte budget"
         return None

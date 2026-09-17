@@ -733,9 +733,15 @@ class _EpisodeRunner(object):
         except (IndexError, KeyError, TypeError, ValueError,
                 AttributeError) as exc:
             raise _ProtocolFailure("malformed snapshot: %s" % exc)
+        # Validate the *complete* need shape before any of it is stored on the
+        # outstanding request: a malformed need must fail this episode here,
+        # not raise later from pages_complete/next_page_request, which run
+        # outside run()'s per-episode failure boundary.
         need = rec.get("need")
-        if need is not None and not isinstance(need, dict):
-            raise _ProtocolFailure("need is not an object")
+        if need is not None:
+            reason = protocol.validate_need(need)
+            if reason:
+                raise _ProtocolFailure("malformed need: %s" % reason)
         self.req.begin(need, seq)
         self.pending = need is not None
         self.pending_need = need
