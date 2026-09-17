@@ -23,7 +23,8 @@ from . import protocol
 # major demon (&), sea monster (;), lizard (:), long-worm tail (~) and mimic
 # (]).  The ghost class is a space (i.e. a blank/omitted cell) and the human
 # class is '@' (the hero or another human), so neither is a distinct monster
-# glyph here.
+# glyph here.  '@' is classified per cell instead -- see monster_cell(): an
+# '@' anywhere but the known hero square is a monster-class hazard.
 MONSTER_PUNCTUATION = set("'&;:~]")
 
 # Cells the hero provably cannot stand on.  Blank/unpainted is unknown, not
@@ -104,6 +105,21 @@ def monster_glyph(ch: str) -> bool:
     if not ch or ch == "@":
         return False
     return ch.isalpha() or ch in MONSTER_PUNCTUATION
+
+
+def monster_cell(ch: str, hero, pos) -> bool:
+    """True for a monster-class hazard occupying the cell at *pos*.
+
+    The hero is identified by the *known hero square*, never by the glyph:
+    '@' is the hero and also every other human, so :func:`monster_glyph`
+    deliberately does not report it.  An '@' on any cell other than the
+    hero's own square, however, is a visible human-class monster and is a
+    hazard exactly like any other monster class -- a hostile human standing
+    beside the hero must reach the safety rules.
+    """
+    if ch == "@":
+        return pos != hero
+    return monster_glyph(ch)
 
 
 def glyph_is_pet(ch: str) -> bool:

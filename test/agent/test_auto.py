@@ -906,6 +906,28 @@ class TestScriptedReflexSafety(unittest.TestCase):
         res = self.ref.decide(self.ctx({"kind": "command", "id": 1}))
         self.assertNotEqual(res.action.get("key"), protocol.DIR_KEYS[(-1, 0)])
 
+    def test_adjacent_at_is_a_monster_hazard(self):
+        # Medium 8: '@' is the hero *and* every other human.  Hero identity
+        # is the known hero square; an '@' on any other cell is a
+        # monster-class hazard.
+        self._hero(10, 10)
+        self.assertFalse(state.monster_glyph("@"))     # identity is per cell
+        self.assertFalse(state.monster_cell("@", (10, 10), (10, 10)))
+        self.mem.grid[(11, 10)] = ("@", "white", 32, "none")
+        self.assertTrue(state.monster_cell("@", (10, 10), (11, 10)))
+        self.assertFalse(self.mem.known_passable((11, 10)))
+        self.assertIn((1, 0),
+                      self.ref._adjacent_monsters(self.mem, (10, 10)))
+        self.mem.status.hp = 20
+        self.mem.status.hp_max = 20
+        self.assertFalse(self.ref._safe_to_rest(self.mem, self.mem.status,
+                                                (10, 10)))
+        # boxed in beside it: never step into it, and never rest
+        self.mem.no_progress = 20
+        res = self.ref.decide(self.ctx({"kind": "command", "id": 1}))
+        self.assertEqual(res.action, {"key": protocol.KEY_SEARCH})
+        self.assertNotEqual(res.action.get("key"), protocol.DIR_KEYS[(1, 0)])
+
     def test_boxed_in_and_hungry_searches_instead_of_waiting(self):
         # Medium 6: every wait is gated on _safe_to_rest, so a boxed-in,
         # hungry hero searches rather than resting.

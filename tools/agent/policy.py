@@ -310,7 +310,7 @@ class ScriptedReflex(object):
         out = []
         for d in KEY.DIR_KEYS:
             dest = (hero[0] + d[0], hero[1] + d[1])
-            if state.monster_glyph(mem.tile(dest)):
+            if state.monster_cell(mem.tile(dest), hero, dest):
                 out.append(d)
         return out
 
@@ -352,9 +352,10 @@ class ScriptedReflex(object):
             target = self._frontier_target(mem, hero)
             if target is not None:
                 step = self._first_step(mem, hero, target)
-                if step is not None and not state.monster_glyph(
-                        mem.tile((hero[0] + step[0], hero[1] + step[1]))):
-                    return {"key": KEY.DIR_KEYS[step]}
+                if step is not None:
+                    dest = (hero[0] + step[0], hero[1] + step[1])
+                    if not state.monster_cell(mem.tile(dest), hero, dest):
+                        return {"key": KEY.DIR_KEYS[step]}
             return {"key": KEY.KEY_SEARCH}
         return {"key": KEY.KEY_SEARCH}
 
