@@ -2609,6 +2609,178 @@ class TestConversationContinuity(WireHarness):
                          ["system", "user", "assistant", "user"])
 
 
+class TestControllerConversation(WireHarness):
+    """Section 2: the controller owns the transactional history commit."""
+
+    def _runner(self, fake, config=None):
+        cfg = config or ProviderConfig(max_ticks=200, postmortem_reserve=0,
+                                       low_confidence_needs=1000,
+                                       boundary_cooldown_ticks=0,
+                                       boundary_cooldown_wall=0.0,
+                                       boundary_emergency_wall=0.0)
+        ctl = controller.Controller(
+            cfg, controller.ControllerPaths("w", "r", "d", "s"), self.dir,
+            episode_timeout=5.0)
+        ctl._new_strategy_provider = lambda: fake
+        result = controller.EpisodeResult(index=1)
+        rec = recording.EpisodeRecorder(self.dir, 1)
+        proc = paced([hello()], [0.0])
+        self.addCleanup(proc.close)
+        runner = controller._EpisodeRunner(ctl, proc, rec, result)
+        runner.mem.status.dlvl = "Dlvl:1"
+        return runner, rec, result
+
+    def _dispatch(self, runner, tick, finalize=True):
+        runner.tick = tick
+        b = events.Boundary("initial-level", "level:Dlvl:1:%d" % tick)
+        runner.event_ledger.detect(b, tick, "Dlvl:1")
+        runner.boundary_queue.submit([b], tick, "Dlvl:1")
+        pending = runner.boundary_queue.ready(tick, time.monotonic())
+        runner._dispatch_strategy(pending, time.monotonic())
+        if finalize and runner._strategy_call is not None:
+            runner._strategy_call.wait(5.0)
+            runner._finalize_strategy()
+        return b
+
+    def _activate(self, runner):
+        runner._activate_pending_directives({"kind": "command"})
+
+    def test_history_grows_across_successful_calls(self):
+        fake = FakeStrategy(_ok_directives())
+        runner, rec, _ = self._runner(fake)
+        self._dispatch(runner, 1)
+        self._activate(runner)
+        self._dispatch(runner, 2)
+        self._activate(runner)
+        self.assertEqual(len(fake.calls), 2)
+        m1 = fake.calls[0].prepared_request.messages
+        m2 = fake.calls[1].prepared_request.messages
+        self.assertEqual(len(m1), 2)
+        self.assertEqual(len(m2), 4)
+        # the earlier turn is a byte-exact prefix of the later request
+        self.assertEqual(m2[:2], m1)
+        self.assertEqual(m2[2][0], "assistant")
+        self.assertEqual(m2[2][1],
+                         runner._conversation.snapshot()[0].assistant)
+        self.assertEqual(len(runner._conversation.snapshot()), 2)
+        rec.finalize({})
+
+    def test_the_canonical_fallback_is_used_without_verbatim_text(self):
+        # FakeStrategy carries no assistant_content, so the committed history
+        # is a stable serialization of the validated set
+        fake = FakeStrategy(_ok_directives())
+        runner, rec, _ = self._runner(fake)
+        self._dispatch(runner, 1)
+        self._activate(runner)
+        self._dispatch(runner, 2)
+        committed = runner._conversation.snapshot()[0].assistant
+        dset, _ = DSEV.validate_directive_set(_ok_directives())
+        self.assertEqual(committed,
+                         json.dumps(dset.to_dict(), sort_keys=True))
+        rec.finalize({})
+
+    def test_history_reflects_only_successful_settlement(self):
+        fake = FakeStrategy({"schema_version": 1, "goals": ["nope"]})
+        runner, rec, _ = self._runner(fake)
+        self._dispatch(runner, 1)
+        self.assertEqual(runner._conversation.snapshot(), [])
+        # an in-process refusal that never reported usage is released
+        self.assertEqual(runner.ledger.strategy_reserved, 0)
+        self.assertEqual(runner.ledger.strategy_dispatched, 0)
+        self.assertEqual(runner.ledger.unknown_exposure_calls, 0)
+        rec.finalize({})
+
+    def test_a_local_refusal_is_released_not_billed(self):
+        fake = FakeStrategy(ok=False)          # provider-level refusal
+        runner, rec, _ = self._runner(fake)
+        self._dispatch(runner, 1)
+        self.assertEqual(runner.ledger.strategy_reserved, 0)
+        self.assertEqual(runner.ledger.strategy_dispatched, 0)
+        self.assertEqual(runner.ledger.unknown_exposure_calls, 0)
+        rec.finalize({})
+
+    def test_an_ambiguous_result_keeps_the_exposure(self):
+        gate = threading.Event()
+        fake = FakeStrategy(_ok_directives(), gate=gate)
+        runner, rec, _ = self._runner(fake)
+        self._dispatch(runner, 1, finalize=False)   # blocked in deliberate
+        self.assertEqual(runner.ledger.strategy_reserved, 1)
+        # a None result after thread start is ambiguous, never proof that the
+        # call did not reach the wire
+        runner._settle_strategy(None, cancelled=True)
+        gate.set()
+        self.assertEqual(runner.ledger.strategy_reserved, 0)
+        self.assertEqual(runner.ledger.strategy_dispatched, 1)
+        self.assertEqual(runner.ledger.unknown_exposure_calls, 1)
+        self.assertEqual(runner._conversation.snapshot(), [])
+        rec.finalize({})
+
+    def test_cancellation_adds_no_history(self):
+        gate = threading.Event()
+        fake = FakeStrategy(_ok_directives(), gate=gate)
+        runner, rec, _ = self._runner(fake)
+        self._dispatch(runner, 1, finalize=False)
+        runner._cancel_strategy()
+        gate.set()
+        self.assertEqual(runner._conversation.snapshot(), [])
+        rec.finalize({})
+
+    def test_context_too_large_is_refused_without_a_call(self):
+        cfg = ProviderConfig(max_ticks=200, postmortem_reserve=0,
+                             low_confidence_needs=1000,
+                             boundary_cooldown_ticks=0,
+                             boundary_cooldown_wall=0.0,
+                             deepseek_context_max_bytes=8)
+        fake = FakeStrategy(_ok_directives())
+        runner, rec, _ = self._runner(fake, cfg)
+        self._dispatch(runner, 1)
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(runner.ledger.strategy_reserved, 0)
+        self.assertEqual(runner.ledger.boundaries_suppressed, 1)
+        rec.finalize({})
+
+    def test_zero_pairs_makes_every_call_stateless(self):
+        cfg = ProviderConfig(max_ticks=200, postmortem_reserve=0,
+                             low_confidence_needs=1000,
+                             boundary_cooldown_ticks=0,
+                             boundary_cooldown_wall=0.0,
+                             deepseek_history_pairs=0)
+        fake = FakeStrategy(_ok_directives())
+        runner, rec, _ = self._runner(fake, cfg)
+        self._dispatch(runner, 1)
+        self._activate(runner)
+        self._dispatch(runner, 2)
+        self._activate(runner)
+        self.assertEqual(len(runner._conversation.snapshot()), 0)
+        for call in fake.calls:
+            self.assertEqual(len(call.prepared_request.messages), 2)
+        rec.finalize({})
+
+    def test_postmortem_uses_a_fresh_conversation(self):
+        cfg = ProviderConfig(max_ticks=200, strategy_call_cap=4,
+                             postmortem_reserve=1, low_confidence_needs=1000,
+                             boundary_cooldown_ticks=0,
+                             boundary_cooldown_wall=0.0)
+        fake = FakeStrategy(_ok_directives())
+        runner, rec, _ = self._runner(fake, cfg)
+        self._dispatch(runner, 1)
+        self._activate(runner)
+        self.assertEqual(len(runner._conversation.snapshot()), 1)
+        runner.closed = True
+        runner._maybe_postmortem()
+        pm = fake.calls[-1]
+        self.assertTrue(pm.postmortem)
+        self.assertEqual(len(pm.prepared_request.messages), 2)
+        user_text = pm.prepared_request.messages[1][1]
+        self.assertIn("mode: postmortem", user_text)
+        self.assertIn("episode summary:", user_text)
+        self.assertNotIn("boundary history:", user_text)
+        self.assertNotIn("active directives:", user_text)
+        # the gameplay conversation is untouched by the postmortem
+        self.assertEqual(len(runner._conversation.snapshot()), 1)
+        rec.finalize({})
+
+
 # ================================================= config validation (M2)
 
 class TestProviderConfigValidation(unittest.TestCase):

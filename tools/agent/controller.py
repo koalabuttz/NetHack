@@ -39,6 +39,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -52,9 +53,16 @@ from .policy import INV_STALE_TICKS, ScriptedReflex
 from .protocol import NeedKey, Request, Snapshot
 from .providers import (NullStrategy, ProviderConfig, ReflexContext,
                         ReflexTimeout, ScriptedReflexProvider,
-                        StrategyContext, strategy_provider,
-                        strategy_token_bound, tariff_from_config)
+                        StrategyContext, StrategyConversation,
+                        StrategyExchange, prepare_strategy_request,
+                        strategy_provider, tariff_from_config)
 from .state import EpisodeMemory, render_map
+
+# How many detected boundary records the episode keeps as *boundary history*
+# for the strategy prompt.  Bounded so a long episode cannot grow the window
+# without limit; the current request's pending boundaries are rendered
+# separately and always survive this truncation.
+_BOUNDARY_HISTORY_MAX = 16
 
 # Environment names the launcher is allowed to inherit.  Everything else --
 # in particular DEEPSEEK_API_KEY and JEV_API_KEY -- is dropped by
@@ -577,6 +585,17 @@ class _EpisodeRunner(object):
         self._strategy_call = None
         self._strategy_pb = None
         self._strategy_level = None
+        self._strategy_prepared = None
+        # The conversation is episode-local and harness-owned: a provider or
+        # worker respawn does not own or clear it, and it is never shared
+        # across campaign episodes.  Boundary history is a bounded,
+        # harness-owned deque updated at detection time, not a recorder
+        # internal or an unbounded event log.
+        self._conversation = StrategyConversation(
+            identity=(controller.config.deepseek_model,
+                      controller.config.deepseek_base_url),
+            max_pairs=controller.config.deepseek_history_pairs)
+        self._boundary_history = deque(maxlen=_BOUNDARY_HISTORY_MAX)
         self._pending_directives = None
         self._pending_directives_level = None
         self.paid_disabled = False
@@ -1044,10 +1063,16 @@ class _EpisodeRunner(object):
 
         Done here -- not in the queue -- so a boundary that is detected while
         the strategy tier is off is still represented as *detected* (it is
-        simply never queued).
+        simply never queued).  The same hook appends a stable
+        eid/reason/tick/level record to the bounded boundary history the
+        strategy prompt renders, so the window is harness-owned rather than a
+        recorder internal or an unbounded event log.
         """
         for b in detected:
             self.event_ledger.detect(b, self.tick, level or "")
+            self._boundary_history.append(
+                {"eid": b.eid, "reason": b.reason, "tick": self.tick,
+                 "level": level or ""})
 
     def _strategy_live(self):
         """Paid strategy dispatch is allowed for this episode."""
@@ -1070,17 +1095,29 @@ class _EpisodeRunner(object):
         self._dispatch_strategy(pending, now)
 
     def _dispatch_strategy(self, pending, now):
-        # Reserve *before* any process is spawned: a call that times out with
-        # no usage is still billed, and the conservative bound (the estimated
-        # prompt plus the configured maximum output) must fit inside what is
-        # left of every cap.  A call whose bound exceeds the remainder is
-        # refused here, before a worker exists.
+        # Prepare first: the pure helper selects the retained history, renders
+        # the new tail once and freezes the full payload, and the bound is
+        # computed from *that* frozen request.  Reservation happens before any
+        # process is spawned: a call that times out with no usage is still
+        # billed, and the conservative bound (the complete request plus the
+        # configured maximum output) must fit inside what is left of every
+        # cap.  A request that does not fit is refused here, before a worker
+        # exists, and neither mutates the conversation nor consumes a call.
         ctx = self._build_strategy_context(pending)
-        prompt, completion = strategy_token_bound(self.c.config, ctx)
-        if not self.ledger.reserve_strategy(prompt_tokens=prompt,
-                                            completion_tokens=completion):
+        prepared = prepare_strategy_request(self.c.config, ctx,
+                                            self._conversation)
+        ctx.prepared_request = prepared
+        if not prepared.fits:
+            self._strategy_prepared = None
+            self.boundary_queue.suppress("strategy-context-too-large")
+            return
+        if not self.ledger.reserve_strategy(
+                prompt_tokens=prepared.prompt_bound,
+                completion_tokens=prepared.completion_bound):
+            self._strategy_prepared = None
             self.boundary_queue.suppress("strategy-cap")
             return
+        self._strategy_prepared = prepared
         self._strategy_pb = \
             self.boundary_queue.mark_dispatched(self.tick, now)
         # The level the advice was *produced* for, not the level at arrival:
@@ -1105,21 +1142,38 @@ class _EpisodeRunner(object):
 
         Guarded by the in-flight boundary set: whichever path runs first
         consumes the reservation, terminates (or holds) the set and records
-        the decision; a later call is a no-op.  A cancelled call that may
-        already have reached the worker is committed as *dispatched* -- never
-        released as undelivered -- with whatever usage it returned, and a
-        result that completed in the cancellation race is preserved rather
-        than dropped.
+        the decision; a later call is a no-op.
+
+        The reservation is *committed* whenever the call may have reached the
+        wire -- a real usage report, a directive answer, a timeout or an HTTP
+        error, or an ambiguous ``None`` result after thread start -- so a
+        genuinely lost call keeps its conservative exposure.  A result that
+        proves a *known local refusal* (no key, cooldown, spawn failure, or an
+        oversize payload) never crossed the dispatch boundary and is
+        *released*, matching the postmortem's treatment rather than booking
+        phantom exposure.  ``res is None`` is never treated as proof of no
+        dispatch.
+
+        History is committed *transactionally*: the retained slice the frozen
+        request carried plus the newly completed pair, and only when the
+        result is ok, carries validated directives, and was not cancelled.  A
+        failed call leaves the previous committed history intact.
         """
         pending = self._strategy_pb
         if pending is None:
             return False
         self._strategy_pb = None
+        prepared = self._strategy_prepared
+        self._strategy_prepared = None
         usage = res.usage if res is not None else None
-        self.ledger.commit_strategy(usage)
+        if res is None or _crossed_dispatch_boundary(res):
+            self.ledger.commit_strategy(usage)
+        else:
+            self.ledger.release_strategy()
         if res is not None and res.ok and res.directives and not cancelled:
             self._pending_directives = res.directives[0]
             self._pending_directives_level = self._strategy_level
+            self._commit_history(prepared, res)
         else:
             # a failed, discarded or cancelled call still terminates its set
             finish_reason = ("strategy-cancelled" if cancelled
@@ -1137,6 +1191,36 @@ class _EpisodeRunner(object):
                                         else []))
         self._note_recorder_health()
         return True
+
+    @staticmethod
+    def _assistant_text(res) -> str:
+        """The assistant text to commit for a validated response.
+
+        The verbatim validated ``choices[0].message.content`` is preferred --
+        canonicalizing it with ``to_dict()`` would change the generated
+        prefix.  A dict-shaped or injected response without verbatim text
+        falls back to a stable serialization of the validated set: still
+        semantically correct, but not generated-prefix faithful.
+        """
+        verbatim = getattr(res, "assistant_content", "")
+        if verbatim:
+            return verbatim
+        first = res.directives[0]
+        to_dict = getattr(first, "to_dict", None)
+        if to_dict is not None:
+            return json.dumps(to_dict(), sort_keys=True)
+        if isinstance(first, dict):
+            return json.dumps(first, sort_keys=True)
+        return ""
+
+    def _commit_history(self, prepared, res):
+        """Install the retained slice plus the new pair, capped to K."""
+        if prepared is None:
+            return
+        self._conversation.install(
+            prepared.retained,
+            StrategyExchange(user=prepared.user_text,
+                             assistant=self._assistant_text(res)))
 
     def _activate_pending_directives(self, need):
         """Activate a returned directive set at the next command boundary."""
@@ -1173,6 +1257,11 @@ class _EpisodeRunner(object):
         if st.level is not None:
             bits.append("XL %d" % st.level)
         inventory = [(r.get("text") or "") for r in self.mem.inventory.rows]
+        # The applicable directive set follows the DirectiveBook's own
+        # applicability rules (level/TTL/preconditions), not merely the last
+        # response received; an advisory that is no longer applicable is not
+        # reported as active.
+        view = self.book.view(self.tick, st.dlvl, self._precondition_state())
         return StrategyContext(
             episode=self.result.index, tick=self.tick,
             summary={"hp": st.hp, "hp_max": st.hp_max, "dlvl": st.dlvl},
@@ -1181,7 +1270,10 @@ class _EpisodeRunner(object):
             status_text=", ".join(bits),
             recent_messages=self.mem.recent_messages(6),
             inventory=inventory, goals=[],
-            remaining_budget=self._remaining_budget(), level=st.dlvl)
+            history=list(self._boundary_history),
+            remaining_budget=self._remaining_budget(), level=st.dlvl,
+            role=self.c.config.role,
+            directives=[view.dset] if view.active else [])
 
     def _precondition_state(self):
         st = self.mem.status
@@ -1252,11 +1344,20 @@ class _EpisodeRunner(object):
             return
         ctx = self._build_strategy_context(None)
         ctx.postmortem = True
+        ctx.summary = self._postmortem_summary()
         ctx.boundaries = [b.eid for b in self.need_boundaries]
-        prompt, completion = strategy_token_bound(self.c.config, ctx)
-        if not self.ledger.reserve_strategy(postmortem=True,
-                                            prompt_tokens=prompt,
-                                            completion_tokens=completion):
+        # The postmortem is a *fresh*, empty conversation: it never carries
+        # gameplay history, and it is never committed back to the gameplay
+        # conversation.
+        ctx.directives = []
+        ctx.history = []
+        prepared = prepare_strategy_request(self.c.config, ctx, retained=[])
+        ctx.prepared_request = prepared
+        if not prepared.fits:
+            return
+        if not self.ledger.reserve_strategy(
+                postmortem=True, prompt_tokens=prepared.prompt_bound,
+                completion_tokens=prepared.completion_bound):
             return
         provider = self._new_postmortem_provider()
         deadline = time.monotonic() + self.c.strategy_deadline
@@ -1269,6 +1370,32 @@ class _EpisodeRunner(object):
             # survives the episode, even if the call raised mid-flight
             _quench_provider(provider)
         self._settle_postmortem(res, ctx.boundaries)
+
+    def _postmortem_summary(self):
+        """An allowlisted, deterministic episode summary for the postmortem.
+
+        Only finalised public state: outcome/stop reason, final tick, visible
+        level and HP, action/invalid/boundary counts, the strategy dispatch
+        count and the currently applicable advice.  No wall duration, no
+        secrets, no raw transcript and no recorder metadata that has not yet
+        been finalised.
+        """
+        st = self.mem.status
+        r = self.result
+        view = self.book.view(self.tick, st.dlvl, self._precondition_state())
+        return {
+            "outcome": r.outcome,
+            "stop_reason": r.stop_reason,
+            "ticks": self.tick,
+            "level": st.dlvl or "",
+            "hp": st.hp,
+            "hp_max": st.hp_max,
+            "actions": self.action_ordinal,
+            "invalids": len(self._invalids),
+            "boundaries": self.ledger.boundaries_detected,
+            "strategy_calls": self.ledger.strategy_dispatched,
+            "advice": list(view.dset.goals) if view.active else [],
+        }
 
     def _new_postmortem_provider(self):
         """A fresh strategy provider owning the postmortem's own lifecycle.
