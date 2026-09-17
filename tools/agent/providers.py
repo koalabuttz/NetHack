@@ -926,13 +926,21 @@ class PreparedStrategyRequest(object):
         }
 
 
-def _messages_for(ctx: StrategyContext, retained) -> List[Tuple[str, str]]:
-    """Build the message list: system, retained pairs, then the new tail."""
+def _messages_for(retained, user_text: str) -> List[Tuple[str, str]]:
+    """Build the message list: system, retained pairs, then the frozen tail.
+
+    The current user tail is *rendered once* by the caller and passed in
+    already frozen, so every candidate message list -- the byte-ceiling
+    probes and the final payload alike -- uses the same bytes and the
+    renderer runs once per preparation (the render-once contract in
+    ``doc/agent-cache-plan.md``).  Selection must never re-render the tail
+    with a mutable context.
+    """
     messages: List[Tuple[str, str]] = [("system", _SYSTEM_PROMPT)]
     for ex in retained:
         messages.append(("user", ex.user))
         messages.append(("assistant", ex.assistant))
-    messages.append(("user", _render_strategy_prompt(ctx)))
+    messages.append(("user", user_text))
     return messages
 
 
@@ -975,6 +983,11 @@ def prepare_strategy_request(config: ProviderConfig, ctx: StrategyContext,
     if retained is None:
         retained = conversation.snapshot() if conversation is not None else []
     retained = list(retained)
+    # Render the current user tail exactly once and freeze it: every candidate
+    # message list below -- the byte-ceiling probes and the final payload --
+    # reuses these bytes, so eviction never re-renders the tail and the frozen
+    # request and its bound always describe the same bytes.
+    user_text = _render_strategy_prompt(ctx)
     # 1. pair-count eviction
     if config.deepseek_history_pairs <= 0:
         retained = []
@@ -983,9 +996,9 @@ def prepare_strategy_request(config: ProviderConfig, ctx: StrategyContext,
     # 2. byte-ceiling eviction of complete pairs, oldest first
     ceiling = int(config.deepseek_context_max_bytes)
     while len(retained) > 0 and _payload_bytes(
-            config, _messages_for(ctx, retained)) > ceiling:
+            config, _messages_for(retained, user_text)) > ceiling:
         retained = retained[1:]
-    messages = _messages_for(ctx, retained)
+    messages = _messages_for(retained, user_text)
     fits = _payload_bytes(config, messages) <= ceiling
     prompt, completion = _bound_for_messages(config, messages)
     return PreparedStrategyRequest(
@@ -996,7 +1009,7 @@ def prepare_strategy_request(config: ProviderConfig, ctx: StrategyContext,
         stream=False,
         response_format={"type": "json_object"},
         retained=tuple(retained),
-        user_text=messages[-1][1],
+        user_text=user_text,
         prompt_bound=prompt,
         completion_bound=completion,
         fits=fits)

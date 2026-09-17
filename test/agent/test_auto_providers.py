@@ -2501,6 +2501,31 @@ class TestContextEviction(unittest.TestCase):
                          ["system", "user", "assistant", "user", "assistant",
                           "user"])
 
+    def test_byte_ceiling_renders_the_tail_exactly_once(self):
+        # the render-once contract: byte-ceiling eviction reuses a single
+        # frozen render for every candidate list and the final payload
+        cfg = self._cfg(deepseek_context_max_bytes=10 ** 9)
+        hist = self._exchanges(6)
+        two = providers.prepare_strategy_request(cfg, self._ctx(),
+                                                 retained=hist[-2:])
+        ceiling = providers._payload_bytes(cfg, two.messages)
+        calls = []
+        real = providers._render_strategy_prompt
+
+        def counting(ctx):
+            calls.append(ctx)
+            return real(ctx)
+
+        with mock.patch.object(providers, "_render_strategy_prompt",
+                               side_effect=counting):
+            p = providers.prepare_strategy_request(
+                self._cfg(deepseek_context_max_bytes=ceiling),
+                self._ctx(), retained=hist)
+        self.assertEqual(len(calls), 1)             # exactly one render
+        # the frozen tail is used for sizing and the final payload alike
+        self.assertEqual(p.user_text, p.messages[-1][1])
+        self.assertEqual(p.user_text, real(self._ctx()))
+
     def test_irreducible_oversize_does_not_fit(self):
         cfg = self._cfg(deepseek_context_max_bytes=8)
         p = providers.prepare_strategy_request(
