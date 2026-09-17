@@ -122,8 +122,13 @@ evaluation" below.
     completes a tariff and is rejected when it exceeds `--deepseek-price-in`,
     because the full input price is the conservative fallback every
     reservation relies on.  No price is invented: with no tariff the estimate
-    stays zero and the unknown-price exposure is counted instead.  Every cap
-    is a *conservative ceiling*: a call is admitted only when the estimated
+    stays zero and the unknown-price exposure is counted instead.  A
+    **partial** tariff (only one of the in/out prices) is usable but
+    explicitly **incomplete**: it never enforces a USD cap, its serialized
+    form carries `complete: false`, and a reported usage component the tariff
+    does not price is counted as unknown-price rather than billed at a
+    fabricated zero.  Every cap is a *conservative ceiling*: a call is
+    admitted only when the estimated
     prompt plus the configured maximum output fits in what is left, and a call
     that returns no usage keeps that exposure recorded (never silently
     dropped).
