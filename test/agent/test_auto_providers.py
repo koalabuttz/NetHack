@@ -3000,6 +3000,26 @@ class TestProviderConfigValidation(unittest.TestCase):
         cfg = ProviderConfig(usd_cap=1.0, deepseek_price_cache_hit=0.1)
         self.assertIn("complete tariff", cfg.validate())
 
+    def test_partial_prices_are_valid_but_incomplete(self):
+        # a partial tariff (no USD cap) is a valid configuration; it is
+        # *incomplete* and its ledger must construct without crashing
+        for cfg in (ProviderConfig(deepseek_price_in=1.0),
+                    ProviderConfig(deepseek_price_out=2.0),
+                    ProviderConfig(deepseek_price_cache_hit=0.5)):
+            with self.subTest(cfg=cfg):
+                self.assertIsNone(cfg.validate())
+                t = providers.tariff_from_config(cfg)
+                self.assertFalse(t.is_complete())
+                self.assertFalse(t.to_dict()["complete"])
+                budget.BudgetLedger(tariff=t)          # no crash
+
+    def test_tariff_from_config_preserves_absence(self):
+        # an absent price is carried through as None, never coerced to 0.0
+        cfg = ProviderConfig(deepseek_price_in=1.0)
+        t = providers.tariff_from_config(cfg)
+        self.assertEqual(t.prompt_per_mtok, 1.0)
+        self.assertIsNone(t.completion_per_mtok)
+
     def test_max_tokens_must_be_at_least_one(self):
         for bad in (0, -5):
             with self.subTest(bad=bad):
@@ -3112,10 +3132,12 @@ class TestLedgerInvariants(unittest.TestCase):
         with self.assertRaises(ValueError):
             budget.BudgetLedger(usd_cap=1.0, tariff=None)
 
-    def test_invalid_tariff_is_rejected(self):
+    def test_a_present_but_malformed_price_is_rejected(self):
+        # a *present* price must be finite and nonnegative; an absent one is a
+        # partial tariff (see TestPartialTariffAccounting), not malformed
         for t in (budget.Tariff(float("nan"), 1.0),
                   budget.Tariff(-1.0, 1.0),
-                  budget.Tariff(None, 1.0)):
+                  budget.Tariff(1.0, float("inf"))):
             with self.subTest(tariff=t):
                 with self.assertRaises(ValueError):
                     budget.BudgetLedger(tariff=t)
@@ -3151,6 +3173,73 @@ class TestLedgerInvariants(unittest.TestCase):
         # the one documented clamp: defence in depth, not a semantic change
         led = budget.BudgetLedger(strategy_cap=4, postmortem_reserve=-1)
         self.assertEqual(led.postmortem_reserve, 0)
+
+
+# ============================================== partial tariffs (M2 review)
+
+class TestPartialTariffAccounting(unittest.TestCase):
+    """A partial tariff is usable but explicitly incomplete, never a
+    zero-priced "complete" one."""
+
+    def test_partial_tariffs_construct_but_are_incomplete(self):
+        for t in (budget.Tariff(prompt_per_mtok=1.0),
+                  budget.Tariff(completion_per_mtok=2.0),
+                  budget.Tariff(cache_hit_per_mtok=0.5)):
+            with self.subTest(tariff=t):
+                led = budget.BudgetLedger(tariff=t)      # no crash
+                self.assertFalse(led.tariff.is_complete())
+                self.assertFalse(led.tariff.to_dict()["complete"])
+
+    def test_complete_tariff_reports_complete(self):
+        led = budget.BudgetLedger(tariff=budget.Tariff(1.0, 2.0))
+        self.assertTrue(led.tariff.is_complete())
+        self.assertTrue(led.tariff.to_dict()["complete"])
+
+    def test_unpriced_completion_is_unknown_not_zero_priced(self):
+        # input-only: completion has no price, so it is never billed as a
+        # fabricated zero -- the call is counted as unknown-priced and the
+        # completion tokens are excluded from the estimated cost
+        led = budget.BudgetLedger(tariff=budget.Tariff(prompt_per_mtok=1.0))
+        led.add_usage({"prompt_tokens": 1000000, "completion_tokens": 500000,
+                       "reported": True})
+        self.assertEqual(led.unknown_price_calls, 1)
+        self.assertAlmostEqual(led.estimated_usd, 1.0)   # prompt only
+        self.assertEqual(led.completion_tokens, 500000)  # still counted
+
+    def test_unpriced_prompt_is_unknown_not_zero_priced(self):
+        tariff = budget.Tariff(completion_per_mtok=1.0)
+        led = budget.BudgetLedger(tariff=tariff)
+        led.add_usage({"prompt_tokens": 1000000, "completion_tokens": 500000,
+                       "reported": True})
+        self.assertEqual(led.unknown_price_calls, 1)
+        self.assertAlmostEqual(led.estimated_usd, 0.5)   # completion only
+
+    def test_cache_only_tariff_is_usable_and_not_rejected(self):
+        # cache-only once coerced to Tariff(0.0, 0.0, hit) and crashed; it is
+        # now an incomplete tariff whose unpriced prompt is unknown-priced
+        tariff = budget.Tariff(cache_hit_per_mtok=0.5)
+        led = budget.BudgetLedger(tariff=tariff)
+        led.add_usage({"prompt_tokens": 100,
+                       "prompt_cache_hit_tokens": 60,
+                       "prompt_cache_miss_tokens": 40,
+                       "completion_tokens": 0, "reported": True})
+        self.assertEqual(led.cache_hit_tokens, 60)
+        self.assertEqual(led.unknown_price_calls, 1)
+        self.assertAlmostEqual(led.estimated_usd, 0.0)
+
+    def test_partial_tariff_reservation_prices_only_configured(self):
+        led = budget.BudgetLedger(tariff=budget.Tariff(prompt_per_mtok=2.0))
+        led.reserve_strategy(prompt_tokens=1000, completion_tokens=500)
+        # only the prompt side is priced; the completion side is not a zero
+        self.assertAlmostEqual(
+            sum(led._price(p, c) for p, c in led._reserved_bounds), 0.002)
+
+    def test_partial_tariff_with_usd_cap_is_still_rejected(self):
+        for t in (budget.Tariff(1.0), budget.Tariff(completion_per_mtok=2.0),
+                  budget.Tariff(cache_hit_per_mtok=0.5)):
+            with self.subTest(tariff=t):
+                with self.assertRaises(ValueError):
+                    budget.BudgetLedger(usd_cap=1.0, tariff=t)
 
 
 # ================================================ Jev fallback usage (M3)

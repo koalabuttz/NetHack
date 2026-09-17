@@ -31,31 +31,55 @@ from typing import Any, Dict, List, Optional, Tuple
 class Tariff(object):
     """Operator-supplied per-million-token prices (USD).
 
-    ``cache_hit_per_mtok`` is *optional* and appended last so existing
+    Every field is ``Optional``: a *partial* configuration (only a prompt
+    price, only a completion price, or only a cache-hit price) is *usable*
+    for the components it prices but is explicitly *incomplete* --
+    ``to_dict`` reports ``complete=False`` and the ledger never fabricates
+    the absent component as a ``0.0`` rate.  A usage component with no
+    configured price is priced as nothing and counted as unknown-priced
+    instead, so a partial tariff can never masquerade as a numerically
+    complete, zero-priced one.  Only a complete tariff (prompt *and*
+    completion) can enforce a USD cap.
+
+    ``cache_hit_per_mtok`` is appended last so existing
     two-positional-argument callers keep working.  When it is unset the
-    effective cache-hit price falls back to the full input price, which is the
-    conservative upper bound: a reservation that never discounts cached
-    tokens can never under-count the spend.  A configured cache-hit price
-    above the input price would break that invariant, so it is rejected rather
-    than silently clamped (see :func:`_check_tariff`).
+    effective cache-hit price falls back to the full input price, which is
+    the conservative upper bound: a reservation that never discounts
+    cached tokens can never under-count the spend.  A configured cache-hit
+    price above a configured input price would break that invariant, so it
+    is rejected rather than silently clamped (see :func:`_check_tariff`);
+    with no configured input price there is nothing to compare against, so
+    a cache-only tariff is accepted as incomplete rather than rejected as
+    an invalid hit-above-zero rate.
     """
 
-    prompt_per_mtok: float
-    completion_per_mtok: float
+    prompt_per_mtok: Optional[float] = None
+    completion_per_mtok: Optional[float] = None
     cache_hit_per_mtok: Optional[float] = None
 
-    def effective_cache_hit_per_mtok(self) -> float:
-        """The cache-hit price actually applied: configured, else input."""
-        if self.cache_hit_per_mtok is None:
-            return self.prompt_per_mtok
-        return self.cache_hit_per_mtok
+    def is_complete(self) -> bool:
+        """True only with *both* a prompt and a completion price configured.
 
-    def to_dict(self) -> Dict[str, float]:
+        Completeness is what a USD cap requires; the cache-hit price is
+        deliberately not part of it (the full input price is the conservative
+        fallback), and neither is a partial one-sided configuration.
+        """
+        return (self.prompt_per_mtok is not None
+                and self.completion_per_mtok is not None)
+
+    def effective_cache_hit_per_mtok(self) -> Optional[float]:
+        """The cache-hit price actually applied: configured, else input."""
+        if self.cache_hit_per_mtok is not None:
+            return self.cache_hit_per_mtok
+        return self.prompt_per_mtok
+
+    def to_dict(self) -> Dict[str, Any]:
         return {"prompt_per_mtok": self.prompt_per_mtok,
                 "completion_per_mtok": self.completion_per_mtok,
                 "cache_hit_per_mtok": self.cache_hit_per_mtok,
                 "effective_cache_hit_per_mtok":
-                    self.effective_cache_hit_per_mtok()}
+                    self.effective_cache_hit_per_mtok(),
+                "complete": self.is_complete()}
 
 
 def _finite_number(name: str, v) -> float:
@@ -91,34 +115,40 @@ def _nonneg_int(name: str, v) -> int:
 
 
 def _check_tariff(tariff) -> None:
-    """Reject a missing, incomplete, non-finite or negative tariff.
+    """Reject a non-finite, negative or inconsistent *present* tariff price.
 
-    The cache-hit price is optional; when present it must be finite,
-    nonnegative and no greater than the input price.  That last rule is what
-    keeps the input price a valid upper bound for reservations -- a cache-hit
-    price above it would let a discount inflate a reservation, so the operator
-    is told rather than silently clamped.
+    A *partial* tariff -- a component left unset -- is deliberately allowed to
+    construct: it is *incomplete* (see :meth:`Tariff.is_complete`), cannot
+    enforce a USD cap, but is still usable for the components it does price.
+    The absent component is never fabricated as a ``0.0`` rate; the ledger
+    routes it to unknown exposure instead, so a partial tariff cannot
+    present a numerically complete, zero-priced total.
+
+    Every *present* price must be finite and nonnegative.  The cache-hit
+    price must not exceed a *configured* input price, because a cache-hit
+    price above it would let a discount inflate a reservation -- the
+    operator is told rather than silently clamped.  With no configured input
+    price there is nothing to compare against, so a cache-only tariff is not
+    rejected here.
     """
-    for field in ("prompt_per_mtok", "completion_per_mtok"):
+    for field in ("prompt_per_mtok", "completion_per_mtok",
+                  "cache_hit_per_mtok"):
         value = getattr(tariff, field, None)
         if value is None:
-            raise ValueError("tariff.%s is missing: a complete tariff is "
-                             "required" % field)
+            continue
         if _finite_number("tariff.%s" % field, value) < 0:
             raise ValueError("tariff.%s must be nonnegative" % field)
     hit = getattr(tariff, "cache_hit_per_mtok", None)
-    if hit is None:
+    prompt = getattr(tariff, "prompt_per_mtok", None)
+    if hit is None or prompt is None:
         return
-    hit = _finite_number("tariff.cache_hit_per_mtok", hit)
-    if hit < 0:
-        raise ValueError("tariff.cache_hit_per_mtok must be nonnegative")
-    if hit > _finite_number("tariff.prompt_per_mtok",
-                            tariff.prompt_per_mtok):
+    if _finite_number("tariff.cache_hit_per_mtok", hit) \
+            > _finite_number("tariff.prompt_per_mtok", prompt):
         raise ValueError(
             "tariff.cache_hit_per_mtok (%r) must not exceed "
             "tariff.prompt_per_mtok (%r): the full input price is the "
             "conservative fallback that keeps every reservation an upper "
-            "bound" % (hit, tariff.prompt_per_mtok))
+            "bound" % (hit, prompt))
 
 
 class BudgetLedger(object):
@@ -226,12 +256,24 @@ class BudgetLedger(object):
 
     # -- strategy reservations ------------------------------------------
     def _price(self, prompt_tokens: int, completion_tokens: int) -> float:
-        """The USD cost of a token count under the configured tariff."""
+        """The USD cost of a token count under the configured tariff.
+
+        Only *configured* components are priced: an absent price is not
+        fabricated as zero, so a partial tariff simply leaves that side of
+        the spend unrepresented here.  The settled-cost and
+        unknown-exposure callers route the unpriced component to
+        unknown-priced accounting instead, so a partial tariff never looks
+        numerically complete.
+        """
         if self.tariff is None:
             return 0.0
-        return (prompt_tokens / 1000000.0 * self.tariff.prompt_per_mtok
-                + completion_tokens / 1000000.0
-                * self.tariff.completion_per_mtok)
+        total = 0.0
+        if self.tariff.prompt_per_mtok is not None:
+            total += prompt_tokens / 1000000.0 * self.tariff.prompt_per_mtok
+        if self.tariff.completion_per_mtok is not None:
+            total += completion_tokens / 1000000.0 \
+                * self.tariff.completion_per_mtok
+        return total
 
     @property
     def unknown_exposure_tokens(self) -> int:
@@ -379,7 +421,9 @@ class BudgetLedger(object):
         reported *zero* is genuinely known and distinct from a missing field;
         only a complete consistent partition (``H + M == P``) earns the cache
         discount, and everything else is priced at the full input price and
-        counted as unclassified.
+        counted as unclassified.  A component the configured tariff does not
+        price is counted as unknown-priced rather than billed as a fabricated
+        zero, so a partial tariff cannot present a complete-looking total.
         """
         if not usage:
             return (False, False)
@@ -408,12 +452,33 @@ class BudgetLedger(object):
             self.reasoning_tokens += reasoning
         if prompt is not None or completion is not None \
                 or usage.get("reported"):
-            if self.tariff is not None:
-                self.estimated_usd += self._reported_price(
-                    classified_hit, prompt or 0, completion or 0)
-            else:
+            self.estimated_usd += self._reported_price(
+                classified_hit, prompt or 0, completion or 0)
+            if self._has_unpriced_component(prompt, completion):
+                # A reported component with no configured price is never
+                # priced as a fabricated zero: the call is counted as
+                # unknown-priced so a partial tariff never yields a
+                # complete-looking total.
                 self.unknown_price_calls += 1
         return (prompt is not None, completion is not None)
+
+    def _has_unpriced_component(self, prompt: Optional[int],
+                                completion: Optional[int]) -> bool:
+        """True when a *reported* component has no configured price.
+
+        With no tariff at all every reported call is unknown-priced.  With a
+        partial tariff only the reported component that lacks a price counts;
+        an absent *usage* component (``None``) is not a pricing gap here --
+        the reservation path already carries its bound as unknown exposure.
+        """
+        if self.tariff is None:
+            return True
+        if prompt is not None and self.tariff.prompt_per_mtok is None:
+            return True
+        if completion is not None \
+                and self.tariff.completion_per_mtok is None:
+            return True
+        return False
 
     def _reported_price(self, hit_tokens: int, prompt_tokens: int,
                         completion_tokens: int) -> float:
@@ -422,18 +487,26 @@ class BudgetLedger(object):
         Cached prompt tokens are billed at the effective cache-hit price, the
         rest of the prompt (misses and unclassified) at the full input price,
         and completion -- which the API already includes reasoning in -- at
-        the output price.  This is deliberately a *separate* function from
-        :meth:`_price`, which stays the conservative full-price figure used
-        for reservations and unknown exposure.
+        the output price.  Only *configured* components are priced: an absent
+        prompt or completion price contributes nothing here and the caller
+        counts the call as unknown-priced, so a partial tariff never yields
+        a complete-looking total.  This is deliberately a *separate*
+        function from :meth:`_price`, which stays the conservative
+        full-price figure used for reservations and unknown exposure.
         """
         if self.tariff is None:
             return 0.0
-        hit = self.tariff.effective_cache_hit_per_mtok()
-        missed = max(0, prompt_tokens - hit_tokens)
-        return (hit_tokens / 1000000.0 * hit
-                + missed / 1000000.0 * self.tariff.prompt_per_mtok
-                + completion_tokens / 1000000.0
-                * self.tariff.completion_per_mtok)
+        total = 0.0
+        prompt_rate = self.tariff.prompt_per_mtok
+        if prompt_rate is not None:
+            hit_rate = self.tariff.effective_cache_hit_per_mtok()
+            missed = max(0, prompt_tokens - hit_tokens)
+            total += (hit_tokens / 1000000.0 * hit_rate
+                      + missed / 1000000.0 * prompt_rate)
+        if self.tariff.completion_per_mtok is not None:
+            total += completion_tokens / 1000000.0 \
+                * self.tariff.completion_per_mtok
+        return total
 
     # -- reflex paid bound (Jev) ----------------------------------------
     def reflex_paid_available(self) -> bool:

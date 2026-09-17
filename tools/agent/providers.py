@@ -1533,20 +1533,22 @@ def strategy_provider(config: ProviderConfig, **kw) -> StrategyProvider:
 def tariff_from_config(config: ProviderConfig) -> Optional[Tariff]:
     """Operator-configured DeepSeek pricing, or None (no invented prices).
 
-    Only ``deepseek_price_in``/``deepseek_price_out`` decide whether a tariff
-    is *complete* (and therefore whether a USD cap is enforceable); the
-    optional cache-hit price is carried through so a reported cache partition
-    can be discounted without ever changing that completeness rule.
+    Every configured price is carried through *as configured*: an absent price
+    stays ``None`` rather than being coerced to a fabricated ``0.0``, so a
+    partial tariff remains explicitly incomplete instead of masquerading as a
+    numerically complete, zero-priced one.  Only ``deepseek_price_in`` and
+    ``deepseek_price_out`` decide whether a tariff is *complete* (and
+    therefore whether a USD cap is enforceable); the optional cache-hit price
+    is carried through so a reported cache partition can be discounted
+    without ever changing that completeness rule.
     """
     if (config.deepseek_price_in is None
             and config.deepseek_price_out is None
             and config.deepseek_price_cache_hit is None):
         return None
-    return Tariff(prompt_per_mtok=float(config.deepseek_price_in or 0.0),
-                  completion_per_mtok=float(config.deepseek_price_out or 0.0),
-                  cache_hit_per_mtok=(
-                      None if config.deepseek_price_cache_hit is None
-                      else float(config.deepseek_price_cache_hit)))
+    return Tariff(prompt_per_mtok=config.deepseek_price_in,
+                  completion_per_mtok=config.deepseek_price_out,
+                  cache_hit_per_mtok=config.deepseek_price_cache_hit)
 
 
 def tariff_complete(config: ProviderConfig) -> bool:
