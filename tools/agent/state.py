@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
 from . import protocol
+from .events import (Boundary, BoundaryDetector, HUNGER_STAGES,
+                     hunger_index, novel_descriptions)
 
 # Monster classes drawn with punctuation rather than a letter.  Taken from the
 # engine's public glyph table (include/defsym.h MONSYM entries): golem ('),
@@ -38,7 +40,9 @@ for _ch in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ":
 STAIRS_DOWN = ">"
 STAIRS_UP = "<"
 
-HUNGER_STAGES = ("Hungry", "Weak", "Fainting", "Fainted", "Starved")
+# ``HUNGER_STAGES`` and its ordering live in :mod:`tools.agent.events` with
+# the rest of the boundary logic; the name is re-exported here for callers
+# that already import it from state.
 
 # Food the reflex is willing to eat.  This is a *known-safe allowlist*, not a
 # keyword soup: a corpse, a tinned or simply unrecognised item is not assumed
@@ -222,6 +226,27 @@ def hero_position(snap: protocol.Snapshot) -> Optional[Tuple[int, int]]:
     return None
 
 
+def render_map(mem: "EpisodeMemory", legend: bool = True) -> str:
+    """The remembered map as a 79x21 text block, with a coordinate legend.
+
+    Only *publicly observed* terrain is drawn; an unseen cell is a blank.
+    The legend pins the coordinate system so a strategy cannot misread a
+    glyph position (the map is ``engine-map``: x=1..79, y=0..20).
+    """
+    lines = []
+    for y in range(protocol.MAP_MIN_Y, protocol.MAP_MAX_Y + 1):
+        row = "".join(mem.tile((x, y))
+                      for x in range(protocol.MAP_MIN_X,
+                                     protocol.MAP_MAX_X + 1))
+        lines.append("%2d %s" % (y, row))
+    if legend:
+        lines.append("x=%d..%d y=%d..%d (x right, y down; '>' down stairs, "
+                     "'<' up stairs, '@' hero)"
+                     % (protocol.MAP_MIN_X, protocol.MAP_MAX_X,
+                        protocol.MAP_MIN_Y, protocol.MAP_MAX_Y))
+    return "\n".join(lines)
+
+
 class Inventory(object):
     """A cached, timestamped view of the last inventory rows the hero read."""
 
@@ -318,44 +343,38 @@ class EpisodeMemory(object):
     def known_passable(self, pos: Tuple[int, int]) -> bool:
         return pos in self.grid and passable(self.tile(pos))
 
+    # -- Wave-2 boundary inputs (all derived from public state only) ------
+    def visible_classes(self) -> Set[str]:
+        """Monster-class glyphs currently visible on the presented map.
 
-class BoundaryDetector(object):
-    """Deterministic boundary events with stable episode-local ids."""
-
-    HP_CRISIS_LOW = 0.30
-    HP_CRISIS_HIGH = 0.50
-
-    def __init__(self) -> None:
-        self._armed_hp = True
-        self._last_level: Optional[str] = None
-        self._last_hunger = ""
-
-    def check(self, st: Status, closed: bool = False) -> List[Boundary]:
-        out: List[Boundary] = []
-        if st.dlvl and st.dlvl != self._last_level:
-            reason = "initial-level" if self._last_level is None \
-                else "level-change"
-            out.append(Boundary(reason, "level:%s" % st.dlvl))
-            self._last_level = st.dlvl
-        if st.hp is not None and st.hp_max:
-            frac = st.hp / float(st.hp_max)
-            if self._armed_hp and frac <= self.HP_CRISIS_LOW:
-                out.append(Boundary("hp-crisis", "hp-crisis:%d" % st.hp_max))
-                self._armed_hp = False
-            elif not self._armed_hp and frac > self.HP_CRISIS_HIGH:
-                self._armed_hp = True
-        stage = self._hunger_stage(st.hunger)
-        if stage and stage != self._last_hunger:
-            out.append(Boundary("hunger-%s" % stage.lower(),
-                                "hunger:%s" % stage))
-            self._last_hunger = stage
-        if closed:
-            out.append(Boundary("closed", "closed"))
+        The *presentation* is per observation, so this is what the hero can
+        see right now; the detector turns a first sighting into one stable
+        episode-local novelty event.
+        """
+        out: Set[str] = set()
+        for cell in self.grid.values():
+            ch = cell[0] if cell else ""
+            if ch and ch != "@" and monster_glyph(ch):
+                out.add(ch)
         return out
 
-    @staticmethod
-    def _hunger_stage(hunger: str) -> str:
-        for stage in HUNGER_STAGES:
-            if hunger.startswith(stage):
-                return stage
-        return ""
+    def inventory_signature(self) -> Optional[Tuple[str, ...]]:
+        """A stable signature of the last inventory list the hero read.
+
+        ``None`` until an inventory has actually been read, so the first read
+        is a baseline rather than a change.
+        """
+        if self.inventory.seen_tick is None:
+            return None
+        names = []
+        for r in self.inventory.rows:
+            text = (r.get("text") or "").strip().lower()
+            if text:
+                names.append(" ".join(text.split()))
+        return tuple(names)
+
+    def failed_food_count(self) -> int:
+        """How many times the engine rejected a food intent this episode."""
+        return sum(1 for m in self.messages
+                   if "don't have that object" in m.lower())
+
