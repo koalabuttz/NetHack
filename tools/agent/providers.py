@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import protocol, state
 from .budget import Tariff
-from .directives import validate_directive_set
+from .directives import MAX_TTL, validate_directive_set
 from .worker import INVOCATION_MARKER, MAX_JOB_BYTES
 
 
@@ -751,7 +751,8 @@ _SYSTEM_PROMPT = (
     'survive, acquire_food, eat_known_safe_food, recover, explore_frontier, '
     'search_dead_ends, descend_known_stairs, inspect_inventory, disengage), '
     'optional "target" ([x,y] observed coordinate), "risk" (0..1), "ttl" '
-    "(integer ticks the advice stays valid), optional \"preconditions\" "
+    "(an integer from 1 to " + str(MAX_TTL) + ": how many ticks the advice "
+    "stays valid), optional \"preconditions\" "
     "(subset of hero_known, hp_known, hungry, not_hungry, hp_below_half, "
     "hp_above_half, inventory_fresh) and a short \"explanation\" string. "
     "Never emit keys, menu ids, command text or any executable content. "

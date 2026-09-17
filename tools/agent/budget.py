@@ -497,12 +497,18 @@ class BudgetLedger(object):
         if self.tariff is None:
             return 0.0
         total = 0.0
+        # Known cache-hit tokens are priced whenever a hit rate is
+        # available -- configured cache price, or the input price as the
+        # documented fallback -- even when the rest of the prompt has no
+        # configured rate (a cache-only tariff prices its one known
+        # component and leaves misses unknown-priced).
+        hit_rate = self.tariff.effective_cache_hit_per_mtok()
+        if hit_rate is not None:
+            total += hit_tokens / 1000000.0 * hit_rate
         prompt_rate = self.tariff.prompt_per_mtok
         if prompt_rate is not None:
-            hit_rate = self.tariff.effective_cache_hit_per_mtok()
             missed = max(0, prompt_tokens - hit_tokens)
-            total += (hit_tokens / 1000000.0 * hit_rate
-                      + missed / 1000000.0 * prompt_rate)
+            total += missed / 1000000.0 * prompt_rate
         if self.tariff.completion_per_mtok is not None:
             total += completion_tokens / 1000000.0 \
                 * self.tariff.completion_per_mtok

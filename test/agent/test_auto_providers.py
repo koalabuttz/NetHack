@@ -3034,6 +3034,19 @@ class TestControllerConversation(WireHarness):
 
 # ================================================= config validation (M2)
 
+class StrategyPromptContractTest(unittest.TestCase):
+    """The stable system prompt advertises the validator's exact bounds.
+
+    A real model that emits an out-of-range ttl loses its whole (paid)
+    strategy call -- the prompt must state the same range the strict
+    validator enforces, so the failure is avoidable rather than observed.
+    """
+
+    def test_ttl_range_is_advertised(self):
+        self.assertIn("an integer from 1 to %d" % directives.MAX_TTL,
+                      providers._SYSTEM_PROMPT)
+
+
 class TestProviderConfigValidation(unittest.TestCase):
     """Medium 2: one validation authority shared by CLI and Controller."""
 
@@ -3289,18 +3302,22 @@ class TestPartialTariffAccounting(unittest.TestCase):
         self.assertEqual(led.unknown_price_calls, 1)
         self.assertAlmostEqual(led.estimated_usd, 0.5)   # completion only
 
-    def test_cache_only_tariff_is_usable_and_not_rejected(self):
+    def test_cache_only_tariff_prices_its_known_component(self):
         # cache-only once coerced to Tariff(0.0, 0.0, hit) and crashed; it is
-        # now an incomplete tariff whose unpriced prompt is unknown-priced
+        # now an incomplete tariff: the KNOWN hit component is priced at the
+        # configured cache rate, the unpriced misses make the call
+        # unknown-priced, and nothing is fabricated as a zero
         tariff = budget.Tariff(cache_hit_per_mtok=0.5)
         led = budget.BudgetLedger(tariff=tariff)
-        led.add_usage({"prompt_tokens": 100,
-                       "prompt_cache_hit_tokens": 60,
-                       "prompt_cache_miss_tokens": 40,
+        led.add_usage({"prompt_tokens": 1000000,
+                       "prompt_cache_hit_tokens": 600000,
+                       "prompt_cache_miss_tokens": 400000,
                        "completion_tokens": 0, "reported": True})
-        self.assertEqual(led.cache_hit_tokens, 60)
+        self.assertEqual(led.cache_hit_tokens, 600000)
+        self.assertEqual(led.cache_miss_tokens, 400000)
         self.assertEqual(led.unknown_price_calls, 1)
-        self.assertAlmostEqual(led.estimated_usd, 0.0)
+        # 600k hit tokens at $0.50/Mtok = $0.30 of known cost
+        self.assertAlmostEqual(led.estimated_usd, 0.3)
 
     def test_partial_tariff_reservation_prices_only_configured(self):
         led = budget.BudgetLedger(tariff=budget.Tariff(prompt_per_mtok=2.0))
