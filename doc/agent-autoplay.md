@@ -51,6 +51,19 @@ wave can add providers without changing the argv.
 `--episode-timeout S` (default 300)
     wall-clock budget per episode.
 
+`--answer-deadline S` (default 1)
+    how long the controller may take to write one outbound line once a
+    request's content is complete; a full stdin pipe is bounded by this
+    rather than blocking.
+
+`--content-deadline S` (default 5)
+    the aggregate content/transport deadline for one outstanding request;
+    exceeding it aborts the episode (`stop=content-deadline`).
+
+`--reflex-deadline S` (default 0.75)
+    the reflex decision allowance.  The synchronous scripted tier needs no
+    budget; a network reflex tier (a later wave) is bounded by it.
+
 `--output-dir DIR`
     where the `ep-N.*` recordings are written.
 
@@ -62,16 +75,23 @@ wave can add providers without changing the argv.
 
 An episode is a success only when the wire reports `closed` after the
 controller has answered every outstanding request: startup selection, the
-tutorial prompt, ordinary play, and every nested end-game prompt.  Reported
-separately, never as success:
+tutorial prompt, ordinary play, and every nested end-game prompt, the
+launcher exits **zero**, its process group is reaped, and the recording is
+complete.  Reported separately, never as success:
 
   * **tick-cap graceful quit** — the reflex asked to quit through the native
     `#quit` path once `--max-ticks` was reached
     (`stop=tick-cap-graceful-quit`);
   * **EOF without `closed`** — a transport failure
     (`stop=transport-failure-eof`), never a fabricated terminal record;
+  * **closure without completion** — `closed` arrived while a request was
+    still unanswered (`stop=closed-unanswered`), a failed outbound write
+    (`stop=transport-failure-write`), a nonzero launcher exit, or a process
+    group that could not be reaped (`teardown_failure`).  Closure is
+    best-effort (`sys/unix/agent_runner.c`), so it is not by itself proof
+    that a request was answered;
   * **episode timeout / forced kill**, and **protocol failure** (a request
-    rejected beyond the retry cap).
+    rejected beyond the retry cap, or a bounded session-validation failure).
 
 The harness also reports the *game outcome* inferred from visible text
 (`death`, `starvation`, `ascension`, ...) **separately** from its own stop

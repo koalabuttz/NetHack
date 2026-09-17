@@ -100,7 +100,32 @@ python3 -m unittest discover -s test/agent -p 'test_auto*.py'
 They import the harness package from the repository root (`tools/agent/`) and
 drive the real controller against an in-memory fake wire, so the transport
 obligations — pages, chunks, `invalid` recovery and retry caps, EOF versus
-`closed`, incomplete recording — are exercised deterministically.
+`closed`, incomplete recording — are exercised deterministically.  The suite
+also covers the transport hardening added in the Wave 1 review fix: exactly
+one `get_page` in flight (proved from the recorded wire offsets),
+deadline-bounded writes against a full stdin pipe, closure honesty (a `closed`
+with an unanswered request, a broken stdin, or a nonzero exit is a failure),
+session validation (missing/duplicate/wrong-profile `hello`, non-monotonic
+`seq`, a malformed snapshot, an overlong line), the single send-and-record
+path, the recorder shutdown/perms rules, the child-environment allowlist and
+process-group teardown, and every `ScriptedReflex` safety rule.
+
+### Food-row selection: row-model coverage
+
+The eat-round-trip that opens the inventory menu with `*` and commits a
+**current, non-first known-safe food row** is covered as a *scripted-policy
+scenario assertion*
+(`TestScriptedReflexSafety`
+`.test_open_eat_then_commit_a_non_first_safe_food_row`).
+It exercises the real row adapter and `protocol.validate_action`, but it is
+deliberately a **row-model** test: it feeds menu rows the controller would
+parse, not rows produced by a live native `select_menu`.  A live-client
+variant is not asserted here because a fresh episode's RNG and native object
+identity are not reproducible from an inbound transcript
+(`doc/agent-autoplay-plan.md`, "Phase-0 eat-menu investigation"): a live run
+is a marked manual probe, not a deterministic gate.  The row-model vector is
+the deterministic half; the live half stays the opt-in
+`make -C test/agent play`/`breadth` flow.
 
 ## Watching an episode
 
