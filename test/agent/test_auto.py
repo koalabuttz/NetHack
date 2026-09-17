@@ -38,7 +38,8 @@ from tools.agent import (controller, policy, protocol,  # noqa: E402
                          recording, state)
 from tools.agent import __main__ as agent_main  # noqa: E402
 from tools.agent.providers import (ProviderConfig,  # noqa: E402
-                                   ReflexContext, ReflexResult)
+                                   ReflexContext, ReflexResult,
+                                   ReflexTimeout)
 
 
 # ------------------------------------------------------------------ fake wire
@@ -299,6 +300,55 @@ class SilentPeer(object):
                 pass
 
 
+class DripPeer(object):
+    """Writes a preamble, then drips one record at a fixed interval.
+
+    Used to prove that a retry state (`invalid`) consumes the *same* content
+    budget instead of restarting it: a peer that drip-feeds rejections must
+    not be able to push the need deadline forward forever.
+    """
+
+    def __init__(self, preamble: bytes, record, interval=0.08, limit=200):
+        self.out_r, self.out_w = os.pipe()
+        self.in_r, self.in_w = os.pipe()
+        self.proc = _PeerProc(self.out_r, self.in_w)
+        self.record = record
+        self.interval = interval
+        self.limit = limit
+        self.sent = 0
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._serve, args=(preamble,),
+                                   daemon=True)
+        self._t.start()
+
+    def _serve(self, preamble):
+        w = os.fdopen(self.out_w, "wb", buffering=0)
+        try:
+            w.write(preamble)
+            for _ in range(self.limit):
+                if self._stop.is_set():
+                    break
+                w.write(_line(self.record))
+                self.sent += 1
+                time.sleep(self.interval)
+        except OSError:
+            pass
+        finally:
+            try:
+                w.close()
+            except OSError:
+                pass
+
+    def close(self):
+        self._stop.set()
+        self._t.join(timeout=1.0)
+        for fd in (self.in_r, self.in_w, self.out_r):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 class WireHarness(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="auto-test.")
@@ -312,8 +362,10 @@ class WireHarness(unittest.TestCase):
             self.dir, episode_timeout=timeout)
 
     def run_scenario(self, scenario: bytes, eof: bool = True,
-                     timeout: float = 10.0, max_ticks: int = 200):
-        ctl = self._controller(timeout=timeout, max_ticks=max_ticks)
+                     timeout: float = 10.0, max_ticks: int = 200,
+                     config=None):
+        ctl = self._controller(timeout=timeout, max_ticks=max_ticks,
+                               config=config)
         proc = FakeProc(scenario, eof=eof)
         ctl._spawn = lambda priv: proc  # deterministic: no real subprocess
         try:
@@ -1246,6 +1298,80 @@ def _wait_gone(pid, timeout):
             return True
         time.sleep(0.05)
     return _process_gone(pid)
+
+
+class TestDeadlines(WireHarness):
+    """High 1: the reflex deadline and the aggregate content deadline."""
+
+    def test_blocking_reflex_falls_back_within_the_reflex_deadline(self):
+        class _SlowReflex(object):
+            def __init__(self, config):
+                self.config = config
+                self.max_ticks = 10
+                self.quitting = False
+                self.quit_reason = ""
+
+            def decide(self, ctx):
+                time.sleep(1.5)
+                return ReflexResult(action={"key": protocol.KEY_SEARCH},
+                                    provider="slow")
+
+            def fallback(self, ctx):
+                return self.decide(ctx)
+
+            def on_closed(self):
+                pass
+
+        cfg = ProviderConfig(max_ticks=50, reflex_deadline=0.15)
+        scen = b"".join([_line(HELLO),
+                         _line(obs(1, {"kind": "command", "id": 1})),
+                         _line(CLOSED)])
+        with mock.patch.object(controller, "ScriptedReflex", _SlowReflex):
+            t0 = time.monotonic()
+            result, actions = self.run_scenario(scen, config=cfg)
+            elapsed = time.monotonic() - t0
+        self.assertTrue(result.closed)
+        self.assertLess(elapsed, 1.2)          # never waited for the sleep
+        self.assertGreaterEqual(result.reflex_timeouts, 1)
+        acts = [a for a in actions if a.get("type") == "act"]
+        self.assertEqual(acts[-1]["action"], {"key": protocol.KEY_WAIT})
+        decs = _read_jsonl(os.path.join(self.dir, "ep-1.decisions.jsonl"))
+        self.assertTrue(any("reflex deadline exceeded" in (d["reason"] or "")
+                            for d in decs))
+
+    def test_scripted_reflex_raises_when_past_its_deadline(self):
+        ref = policy.ScriptedReflex(ProviderConfig())
+        ctx = ReflexContext(
+            episode=1, tick=0, need={"kind": "command", "id": 1},
+            need_key=protocol.NeedKey(1, 0, 1), snapshot=protocol.Snapshot(),
+            pages=[], memory=state.EpisodeMemory(),
+            deadline=time.monotonic() - 1.0)
+        with self.assertRaises(ReflexTimeout):
+            ref.decide(ctx)
+
+    def test_drip_invalids_do_not_extend_the_content_deadline(self):
+        # retries consume the ORIGINAL content budget: a peer cannot buy a
+        # fresh content_deadline with each rejection
+        cfg = ProviderConfig(max_ticks=200, content_deadline=0.4,
+                             reflex_deadline=0.05)
+        ctl = controller.Controller(
+            cfg, controller.ControllerPaths("w", "r", "d", "s"), self.dir,
+            episode_timeout=1.5, max_retries=1000)
+        need = {"id": 1, "kind": "command"}
+        preamble = _line(HELLO) + _line(obs(1, need))
+        invalid = {"v": 1, "ch": "control", "type": "invalid", "d": 2,
+                   "code": "kind"}
+        peer = DripPeer(preamble, invalid)
+        self.addCleanup(peer.close)
+        ctl._spawn = lambda priv: peer.proc
+        t0 = time.monotonic()
+        results = ctl.run_campaign(1)
+        elapsed = time.monotonic() - t0
+        result = results[0]
+        self.assertEqual(result.stop_reason, "content-deadline")
+        self.assertLess(elapsed, 1.4)
+        self.assertGreaterEqual(result.invalids, 1)
+        self.assertLessEqual(result.invalids, 8)
 
 
 class TestClosure(WireHarness):

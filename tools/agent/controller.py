@@ -37,6 +37,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -45,7 +46,7 @@ from . import protocol, recording
 from .codec import AssemblerLimit, ChunkError, IncrementalAssembler
 from .policy import ScriptedReflex
 from .protocol import NeedKey, Request, Snapshot
-from .providers import ProviderConfig, ReflexContext
+from .providers import ProviderConfig, ReflexContext, ReflexTimeout
 from .state import EpisodeMemory
 
 # Environment names the launcher is allowed to inherit.  Everything else --
@@ -123,6 +124,7 @@ class EpisodeResult(object):
     needs: int = 0
     invalids: int = 0
     actions: int = 0
+    reflex_timeouts: int = 0
     returncode: Optional[int] = None
     recording_complete: bool = False
     stderr_tail: str = ""
@@ -153,6 +155,10 @@ class Controller(object):
         self.answer_deadline = float(getattr(config, "answer_deadline", 1.0))
         self.content_deadline = float(
             getattr(config, "content_deadline", 5.0))
+        # The reflex allowance is an absolute per-decision deadline enforced
+        # at the provider boundary; 0 disables the bound.
+        self.reflex_deadline = float(
+            getattr(config, "reflex_deadline", 0.75) or 0.0)
         ensure_private_dir(output_dir)
 
     # -- campaign --------------------------------------------------------
@@ -198,6 +204,7 @@ class Controller(object):
                 "ticks": result.ticks,
                 "needs": result.needs,
                 "invalids": result.invalids,
+                "reflex_timeouts": result.reflex_timeouts,
                 "returncode": result.returncode,
             }
             rec.finalize(meta)
@@ -280,6 +287,43 @@ def _wait_child(proc, timeout: float) -> bool:
         return False
 
 
+class _ReflexCall(object):
+    """Run one provider decision on a bounded daemon thread.
+
+    A cooperative in-process provider checks the absolute deadline it is
+    handed (``ReflexContext.deadline``) and returns within it.  A provider
+    that ignores the deadline -- or a truly blocking call such as a network
+    round trip -- cannot be interrupted in-process, so this bounds only how
+    long the *controller* waits: on timeout the thread is abandoned and the
+    scripted fallback answers, which keeps the wire moving.  A real network
+    provider must run in the Wave-2 killable worker process so the abandoned
+    work is reaped too; the contract and plumbing for the deadline exist now.
+    """
+
+    def __init__(self, fn):
+        self.fn = fn
+        self.result = None
+        self.error = None
+        self._done = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self):
+        try:
+            self.result = self.fn()
+        except BaseException as exc:     # noqa: BLE001 - re-raised by caller
+            self.error = exc
+        finally:
+            self._done.set()
+
+    def start(self):
+        self._thread.start()
+
+    def wait(self, timeout):
+        if timeout is None:
+            return self._done.wait()
+        return self._done.wait(max(0.0, timeout))
+
+
 class _StderrDrain(object):
     """Drain the launcher's stderr on a daemon thread so it cannot block."""
 
@@ -345,8 +389,9 @@ class _EpisodeRunner(object):
         self.last_seq = 0
         self.closed = False
         self.deadline = 0.0
-        self.need_started = 0.0
+        self.need_deadline = None
         self.action_ordinal = 0
+        self.reflex_timeouts = 0
         self.rec_healthy = True
 
     # -- top loop --------------------------------------------------------
@@ -390,6 +435,7 @@ class _EpisodeRunner(object):
         self.result.needs = self._needs
         self.result.invalids = len(self._invalids)
         self.result.actions = self.action_ordinal
+        self.result.reflex_timeouts = self.reflex_timeouts
         self.result.closed = self.closed
         # Closure is best-effort: `closed` while a request is still awaiting
         # pages or an action is an unanswered obligation, not a completion.
@@ -486,7 +532,7 @@ class _EpisodeRunner(object):
     def _need_deadline(self):
         if not self.pending or self.pending_need is None:
             return None
-        return self.need_started + self.c.content_deadline
+        return self.need_deadline
 
     def _readline(self, deadline=None):
         if deadline is None:
@@ -626,7 +672,11 @@ class _EpisodeRunner(object):
         self.pending = need is not None
         self.pending_need = need
         self.pending_seq = seq
-        self.need_started = time.monotonic()
+        # The aggregate content deadline is anchored to the moment the need
+        # first appeared.  An `invalid` retry must NOT restart it: every
+        # retry consumes the same budget, so a peer that drip-feeds
+        # rejections cannot buy a fresh content_deadline per retry.
+        self.need_deadline = time.monotonic() + self.c.content_deadline
         self.force_fallback = False
         self.retries = 0
         if need is not None:
@@ -672,9 +722,9 @@ class _EpisodeRunner(object):
             self.req.reset_delivery()
         else:
             self.force_fallback = True
-        # the engine left the SAME request outstanding: re-arm it
+        # the engine left the SAME request outstanding: re-arm it, but keep
+        # the ORIGINAL need deadline -- the retry shares the first budget
         self.pending = True
-        self.need_started = time.monotonic()
 
     def _on_closed(self, rec):
         self.closed = True
@@ -698,10 +748,14 @@ class _EpisodeRunner(object):
 
     def _answer_now(self, deadline) -> bool:
         need = self.pending_need
-        write_dl = time.monotonic() + self.c.answer_deadline
+        proposal, provider, reason, latency, usage = self._decide(need,
+                                                                  deadline)
+        now = time.monotonic()
+        write_dl = now + self.c.answer_deadline
         if deadline is not None:
-            write_dl = min(write_dl, deadline)
-        proposal, provider, reason, latency, usage = self._decide(need)
+            # the answer must still go out even when the content deadline has
+            # just passed, so the bounded write keeps a small floor
+            write_dl = min(write_dl, max(deadline, now + 0.25))
         if proposal is None:
             selected = self._safe_fallback(need)
             sel_reason = ("no proposal (%s): safe fallback"
@@ -729,19 +783,54 @@ class _EpisodeRunner(object):
         self.force_fallback = False
         return True
 
-    def _decide(self, need):
+    def _decide(self, need, need_deadline=None):
+        """Answer one need within an *absolute* reflex deadline.
+
+        The deadline is handed to the provider in the context and the call is
+        run on a bounded thread: a stuck provider is abandoned (a later wave
+        runs it in a killable worker), and the controller always returns a
+        bounded scripted fallback rather than hanging the wire.
+        """
         if self.force_fallback:
             return (self._safe_fallback(need), "controller",
                     "forced fallback", 0.0, {})
+        reflex_dl = None
+        if self.c.reflex_deadline > 0:
+            reflex_dl = time.monotonic() + self.c.reflex_deadline
+        if need_deadline is not None:
+            reflex_dl = (need_deadline if reflex_dl is None
+                         else min(reflex_dl, need_deadline))
         ctx = ReflexContext(
             episode=self.result.index, tick=self.tick, need=need,
             need_key=self.pending_key, snapshot=self.snap,
-            pages=self.req.page_rows(), memory=self.mem)
+            pages=self.req.page_rows(), memory=self.mem,
+            deadline=reflex_dl or 0.0)
         t0 = time.monotonic()
-        res = self.reflex.decide(ctx)
+        call = _ReflexCall(lambda: self.reflex.decide(ctx))
+        call.start()
+        wait = None if reflex_dl is None else reflex_dl - time.monotonic()
+        finished = call.wait(wait)
         latency = time.monotonic() - t0
-        return res.action, res.provider or "scripted", res.reason, latency, \
-            res.usage
+        if not finished:
+            self.reflex_timeouts += 1
+            return (None, "scripted",
+                    "reflex deadline exceeded (>%.2fs, provider still "
+                    "running)" % self.c.reflex_deadline, latency, {})
+        if call.error is not None:
+            if isinstance(call.error, ReflexTimeout):
+                self.reflex_timeouts += 1
+                return (None, "scripted", "reflex deadline exceeded: %s"
+                        % call.error, latency, {})
+            if isinstance(call.error, Exception):
+                return (None, "scripted", "reflex provider error: %s"
+                        % call.error, latency, {})
+            raise call.error
+        res = call.result
+        if res is None:
+            return (None, "controller", "reflex returned no result",
+                    latency, {})
+        return (res.action, res.provider or "scripted", res.reason, latency,
+                res.usage)
 
     def _safe_fallback(self, need) -> dict:
         kind = need.get("kind")
