@@ -1995,6 +1995,25 @@ class TestProviderConfigValidation(unittest.TestCase):
                       cfg.validate(episode_timeout=-1.0))
         self.assertIsNone(cfg.validate(episodes=2, episode_timeout=300.0))
 
+    def test_unknown_selectors_are_rejected(self):
+        self.assertIn("reflex",
+                      ProviderConfig(reflex="jevv").validate())
+        self.assertIn("strategy",
+                      ProviderConfig(strategy="local").validate())
+        self.assertIsNone(ProviderConfig(reflex="jev",
+                                         strategy="deepseek").validate())
+
+    def test_response_byte_limits_must_be_positive_ints(self):
+        for field in ("deepseek_max_bytes", "provider_max_bytes"):
+            flag = "--" + field.replace("_", "-")
+            for bad in (0, -1):
+                with self.subTest(field=field, bad=bad):
+                    cfg = ProviderConfig(**{field: bad})
+                    self.assertIn(flag, cfg.validate())
+            with self.subTest(field=field, bad="wide"):
+                cfg = ProviderConfig(**{field: "32768"})
+                self.assertIn("integer", cfg.validate())
+
 
 class TestControllerConstructionValidation(WireHarness):
     """Medium 2: a programmatic config cannot bypass the CLI's checks."""
@@ -2024,6 +2043,44 @@ class TestControllerConstructionValidation(WireHarness):
 
     def test_valid_config_still_constructs(self):
         self.assertIsNotNone(self._build(ProviderConfig()))
+
+    def test_unknown_selector_fails_loudly(self):
+        with self.assertRaises(ValueError):
+            self._build(ProviderConfig(reflex="jevv"))
+        with self.assertRaises(ValueError):
+            self._build(ProviderConfig(strategy="local"))
+
+    def test_bad_response_byte_limit_fails_loudly(self):
+        with self.assertRaises(ValueError):
+            self._build(ProviderConfig(provider_max_bytes=0))
+        with self.assertRaises(ValueError):
+            self._build(ProviderConfig(deepseek_max_bytes=-1))
+
+
+class TestCampaignCountValidation(WireHarness):
+    """Low 2: run_campaign refuses a count that would silently do nothing."""
+
+    def _controller(self):
+        return controller.Controller(
+            ProviderConfig(max_ticks=200),
+            controller.ControllerPaths("w", "r", "d", "s"), self.dir,
+            episode_timeout=5.0)
+
+    def test_bad_episode_counts_raise(self):
+        ctl = self._controller()
+        for bad in (0, -1, True, "3", 1.5):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    ctl.run_campaign(bad)
+
+    def test_a_valid_count_still_runs(self):
+        ctl = self._controller()
+        seen = []
+        ctl.run_episode = lambda i: (seen.append(i),
+                                     controller.EpisodeResult(index=i))[1]
+        results = ctl.run_campaign(2)
+        self.assertEqual(seen, [1, 2])
+        self.assertEqual([r.index for r in results], [1, 2])
 
 
 class TestLedgerInvariants(unittest.TestCase):

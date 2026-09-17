@@ -192,6 +192,13 @@ class Controller(object):
 
     # -- campaign --------------------------------------------------------
     def run_campaign(self, episodes: int) -> List[EpisodeResult]:
+        # Validate the campaign count through the same authority the rest of
+        # the config uses, so a programmatic call cannot silently return an
+        # empty result list for a zero/negative/non-integer count.
+        err = self.config.validate(episodes=episodes,
+                                   episode_timeout=self.episode_timeout)
+        if err is not None:
+            raise ValueError(err)
         results = []
         for i in range(1, episodes + 1):
             results.append(self.run_episode(i))

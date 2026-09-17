@@ -119,14 +119,22 @@ class ProviderConfig(object):
         to live rather than two copies that can drift.
 
         Every numeric option must be finite and in range;
-        ``deepseek_max_tokens`` must be at least 1; the postmortem reserve
-        must fit inside the strategy cap (a larger reserve would make the
-        held-back slot meaningless); and a USD cap requires a *complete*
+        ``deepseek_max_tokens``, ``deepseek_max_bytes`` and
+        ``provider_max_bytes`` must be at least 1; the ``reflex`` and
+        ``strategy`` selectors must name a supported tier; the postmortem
+        reserve must fit inside the strategy cap (a larger reserve would make
+        the held-back slot meaningless); and a USD cap requires a *complete*
         tariff, because a cap that is silently ignored is worse than one that
         is rejected.  ``episodes`` and ``episode_timeout`` are campaign-level
         fields the config does not itself carry -- the CLI passes them in so
         its own checks run through the same routine.
         """
+        if self.reflex not in ("scripted", "jev"):
+            return ("--reflex must be scripted or jev (got %r)"
+                    % (self.reflex,))
+        if self.strategy not in ("off", "deepseek"):
+            return ("--strategy must be off or deepseek (got %r)"
+                    % (self.strategy,))
         ints = (("max-ticks", self.max_ticks, 0, 10 ** 9),
                 ("strategy-call-cap", self.strategy_call_cap, 0, 10 ** 9),
                 ("postmortem-reserve", self.postmortem_reserve, 0, 10 ** 9),
@@ -137,7 +145,11 @@ class ProviderConfig(object):
                 ("low-confidence-needs", self.low_confidence_needs,
                  1, 10 ** 6),
                 ("deepseek-max-tokens", self.deepseek_max_tokens,
-                 1, 10 ** 7))
+                 1, 10 ** 7),
+                ("deepseek-max-bytes", self.deepseek_max_bytes,
+                 1, 10 ** 9),
+                ("provider-max-bytes", self.provider_max_bytes,
+                 1, 10 ** 9))
         if episodes is not None:
             ints = (("episodes", episodes, 1, 10 ** 9),) + ints
         for name, val, lo, hi in ints:
