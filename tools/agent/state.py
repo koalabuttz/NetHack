@@ -29,6 +29,25 @@ STAIRS_UP = "<"
 
 HUNGER_STAGES = ("Hungry", "Weak", "Fainting", "Fainted", "Starved")
 
+# Food the reflex is willing to eat.  This is a *known-safe allowlist*, not a
+# keyword soup: a corpse, a tinned or simply unrecognised item is not assumed
+# edible (corpse safety is uncertain, and unseen quantities are unknown).
+KNOWN_SAFE_FOOD = ("food ration", "ration", "apple", "banana", "orange",
+                   "melon", "kelp frond", "kelp", "cram", "lembas",
+                   "fortune cookie", "candy bar", "cream pie", "meatball",
+                   "tripe", "egg")
+UNSAFE_FOOD_MARKERS = ("corpse", "tinned", "unknown", "glop")
+
+
+def is_known_safe_food(text) -> bool:
+    """True only for a recognised, safe food name."""
+    low = (text or "").lower()
+    if not low:
+        return False
+    if any(marker in low for marker in UNSAFE_FOOD_MARKERS):
+        return False
+    return any(name in low for name in KNOWN_SAFE_FOOD)
+
 
 def passable(ch: str) -> bool:
     return bool(ch) and ch not in NON_WALKABLE
@@ -114,11 +133,7 @@ class Inventory(object):
     def food_rows(self) -> List[dict]:
         out = []
         for r in self.rows:
-            text = (r.get("text") or "").lower()
-            if r.get("selectable") and ("ration" in text or "food" in text
-                                        or "apple" in text or "banana" in text
-                                        or "orange" in text or "melon" in text
-                                        or "corpse" in text):
+            if r.get("selectable") and is_known_safe_food(r.get("text")):
                 out.append(r)
         return out
 

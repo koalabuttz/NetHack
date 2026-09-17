@@ -4,16 +4,25 @@ The play agent's inline policy was not recoverable from the tree, so the
 campaign's working heuristics are reconstructed here explicitly (see
 ``doc/agent-autoplay-plan.md`` section "ScriptedReflex"):
 
-  * startup: pick the configured role, take the visible start-game row, and
-    explicitly decline the tutorial; never select the first row blindly;
+  * startup: pick the configured role / race / alignment and explicitly
+    decline the tutorial from a *recognised* menu; an unrecognised menu is
+    cancelled rather than blindly confirmed (a bare "first selectable row"
+    could accept a tutorial or a destructive choice);
+  * safety: explicit low-HP disengagement, and a monster is never walked into
+    -- public appearance is ambiguous, so getting unblocked means searching,
+    routing around or changing plan, never attacking a possible pet;
   * navigation: Dijkstra over remembered, publicly observed terrain with a
     visit-count penalty, preferring known down-stairs, then reachable
-    frontiers, with bounded searching to break loops;
-  * safety: disengage at low HP, avoid traps and monsters (never walk into a
-    pet), rest only when safe;
-  * hunger: answer the engine's ``getobj`` eat prompt with a *valid* inventory
-    letter parsed out of the prompt, or open the inventory menu, with a
-    mandatory loop breaker after two equivalent rejected food intents;
+    frontiers, with bounded searching to break loops; **unknown cells are not
+    walkable in the fallback** -- exploration happens only through deliberate
+    observed edges (frontier cells border known floor);
+  * hunger: a known-safe food allowlist (corpses and unrecognised items are
+    not assumed safe), with a mandatory loop breaker after two equivalent
+    rejected food intents;
+  * rest: only when provably safe -- no adjacent monster, adequate HP and not
+    hungry;
+  * inventory: refreshed from recognised inventory content and by a bounded
+    periodic ``i`` when the cache goes stale;
   * every need has a total fallback path so no request is ever left
     unanswered.
 
@@ -29,6 +38,24 @@ from . import protocol, state
 from .providers import ReflexContext, ReflexResult
 
 KEY = protocol
+
+# Safety thresholds (heuristic policy constants, not calibrated values).
+LOW_HP_FRACTION = 0.30          # disengage at or below this HP fraction
+ADEQUATE_HP_FRACTION = 0.50     # rest is only considered above this
+INV_STALE_TICKS = 240           # refresh the inventory cache after this many
+INV_REFRESH_COOLDOWN = 40       # ... but never more often than this
+EAT_RETRY_INTERVAL = 25
+
+# Recognised startup menu kinds.  Only these are answered with a selection;
+# anything else is cancelled.
+_MENU_KEYWORDS = (("tutorial", "tutorial"),
+                  ("role", "role"),
+                  ("profession", "role"),
+                  ("race", "race"),
+                  ("alignment", "alignment"),
+                  ("creed", "alignment"),
+                  ("start game", "ok"),
+                  ("ok", "ok"))
 
 
 def bracket_info(prompt: str) -> Tuple[List[str], bool, bool]:
@@ -48,6 +75,15 @@ def bracket_info(prompt: str) -> Tuple[List[str], bool, bool]:
     return letters, "*" in content, "?" in content
 
 
+def menu_kind(title: str) -> str:
+    """Classify a menu by its displayed title; "" means unrecognised."""
+    low = (title or "").lower()
+    for needle, kind in _MENU_KEYWORDS:
+        if needle in low:
+            return kind
+    return ""
+
+
 class ScriptedReflex(object):
     """Deterministic, always-available scripted decision policy."""
 
@@ -58,6 +94,7 @@ class ScriptedReflex(object):
         self.eat_reject_base = 0
         self.eat_forced_menu = False
         self.last_eat_tick = -1000
+        self.last_inv_tick = -1000
         self.quitting = False
         self.quit_reason = ""
         self.last_hero: Optional[Tuple[int, int]] = None
@@ -95,48 +132,56 @@ class ScriptedReflex(object):
         if self.intent == "quit" or self.quitting:
             return {"cancel": True}, "dismiss endgame display"
         rows = [r for r in context.pages if r.get("selectable")]
-        title = context.snapshot.window_title(need.get("content")).lower()
+        title = context.snapshot.window_title(need.get("content")) or ""
+        self._maybe_refresh_inventory(context, context.pages, title)
 
         if self.intent == "eat":
-            food = [r for r in rows if _is_food(r.get("text", ""))]
             self.intent = ""
             self.eat_forced_menu = False
+            food = [r for r in rows
+                    if state.is_known_safe_food(r.get("text"))]
             if food:
                 return {"menu": need.get("menu"),
-                        "commit": [[food[0]["r"], -1]]}, "eat a food row"
-            return {"cancel": True}, "no food row: cancel"
+                        "commit": [[food[0]["r"], -1]]}, "eat a safe food row"
+            return {"cancel": True}, "no known-safe food row: cancel"
 
-        pick = self._preferred_row(rows, title)
-        if "tutorial" in title:
+        kind = menu_kind(title)
+        if not kind:
+            # an unmatched menu is never blindly confirmed
+            return {"cancel": True}, "unrecognised menu title: cancel"
+        if kind in ("tutorial", "ok"):
             self.selection_done = True
-        if pick is not None:
-            if title and ("ok" in title or "tutorial" in title):
-                self.selection_done = True
-            return {"menu": need.get("menu"),
-                    "commit": [[pick["r"], -1]]}, "select a visible row"
-        if rows:
-            return {"menu": need.get("menu"),
-                    "commit": [[rows[0]["r"], -1]]}, "first selectable row"
-        return {"cancel": True}, "no selectable row: cancel"
+        pick = self._preferred_row(rows, kind)
+        if pick is None:
+            return {"cancel": True}, "no matching row in a %s menu: cancel" \
+                % kind
+        return {"menu": need.get("menu"),
+                "commit": [[pick["r"], -1]]}, "select the %s row" % kind
 
-    def _preferred_row(self, rows: List[dict],
-                       title: str) -> Optional[dict]:
+    def _preferred_row(self, rows: List[dict], kind: str) -> Optional[dict]:
         wants: List[str] = []
-        if "tutorial" in title:
+        if kind == "tutorial":
             wants = ["no, just start play", "no"]
-        elif "ok" in title:
+        elif kind == "ok":
             wants = ["yes; start game", "yes"]
-        elif "role" in title or "profession" in title:
+        elif kind == "role":
             wants = [self.config.role.lower()]
-        elif "race" in title:
+        elif kind == "race":
             wants = ["human"]
-        elif "alignment" in title or "creed" in title:
+        elif kind == "alignment":
             wants = ["lawful"]
         for want in wants:
             for r in rows:
-                if want in (r.get("text") or "").lower():
+                if want and want in (r.get("text") or "").lower():
                     return r
         return None
+
+    # -- inventory cache maintenance ------------------------------------
+    def _maybe_refresh_inventory(self, context: ReflexContext, rows, title):
+        if not title or "inventory" not in title.lower():
+            return
+        context.memory.inventory.refresh(
+            list(rows), context.tick, context.snapshot.time_value())
 
     # -- yes/no (including the unrestricted getobj prompt) --------------
     def _yn(self, context: ReflexContext):
@@ -175,11 +220,14 @@ class ScriptedReflex(object):
         if rejected >= 2 or self.eat_forced_menu:
             self.eat_forced_menu = True
             return {"yn": ord("*")}, "eat loop breaker: open inventory menu"
-        if letters:
-            return {"yn": ord(letters[0])}, "eat a bracketed food letter"
+        # only answer a letter the cached inventory already confirmed is safe
+        known = {l.lower() for l in context.memory.inventory.food_letters()}
+        safe = [c for c in letters if c.lower() in known]
+        if safe:
+            return {"yn": ord(safe[0])}, "eat a known-safe cached food letter"
         if has_star:
             return {"yn": ord("*")}, "open the food menu"
-        return {"yn": KEY.KEY_ESC}, "no food answer: cancel eat"
+        return {"yn": KEY.KEY_ESC}, "no known-safe food answer: cancel eat"
 
     # -- gameplay commands ----------------------------------------------
     def _command(self, context: ReflexContext):
@@ -194,9 +242,13 @@ class ScriptedReflex(object):
         st = mem.status
         hero = mem.hero
 
+        # 1. low-HP disengagement: escape before taking any other action
+        if hero is not None and self._low_hp(st):
+            return self._escape(mem, hero)
+
+        # 2. hunger: schedule a known-safe food intent
         if self._hungry(st) and \
-                (context.tick - self.last_eat_tick) > 25:
-            # schedule a food intent before navigation if we might have food
+                (context.tick - self.last_eat_tick) > EAT_RETRY_INTERVAL:
             self.last_eat_tick = context.tick
             self.intent = "eat"
             self.eat_reject_base = sum(1 for m in mem.messages
@@ -208,27 +260,89 @@ class ScriptedReflex(object):
             key = self._random_dir(mem, hero)
             return {"key": key}, "no hero fix: random move"
 
-        # loop breaker: a move that never changes the hero's square (a bump
-        # into a wall, a boulder or a locked door) must not repeat forever
+        # 3. loop breakers: progress without ever walking into a monster
         np = mem.no_progress
         if np >= 10:
-            # stepping into an adjacent monster swaps places with a pet and
-            # attacks a hostile -- either way the square is freed
-            key = self._step_into_monster(mem, hero)
-            if key is not None:
-                return {"key": key}, "loop breaker: unblock a monster"
-            return {"key": KEY.KEY_WAIT}, "loop breaker: rest"
+            return self._unblock(mem, hero, st), "loop breaker: unblock"
         if np >= 6:
             key, why = self._random_move(mem, hero)
             return {"key": key}, "loop breaker: %s" % why
         if np >= 3:
             return {"key": KEY.KEY_SEARCH}, "loop breaker: search"
 
+        # 4. inventory cache maintenance (never preempts safety or progress)
+        if mem.inventory.stale(context.tick, INV_STALE_TICKS):
+            if (context.tick - self.last_inv_tick) > INV_REFRESH_COOLDOWN:
+                self.last_inv_tick = context.tick
+                return {"key": KEY.KEY_INV}, "refresh the inventory cache"
+
         step = self._move_key(context, hero)
         return {"key": step[0]}, step[1]
 
     def _hungry(self, st: state.Status) -> bool:
         return st.hunger.startswith(("Hungry", "Weak", "Fainting"))
+
+    def _low_hp(self, st: state.Status) -> bool:
+        if st.hp is None or not st.hp_max:
+            return False
+        return st.hp / float(st.hp_max) <= LOW_HP_FRACTION
+
+    def _adequate_hp(self, st: state.Status) -> bool:
+        if st.hp is None or not st.hp_max:
+            return True
+        return st.hp / float(st.hp_max) > ADEQUATE_HP_FRACTION
+
+    def _adjacent_monsters(self, mem, hero):
+        out = []
+        for d in KEY.DIR_KEYS:
+            dest = (hero[0] + d[0], hero[1] + d[1])
+            if state.monster_glyph(mem.tile(dest)):
+                out.append(d)
+        return out
+
+    # -- safety: escape ------------------------------------------------
+    def _escape(self, mem, hero):
+        """Disengage at low HP: never toward a monster."""
+        threats = self._adjacent_monsters(mem, hero)
+        for dx, dy in threats:
+            away = (-dx, -dy)
+            if mem.known_passable((hero[0] + away[0], hero[1] + away[1])):
+                return {"key": KEY.DIR_KEYS[away]}, "low HP: retreat"
+        for d, k in KEY.DIR_KEYS.items():
+            dest = (hero[0] + d[0], hero[1] + d[1])
+            if d not in threats and mem.known_passable(dest):
+                return {"key": k}, "low HP: sidestep"
+        if hero in mem.stairs_up:
+            return ord("<"), "low HP: withdraw upstairs"
+        target = self._nearest(mem.stairs_up, hero)
+        if target is not None:
+            step = self._first_step(mem, hero, target)
+            if step is not None:
+                return {"key": KEY.DIR_KEYS[step]}, "low HP: flee upstairs"
+        if self._safe_to_rest(mem, mem.status, hero):
+            return {"key": KEY.KEY_WAIT}, "low HP: hold position"
+        return {"key": KEY.KEY_SEARCH}, "low HP: search for an exit"
+
+    def _safe_to_rest(self, mem, st, hero) -> bool:
+        if self._hungry(st):
+            return False
+        if not self._adequate_hp(st):
+            return False
+        return not self._adjacent_monsters(mem, hero)
+
+    def _unblock(self, mem, hero, st):
+        """Break a stuck state without walking into an ambiguous monster."""
+        if self._safe_to_rest(mem, st, hero):
+            return {"key": KEY.KEY_WAIT}
+        if self._adjacent_monsters(mem, hero):
+            target = self._frontier_target(mem, hero)
+            if target is not None:
+                step = self._first_step(mem, hero, target)
+                if step is not None and not state.monster_glyph(
+                        mem.tile((hero[0] + step[0], hero[1] + step[1]))):
+                    return {"key": KEY.DIR_KEYS[step]}
+            return {"key": KEY.KEY_SEARCH}
+        return {"key": KEY.KEY_SEARCH}
 
     # -- navigation ------------------------------------------------------
     def _move_key(self, context: ReflexContext, hero):
@@ -265,31 +379,37 @@ class ScriptedReflex(object):
         out += sorted(unvisited, key=lambda p: _manhattan(p, hero))[:8]
         return out
 
-    def _random_move(self, mem, hero):
-        dirs = list(KEY.DIR_KEYS)
-        self.rng.shuffle(dirs)
-        # prefer a destination we already know is walkable
-        for dx, dy in dirs:
-            dest = (hero[0] + dx, hero[1] + dy)
-            if mem.known_passable(dest):
-                return KEY.DIR_KEYS[(dx, dy)], "random walk (known floor)"
-        for dx, dy in dirs:
-            dest = (hero[0] + dx, hero[1] + dy)
-            if dest not in mem.grid:
-                return KEY.DIR_KEYS[(dx, dy)], "random step into the dark"
-        for dx, dy in dirs:
-            return KEY.DIR_KEYS[(dx, dy)], "random walk"
-        return KEY.KEY_WAIT, "wait"
+    def _frontier_target(self, mem, hero):
+        best = None
+        for pos in mem.grid:
+            if pos == hero or not state.passable(mem.tile(pos)):
+                continue
+            if self._is_frontier(mem, pos):
+                if best is None or _manhattan(pos, hero) < \
+                        _manhattan(best, hero):
+                    best = pos
+        return best
 
-    def _step_into_monster(self, mem, hero):
+    def _nearest(self, cells, hero):
+        cells = list(cells)
+        if not cells:
+            return None
+        return min(cells, key=lambda p: _manhattan(p, hero))
+
+    def _random_move(self, mem, hero):
+        """A fallback move over *known* floor only.
+
+        Unknown blanks are not freely traversable: a step into an unpainted
+        cell is only ever taken by a deliberate navigation path that ends on a
+        remembered frontier cell, never by this fallback.
+        """
         dirs = list(KEY.DIR_KEYS)
         self.rng.shuffle(dirs)
-        for dx, dy in dirs:
-            dest = (hero[0] + dx, hero[1] + dy)
-            cell = mem.grid.get(dest)
-            if cell and state.monster_glyph(cell[0]):
-                return KEY.DIR_KEYS[(dx, dy)]
-        return None
+        for d in dirs:
+            dest = (hero[0] + d[0], hero[1] + d[1])
+            if mem.known_passable(dest):
+                return KEY.DIR_KEYS[d], "random walk (known floor)"
+        return KEY.KEY_WAIT, "no known floor: wait"
 
     def _is_frontier(self, mem: state.EpisodeMemory, pos) -> bool:
         x, y = pos
@@ -364,10 +484,3 @@ class ScriptedReflex(object):
 
 def _manhattan(a, b):
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
-
-
-def _is_food(text: str) -> bool:
-    low = text.lower()
-    return any(w in low for w in ("ration", "food", "apple", "banana",
-                                  "orange", "melon", "corpse", "kelp",
-                                  "cram", "lembas", "food ration"))
