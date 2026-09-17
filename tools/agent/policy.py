@@ -36,16 +36,19 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 from . import protocol, state
+from .directives import DirectiveView
 from .providers import ReflexContext, ReflexResult, ReflexTimeout
 
 KEY = protocol
 
 # Safety thresholds (heuristic policy constants, not calibrated values).
 LOW_HP_FRACTION = 0.30          # disengage at or below this HP fraction
+DISENGAGE_HP_FRACTION = 0.50    # ... raised while a disengage directive holds
 ADEQUATE_HP_FRACTION = 0.50     # rest is only considered above this
 INV_STALE_TICKS = 240           # refresh the inventory cache after this many
 INV_REFRESH_COOLDOWN = 40       # ... but never more often than this
 EAT_RETRY_INTERVAL = 25
+EAT_DIRECTIVE_INTERVAL = 10     # eat more eagerly under acquire_food
 
 # Recognised startup menu kinds.  Only these are answered with a selection;
 # anything else is cancelled.
@@ -102,6 +105,10 @@ class ScriptedReflex(object):
         self.stuck = 0
         self.rng = random.Random(0)
         self.max_ticks = 2000
+        # The active directive view the reflex may consult (never an action
+        # source: a directive can only bias a decision the reflex already
+        # knows how to build).
+        self.directives = DirectiveView(None)
         # Absolute monotonic deadline for the decision in flight (0 = none).
         # The controller sets it via ReflexContext.deadline; it is checked at
         # every loop boundary so a single scripted decision cannot overrun its
@@ -115,6 +122,7 @@ class ScriptedReflex(object):
 
     def decide(self, context: ReflexContext) -> ReflexResult:
         self.deadline = float(getattr(context, "deadline", 0.0) or 0.0)
+        self.directives = _directive_view(context)
         self._check_deadline()
         need = context.need or {}
         kind = need.get("kind")
@@ -258,15 +266,27 @@ class ScriptedReflex(object):
         if hero is not None and self._low_hp(st):
             return self._escape(mem, hero)
 
-        # 2. hunger: schedule a known-safe food intent
+        # 2. hunger: schedule a known-safe food intent.  An acquire_food
+        #    directive shortens the retry interval and, when the cache shows
+        #    no known-safe food, inspects the inventory before exploring.
         if self._hungry(st) and \
-                (context.tick - self.last_eat_tick) > EAT_RETRY_INTERVAL:
+                (context.tick - self.last_eat_tick) > self._eat_interval():
             self.last_eat_tick = context.tick
             self.intent = "eat"
             self.eat_reject_base = sum(1 for m in mem.messages
                                        if "don't have that object" in m)
             self.eat_forced_menu = False
             return {"key": KEY.KEY_EAT}, "hungry: attempt to eat"
+
+        if self.directives.wants_food() and hero is not None \
+                and not mem.inventory.food_rows() \
+                and mem.inventory.stale(context.tick, INV_STALE_TICKS) \
+                and (context.tick - self.last_inv_tick) \
+                > INV_REFRESH_COOLDOWN:
+            self.last_inv_tick = context.tick
+            return {"key": KEY.KEY_INV}, \
+                "directive %s: inspect inventory for food" \
+                % self.directives.top_goal()
 
         if hero is None:
             # The hero's square is unknown, so every direction leads into
@@ -296,10 +316,18 @@ class ScriptedReflex(object):
     def _hungry(self, st: state.Status) -> bool:
         return st.hunger.startswith(("Hungry", "Weak", "Fainting"))
 
+    def _eat_interval(self) -> int:
+        return EAT_DIRECTIVE_INTERVAL if self.directives.wants_food() \
+            else EAT_RETRY_INTERVAL
+
+    def _flee_fraction(self) -> float:
+        return DISENGAGE_HP_FRACTION if self.directives.disengage() \
+            else LOW_HP_FRACTION
+
     def _low_hp(self, st: state.Status) -> bool:
         if st.hp is None or not st.hp_max:
             return False
-        return st.hp / float(st.hp_max) <= LOW_HP_FRACTION
+        return st.hp / float(st.hp_max) <= self._flee_fraction()
 
     def _adequate_hp(self, st: state.Status) -> bool:
         if st.hp is None or not st.hp_max:
@@ -362,17 +390,27 @@ class ScriptedReflex(object):
     # -- navigation ------------------------------------------------------
     def _move_key(self, context: ReflexContext, hero):
         mem = context.memory
-        # standing on the known down stairs: descend (bounded progress)
-        if hero in mem.stairs_down:
+        # standing on the known down stairs: descend (bounded progress),
+        # unless an explore_frontier/search_dead_ends directive is in force
+        # and nothing asked to descend -- the directive only changes the
+        # reflex's own ordering, it never supplies the key.
+        explore_first = self.directives.prefers_frontier() \
+            and not self.directives.prefers_stairs()
+        if hero in mem.stairs_down and not explore_first:
             return ord(">"), "descend the known stairs"
         for target in self._target_list(mem, hero):
             step = self._first_step(mem, hero, target)
             if step is not None:
-                return KEY.DIR_KEYS[step], "navigate"
+                return KEY.DIR_KEYS[step], self._nav_reason()
         if mem.searches_since_progress < 3:
             mem.searches_since_progress += 1
             return KEY.KEY_SEARCH, "search for secret doors"
         return self._random_move(mem, hero)
+
+    def _nav_reason(self) -> str:
+        if not self.directives.active:
+            return "navigate"
+        return "navigate (%s)" % self.directives.top_goal()
 
     def _target_list(self, mem, hero):
         down = [p for p in mem.stairs_down
@@ -385,14 +423,20 @@ class ScriptedReflex(object):
                 frontier.append(pos)
             elif mem.visits.get(pos, 0) == 0:
                 unvisited.append(pos)
-        out = []
-        if down:
-            out.append(min(down, key=lambda p: _manhattan(p, hero)))
-        out += sorted(frontier,
-                      key=lambda p: _manhattan(p, hero) + 0.5
-                      * mem.visits.get(p, 0))[:8]
-        out += sorted(unvisited, key=lambda p: _manhattan(p, hero))[:8]
-        return out
+        stairs = [min(down, key=lambda p: _manhattan(p, hero))] \
+            if down else []
+        fronts = sorted(frontier,
+                        key=lambda p: _manhattan(p, hero) + 0.5
+                        * mem.visits.get(p, 0))[:8]
+        unexplored = sorted(unvisited, key=lambda p: _manhattan(p, hero))[:8]
+        # An explore_frontier/search_dead_ends directive puts frontiers first
+        # and holds the stair target back; every other goal keeps the
+        # default, which is down-stairs first.
+        if self.directives.prefers_frontier() \
+                and not self.directives.prefers_stairs():
+            extras = [p for p in down if p not in stairs]
+            return fronts + unexplored + stairs + extras
+        return stairs + fronts + unexplored
 
     def _frontier_target(self, mem, hero):
         best = None
@@ -497,3 +541,21 @@ class ScriptedReflex(object):
 
 def _manhattan(a, b):
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+def _directive_view(context) -> DirectiveView:
+    """Extract the active directive view from a reflex context.
+
+    The controller passes the view the :class:`DirectiveBook` produced for
+    this decision; anything else (an empty list, a mock, a raw dict) degrades
+    to the no-op view, so a directive can never inject an action.
+    """
+    raw = getattr(context, "directives", None)
+    if isinstance(raw, (list, tuple)) and raw:
+        view = raw[0]
+        if isinstance(view, DirectiveView):
+            return view
+    if isinstance(raw, DirectiveView):
+        return raw
+    return DirectiveView(None)
+
