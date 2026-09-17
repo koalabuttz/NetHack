@@ -227,6 +227,11 @@ class Controller(object):
                                 stderr=subprocess.PIPE, bufsize=0,
                                 env=self._child_env(),
                                 start_new_session=True)
+        # Own the whole process group from the moment of spawn.  Resolving the
+        # group at signal time is not enough: if the direct launcher exits on
+        # TERM while a descendant ignores it, the leader PID is gone and the
+        # group can no longer be found from it.
+        proc._auto_pgid = _pgid_of(proc.pid)
         try:
             os.set_blocking(proc.stdin.fileno(), False)
         except (OSError, ValueError):
@@ -242,18 +247,34 @@ class Controller(object):
             proc.stdin.close()
         except (OSError, ValueError):
             pass
-        # Give the launcher a moment to exit and clean up its own tree; a
-        # clean exit must keep its real status.  Only a launcher that does not
-        # exit is escalated, TERM -> KILL, across the whole process group it
-        # owns (start_new_session made it a group leader), so a launcher that
-        # ignores SIGTERM cannot leave a long-lived worker behind.
-        if not _wait_child(proc, self.reap_grace):
-            _signal_group(proc, signal.SIGTERM)
+        pgid = getattr(proc, "_auto_pgid", None)
+        # Phase 1: a launcher that exits on its own keeps its real status.  A
+        # TERM-ignoring descendant can survive it, so the owned GROUP is
+        # assessed -- and killed -- independently of the direct child.
+        if _wait_child(proc, self.reap_grace):
+            if not _group_gone(pgid):
+                result.forced_kill = True
+                _signal_group(pgid, proc, signal.SIGTERM)
+                if not _group_gone(pgid, 3.0):
+                    _signal_group(pgid, proc, signal.SIGKILL)
+                    if not _group_gone(pgid, 5.0):
+                        # never silently continue: the group may still be
+                        # alive
+                        result.teardown_failure = True
+        # Phase 2: the launcher itself is still running; escalate TERM ->
+        # KILL across the whole group, then assess the group again even if the
+        # leader has now exited, so a stubborn descendant is still killed.
+        else:
+            _signal_group(pgid, proc, signal.SIGTERM)
             if not _wait_child(proc, 3.0):
                 result.forced_kill = True
-                _signal_group(proc, signal.SIGKILL)
+                _signal_group(pgid, proc, signal.SIGKILL)
                 if not _wait_child(proc, 5.0):
-                    # never silently continue: the subtree may still be alive
+                    result.teardown_failure = True
+            if not _group_gone(pgid):
+                result.forced_kill = True
+                _signal_group(pgid, proc, signal.SIGKILL)
+                if not _group_gone(pgid, 5.0):
                     result.teardown_failure = True
         drain = getattr(proc, "_auto_stderr", None)
         if drain is not None:
@@ -262,13 +283,24 @@ class Controller(object):
         result.returncode = proc.returncode
 
 
-def _signal_group(proc, sig) -> None:
-    pid = getattr(proc, "pid", None)
-    if pid:
+def _pgid_of(pid):
+    """The owned process-group id for a spawned leader (or the pid)."""
+    try:
+        return os.getpgid(pid)
+    except (ProcessLookupError, PermissionError, OSError):
+        return pid
+
+
+def _signal_group(pgid, proc, sig) -> None:
+    """Signal the whole owned group; fall back to the direct child."""
+    if pgid is not None:
         try:
-            os.killpg(os.getpgid(pid), sig)
+            os.killpg(pgid, sig)
             return
-        except (ProcessLookupError, PermissionError, OSError):
+        except ProcessLookupError:
+            # the entire group is already gone
+            return
+        except (PermissionError, OSError):
             pass
     send = getattr(proc, "kill" if sig == signal.SIGKILL else "terminate",
                    None)
@@ -277,6 +309,29 @@ def _signal_group(proc, sig) -> None:
             send()
         except (OSError, ProcessLookupError):
             pass
+
+
+def _group_gone(pgid, timeout: float = 0.0) -> bool:
+    """True once no process remains in the owned group *pgid*.
+
+    Assesses the group itself, not the direct child: this is what catches a
+    descendant that outlives a launcher which exited on TERM.
+    """
+    if pgid is None:
+        return True
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        except OSError:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 def _wait_child(proc, timeout: float) -> bool:

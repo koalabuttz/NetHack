@@ -1618,6 +1618,57 @@ class TestEnvAndProcess(WireHarness):
         self.assertTrue(_wait_gone(proc.pid, 3.0),
                         "the launcher survived teardown")
 
+    def _forker_script(self, pidfile):
+        """A launcher that forks a TERM-ignoring child and then, unlike the
+        child, exits on TERM (the default disposition)."""
+        script = os.path.join(self.dir, "forker.py")
+        with open(script, "w") as fh:
+            fh.write(
+                "#!/usr/bin/env python3\n"
+                "import os, signal, time\n"
+                "pid = os.fork()\n"
+                "if pid == 0:\n"
+                "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "    while True:\n"
+                "        time.sleep(0.5)\n"
+                "open(%r, 'w').write(str(pid))\n"
+                "while True:\n"
+                "    time.sleep(0.5)\n" % pidfile)
+        os.chmod(script, 0o755)
+        return script
+
+    def _wait_pidfile(self, pidfile, timeout=3.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if os.path.exists(pidfile):
+                with open(pidfile) as fh:
+                    return int(fh.read().strip())
+            time.sleep(0.05)
+        return None
+
+    def test_watchdog_kills_the_group_when_the_leader_exits_on_term(self):
+        # Medium 8: escalation must not depend on the direct launcher still
+        # running.  Here the leader exits on TERM but its child ignores it, so
+        # only a group-level assessment can find and kill the descendant.
+        pidfile = os.path.join(self.dir, "fork.pid")
+        script = self._forker_script(pidfile)
+        ctl = controller.Controller(
+            ProviderConfig(), controller.ControllerPaths(
+                worker="w", runner=script, data="d"), self.dir,
+            episode_timeout=5.0, reap_grace=0.5)
+        proc = ctl._spawn(self.dir)
+        child_pid = self._wait_pidfile(pidfile)
+        self.assertIsNotNone(child_pid, "the launcher never forked a child")
+        result = controller.EpisodeResult(index=1)
+        ctl._reap(proc, result)
+        # the group was killed after the leader had already exited
+        self.assertTrue(result.forced_kill)
+        self.assertFalse(result.teardown_failure)
+        self.assertTrue(_wait_gone(child_pid, 3.0),
+                        "the TERM-ignoring descendant survived teardown")
+        self.assertTrue(_wait_gone(proc.pid, 3.0),
+                        "the launcher was not reaped")
+
 
 class TestPerEpisodeReset(unittest.TestCase):
     def test_two_episodes_have_independent_state(self):
