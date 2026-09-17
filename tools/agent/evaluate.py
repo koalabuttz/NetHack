@@ -42,6 +42,7 @@ presence of a key alone never opts a user in, mirroring the live harness.
 import argparse
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -96,18 +97,83 @@ def _is_int(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
 
 
-def canonical_action(need, action) -> Tuple:
+# A displayed stack of N identical items is rendered with a leading count
+# ("2 uncursed food rations"); a single item has no such prefix
+# ("a +1 spear").
+_COUNT_PREFIX = re.compile(r"^\s*\d+\s")
+
+
+def _menu_row_meta(rows) -> Dict[int, dict]:
+    """Delivered menu-row metadata keyed by row id (page ``r`` field)."""
+    meta: Dict[int, dict] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        rid = row.get("r")
+        if _is_int(rid):
+            meta[int(rid)] = row
+    return meta
+
+
+def _row_is_single_item(meta, rid) -> bool:
+    """True only when the delivered metadata *proves* the row is one item.
+
+    ``-1`` ("the whole stack") and ``1`` ("one item") select the same thing
+    only for a row that is not a stack.  That is proven from the delivered
+    page metadata: the row's displayed text must carry no count prefix and its
+    ``initial`` must not be a positive stack count.  With no delivered
+    metadata the row cannot be proven single, so the counts stay distinct.
+    """
+    row = meta.get(rid)
+    if row is None:
+        return False
+    text = row.get("text")
+    if not isinstance(text, str) or _COUNT_PREFIX.match(text):
+        return False
+    initial = row.get("initial")
+    if _is_int(initial) and initial > 1:
+        return False
+    return True
+
+
+def _canonical_count(rid, count, meta):
+    """The semantic count of one committed menu row.
+
+    ``-1`` and ``1`` collapse to the same value only when the delivered
+    metadata proves the row is a single item; otherwise they stay distinct.  A
+    non-integer count is preserved as a tagged value so it never compares
+    equal to a real count.
+    """
+    if not _is_int(count):
+        return ("nonint", repr(count))
+    c = int(count)
+    if c in (-1, 1) and _row_is_single_item(meta, rid):
+        return 1
+    return c
+
+
+def _count_sort_key(rc):
+    c = rc[1]
+    return (rc[0], 0, c) if _is_int(c) else (rc[0], 1, repr(c))
+
+
+def canonical_action(need, action, rows=None) -> Tuple:
     """A semantic key for one action, comparable across two encodings.
 
     This is what an agreement check compares -- **not** the JSON.  The rules:
 
       * a ``cancel`` and an ``ack`` are their own shapes;
       * ``key``/``yn``/``position``/``text`` compare by value;
-      * a ``menu`` commit compares as the **final set of rows**, ignoring the
-        per-row count (``-1`` means "the whole stack" and ``1`` means "one
-        item"; for a single item those select the same thing) and ignoring the
-        menu *generation id*, which is scoped to this one need and is the same
-        for both sides.
+      * a ``menu`` commit compares as the **final set of rows with their
+        semantic counts**, ignoring the menu *generation id* (scoped to this
+        one need and equal for both sides).  Row order does not matter.  The
+        count does: two commits that select the same rows with different
+        counts are different actions.  ``-1`` and ``1`` normalize equal
+        **only** when the delivered menu metadata (``rows``, the page rows
+        carrying ``text``/``initial``) proves the row is a single item -- a
+        displayed text with no count prefix and an ``initial`` that is not a
+        positive stack count.  On a multi-item stack (or with no delivered
+        metadata) they are preserved as distinct.
 
     A non-object or unrecognised action is a distinct ``("other", ...)`` key.
     """
@@ -131,14 +197,16 @@ def canonical_action(need, action) -> Tuple:
         commit = action.get("commit")
         if not isinstance(commit, list):
             return ("other", "menu")
-        rows = []
+        meta = _menu_row_meta(rows)
+        canon = []
         for row in commit:
             if isinstance(row, (list, tuple)) and len(row) == 2 \
                     and _is_int(row[0]):
-                rows.append(int(row[0]))
+                rid = int(row[0])
+                canon.append((rid, _canonical_count(rid, row[1], meta)))
             else:
                 return ("other", "menu")
-        return ("menu", tuple(sorted(rows)))
+        return ("menu", tuple(sorted(canon, key=_count_sort_key)))
     if "text" in action:
         return ("text", action["text"])
     return ("other", sorted(action))
@@ -156,15 +224,65 @@ def _action_of(record_action) -> Optional[dict]:
 
 # ------------------------------------------------------------ sidecars
 
-def load_actions_index(path: Optional[str]) -> Dict[Tuple[int, int], dict]:
-    """Map ``(seq, id)`` -> the *first sent* original action for that need.
+class _ActionsIndex(object):
+    """The actions sidecar as ordered per-need original attempts.
+
+    Each ``(seq, id)`` maps to the original actions for that need **in the
+    order they were sent**.  A need whose first attempt(s) the wire rejected
+    with ``invalid`` therefore has more than one: the accepted candidate is
+    the first attempt the wire did not reject, and the earlier ones are
+    labelled rejected rather than silently treated as ground truth (see
+    :func:`_scan_invalids` and ``ReplayPass._decide_pending``).
+    """
+
+    def __init__(self) -> None:
+        self._attempts: Dict[Tuple[int, int], List[dict]] = {}
+
+    def add(self, key: Tuple[int, int], action: dict) -> None:
+        self._attempts.setdefault(key, []).append(action)
+
+    def attempts(self, key: Tuple[int, int]) -> List[dict]:
+        return list(self._attempts.get(key, ()))
+
+    def rejected(self, key: Tuple[int, int], rejected: int) -> List[dict]:
+        """The first *rejected* ordered attempts for a need."""
+        return self.attempts(key)[:max(0, rejected)]
+
+    def accepted(self, key: Tuple[int, int], rejected: int) -> Optional[dict]:
+        """The first attempt the wire did not reject, or None if unknown.
+
+        The wire rejected ``rejected`` attempts for this need, so the accepted
+        candidate is the attempt that follows them.  With no recorded attempts
+        beyond the rejected ones, the original action is unknown.
+        """
+        att = self._attempts.get(key, ())
+        if 0 <= rejected < len(att):
+            return att[rejected]
+        return None
+
+    def ground_truth(self, key: Tuple[int, int]) -> Optional[dict]:
+        """The last recorded attempt for a need (its accepted candidate)."""
+        att = self._attempts.get(key, ())
+        return att[-1] if att else None
+
+    def __bool__(self) -> bool:
+        return bool(self._attempts)
+
+    def __contains__(self, key) -> bool:
+        return key in self._attempts
+
+
+# ------------------------------------------------------------ sidecars
+
+def load_actions_index(path: Optional[str]) -> _ActionsIndex:
+    """The ordered original actions per ``(seq, id)`` from an actions sidecar.
 
     Only ``kind == "act"`` records are ground truth; ``get_page`` and
-    ``ack_chunk`` are transport, not gameplay.  A retry (a second ``act`` for
-    the same need after an ``invalid``) does not overwrite the first answer --
-    the first sent action is what the trajectory actually followed.
+    ``ack_chunk`` are transport, not gameplay.  Every sent attempt is kept in
+    send order, so a retry after an ``invalid`` is visible as a second attempt
+    rather than silently overwriting (or being overwritten by) the first.
     """
-    index: Dict[Tuple[int, int], dict] = {}
+    index = _ActionsIndex()
     if not path:
         return index
     with open(path) as fh:
@@ -187,8 +305,44 @@ def load_actions_index(path: Optional[str]) -> Dict[Tuple[int, int], dict]:
             action = _action_of(obj.get("action"))
             if action is None:
                 continue
-            index.setdefault((seq, nid), action)
+            index.add((seq, nid), action)
     return index
+
+
+def _scan_invalids(wire_lines: List[bytes]) -> Dict[Tuple[int, int], int]:
+    """Count wire ``invalid`` records per need key, before the pass runs.
+
+    An ``invalid`` rejects the most recent need's most recent action, so it
+    belongs to the last need seen.  Counting them up front lets a decision
+    point know how many of a need's recorded attempts were rejected *before*
+    it labels the accepted candidate -- the wire itself is not consulted for
+    the label at decision time, only this deterministic pre-scan.  The scan is
+    best-effort: a malformed stream stops it, and the pass then reports the
+    protocol failure as usual.
+    """
+    counts: Dict[Tuple[int, int], int] = {}
+    asm = IncrementalAssembler(
+        max_retained_bytes=protocol.MAX_RETAINED_BYTES,
+        max_chunks=protocol.MAX_CHUNKS, max_streams=protocol.MAX_STREAMS,
+        max_line_bytes=protocol.MAX_PHYSICAL_LINE)
+    current: Optional[Tuple[int, int]] = None
+    try:
+        for line in wire_lines:
+            for rec in asm.feed(line):
+                if not isinstance(rec, dict):
+                    continue
+                t = rec.get("type")
+                if t == "obs":
+                    need = rec.get("need")
+                    seq = rec.get("seq")
+                    if isinstance(need, dict) and _is_int(seq) \
+                            and _is_int(need.get("id")):
+                        current = (seq, need["id"])
+                elif t == "invalid" and current is not None:
+                    counts[current] = counts.get(current, 0) + 1
+    except (AssemblerLimit, ChunkError, ValueError, KeyError, TypeError):
+        pass
+    return counts
 
 
 def load_decisions(path: Optional[str]) -> List[dict]:
@@ -254,13 +408,14 @@ class ReplayPass(object):
     def __init__(self, wire_lines: List[bytes], config: ProviderConfig,
                  provider_name: str, strategy_name: str,
                  allow_network: bool = False,
-                 actions_index: Optional[Dict] = None) -> None:
+                 actions_index: Optional[_ActionsIndex] = None) -> None:
         self.wire_lines = wire_lines
         self.config = config
         self.provider_name = provider_name
         self.strategy_name = strategy_name
         self.allow_network = allow_network
-        self.actions_index = actions_index or {}
+        self.actions_index = (actions_index if actions_index is not None
+                              else _ActionsIndex())
 
         self.asm = IncrementalAssembler(
             max_retained_bytes=protocol.MAX_RETAINED_BYTES,
@@ -310,6 +465,15 @@ class ReplayPass(object):
         self._pending: Optional[_Need] = None
         self._strategy_pending = None
         self._strategy_level = None
+        # Ground-truth correlation: the wire-rejected attempts per need are
+        # known up front, the live count of invalid records seen so far labels
+        # each rejected attempt, and the delivered page rows are kept so an
+        # agreement check can prove a menu row is (or is not) a single item.
+        self.invalids_by_key: Dict[Tuple[int, int], int] = {}
+        self._last_key: Optional[Tuple[int, int]] = None
+        self._last_need_kind: Optional[str] = None
+        self._invalid_seen: Dict[Tuple[int, int], int] = {}
+        self._rows_by_key: Dict[Tuple[int, int], list] = {}
 
     # -- provider construction ------------------------------------------
     def _build_reflex(self, name):
@@ -326,6 +490,10 @@ class ReplayPass(object):
 
     # -- entry -----------------------------------------------------------
     def run(self) -> None:
+        # Correlation data is derived from the whole wire before any decision
+        # point is evaluated: which advances may follow an invalid is a
+        # property of the recording, not of arrival order.
+        self.invalids_by_key = _scan_invalids(self.wire_lines)
         try:
             for line in self.wire_lines:
                 self.clock.advance()
@@ -421,6 +589,8 @@ class ReplayPass(object):
         if need is None:
             return
         self.needs += 1
+        self._last_key = (seq, need.get("id"))
+        self._last_need_kind = need.get("kind")
         self._pending = _Need(
             index=self.needs, seq=seq, nid=need.get("id"), need=need,
             declared_pages=need.get("pages", 0) or 0,
@@ -433,36 +603,69 @@ class ReplayPass(object):
             self._decide_pending()
 
     def _on_page(self, rec) -> None:
+        # Strict, exactly as the live controller: a page is only ever the
+        # response to the one owed get_page.  The replay has no outbound side,
+        # so it *models* that send: the owed request becomes the in-flight
+        # one, and the incoming page must be that exact page, for this need's
+        # content, declaring this need's total.  Any violation is an
+        # evaluation protocol failure, not a silently dropped page.
         need = self._pending
-        if need is None or need.decided:
+        if need is None or need.decided or not self.req.need:
+            self._fail("page delivered with no outstanding need")
             return
-        if rec.get("content") != need.need.get("content"):
+        if rec.get("content") != self.req.content:
+            self._fail("page for unexpected content %r"
+                       % (rec.get("content"),))
             return
+        if self.req.in_flight is None:
+            preq = self.req.next_page_request()
+            if preq is None:
+                self._fail("page delivered with no outstanding request")
+                return
+            self.req.mark_page_requested(preq["page"])
         idx = rec.get("page")
-        if not _is_int(idx) or idx < 0:
+        if idx != self.req.in_flight:
+            self._fail("page %r is not the outstanding page %r"
+                       % (idx, self.req.in_flight))
             return
+        total = rec.get("pages")
+        if total != self.req.pages_declared:
+            self._fail("page declares %r pages but the need declares %r"
+                       % (total, self.req.pages_declared))
+            return
+        self.req.note_page(rec)
         need.delivered_pages.setdefault(idx, rec.get("rows") or [])
-        if all(k in need.delivered_pages
-               for k in range(need.declared_pages)):
+        if self.req.pages_complete():
             self._decide_pending()
+
+    def _fail(self, reason: str) -> None:
+        self.protocol_failure = reason
+        self.closed = True
 
     def _on_invalid(self, rec) -> None:
         self.invalids += 1
         self.ledger.reflex_invalid += 1
         # `invalid` leaves the same request outstanding: a rejected *attempt*,
-        # not a completed decision.  It is recorded as its own decision row.
+        # not a completed decision.  It is recorded as its own decision row,
+        # and -- when the attempt it rejected is known -- that rejected action
+        # is labelled here, distinct from the accepted ground truth.
+        key = self._last_key
+        rejected_action = None
+        if key is not None:
+            n = self._invalid_seen.get(key, 0)
+            self._invalid_seen[key] = n + 1
+            rejected_action = self.actions_index.accepted(key, n)
         self.decisions.append({
             "schema": EVAL_SCHEMA, "record": "need", "index": self.needs,
-            "need": {"seq": self.last_seq,
-                     "id": (self._pending.need.get("id")
-                            if self._pending else None),
-                     "kind": (self._pending.need.get("kind")
-                              if self._pending else None)},
+            "need": {"seq": (key[0] if key is not None else self.last_seq),
+                     "id": (key[1] if key is not None else None),
+                     "kind": self._last_need_kind},
             "proposal": None, "selected": None, "provider": "controller",
             "reason": "invalid:%s" % (rec.get("code"),),
             "legal": None, "fallback": True, "low_confidence": True,
             "agreement": None, "actual_action": None,
             "actual_action_source": "unknown",
+            "rejected_action": rejected_action,
             "boundaries": [], "directives": [],
         })
 
@@ -622,13 +825,22 @@ class ReplayPass(object):
         legal = protocol.validate_action(need.need, selected) is None
         low = fallback or provider_label != self.provider_name
 
-        actual = self.actions_index.get((need.seq, need.nid))
+        key = (need.seq, need.nid)
+        self._rows_by_key[key] = rows
+        # Ground truth is the *accepted* attempt: the wire rejected the first
+        # ``rejected_n`` recorded actions (each labelled at its own invalid
+        # record), so the accepted candidate is the next one.  With every
+        # attempt rejected, the original action is unknown -- never the first
+        # rejected one.
+        rejected_n = self.invalids_by_key.get(key, 0)
+        rejected_actions = self.actions_index.rejected(key, rejected_n)
+        actual = self.actions_index.accepted(key, rejected_n)
         if actual is None:
             agreement = None
             actual_source = "unknown"
         else:
-            agreement = (canonical_action(need.need, actual)
-                         == canonical_action(need.need, selected))
+            agreement = (canonical_action(need.need, actual, rows)
+                         == canonical_action(need.need, selected, rows))
             actual_source = "sidecar"
 
         self._note_low_conf(low)
@@ -641,6 +853,8 @@ class ReplayPass(object):
             "reason": reason, "legal": legal, "fallback": fallback,
             "low_confidence": low,
             "actual_action": actual, "actual_action_source": actual_source,
+            "rejected_attempts": rejected_actions,
+            "rejected_count": len(rejected_actions),
             "agreement": agreement,
             "boundaries": list(need.boundaries),
             "directives": [view.dset.to_dict()] if view.active else [],
@@ -898,13 +1112,15 @@ def run_evaluation(a) -> int:
                 break
             rd = _recorded_selecteds[answer_index]
             answer_index += 1
+            rows = primary._rows_by_key.get(key)
             rec["recorded"] = {
                 "provider": rd.get("provider"),
                 "selected": rd.get("selected"),
                 "boundaries": rd.get("boundaries"),
-                "agreement": (canonical_action(rec["need"], rd["selected"])
+                "agreement": (canonical_action(rec["need"], rd["selected"],
+                                               rows)
                               == canonical_action(rec["need"],
-                                                  rec["selected"])),
+                                                  rec["selected"], rows)),
             }
 
     # emit: per-need records, then the deterministic event ledger, then a

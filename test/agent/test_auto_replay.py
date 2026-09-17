@@ -29,6 +29,8 @@ for _p in (_ROOT, _HERE):
 
 from tools.agent import evaluate  # noqa: E402
 from tools.agent.providers import ProviderConfig  # noqa: E402
+from test_auto import (CLOSED, HELLO, WireHarness, _line, obs,  # noqa: E402
+                       obs_menu, page, row)
 
 _FIX = os.path.join(_HERE, "fixtures", "auto")
 STARTUP = os.path.join(_FIX, "startup.wire.jsonl")
@@ -66,26 +68,68 @@ def _run(argv):
 class CanonicalActionTest(unittest.TestCase):
     """Agreement compares action *semantics*, never JSON bytes."""
 
-    def test_menu_final_set_ignores_count_and_generation(self):
-        need = {"kind": "menu", "menu": "m7"}
+    NEED = {"kind": "menu", "menu": "m7"}
+    # Delivered page rows: row 14 is a single item (no count prefix, no
+    # positive stack count); row 7 displays a two-item stack; row 5 carries a
+    # positive stack count with no text prefix.
+    ROWS = [
+        {"r": 14, "text": "a Valkyrie", "initial": None},
+        {"r": 7, "text": "2 uncursed food rations", "initial": None},
+        {"r": 5, "text": "uncursed scrolls", "initial": 3},
+    ]
+
+    def test_menu_generation_id_is_ignored(self):
         a = {"menu": "m7", "commit": [[14, -1]]}
-        b = {"menu": "m7", "commit": [[14, 1]]}       # same single row
-        self.assertEqual(evaluate.canonical_action(need, a),
-                         evaluate.canonical_action(need, b))
+        b = {"menu": "m42", "commit": [[14, -1]]}    # different generation
+        self.assertEqual(evaluate.canonical_action(self.NEED, a),
+                         evaluate.canonical_action(self.NEED, b))
+
+    def test_proven_single_item_counts_normalize(self):
+        # delivered metadata proves row 14 is one item: -1 and 1 agree
+        a = {"menu": "m7", "commit": [[14, -1]]}
+        b = {"menu": "m7", "commit": [[14, 1]]}
+        self.assertEqual(evaluate.canonical_action(self.NEED, a, self.ROWS),
+                         evaluate.canonical_action(self.NEED, b, self.ROWS))
+
+    def test_counts_are_preserved_without_metadata(self):
+        # no delivered metadata: -1 vs 1 cannot be proven equal -> disagree
+        a = {"menu": "m7", "commit": [[14, -1]]}
+        b = {"menu": "m7", "commit": [[14, 1]]}
+        self.assertNotEqual(evaluate.canonical_action(self.NEED, a),
+                            evaluate.canonical_action(self.NEED, b))
+
+    def test_different_counts_disagree(self):
+        a = {"menu": "m7", "commit": [[14, 1]]}
+        b = {"menu": "m7", "commit": [[14, 2]]}
+        ca = evaluate.canonical_action(self.NEED, a, self.ROWS)
+        cb = evaluate.canonical_action(self.NEED, b, self.ROWS)
+        self.assertNotEqual(ca, cb)
+
+    def test_stack_counts_stay_distinct(self):
+        # row 7 is a two-item stack (-1 = whole stack, 1 = one item) ...
+        a = {"menu": "m7", "commit": [[7, -1]]}
+        b = {"menu": "m7", "commit": [[7, 1]]}
+        ca = evaluate.canonical_action(self.NEED, a, self.ROWS)
+        cb = evaluate.canonical_action(self.NEED, b, self.ROWS)
+        self.assertNotEqual(ca, cb)
+        # ... and a positive declared stack count also proves a stack
+        c = {"menu": "m7", "commit": [[5, -1]]}
+        d = {"menu": "m7", "commit": [[5, 1]]}
+        cc = evaluate.canonical_action(self.NEED, c, self.ROWS)
+        cd = evaluate.canonical_action(self.NEED, d, self.ROWS)
+        self.assertNotEqual(cc, cd)
 
     def test_menu_final_set_is_order_insensitive(self):
-        need = {"kind": "menu", "menu": "m7"}
         a = {"menu": "m7", "commit": [[3, -1], [1, -1]]}
         b = {"menu": "m7", "commit": [[1, -1], [3, -1]]}
-        self.assertEqual(evaluate.canonical_action(need, a),
-                         evaluate.canonical_action(need, b))
+        self.assertEqual(evaluate.canonical_action(self.NEED, a),
+                         evaluate.canonical_action(self.NEED, b))
 
     def test_different_rows_disagree(self):
-        need = {"kind": "menu", "menu": "m7"}
         a = {"menu": "m7", "commit": [[3, -1]]}
         b = {"menu": "m7", "commit": [[4, -1]]}
-        self.assertNotEqual(evaluate.canonical_action(need, a),
-                            evaluate.canonical_action(need, b))
+        self.assertNotEqual(evaluate.canonical_action(self.NEED, a),
+                            evaluate.canonical_action(self.NEED, b))
 
     def test_shapes_are_distinct(self):
         need = {"kind": "command"}
@@ -320,6 +364,216 @@ class FixtureIntegrityTest(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(_FIX, name)), name)
 
 
+# ----------------------------------------------- retry ground truth (M4)
+
+class RetryGroundTruthTest(unittest.TestCase):
+    """Medium 4: a rejected attempt is never the accepted ground truth."""
+
+    def _wire(self, with_invalid=True):
+        lines = [
+            _line(HELLO),
+            _line(obs(1, {"kind": "command", "id": 1})),
+        ]
+        if with_invalid:
+            lines.append(_line({"v": 1, "ch": "control", "type": "invalid",
+                                "d": 1, "code": "stale-id"}))
+        lines.append(_line(obs(2, {"kind": "command", "id": 2})))
+        lines.append(_line(CLOSED))
+        return lines
+
+    def _index(self, attempts):
+        idx = evaluate._ActionsIndex()
+        for a in attempts:
+            idx.add((1, 1), a)
+        return idx
+
+    def _pass(self, index=None, with_invalid=True):
+        cfg = ProviderConfig(reflex="scripted", strategy="off")
+        p = evaluate.ReplayPass(self._wire(with_invalid=with_invalid), cfg,
+                                "scripted", "off", actions_index=index)
+        p.run()
+        return p
+
+    def _answered(self, p, nid):
+        return [d for d in p.decisions
+                if d.get("record") == "need"
+                and d.get("need", {}).get("id") == nid
+                and d.get("selected") is not None]
+
+    def _other_key(self, sel):
+        k = sel.get("key") if isinstance(sel, dict) else None
+        return {"key": 46 if k != 46 else 47}
+
+    def _probe(self):
+        return self._answered(self._pass(), 1)[0]["selected"]
+
+    def test_the_retry_is_the_accepted_ground_truth(self):
+        sel = self._probe()
+        other = self._other_key(sel)
+        p = self._pass(self._index([sel, other]))
+        rec = self._answered(p, 1)
+        self.assertEqual(len(rec), 1)             # no duplicate need records
+        d = rec[0]
+        self.assertEqual(d["actual_action"], other)
+        self.assertEqual(d["actual_action_source"], "sidecar")
+        self.assertEqual(d["rejected_attempts"], [sel])
+        self.assertEqual(d["rejected_count"], 1)
+        self.assertFalse(d["agreement"],
+                         "the rejected first attempt must not be the ground "
+                         "truth")
+
+    def test_each_rejected_attempt_is_labelled_at_its_invalid(self):
+        sel = self._probe()
+        other = self._other_key(sel)
+        p = self._pass(self._index([sel, other]))
+        invalids = [d for d in p.decisions
+                    if str(d.get("reason", "")).startswith("invalid:")]
+        self.assertEqual(len(invalids), 1)
+        self.assertEqual(invalids[0]["rejected_action"], sel)
+        self.assertEqual(invalids[0]["need"]["id"], 1)
+
+    def test_single_attempt_without_invalid_is_the_ground_truth(self):
+        sel = self._probe()
+        p = self._pass(self._index([sel]), with_invalid=False)
+        d = self._answered(p, 1)[0]
+        self.assertEqual(d["actual_action"], sel)
+        self.assertTrue(d["agreement"])
+        self.assertEqual(d["rejected_attempts"], [])
+
+    def test_every_attempt_rejected_leaves_the_action_unknown(self):
+        sel = self._probe()
+        p = self._pass(self._index([sel]))          # one attempt, rejected
+        d = self._answered(p, 1)[0]
+        self.assertIsNone(d["actual_action"])
+        self.assertEqual(d["actual_action_source"], "unknown")
+        self.assertEqual(d["rejected_attempts"], [sel])
+
+    def test_cli_coverage_uses_the_accepted_action(self):
+        sel = self._probe()
+        other = self._other_key(sel)
+        with tempfile.TemporaryDirectory() as d:
+            wire = os.path.join(d, "ep.wire.jsonl")
+            acts = os.path.join(d, "ep.actions.jsonl")
+            out = os.path.join(d, "e.jsonl")
+            with open(wire, "wb") as fh:
+                fh.writelines(self._wire())
+            with open(acts, "w") as fh:
+                for a in (sel, other):
+                    fh.write(json.dumps({
+                        "kind": "act", "status": "sent",
+                        "need": {"episode": 1, "seq": 1, "id": 1},
+                        "action": a}) + "\n")
+            rc = _run([wire, "--reflex", "scripted", "--strategy", "off",
+                       "--actions", acts, "--output", out])
+            self.assertEqual(rc, 0)
+            records = _read(out)
+        summary = [r for r in records if r.get("record") == "summary"][-1]
+        # the accepted (second) action is the only known ground truth for the
+        # retried need, and it disagrees with the scripted pick
+        self.assertEqual(summary["actual_known"], 1)
+        ag = summary["agreement"]["scripted"]
+        self.assertEqual(ag["total"], 1)
+        self.assertEqual(ag["agree"], 0)
+
+
+# ------------------------------------------------- page strictness (L5)
+
+class PageCollectionStrictnessTest(unittest.TestCase):
+    """Low 5: page collection mirrors the live Request's strict checks."""
+
+    ROWS = [row(14, "a Valkyrie")]
+
+    def _wire(self, pages, declared=2, content="c10"):
+        lines = [_line(HELLO),
+                 _line(obs_menu(1, 10, "m10", content, "Pick",
+                                pages=declared))]
+        lines.extend(_line(p) for p in pages)
+        lines.append(_line(CLOSED))
+        return lines
+
+    def _replay(self, pages, declared=2, content="c10"):
+        cfg = ProviderConfig(reflex="scripted", strategy="off")
+        p = evaluate.ReplayPass(self._wire(pages, declared=declared,
+                                           content=content),
+                                cfg, "scripted", "off")
+        p.run()
+        return p
+
+    def test_valid_page_stream_is_accepted(self):
+        p = self._replay([page("c10", 0, 2, self.ROWS),
+                          page("c10", 1, 2, self.ROWS)])
+        self.assertIsNone(p.protocol_failure)
+        self.assertEqual(p.answered, 1)
+
+    def test_out_of_order_page_fails(self):
+        p = self._replay([page("c10", 1, 2, self.ROWS),
+                          page("c10", 0, 2, self.ROWS)])
+        self.assertIsNotNone(p.protocol_failure)
+
+    def test_duplicate_page_fails(self):
+        p = self._replay([page("c10", 0, 2, self.ROWS),
+                          page("c10", 0, 2, self.ROWS)])
+        self.assertIsNotNone(p.protocol_failure)
+
+    def test_total_mismatch_fails(self):
+        p = self._replay([page("c10", 0, 3, self.ROWS)])   # need declares 2
+        self.assertIsNotNone(p.protocol_failure)
+
+    def test_wrong_content_fails(self):
+        p = self._replay([page("cOTHER", 0, 2, self.ROWS)])
+        self.assertIsNotNone(p.protocol_failure)
+
+    def test_extra_page_after_completion_fails(self):
+        p = self._replay([page("c10", 0, 2, self.ROWS),
+                          page("c10", 1, 2, self.ROWS),
+                          page("c10", 1, 2, self.ROWS)])
+        self.assertIsNotNone(p.protocol_failure)
+
+
+class PageParityTest(WireHarness):
+    """Low 5: the evaluator and the live controller accept/reject alike."""
+
+    ROWS = PageCollectionStrictnessTest.ROWS
+
+    def _cases(self):
+        return [
+            ("valid", [page("c10", 0, 2, self.ROWS),
+                       page("c10", 1, 2, self.ROWS)], 2, "c10"),
+            ("out-of-order", [page("c10", 1, 2, self.ROWS),
+                              page("c10", 0, 2, self.ROWS)], 2, "c10"),
+            ("duplicate", [page("c10", 0, 2, self.ROWS),
+                           page("c10", 0, 2, self.ROWS)], 2, "c10"),
+            ("total-mismatch", [page("c10", 0, 3, self.ROWS)], 2, "c10"),
+            ("wrong-content", [page("cOTHER", 0, 2, self.ROWS)], 2, "c10"),
+        ]
+
+    def _records(self, pages, declared, content):
+        recs = [_line(HELLO),
+                _line(obs_menu(1, 10, "m10", content, "Pick",
+                               pages=declared))]
+        recs.extend(_line(p) for p in pages)
+        recs.append(_line(CLOSED))
+        return recs
+
+    def test_controller_and_replay_agree(self):
+        for name, pages, declared, content in self._cases():
+            with self.subTest(case=name):
+                recs = self._records(pages, declared, content)
+                result, _actions = self.run_scenario(b"".join(recs))
+                live_failed = (
+                    result.protocol_failure is not None
+                    or result.stop_reason == "protocol-failure")
+                cfg = ProviderConfig(reflex="scripted", strategy="off")
+                p = evaluate.ReplayPass(recs, cfg, "scripted", "off")
+                p.run()
+                replay_failed = p.protocol_failure is not None
+                self.assertEqual(live_failed, replay_failed,
+                                 "%s: live=%s replay=%s" %
+                                 (name, live_failed, replay_failed))
+
+
+# ------------------------------------------------- campaign summary (M2/L6)
+
 class CampaignSummaryTest(unittest.TestCase):
     """The compact campaign.json rollup is written next to the recordings."""
 
@@ -337,7 +591,10 @@ class CampaignSummaryTest(unittest.TestCase):
         r.strategy_calls = kw.get("strategy_calls", 2)
         r.directives_applied = kw.get("directives_applied", 2)
         r.budget = {"usage": {"prompt_tokens": 100, "completion_tokens": 40,
-                              "estimated_usd": 0.0, "unknown_price_calls": 0}}
+                              "estimated_usd": 0.0, "unknown_price_calls": 0,
+                              "unknown_exposure_calls": 0,
+                              "unknown_exposure_tokens": 0,
+                              "unknown_exposure_usd": 0.0}}
         return r
 
     def test_rollup_counts_and_totals(self):
@@ -357,6 +614,37 @@ class CampaignSummaryTest(unittest.TestCase):
         self.assertIn("config", summary)
         self.assertNotIn("deepseek_key_file", summary["config"])
 
+    def test_unknown_exposure_and_config_bounds_are_preserved(self):
+        from tools.agent import controller
+        reported = self._result(1)
+        unreported = self._result(2)
+        unreported.budget = {"usage": {
+            "prompt_tokens": 0, "completion_tokens": 0,
+            "estimated_usd": 0.0, "unknown_price_calls": 0,
+            "unknown_exposure_calls": 2, "unknown_exposure_tokens": 500,
+            "unknown_exposure_usd": 0.25}}
+        cfg = ProviderConfig(deepseek_max_tokens=4096,
+                             deepseek_max_bytes=65536)
+        summary = controller.campaign_summary([reported, unreported], cfg,
+                                              300.0)
+        totals = summary["totals"]
+        # reported usage and unknown exposure are totalled separately
+        self.assertEqual(totals["prompt_tokens"], 100)
+        self.assertEqual(totals["completion_tokens"], 40)
+        self.assertEqual(totals["unknown_price_calls"], 0)
+        self.assertEqual(totals["unknown_exposure_calls"], 2)
+        self.assertEqual(totals["unknown_exposure_tokens"], 500)
+        self.assertAlmostEqual(totals["unknown_exposure_usd"], 0.25)
+        per_ep = summary["results"][1]["usage"]
+        self.assertEqual(per_ep["unknown_exposure_calls"], 2)
+        self.assertEqual(per_ep["unknown_exposure_tokens"], 500)
+        # the non-secret config bounds are carried
+        self.assertEqual(summary["config"]["deepseek_max_tokens"], 4096)
+        self.assertEqual(summary["config"]["deepseek_max_bytes"], 65536)
+        for secret in ("deepseek_key_file", "jev_key_file",
+                       "deepseek_api_key"):
+            self.assertNotIn(secret, summary["config"])
+
     def test_run_campaign_writes_campaign_json(self):
         from tools.agent import controller
         with tempfile.TemporaryDirectory() as d:
@@ -369,6 +657,44 @@ class CampaignSummaryTest(unittest.TestCase):
                 data = json.load(fh)
             self.assertEqual(data["episodes"], 1)
             self.assertEqual(data["results"][0]["index"], 1)
+
+    def test_summary_write_failure_is_recorded_not_swallowed(self):
+        from tools.agent import controller
+        with tempfile.TemporaryDirectory() as d:
+            ctl = controller.Controller(
+                ProviderConfig(),
+                controller.ControllerPaths("w", "r", "d", "s"), d,
+                episode_timeout=10.0)
+            ctl.run_episode = lambda i: self._result(i)
+            with mock.patch.object(controller, "write_campaign_summary",
+                                   side_effect=OSError("disk full")):
+                results = ctl.run_campaign(1)
+            # episode results survive; the failure is recorded, path is None
+            self.assertEqual(len(results), 1)
+            self.assertIsNone(ctl.summary_path)
+            self.assertEqual(ctl.summary_error, "disk full")
+
+    def test_cli_reports_the_summary_failure(self):
+        from tools.agent import __main__ as cli
+        from tools.agent import controller
+        with tempfile.TemporaryDirectory() as d:
+            def fake_run_campaign(_self, episodes):
+                _self.summary_path = None
+                _self.summary_error = "disk full"
+                return []
+
+            err = io.StringIO()
+            with mock.patch.object(controller.Controller, "run_campaign",
+                                   fake_run_campaign):
+                with contextlib.redirect_stdout(io.StringIO()) as out, \
+                        contextlib.redirect_stderr(err):
+                    rc = cli.main(["auto", "--episodes", "1",
+                                   "--reflex", "scripted",
+                                   "--strategy", "off",
+                                   "--output-dir", d])
+            self.assertEqual(rc, 0)
+            self.assertIn("NOT WRITTEN", err.getvalue())
+            self.assertNotIn("campaign.json", out.getvalue())
 
 
 if __name__ == "__main__":
