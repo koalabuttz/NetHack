@@ -253,6 +253,12 @@ class StrategyResult(object):
     latency: float = 0.0
     reason: str = ""
     ok: bool = False
+    # True once the call actually crossed the dispatch boundary (a worker was
+    # started and the request reached the wire).  A result refused before any
+    # work started -- a cooldown, a missing key, a sticky cancellation, or a
+    # spawn failure -- leaves this False, so a caller that books *exposure*
+    # can tell a genuinely lost call from one that never left.
+    dispatched: bool = False
 
 
 # --------------------------------------------------------------- providers
@@ -914,15 +920,18 @@ class DeepSeekStrategy(StrategyProvider):
     def _timeout_result(self, latency):
         self.cooldown_until = self.now() + self.config.strategy_cooldown
         self.last_error = "timeout"
+        # the worker was started and the request reached the wire: a timeout
+        # is a genuinely lost call, not an undelivered one
         return StrategyResult(provider=self.name, reason="timeout", usage={},
-                              latency=latency, ok=False)
+                              latency=latency, ok=False, dispatched=True)
 
     def _interpret(self, res: WorkerResult) -> StrategyResult:
         if res.timed_out:
             self.cooldown_until = self.now() + self.config.strategy_cooldown
             self.last_error = "timeout"
             return StrategyResult(provider=self.name, reason="timeout",
-                                  usage={}, latency=res.latency, ok=False)
+                                  usage={}, latency=res.latency, ok=False,
+                                  dispatched=True)
         if not res.ok or res.json is None:
             self.last_error = res.error or "error"
             if res.error in ("http-429", "http-5xx", "http-4xx"):
@@ -930,7 +939,8 @@ class DeepSeekStrategy(StrategyProvider):
                     self.now() + self.config.strategy_cooldown
             return StrategyResult(provider=self.name,
                                   reason="error:%s" % (res.error or "?"),
-                                  usage={}, latency=res.latency, ok=False)
+                                  usage={}, latency=res.latency, ok=False,
+                                  dispatched=True)
         body = res.json
         dset_obj = _parse_chat_response(body)
         if dset_obj is None:
@@ -938,17 +948,17 @@ class DeepSeekStrategy(StrategyProvider):
             return StrategyResult(provider=self.name,
                                   reason="malformed-response",
                                   usage=_usage_of(body), latency=res.latency,
-                                  ok=False)
+                                  ok=False, dispatched=True)
         dset, why = validate_directive_set(dset_obj)
         if dset is None:
             self.last_error = "invalid-directives"
             return StrategyResult(provider=self.name,
                                   reason="invalid-directives: %s" % why,
                                   usage=_usage_of(body), latency=res.latency,
-                                  ok=False)
+                                  ok=False, dispatched=True)
         return StrategyResult(directives=[dset], provider=self.name,
                               usage=_usage_of(body), latency=res.latency,
-                              reason="directives", ok=True)
+                              reason="directives", ok=True, dispatched=True)
 
 
 def _chat_url(base_url: str) -> str:

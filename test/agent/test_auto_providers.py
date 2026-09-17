@@ -1749,6 +1749,161 @@ class TestPostmortemEligibility(WireHarness):
         self.assertEqual(self._postmortems(fake), 0)
 
 
+# ============================================ postmortem fresh lifecycle
+
+class TestPostmortemFreshLifecycle(WireHarness):
+    """Medium 1: the reserved postmortem runs on a fresh provider lifecycle.
+
+    The episode's gameplay provider is cancelled with the episode; the
+    postmortem must still reach a real provider, and only book exposure for a
+    call that actually crossed the dispatch boundary.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.calls = {"n": 0}
+
+        def responder(path, body):
+            self.calls["n"] += 1
+            n = self.calls["n"]
+            return (200, _chat_body(_ok_directives(), prompt_tokens=10 * n,
+                                    completion_tokens=1))
+
+        self.ep = FakeEndpoint(responder)
+        self.addCleanup(self.ep.close)
+        env = mock.patch.dict(os.environ,
+                              {"DEEPSEEK_API_KEY": "sk-test-secret"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _controller(self, deadline=3.0, reserve=1):
+        cfg = ProviderConfig(strategy="deepseek",
+                             deepseek_base_url=self.ep.base_url,
+                             strategy_deadline=deadline, max_ticks=200,
+                             strategy_call_cap=4, postmortem_reserve=reserve,
+                             low_confidence_needs=1000)
+        return controller.Controller(
+            cfg, controller.ControllerPaths("w", "r", "d", "s"), self.dir,
+            episode_timeout=15.0)
+
+    def _postmortems(self):
+        decs = _read_jsonl(os.path.join(self.dir, "ep-1.decisions.jsonl"))
+        return [d for d in decs
+                if str(d.get("reason", "")).startswith("postmortem")]
+
+    def test_clean_close_runs_one_real_postmortem(self):
+        ctl = self._controller()
+        records = [
+            hello(),
+            st_obs(1, command_need(1), dlvl="Dlvl:1", hp=10, hp_max=20),
+            CLOSED,
+        ]
+        proc = paced(records, [0.05, 1.2, 0.05])
+        ctl._spawn = lambda priv: proc
+        result = ctl.run_episode(1)
+        proc.close()
+        self.assertTrue(result.closed)
+        budget = result.budget
+        self.assertEqual(budget["strategy"]["postmortem_dispatched"], 1)
+        self.assertEqual(budget["usage"]["unknown_exposure_calls"], 0)
+        pm = self._postmortems()
+        self.assertEqual(len(pm), 1)
+        # one play request, then exactly one postmortem request; the
+        # postmortem's own usage is booked to the postmortem decision
+        self.assertEqual(len(self.ep.requests), 2)
+        self.assertEqual(pm[0]["usage"].get("prompt_tokens"), 20)
+        self.assertEqual(budget["usage"]["prompt_tokens"], 30)
+
+    def test_in_flight_play_call_settles_before_the_postmortem(self):
+        # the endpoint answers slowly, so the play call is still in flight
+        # when the episode closes and is cancelled -- yet the postmortem, on
+        # its own fresh provider, still reaches the endpoint
+        self.ep.delay = 1.5
+        ctl = self._controller(deadline=4.0)
+        records = [
+            hello(),
+            st_obs(1, command_need(1), dlvl="Dlvl:1", hp=10, hp_max=20),
+            CLOSED,
+        ]
+        proc = paced(records, [0.05, 0.2, 0.05])
+        ctl._spawn = lambda priv: proc
+        result = ctl.run_episode(1)
+        proc.close()
+        self.assertTrue(result.closed)
+        pm = self._postmortems()
+        self.assertEqual(len(pm), 1)
+        self.assertNotIn("cancelled", pm[0]["reason"])
+        self.assertGreaterEqual(pm[0]["usage"].get("prompt_tokens", 0), 1)
+        self.assertEqual(
+            result.budget["strategy"]["postmortem_dispatched"], 1)
+
+    def _runner(self):
+        result = controller.EpisodeResult(index=1)
+        rec = recording.EpisodeRecorder(self.dir, 1)
+        proc = paced([hello()], [0.0])
+        self.addCleanup(proc.close)
+        cfg = ProviderConfig(max_ticks=200, strategy_call_cap=4,
+                             postmortem_reserve=1,
+                             low_confidence_needs=1000)
+        ctl = controller.Controller(
+            cfg, controller.ControllerPaths("w", "r", "d", "s"), self.dir,
+            episode_timeout=5.0)
+        return controller._EpisodeRunner(ctl, proc, rec, result)
+
+    def test_settle_releases_an_undelivered_postmortem(self):
+        # a provider result refused before any worker existed (no usage, no
+        # dispatch flag) is released: no dispatched call, no exposure
+        runner = self._runner()
+        self.assertTrue(runner.ledger.reserve_strategy(
+            postmortem=True, prompt_tokens=10, completion_tokens=5))
+        runner._settle_postmortem(
+            StrategyResult(provider="fake", reason="cancelled", ok=False), [])
+        self.assertEqual(runner.ledger.postmortem_dispatched, 0)
+        self.assertEqual(runner.ledger.strategy_reserved, 0)
+        self.assertEqual(runner.ledger.strategy_dispatched, 0)
+        self.assertEqual(runner.ledger.unknown_exposure_calls, 0)
+
+    def test_settle_books_a_lost_postmortem_as_exposure(self):
+        # a call that reached the wire but returned no usage keeps its bound
+        runner = self._runner()
+        self.assertTrue(runner.ledger.reserve_strategy(
+            postmortem=True, prompt_tokens=10, completion_tokens=5))
+        runner._settle_postmortem(
+            StrategyResult(provider="fake", reason="timeout", ok=False,
+                           dispatched=True), [])
+        self.assertEqual(runner.ledger.postmortem_dispatched, 1)
+        self.assertEqual(runner.ledger.strategy_reserved, 0)
+        self.assertEqual(runner.ledger.unknown_exposure_calls, 1)
+
+    def test_a_refused_postmortem_books_no_exposure(self):
+        # no key -> the provider is unavailable and the postmortem cannot even
+        # start: nothing is booked as a dispatched call or as exposure
+        env = mock.patch.dict(os.environ, {}, clear=True)
+        env.start()
+        self.addCleanup(env.stop)
+        cfg = ProviderConfig(strategy="deepseek",
+                             deepseek_base_url=self.ep.base_url,
+                             max_ticks=200, strategy_call_cap=4,
+                             postmortem_reserve=1, low_confidence_needs=1000)
+        ctl = controller.Controller(
+            cfg, controller.ControllerPaths("w", "r", "d", "s"), self.dir,
+            episode_timeout=15.0)
+        records = [
+            hello(),
+            st_obs(1, command_need(1), dlvl="Dlvl:1", hp=10, hp_max=20),
+            CLOSED,
+        ]
+        proc = paced(records, [0.05, 0.5, 0.05])
+        ctl._spawn = lambda priv: proc
+        result = ctl.run_episode(1)
+        proc.close()
+        budget = result.budget
+        self.assertEqual(budget["strategy"]["postmortem_dispatched"], 0)
+        self.assertEqual(budget["strategy"]["reserved"], 0)
+        self.assertEqual(budget["usage"]["unknown_exposure_calls"], 0)
+        self.assertEqual(self._postmortems(), [])
+
+
 # ============================================================ low conf
 
 class _FakeJev(object):

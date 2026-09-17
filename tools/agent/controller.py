@@ -178,6 +178,10 @@ class Controller(object):
             getattr(config, "reflex_deadline", 0.75) or 0.0)
         self.strategy_deadline = float(
             getattr(config, "strategy_deadline", 20.0) or 0.0)
+        # The campaign rollup's outcome: set by run_campaign so the CLI can
+        # report a summary-write failure instead of claiming a missing path.
+        self.summary_path: Optional[str] = None
+        self.summary_error: Optional[str] = None
         ensure_private_dir(output_dir)
 
     # -- provider construction (per episode) -----------------------------
@@ -204,12 +208,16 @@ class Controller(object):
             results.append(self.run_episode(i))
         # A compact, secret-free rollup of the campaign, written next to the
         # per-episode recordings.  Failure to write it must not lose the
-        # episode results, so it is best-effort after the run.
+        # episode results, so it is best-effort after the run -- but the
+        # failure is recorded rather than swallowed, so the CLI can report it
+        # and never claim a path that does not exist.
+        self.summary_path = None
+        self.summary_error = None
         try:
-            write_campaign_summary(self.output_dir, results, self.config,
-                                   self.episode_timeout)
-        except OSError:
-            pass
+            self.summary_path = write_campaign_summary(
+                self.output_dir, results, self.config, self.episode_timeout)
+        except OSError as exc:
+            self.summary_error = str(exc)
         return results
 
     def run_episode(self, index: int) -> EpisodeResult:
@@ -494,6 +502,40 @@ def _directive_dicts(dsets) -> list:
         elif isinstance(d, dict):
             out.append(d)
     return out
+
+
+def _crossed_dispatch_boundary(res) -> bool:
+    """True when a strategy call actually reached the provider's wire.
+
+    A provider reports this directly through ``StrategyResult.dispatched``; an
+    in-process provider that leaves the flag unset is inferred from a result
+    that carries usage or succeeded (it obviously ran).  A ``None`` result --
+    an exception before any worker existed -- never crossed.
+    """
+    if res is None:
+        return False
+    if getattr(res, "dispatched", False):
+        return True
+    return bool(res.usage) or bool(res.ok)
+
+
+def _quench_provider(provider) -> None:
+    """Cancel and reap a strategy provider, never raising.
+
+    The provider that ran the postmortem is its own instance; whether the call
+    completed, timed out or raised, nothing it started may outlive the
+    episode.  ``reap`` is optional (an in-process provider has no worker).
+    """
+    try:
+        provider.cancel()
+    except Exception:                        # noqa: BLE001 - teardown
+        pass
+    reap = getattr(provider, "reap", None)
+    if reap is not None:
+        try:
+            reap()
+        except Exception:                    # noqa: BLE001 - teardown
+            pass
 
 
 class _EpisodeRunner(object):
@@ -1192,6 +1234,15 @@ class _EpisodeRunner(object):
         cap is available during play.  It also requires a clean closure, a
         healthy recording (via :meth:`_strategy_live`) and enough remaining
         budget to cover the call's conservative bound.
+
+        The postmortem runs through a **fresh provider lifecycle**.  The
+        episode's gameplay provider has already been cancelled at this point
+        (``_cancel_strategy``), and that cancellation is sticky, so reusing it
+        would refuse the spawn and the reserved call would never reach the
+        provider.  A new provider instance -- with its own bounded worker and
+        deadline -- is constructed here instead, and the reservation is
+        settled as *dispatched* only once work actually crossed the dispatch
+        boundary (see :meth:`_settle_postmortem`).
         """
         if self.ledger.postmortem_reserve <= 0:
             return
@@ -1207,18 +1258,51 @@ class _EpisodeRunner(object):
                                             prompt_tokens=prompt,
                                             completion_tokens=completion):
             return
+        provider = self._new_postmortem_provider()
         deadline = time.monotonic() + self.c.strategy_deadline
         try:
-            res = self.strategy_provider.deliberate(ctx, deadline)
+            res = provider.deliberate(ctx, deadline)
         except Exception:                    # noqa: BLE001 - bounded policy
             res = None
+        finally:
+            # bound and reap the postmortem's own worker so nothing it started
+            # survives the episode, even if the call raised mid-flight
+            _quench_provider(provider)
+        self._settle_postmortem(res, ctx.boundaries)
+
+    def _new_postmortem_provider(self):
+        """A fresh strategy provider owning the postmortem's own lifecycle.
+
+        A new instance carries no cancellation left over from the episode's
+        gameplay provider, so the reserved postmortem can still reach the
+        provider.  The factory is :meth:`Controller._new_strategy_provider`,
+        the same hook the per-episode provider is built from, so an injected
+        test provider keeps working.
+        """
+        return self.c._new_strategy_provider()
+
+    def _settle_postmortem(self, res, boundaries):
+        """Book the postmortem only once it reached the wire.
+
+        The reservation is consumed exactly once.  A result that crossed the
+        dispatch boundary -- real usage, a directive answer, a timeout or an
+        HTTP error -- is committed as *dispatched* and keeps its usage or,
+        when no usage came back, its conservative bound as unknown exposure.
+        A call refused before any work started (cancelled, no key, cooldown,
+        spawn failure, or an exception during spawn) is released without
+        booking anything, so the ledger never reports a phantom dispatch or a
+        phantom billing exposure.
+        """
         usage = res.usage if res is not None else None
-        self.ledger.commit_strategy(usage, postmortem=True)
+        if _crossed_dispatch_boundary(res):
+            self.ledger.commit_strategy(usage, postmortem=True)
+        else:
+            self.ledger.release_strategy()
         self.rec.record_decision(
             proposal=None, selected=None, provider="strategy",
             reason="postmortem: %s" % (res.reason if res is not None
                                        else "no result"),
-            boundaries=ctx.boundaries,
+            boundaries=boundaries,
             usage=usage or {},
             latency=res.latency if res is not None else 0.0,
             directives=_directive_dicts(res.directives if res is not None
@@ -1499,6 +1583,8 @@ def _safe_config(config: ProviderConfig) -> dict:
         "content_deadline": getattr(config, "content_deadline", None),
         "strategy_deadline": getattr(config, "strategy_deadline", None),
         "postmortem_reserve": getattr(config, "postmortem_reserve", None),
+        "deepseek_max_tokens": getattr(config, "deepseek_max_tokens", None),
+        "deepseek_max_bytes": getattr(config, "deepseek_max_bytes", None),
         "boundary_cooldown_ticks": getattr(config,
                                            "boundary_cooldown_ticks", None),
         "boundary_cooldown_wall": getattr(config,
@@ -1546,11 +1632,20 @@ def _episode_summary(r: EpisodeResult) -> dict:
         "invalids": r.invalids,
         "boundaries": r.boundaries, "strategy_calls": r.strategy_calls,
         "directives_applied": r.directives_applied,
+        # Reported usage, unknown-price calls and unknown *exposure* are three
+        # distinct things: the first is asserted cost, the second is a real
+        # answer whose price is unknown, the third is a call that reached the
+        # wire but returned no usage at all.  They are never merged into a
+        # single asserted figure.
         "usage": {
             "prompt_tokens": usage.get("prompt_tokens", 0),
             "completion_tokens": usage.get("completion_tokens", 0),
             "estimated_usd": usage.get("estimated_usd", 0.0),
             "unknown_price_calls": usage.get("unknown_price_calls", 0),
+            "unknown_exposure_calls": usage.get("unknown_exposure_calls", 0),
+            "unknown_exposure_tokens": usage.get("unknown_exposure_tokens",
+                                                 0),
+            "unknown_exposure_usd": usage.get("unknown_exposure_usd", 0.0),
         },
     }
 
@@ -1561,15 +1656,23 @@ def campaign_summary(results, config, episode_timeout: float) -> dict:
     totals = {"ticks": 0, "needs": 0, "actions": 0, "invalids": 0,
               "boundaries": 0, "strategy_calls": 0, "directives_applied": 0,
               "prompt_tokens": 0, "completion_tokens": 0,
-              "estimated_usd": 0.0}
+              "estimated_usd": 0.0, "unknown_price_calls": 0,
+              "unknown_exposure_calls": 0, "unknown_exposure_tokens": 0,
+              "unknown_exposure_usd": 0.0}
     for e in episodes:
         for key in ("ticks", "needs", "actions", "invalids", "boundaries",
                     "strategy_calls", "directives_applied"):
             totals[key] += e[key]
-        totals["prompt_tokens"] += e["usage"]["prompt_tokens"]
-        totals["completion_tokens"] += e["usage"]["completion_tokens"]
+        u = e["usage"]
+        totals["prompt_tokens"] += u["prompt_tokens"]
+        totals["completion_tokens"] += u["completion_tokens"]
         totals["estimated_usd"] = round(
-            totals["estimated_usd"] + e["usage"]["estimated_usd"], 6)
+            totals["estimated_usd"] + u["estimated_usd"], 6)
+        totals["unknown_price_calls"] += u["unknown_price_calls"]
+        totals["unknown_exposure_calls"] += u["unknown_exposure_calls"]
+        totals["unknown_exposure_tokens"] += u["unknown_exposure_tokens"]
+        totals["unknown_exposure_usd"] = round(
+            totals["unknown_exposure_usd"] + u["unknown_exposure_usd"], 6)
     successes = sum(1 for e in episodes if e["ok"])
     return {
         "schema": 1,

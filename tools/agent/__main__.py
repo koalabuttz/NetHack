@@ -208,8 +208,14 @@ def cmd_auto(a) -> int:
             print("  stderr tail: %s" % r.stderr_tail.strip()
                   .replace("\n", " | ")[-300:])
     print("campaign: %d episode(s), %d failure(s)" % (len(results), failures))
-    print("campaign summary: %s"
-          % os.path.join(a.output_dir, "campaign.json"))
+    # The episode results above are authoritative even when the rollup could
+    # not be written; report the failure explicitly and never claim a path
+    # that does not exist.
+    if controller.summary_error is not None:
+        print("campaign summary: NOT WRITTEN: %s" % controller.summary_error,
+              file=sys.stderr)
+    elif controller.summary_path is not None:
+        print("campaign summary: %s" % controller.summary_path)
     return 1 if failures else 0
 
 
