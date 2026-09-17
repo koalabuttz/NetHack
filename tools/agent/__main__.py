@@ -92,7 +92,10 @@ def build_parser():
                       default="https://api.deepseek.com")
     auto.add_argument("--deepseek-key-file", default=None,
                       help="0600 file holding DEEPSEEK_API_KEY")
-    auto.add_argument("--deepseek-max-tokens", type=int, default=400)
+    auto.add_argument("--deepseek-max-tokens", type=int, default=4096,
+                      help="bounded output budget; a reasoning model needs "
+                           "headroom beyond its reasoning tokens or it "
+                           "returns empty content")
     # -- Jev (ships disabled) --------------------------------------------
     auto.add_argument("--jev-key-file", default=None)
     auto.add_argument("--jev-base-url", default=None)

@@ -93,7 +93,15 @@ class ProviderConfig(object):
     content_deadline: float = 5.0
     strategy_deadline: float = 20.0
     strategy_cooldown: float = 2.0
-    deepseek_max_tokens: int = 400
+    # ``deepseek-v4-flash`` is a *reasoning* model: it emits
+    # ``completion_tokens_details.reasoning_tokens`` before any answer, and a
+    # budget that only covers the reasoning returns an empty ``content`` --
+    # an unusable response.  The reasoning length is variable (hundreds to
+    # >2000 tokens observed), so a 400-token bound was always unusable and a
+    # 2048-token bound was still truncated on a real game state; the shipped
+    # default is 4096, which keeps the observed reasoning plus the JSON plan
+    # inside the bound while staying a bounded, conservative output limit.
+    deepseek_max_tokens: int = 4096
     deepseek_max_bytes: int = 32768
     provider_max_bytes: int = 65536
     boundary_cooldown_ticks: int = 50
