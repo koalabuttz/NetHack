@@ -132,6 +132,17 @@ class NullStrategy(StrategyProvider):
         return StrategyResult(provider="off", reason="strategy disabled")
 
 
+class ScriptedReflexProvider(ReflexProvider):
+    """The always-available scripted tier (decisions live in policy.py)."""
+
+    name = "scripted"
+
+    def available(self, config: ProviderConfig) -> Availability:
+        if config.reflex == "scripted":
+            return Availability(True, "scripted reflex is always available")
+        return Availability(False, "reflex tier is %s" % config.reflex)
+
+
 class JevReflex(ReflexProvider):
     """Placeholder.  JevReflex ships DISABLED pending official API terms."""
 
@@ -165,7 +176,7 @@ class DeepSeekStrategy(StrategyProvider):
 def reflex_provider(config: ProviderConfig) -> ReflexProvider:
     if config.reflex == "jev":
         return JevReflex()
-    return ReflexProvider()
+    return ScriptedReflexProvider()
 
 
 def strategy_provider(config: ProviderConfig) -> StrategyProvider:

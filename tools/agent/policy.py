@@ -170,7 +170,8 @@ class ScriptedReflex(object):
     def _eat_answer(self, context: ReflexContext, letters: List[str],
                     has_star: bool):
         rejected = sum(1 for m in context.memory.messages
-                       if "don't have that object" in m) - self.eat_reject_base
+                       if "don't have that object" in m) \
+            - self.eat_reject_base
         if rejected >= 2 or self.eat_forced_menu:
             self.eat_forced_menu = True
             return {"yn": ord("*")}, "eat loop breaker: open inventory menu"

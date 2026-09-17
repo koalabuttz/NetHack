@@ -68,6 +68,7 @@ prints only `win/agent/*.h` plus system headers.
 | `test/agent/schema_check.py` | dependency-free JSON Schema subset validator plus 25 positive and 29 negative vectors; also validates real encoder output piped from `test_protocol --dump` |
 | `test/agent/spectate.py` | live spectate: a transparent byte-exact proxy that renders the flowing records to a side channel while relaying the wire, a transcript replay mode, and a runner-mode shim usable as the driver's `--runner` |
 | `test/agent/test_spectate.py` | integration tests for the spectate revision: incremental/batch assembler agreement and every rejection vector, the deadline-scheduled render pipeline and its bounded shutdown, the writer helper and its acknowledgements, byte-exact relay/transcript back-pressure, argv identity, failure exit-status hygiene, replay equivalence, plus the opt-in performance (`--benchmark`) and byte-exact (`--byte-exact`) harnesses |
+| `test/agent/test_auto.py` | autonomous harness tests; see below |
 
 ## Formatter
 
@@ -84,6 +85,22 @@ chunks stored by `(rid, i)` with contiguous indices from zero, exact repeats
 deduplicated, changed repeats and gaps rejected, header parts allowed only in
 chunk 0, and long-text slices required to name an existing element with
 contiguous offsets before the record is rebuilt atomically.
+
+## Autonomous play
+
+The user-facing autonomous harness lives in `tools/agent/` (not here) and is
+launched by `./agent.sh auto`; `doc/agent-autoplay.md` is its operational
+guide.  It is scripted-only in this release and makes no network calls.  Its
+tests are part of this fixture directory and run without spawning a game:
+
+```sh
+python3 -m unittest discover -s test/agent -p 'test_auto*.py'
+```
+
+They import the harness package from the repository root (`tools/agent/`) and
+drive the real controller against an in-memory fake wire, so the transport
+obligations — pages, chunks, `invalid` recovery and retry caps, EOF versus
+`closed`, incomplete recording — are exercised deterministically.
 
 ## Watching an episode
 

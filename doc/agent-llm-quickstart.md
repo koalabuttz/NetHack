@@ -109,6 +109,15 @@ For serious use, keep per-episode state in a client model (the driver's
 grid in the model prompt, and prefer `move`-style decisions to raw keys only
 when you have verified the bindings (`llm-final-v1` fixes the bindings).
 
+## Autonomous play (no external harness)
+
+`./agent.sh auto` runs a built-in, scripted-only autonomous player that speaks
+this same wire while owning the pipe itself; see `doc/agent-autoplay.md`.  It
+needs no external policy and makes no network calls, and it is the reference
+for how a harness should fulfil the transport obligations below (answer every
+outstanding request, fetch all pages before committing, treat `invalid` as a
+retry).
+
 ## Ground rules the protocol enforces
 
 - You only ever see what a human player would see; there is nothing to cheat

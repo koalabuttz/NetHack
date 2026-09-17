@@ -122,7 +122,8 @@ class Controller(object):
                 "--private-root", priv, "--data", self.paths.data]
         if self.paths.sysconf:
             argv += ["--sysconf", self.paths.sysconf]
-        argv += ["--deadline", str(int(self.episode_timeout + self.read_slack))]
+        deadline = int(self.episode_timeout + self.read_slack)
+        argv += ["--deadline", str(deadline)]
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, bufsize=0)
@@ -218,7 +219,8 @@ class _EpisodeRunner(object):
         try:
             while not self.closed:
                 if self.pending:
-                    if self.req.pages_declared and not self.req.pages_complete():
+                    if self.req.pages_declared \
+                            and not self.req.pages_complete():
                         self._request_pages()
                         if not self._pump():
                             break

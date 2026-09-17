@@ -66,8 +66,8 @@ wizard3.lua   wizhelp
 
 doc:
 (files for all versions)
-agent-interface.md  agent-llm-quickstart.md  agent-profile-v1.tsv
-agent-v1.schema.json
+agent-autoplay.md   agent-interface.md  agent-llm-quickstart.md
+agent-profile-v1.tsv  agent-v1.schema.json
 Gbk-1pg-pfx.mn     Gbk-1pg-sfx.mn     Guidebook.mn       Guidebook.tex
 Guidebook.txt      config.nh          dlb.6              dlb.txt
 fixes1-0.txt       fixes1-4-f.txt     fixes2-2.txt       fixes2-3-e.txt
@@ -590,8 +590,14 @@ test/agent:
 .gitignore          Makefile            README.md           driver.py
 format_obs.py       gen_profile.py      hostile_matrix.py   reference_state.c
 reference_state.h   schema_check.py     spectate.py         sysconf
-test_menu.c         test_protocol.c     test_spectate.py    test_state.c
-test_view.c
+test_auto.py        test_menu.c         test_protocol.c     test_spectate.py
+test_state.c        test_view.c
+
+tools/agent:
+(files for the autonomous play harness)
+.gitignore          __init__.py         __main__.py         codec.py
+controller.py       policy.py           protocol.py         providers.py
+recording.py        state.py
 
 util:
 (files for all versions)

@@ -186,7 +186,7 @@ def _need_key_obj(need_key):
 
 def infer_outcome(messages):
     """Infer a *visible* game outcome from public text.  This is an
-    observation, never proof: merely seeing ``closed`` does not prove death."""
+    observation, never proof: seeing ``closed`` alone does not prove death."""
     text = " ".join(messages).lower()
     for marker, label in (("you die", "death"),
                           ("you are dead", "death"),

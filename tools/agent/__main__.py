@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """CLI entrypoint for the two-tier autoplay harness.
 
-    python3 -m tools.agent auto --episodes N --reflex scripted --strategy off \
-        --max-ticks 2000 --episode-timeout 300 --output-dir DIR
+    python3 -m tools.agent auto --episodes N --reflex scripted \\
+        --strategy off --max-ticks 2000 --episode-timeout 300 \\
+        --output-dir DIR
 
-Wave 1 exposes only ``--reflex scripted --strategy off``; deeper provider flags
-are accepted (and ignored / reported unavailable) so a later wave can add
-providers without changing this argv.  The default configuration is completely
-network-free.
+Wave 1 exposes only ``--reflex scripted --strategy off``; deeper provider
+flags are accepted (and ignored / reported unavailable) so a later wave can
+add providers without changing this argv.  The default configuration is
+completely network-free.
 """
 
 import argparse
@@ -34,7 +35,8 @@ def build_parser():
     auto.add_argument("--episodes", type=int, default=1)
     auto.add_argument("--reflex", choices=["scripted", "jev"],
                       default="scripted")
-    auto.add_argument("--strategy", choices=["off", "deepseek"], default="off")
+    auto.add_argument("--strategy", choices=["off", "deepseek"],
+                      default="off")
     auto.add_argument("--role", default="Valkyrie")
     auto.add_argument("--max-ticks", type=int, default=2000)
     auto.add_argument("--episode-timeout", type=float, default=300.0)

@@ -2,15 +2,17 @@
 # Convenience front end for the NetHack headless agent interface.
 #
 #   ./agent.sh build        build/refresh the agent binaries (automatic on demand)
+#   ./agent.sh auto OPTS    run autonomous scripted episodes (tools/agent)
 #   ./agent.sh watch [N]    watch N scripted episodes live (default 1)
 #   ./agent.sh play [N]     run N scripted episodes headlessly
 #   ./agent.sh serve        expose the JSON wire on stdin/stdout (LLM harness mode)
 #   ./agent.sh replay FILE  replay a saved spectate transcript
 #
 # The wire protocol is specified in doc/agent-interface.md; driving it from
-# an LLM is described in doc/agent-llm-quickstart.md.  Data is staged once
-# into $AGENT_DATA (default /tmp/nethack-agent-data); episodes run in private
-# temp directories that are cleaned up automatically.
+# an LLM is described in doc/agent-llm-quickstart.md, and the autonomous
+# harness in doc/agent-autoplay.md.  Data is staged once into $AGENT_DATA
+# (default /tmp/nethack-agent-data); episodes run in private temp directories
+# that are cleaned up automatically.
 
 set -e
 cd "$(dirname "$0")"
@@ -109,13 +111,25 @@ replay() {
     exec python3 test/agent/spectate.py replay "$1"
 }
 
+auto() {
+    build
+    stage
+    # The autonomous harness is a package, not a single script: it owns the
+    # game pipe itself and writes ep-N recordings into --output-dir.  This
+    # wave ships scripted-only play; the strategy tier is a later addition.
+    python3 -m tools.agent auto "$@" \
+        --worker "$PWD/$BIN" --runner "$RUNNER" \
+        --data "$DATA" --sysconf "$DATA/sysconf"
+}
+
 case "${1:-help}" in
     build)  build ;;
+    auto)   shift; auto "$@" ;;
     watch)  shift; watch "$@" ;;
     play)   shift; play "$@" ;;
     serve)  serve ;;
     replay) shift; replay "$@" ;;
     *)
-        sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
         ;;
 esac

@@ -149,6 +149,14 @@ In our own patches, we will assume that your code is synchronized with ours.
 
                   -- Good luck, and happy Hacking --
 
+Files of local interest in this working tree (the headless agent interface)
+---------------------------------------------------------------------------
+This tree adds a headless agent interface and an autonomous play harness on
+top of NetHack 5.0.  Start at AGENTS.md; the wire protocol is
+doc/agent-interface.md, the recipe for driving it from an external policy is
+doc/agent-llm-quickstart.md, and the built-in autonomous harness is
+doc/agent-autoplay.md.  The `./agent.sh` script is the front end.
+
 # $NHDT-Date: 1779926755 2026/05/28 00:05:55 $ $NHDT-Branch: NetHack-5.0 $:$NHDT-Revision: 1.113 $
 # Copyright (c) 2012 by Michael Allison
 # NetHack may be freely redistributed.  See license for details.

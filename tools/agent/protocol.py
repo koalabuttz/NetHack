@@ -105,7 +105,8 @@ class Snapshot(object):
                                     % (pid,))
             if pid == 0:
                 raise ProtocolError("blank cells must be omitted, not id 0")
-            if not (MAP_MIN_X <= x <= MAP_MAX_X and MAP_MIN_Y <= y <= MAP_MAX_Y):
+            if not (MAP_MIN_X <= x <= MAP_MAX_X
+                    and MAP_MIN_Y <= y <= MAP_MAX_Y):
                 raise ProtocolError("map coordinate out of range: %r"
                                     % (triple,))
             order = (y, x)
@@ -246,7 +247,7 @@ def make_ack_seq(seq: int) -> dict:
     return {"v": 1, "type": "ack_seq", "seq": seq}
 
 
-# ------------------------------------------------------------------ validation
+# --------------------------------------------------------------- validation
 
 def _is_int(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)

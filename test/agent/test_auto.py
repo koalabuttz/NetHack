@@ -5,10 +5,11 @@ Run from the repository root:
 
     python3 -m unittest discover -s test/agent -p 'test_auto*.py'
 
-The integration tests drive the real :class:`tools.agent.controller.Controller`
-against an in-memory fake wire (a pipe the controller reads exactly as it would
-a launcher), so the whole request state machine -- pages, chunks, invalid
-recovery, retry caps, EOF/closed -- is exercised without spawning a game.
+The integration tests drive the real controller
+(:class:`tools.agent.controller.Controller`) against an in-memory fake wire
+(a pipe the controller reads exactly as it would a launcher), so the whole
+request state machine -- pages, chunks, invalid recovery, retry caps,
+EOF/closed -- is exercised without spawning a game.
 """
 
 import json
@@ -25,7 +26,8 @@ for _p in (_ROOT, _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from tools.agent import controller, policy, protocol, recording, state  # noqa: E402
+from tools.agent import (controller, policy, protocol,  # noqa: E402
+                         recording, state)
 from tools.agent.providers import ProviderConfig, ReflexContext  # noqa: E402
 
 
@@ -188,7 +190,7 @@ HELLO = {"v": 1, "ch": "control", "type": "hello", "d": 1,
 CLOSED = {"v": 1, "ch": "control", "type": "closed"}
 
 
-# ================================================================== unit tests
+# ============================================================ unit tests
 
 class TestValidation(unittest.TestCase):
     def test_every_need_kind_accepts_its_shape(self):
@@ -315,7 +317,8 @@ class TestScriptedReflex(unittest.TestCase):
             ({"kind": "position", "id": 1, "x0": 1, "y0": 0, "x1": 79,
               "y1": 20}, ()),
             (yn_need(1, "Really quit without saving?", choices="yn"), ()),
-            (yn_need(1, "Do you want your possessions identified? [ynq]"), ()),
+            (yn_need(1, "Do you want your possessions identified?"
+                        " [ynq]"), ()),
             ({"kind": "line", "id": 1, "max": 100}, ()),
             ({"kind": "extcmd", "id": 1, "max": 100}, ()),
             (menu_need(1, "m1", "c1"), (row(1, "Yes; start game"),)),
@@ -383,12 +386,13 @@ class TestScriptedReflex(unittest.TestCase):
         self.assertEqual(fresh.intent, "")
 
 
-# =========================================================== integration tests
+# ====================================================== integration tests
 
 class TestController(WireHarness):
     def test_startup_selection_and_quit(self):
         rows_role = [row(3, "an Archeologist"), row(14, "a Valkyrie")]
-        rows_tut = [row(1, "Yes, do a tutorial"), row(2, "No, just start play")]
+        rows_tut = [row(1, "Yes, do a tutorial"),
+                    row(2, "No, just start play")]
         scen = b"".join([
             _line(HELLO),
             _line(obs(1, yn_need(1, "Shall I pick character's race...?"
@@ -529,7 +533,8 @@ class TestRecording(unittest.TestCase):
         d = tempfile.mkdtemp(prefix="auto-rec.")
         rec = recording.EpisodeRecorder(d, 2)
         rec.record_wire(b'{"type":"hello"}\n')
-        rec.record_action(1, 0, protocol.NeedKey(2, 1, 1), {"key": 46}, "sent")
+        rec.record_action(1, 0, protocol.NeedKey(2, 1, 1), {"key": 46},
+                          "sent")
         rec.record_decision({"key": 46}, {"key": 46}, "scripted", "navigate")
         meta = rec.finalize({"stop_reason": "closed"})
         self.assertTrue(meta["recording_complete"])
