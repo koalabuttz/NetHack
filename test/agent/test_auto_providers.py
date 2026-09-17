@@ -2044,6 +2044,81 @@ class TestPostmortemFreshLifecycle(WireHarness):
         self.assertEqual(runner.ledger.strategy_reserved, 0)
         self.assertEqual(runner.ledger.unknown_exposure_calls, 1)
 
+    def test_invoked_exception_keeps_the_full_bound_as_exposure(self):
+        # Medium 1: once deliberate() has been invoked, a missing result is
+        # ambiguous and keeps the reserved bound -- never released
+        runner = self._runner()
+        self.assertTrue(runner.ledger.reserve_strategy(
+            postmortem=True, prompt_tokens=1234, completion_tokens=567))
+        runner._settle_postmortem(None, [], invoked=True)
+        self.assertEqual(runner.ledger.postmortem_dispatched, 1)
+        self.assertEqual(runner.ledger.strategy_dispatched, 1)
+        self.assertEqual(runner.ledger.strategy_reserved, 0)
+        self.assertEqual(runner.ledger.unknown_exposure_calls, 1)
+        self.assertEqual(runner.ledger.unknown_prompt_tokens, 1234)
+        self.assertEqual(runner.ledger.unknown_completion_tokens, 567)
+
+    def test_a_structured_local_refusal_is_still_released(self):
+        # a *structured* refusal (dispatched False, no usage) is a known
+        # pre-dispatch no-op and is released with zero exposure
+        runner = self._runner()
+        self.assertTrue(runner.ledger.reserve_strategy(
+            postmortem=True, prompt_tokens=10, completion_tokens=5))
+        runner._settle_postmortem(
+            StrategyResult(provider="fake", reason="no key", ok=False), [],
+            invoked=True)
+        self.assertEqual(runner.ledger.postmortem_dispatched, 0)
+        self.assertEqual(runner.ledger.strategy_dispatched, 0)
+        self.assertEqual(runner.ledger.unknown_exposure_calls, 0)
+
+    def test_provider_that_raises_after_invocation_keeps_exposure(self):
+        # end to end: a postmortem provider that records the invocation and
+        # then raises is one dispatch, one unknown-exposure call, with the
+        # reserved prompt/completion bound preserved exactly
+        calls = {"n": 0}
+
+        class _Raising(providers.StrategyProvider):
+            name = "raising"
+
+            def available(self, config=None):
+                return Availability(True, "raising")
+
+            def deliberate(self, ctx, deadline=0.0):
+                calls["n"] += 1
+                raise RuntimeError("boom after dispatch")
+
+        ctl = self._controller()
+        real_factory = ctl._new_strategy_provider
+        seen = {"n": 0}
+
+        def factory():
+            # the episode's gameplay provider is real; the postmortem gets a
+            # fresh raiser, just as _new_postmortem_provider builds one
+            seen["n"] += 1
+            return real_factory() if seen["n"] == 1 else _Raising()
+
+        ctl._new_strategy_provider = factory
+        records = [
+            hello(),
+            st_obs(1, command_need(1), dlvl="Dlvl:1", hp=10, hp_max=20),
+            CLOSED,
+        ]
+        proc = paced(records, [0.05, 1.2, 0.05])
+        ctl._spawn = lambda priv: proc
+        result = ctl.run_episode(1)
+        proc.close()
+        self.assertTrue(result.closed)
+        self.assertEqual(calls["n"], 1)          # exactly one postmortem call
+        budget = result.budget
+        self.assertEqual(budget["strategy"]["postmortem_dispatched"], 1)
+        self.assertEqual(budget["strategy"]["reserved"], 0)
+        self.assertEqual(budget["usage"]["unknown_exposure_calls"], 1)
+        # the reserved bound is preserved (not zero, not released)
+        self.assertGreater(budget["usage"]["unknown_exposure_tokens"], 0)
+        pm = self._postmortems()
+        self.assertEqual(len(pm), 1)
+        self.assertEqual(pm[0]["usage"], {})
+
     def test_a_refused_postmortem_books_no_exposure(self):
         # no key -> the provider is unavailable and the postmortem cannot even
         # start: nothing is booked as a dispatched call or as exposure

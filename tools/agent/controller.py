@@ -1361,7 +1361,15 @@ class _EpisodeRunner(object):
             return
         provider = self._new_postmortem_provider()
         deadline = time.monotonic() + self.c.strategy_deadline
+        # Once ``deliberate`` has been *invoked* the reserved call may have
+        # reached the wire, so an exception or a missing result is *ambiguous*
+        # -- exactly like the live/replay strategy paths -- and must keep its
+        # conservative exposure rather than have it erased.  ``invoked`` is
+        # set immediately before the call so a raise from inside the provider
+        # is still recorded as "the call was made".
+        invoked = False
         try:
+            invoked = True
             res = provider.deliberate(ctx, deadline)
         except Exception:                    # noqa: BLE001 - bounded policy
             res = None
@@ -1369,7 +1377,7 @@ class _EpisodeRunner(object):
             # bound and reap the postmortem's own worker so nothing it started
             # survives the episode, even if the call raised mid-flight
             _quench_provider(provider)
-        self._settle_postmortem(res, ctx.boundaries)
+        self._settle_postmortem(res, ctx.boundaries, invoked=invoked)
 
     def _postmortem_summary(self):
         """An allowlisted, deterministic episode summary for the postmortem.
@@ -1408,20 +1416,26 @@ class _EpisodeRunner(object):
         """
         return self.c._new_strategy_provider()
 
-    def _settle_postmortem(self, res, boundaries):
-        """Book the postmortem only once it reached the wire.
+    def _settle_postmortem(self, res, boundaries, invoked: bool = True):
+        """Book the postmortem once it may have reached the wire.
 
-        The reservation is consumed exactly once.  A result that crossed the
-        dispatch boundary -- real usage, a directive answer, a timeout or an
-        HTTP error -- is committed as *dispatched* and keeps its usage or,
-        when no usage came back, its conservative bound as unknown exposure.
-        A call refused before any work started (cancelled, no key, cooldown,
-        spawn failure, or an exception during spawn) is released without
-        booking anything, so the ledger never reports a phantom dispatch or a
-        phantom billing exposure.
+        The reservation is consumed exactly once.  Once ``deliberate`` has
+        been *invoked* the call may have crossed the dispatch boundary, so an
+        exception or an absent result (``res is None``) is treated as
+        *ambiguous* -- exactly like the live/replay strategy paths -- and the
+        reserved conservative bound is committed as unknown exposure; a
+        genuinely lost paid call must never have its exposure erased.
+
+        Only a *structured* result that affirmatively represents a known local
+        refusal -- ``dispatched`` False with neither success nor usage
+        evidence (a cooldown, a missing key, a sticky cancellation, a spawn
+        failure or an oversize payload, all of which the provider reports as a
+        ``StrategyResult``) -- is released without booking anything, so the
+        ledger never reports a phantom dispatch or a phantom billing exposure.
         """
         usage = res.usage if res is not None else None
-        if _crossed_dispatch_boundary(res):
+        ambiguous = invoked and res is None
+        if ambiguous or _crossed_dispatch_boundary(res):
             self.ledger.commit_strategy(usage, postmortem=True)
         else:
             self.ledger.release_strategy()
