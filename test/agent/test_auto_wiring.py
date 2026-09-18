@@ -176,13 +176,39 @@ class RejectionExclusion(WireHarness):
             arbitration.classify_invalid("incomplete", cand).repair)
         self.assertTrue(
             arbitration.classify_invalid("kind", cand).gameplay)
-        # and the controller excludes only on an ordinary invalid
+
+
+class InvalidExclusion(unittest.TestCase):
+    """`_on_invalid` excludes exactly the in-flight attempt's action."""
+
+    def _runner_with_invalid(self, code):
         r = bare_runner()
         r._arm_attempt(1, {"key": EAST})
         sig = r.attempt.action.signature()
-        r._exclude_attempt()
-        rs = r.rejections[candidates.normalize_need_key(r.pending_key)]
+        r.req = types.SimpleNamespace(need={"id": 1}, id=1,
+                                      reset_delivery=lambda: None)
+        r.pending_need = {"id": 1, "kind": "command"}
+        r._invalids = []
+        r.retries = 0
+        r.ledger = types.SimpleNamespace(reflex_invalid=0)
+        r.rec = types.SimpleNamespace(record_decision=lambda **k: None)
+        r.c = types.SimpleNamespace(max_retries=5)
+        r.pending = True
+        r._on_invalid({"code": code})
+        rs = r.rejections.get(
+            candidates.normalize_need_key(r.pending_key))
+        return r, sig, rs
+
+    def test_ordinary_invalid_excludes_the_candidate(self):
+        _r, sig, rs = self._runner_with_invalid("kind")
+        self.assertIsNotNone(rs)
         self.assertTrue(rs.excludes_signature(sig))
+        self.assertGreaterEqual(rs.version, 1)
+
+    def test_incomplete_does_not_exclude_the_candidate(self):
+        _r, sig, rs = self._runner_with_invalid("incomplete")
+        # no gameplay exclusion happened, so no rejection set was created
+        self.assertTrue(rs is None or not rs.excludes_signature(sig))
 
 
 class DirectiveInstanceScope(unittest.TestCase):
