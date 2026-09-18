@@ -38,6 +38,21 @@ from .events import HUNGER_STAGES
 FORCED_SEARCH_PREFIX = "m"
 FORCED_SEARCH_SUFFIX = "s"
 
+#: Their wire key codes (the ``key`` action payload).
+FORCED_SEARCH_PREFIX_CODE = ord("m")
+FORCED_SEARCH_SUFFIX_CODE = ord("s")
+
+#: The proposed-effect label the reflex attaches to a forced-search prefix
+#: candidate so the controller can recognise it without a mapped action.
+FORCED_SEARCH_EFFECT = "forced-search"
+
+#: True once the native prefix/cancellation contract has been proven through
+#: the real adapter by ``test/agent/native_prefix_probe.py`` (gate 6).  It is
+#: a module constant, not a per-run guess: the fixture established that the
+#: ``m`` prefix consumes no game time, the exact following need is a command
+#: need, and native double-``m`` cancels the prefix with no time.
+PREFIX_CONTRACT_VERIFIED = True
+
 #: The episode activation cap: three successful prefixes, then trapped.
 ACTIVATION_CAP = 3
 
@@ -118,6 +133,12 @@ GATE_REASSESS = "g10-reassess"
 
 ACTIVATION_GATES = (GATE_HERO, GATE_HP, GATE_CONDITIONS, GATE_REFUSAL,
                     GATE_EXHAUSTION, GATE_READY, GATE_CAP, GATE_BINDING)
+
+#: The gates the reflex alone can judge (plan 5.3 gates 1-5): identity,
+#: HP, conditions, exact refusal and exhaustion.  The controller owns the
+#: remaining activation gates (transport, cap, binding).
+LOCAL_GATES = (GATE_HERO, GATE_HP, GATE_CONDITIONS, GATE_REFUSAL,
+               GATE_EXHAUSTION)
 
 
 @dataclass(frozen=True)
@@ -252,12 +273,84 @@ def evaluate_reassess(ctx: ForcedSearchContext) -> GateReport:
         "" if ok else "unchanged failed activation would repeat"),))
 
 
+#: The gates rechecked immediately before a suffix send (plan 5.4).  This is
+#: deliberately *not* the full activation set: exhaustion is not re-evaluated
+#: because the prefix is already armed and the only legal continuations are
+#: the bound suffix or a native cancellation, so the relevant question is
+#: whether identity/HP/condition/transport/binding facts still hold.
+BINDING_GATES = (GATE_HERO, GATE_HP, GATE_CONDITIONS, GATE_READY,
+                 GATE_BINDING)
+
+
+def evaluate_binding_gates(ctx: ForcedSearchContext) -> GateReport:
+    """The subset of the activation gates rechecked before a suffix send."""
+    full = evaluate_activation_gates(ctx)
+    keep = {g.gate: g for g in full.gates}
+    return GateReport(tuple(keep[name] for name in BINDING_GATES))
+
+
+#: The gates checked before a *new* activation is proposed: the eight
+#: activation gates plus the reassessment gate 10 (never repeat an unchanged
+#: failed activation).  Gate 9 (outcome) is excluded -- it is only meaningful
+#: after the suffix is sent.
+PROPOSAL_GATES = ACTIVATION_GATES + (GATE_REASSESS,)
+
+
+def evaluate_proposal_gates(ctx: ForcedSearchContext) -> GateReport:
+    """The gates that must all hold before a prefix is proposed (5.3)."""
+    a = evaluate_activation_gates(ctx)
+    r = evaluate_reassess(ctx)
+    return GateReport(tuple(a.gates) + tuple(r.gates))
+
+
 def evaluate_all(ctx: ForcedSearchContext) -> GateReport:
     """All ten gates, for telemetry."""
     a = evaluate_activation_gates(ctx)
     s = evaluate_success_gates(ctx)
     r = evaluate_reassess(ctx)
     return GateReport(tuple(a.gates) + tuple(s.gates) + tuple(r.gates))
+
+
+#: The gate inputs the controller supplies authoritatively.  The reflex's
+#: nomination only contributes its own exhaustion/refusal judgement; every
+#: other public fact (identity, HP, conditions, transport, cap, binding) is
+#: re-derived by the controller from the live observation, so a stale reflex
+#: view cannot activate the dangerous exception.  ``merge_controller_fields``
+#: refuses a name outside this set so a typo cannot silently leave a gate
+#: fail-closed or, worse, silently pass it.
+CONTROLLER_GATE_FIELDS = (
+    "hero_confirmed", "command_need_coherent", "instance_resolved",
+    "transition_pending", "hp", "hp_max", "hunger", "conditions",
+    "conditions_complete", "no_pending_intent", "transport_healthy",
+    "prefix_contract_verified", "activations_used", "bound_suffix_need",
+    "following_need", "planned_suffix", "reassessed",
+    "unchanged_failed_retry",
+)
+
+
+def merge_controller_fields(ctx: ForcedSearchContext, **fields
+                            ) -> ForcedSearchContext:
+    """Overlay the controller-owned gate fields on a reflex-local template.
+
+    Unknown field names are refused so a misspelling cannot quietly leave a
+    gate fail-closed (or silently gate an activation).
+    """
+    bad = [k for k in fields if k not in CONTROLLER_GATE_FIELDS]
+    if bad:
+        raise ValueError("not controller gate fields: %r" % (bad,))
+    data = dict(ctx.__dict__)
+    data.update(fields)
+    return ForcedSearchContext(**data)
+
+
+def local_ok(report: GateReport) -> bool:
+    """True when every reflex-local gate (1-5) passed.
+
+    The controller-only gates are ignored, so a reflex-local template whose
+    controller fields are still fail-closed is not misread as a denial.
+    """
+    seen = {g.gate: g.ok for g in report.gates}
+    return all(seen.get(name, False) for name in LOCAL_GATES)
 
 
 # -- the episode activation cap --------------------------------------------
@@ -491,16 +584,21 @@ def _replace(rec: ForcedSearchTelemetry, **fields) -> ForcedSearchTelemetry:
 
 
 __all__ = [
-    "FORCED_SEARCH_PREFIX", "FORCED_SEARCH_SUFFIX", "ACTIVATION_CAP",
+    "FORCED_SEARCH_PREFIX", "FORCED_SEARCH_SUFFIX",
+    "FORCED_SEARCH_PREFIX_CODE", "FORCED_SEARCH_SUFFIX_CODE",
+    "FORCED_SEARCH_EFFECT", "PREFIX_CONTRACT_VERIFIED", "ACTIVATION_CAP",
     "RISK_LABEL", "TRAPPED_QUIT_REASON",
     "RECOGNIZED_CONDITIONS", "BENIGN_CONDITIONS", "DANGEROUS_CONDITIONS",
     "DENY_HUNGER_STAGES",
     "GateResult", "GateReport", "ForcedSearchContext",
     "GATE_HERO", "GATE_HP", "GATE_CONDITIONS", "GATE_REFUSAL",
     "GATE_EXHAUSTION", "GATE_READY", "GATE_CAP", "GATE_BINDING",
-    "GATE_OUTCOME", "GATE_REASSESS", "ACTIVATION_GATES",
+    "GATE_OUTCOME", "GATE_REASSESS", "ACTIVATION_GATES", "LOCAL_GATES",
+    "BINDING_GATES", "evaluate_binding_gates",
+    "PROPOSAL_GATES", "evaluate_proposal_gates",
     "conditions_ok", "evaluate_activation_gates", "evaluate_success_gates",
     "evaluate_reassess", "evaluate_all",
+    "CONTROLLER_GATE_FIELDS", "merge_controller_fields", "local_ok",
     "ForcedSearchBudget", "ForcedSearchTelemetry",
     "ForcedSearchTransaction", "ForcedSearchTransactionError",
     "STATE_PROPOSED", "STATE_PREFIX_SENT", "STATE_SUFFIX_SENT",

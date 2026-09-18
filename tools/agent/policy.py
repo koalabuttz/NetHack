@@ -35,7 +35,7 @@ import random
 import time
 from typing import Dict, List, Optional, Tuple
 
-from . import candidates, navigation, protocol, recovery, state
+from . import candidates, forced_search, navigation, protocol, recovery, state
 from .arbitration import select_retained
 from .directives import DirectiveView
 from .providers import ReflexContext, ReflexResult, ReflexTimeout
@@ -89,6 +89,25 @@ def menu_kind(title: str) -> str:
     return ""
 
 
+def condition_texts(snapshot) -> Tuple[str, ...]:
+    """The displayed condition names from an observation (public evidence).
+
+    ``snap.cond`` is the engine's ordered condition list of
+    ``{text, color, style}`` records (``doc/agent-v1.schema.json``, the
+    ``cond_entry`` definition).  Only the ``text`` field is a condition name;
+    an entry without one is skipped rather than guessed at.
+    """
+    out = []
+    for entry in getattr(snapshot, "cond", ()) or ():
+        if isinstance(entry, dict):
+            text = (entry.get("text") or "").strip()
+        else:
+            text = ""
+        if text:
+            out.append(text)
+    return tuple(out)
+
+
 class ScriptedReflex(object):
     """Deterministic, always-available scripted decision policy."""
 
@@ -132,6 +151,16 @@ class ScriptedReflex(object):
         # controller-owned SentAttempt lifecycle (set in decide()).
         self.last_prepared = None
         self.last_candidate = None
+        # The reflex-local activation evidence (gates 1-5) of the most recent
+        # forced-search proposal, exposed for the controller to merge with its
+        # own transport/lifecycle gates (wave 5).  None when no proposal was
+        # made.  The reflex never sends anything: it only nominates.
+        self.forced_template = None
+        # The current need's kind and the displayed condition names, bound
+        # from the context at the start of each decision so the forced-search
+        # template reads the same public evidence the decision itself did.
+        self._pending_kind = ""
+        self._conditions = ()
 
     # -- provider surface ------------------------------------------------
     def _check_deadline(self) -> None:
@@ -141,6 +170,8 @@ class ScriptedReflex(object):
     def decide(self, context: ReflexContext) -> ReflexResult:
         self.deadline = float(getattr(context, "deadline", 0.0) or 0.0)
         self.directives = _directive_view(context)
+        self._pending_kind = (context.need or {}).get("kind")
+        self._conditions = condition_texts(context.snapshot)
         self._check_deadline()
         kind = (context.need or {}).get("kind")
         if kind not in ("command", "key", "direction"):
@@ -181,6 +212,8 @@ class ScriptedReflex(object):
         """
         self.deadline = float(getattr(context, "deadline", 0.0) or 0.0)
         self.directives = _directive_view(context)
+        self._pending_kind = (context.need or {}).get("kind")
+        self._conditions = condition_texts(context.snapshot)
         kind = (context.need or {}).get("kind")
         if kind in ("command", "key", "direction"):
             cands = self._command_candidates(context)
@@ -230,14 +263,24 @@ class ScriptedReflex(object):
         an intent, a search counter or an inventory refresh.
         """
         effect = cand.proposed_effect
-        if effect == "prompt":
+        if effect in ("prompt", forced_search.FORCED_SEARCH_EFFECT):
+            # a prompt continuation and a forced-search *nomination* commit no
+            # reflex-local gameplay bookkeeping: the controller owns whether
+            # the dangerous prefix is actually sent, and only a completed
+            # suffix search consumes a search budget (records it on its own
+            # outcome), never the nomination
             return
         self.intent = ""
         if effect == "quit":
             self.quitting = True
             if self.quit_reason == "":
-                self.quit_reason = ("tick-cap" if context.tick
-                                    >= self.max_ticks else "quit")
+                if cand.semantic_label == "trapped":
+                    # the exhaustion fallback is the plan's graceful
+                    # `policy-exhausted/trapped` quit, not a generic quit
+                    self.quit_reason = forced_search.TRAPPED_QUIT_REASON
+                else:
+                    self.quit_reason = ("tick-cap" if context.tick
+                                        >= self.max_ticks else "quit")
         elif effect == "schedule-eat":
             self.last_eat_tick = context.tick
             self.intent = "eat"
@@ -521,15 +564,66 @@ class ScriptedReflex(object):
         Command ``s`` is never an exhaustion fallback (3.5): once the site's
         ordinary search is suppressed, recovery uses a deterministic safe
         alternative step, and when even that is unavailable the reflex
-        requests a bounded graceful quit instead of looping.
+        nominates the single caller-approved dangerous exception (plan 5.3)
+        if its reflex-local gates hold, and otherwise requests a bounded
+        graceful quit instead of looping.  The nomination is only a
+        *proposal*: the controller owns every controller-side gate and the
+        actual two-send transaction (5.4).
         """
         key, why = self._random_move(mem, hero)
         if key != KEY.KEY_SEARCH:
             return (self._cand({"key": key}, "recovery-step", "recovery", 0,
                                "recovery: %s" % why, "recovery"),)
+        template = self._forced_template(mem, hero)
+        if forced_search.local_ok(
+                forced_search.evaluate_activation_gates(template)):
+            self.forced_template = template
+            return (self._cand(
+                {"key": forced_search.FORCED_SEARCH_PREFIX_CODE},
+                "forced-search", "recovery", 0,
+                "trapped: nominate the dangerous forced search",
+                forced_search.FORCED_SEARCH_EFFECT),)
+        self.forced_template = None
         return (self._cand({"key": KEY.KEY_HASH}, "trapped", "other", 0,
                            "search suppressed and no safe alternative: "
                            "request quit", "quit"),)
+
+    def _forced_template(self, mem, hero):
+        """The reflex-local activation evidence (gates 1-5) of a nomination.
+
+        Every gate the reflex alone can judge is filled from public evidence;
+        the controller-owned gates (transport, cap, binding) are left
+        fail-closed so a caller cannot mistake the template for a full
+        activation report.  :func:`forced_search.merge_controller_fields`
+        overlays them before the controller evaluates the gates.
+        """
+        st = mem.status
+        kind = (self._pending_kind or "")
+        commandish = kind in ("command", "key", "direction")
+        refusal = recovery.refusal_in(mem.recent_messages(6))
+        return forced_search.ForcedSearchContext(
+            hero_confirmed=hero is not None,
+            command_need_coherent=commandish,
+            instance_resolved=bool(self.instance_id),
+            transition_pending=False,
+            hp=st.hp, hp_max=st.hp_max,
+            hunger=st.hunger,
+            conditions=self._conditions,
+            conditions_complete=True,
+            refusal_kind=refusal or "",
+            alternatives_exhausted=True,
+            no_pending_intent=False,
+            transport_healthy=False,
+            prefix_contract_verified=False,
+            activations_used=0,
+            bound_suffix_need=(),
+            following_need=(),
+            planned_suffix=forced_search.FORCED_SEARCH_SUFFIX,
+        )
+
+    def forced_search_local(self):
+        """The most recent nomination's reflex-local template, or ``None``."""
+        return self.forced_template
 
     def _observe(self, mem, hero):
         """Fold public messages into the bounded-recovery scoped evidence."""

@@ -25,8 +25,8 @@ for _p in (_ROOT, _HERE):
         sys.path.insert(0, _p)
 
 from tools.agent import (arbitration, candidates,  # noqa: E402
-                         controller, directives, instances, policy,
-                         protocol, state)
+                         controller, directives, forced_search, instances,
+                         policy, protocol, state)
 from tools.agent.providers import ProviderConfig  # noqa: E402
 from test_auto import (CLOSED, HELLO, WireHarness,  # noqa: E402
                        _line, obs)
@@ -80,6 +80,12 @@ def bare_runner():
     r.attempts_armed = 0
     r.reconciliations = 0
     r._last_table_id = ""
+    # wave-5 forced-search transaction state (a bare runner has none live)
+    r.forced = None
+    r.forced_budget = forced_search.ForcedSearchBudget()
+    r._forced_next = None
+    r._forced_suffix_ordinal = None
+    r._forced_failed_fp = None
     r.mem = state.EpisodeMemory()
     r.reflex = policy.ScriptedReflex(ProviderConfig())
     r.pending_key = protocol.NeedKey(1, 1, 1)

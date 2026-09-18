@@ -18,9 +18,12 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
+sys.path.insert(0, HERE)
 
 from tools.agent import forced_search as fs          # noqa: E402
 from tools.agent import recovery                     # noqa: E402
+from test_auto import (CLOSED, HELLO, WireHarness,   # noqa: E402
+                       _line, obs)
 
 
 def good_ctx(**over):
@@ -378,6 +381,163 @@ class BudgetUnit(unittest.TestCase):
         b.consume()
         self.assertFalse(b.allows())
         self.assertTrue(b.exhausted())
+
+
+# -- live wiring through the real controller harness (plan 8.4) ------------
+#
+# These drive the *real* ``_EpisodeRunner`` with a synthetic wire, so the
+# two-send transaction is exercised end to end: the reflex nominates, the
+# controller validates the ten gates, sends the ``m`` prefix, binds the exact
+# following command need's ``s`` suffix, consumes the cap at the first sent
+# prefix, cancels with native double-``m`` and reports ``policy-exhausted``.
+# The local gates are arranged by observation content (HP, an adjacent monster
+# and the engine's exact search-refusal message).
+
+_LIVE_PAL = [[0, " ", "none", 0, "none"], [1, ".", "gray", 0, "none"],
+             [2, "@", "white", 0, "none"], [3, "a", "brown", 0, "none"]]
+# hero at (10,10) with a monster on the only neighbouring cell, so ordinary
+# search is refused and every fallback move is unsafe -- genuinely trapped.
+_LIVE_MAP = [[10, 10, 2], [11, 10, 3]]
+_REFUSAL = ("You already found a monster.  "
+            "Use 'm' prefix to force another search.")
+
+
+def _status(hp, hp_max, t):
+    return {"hitpoints": {"text": str(hp)},
+            "hitpoints-max": {"text": str(hp_max)},
+            "time": {"text": str(t)},
+            "dungeon-level": {"text": "1"}}
+
+
+def _live_obs(seq, i, hp=10, hp_max=10, t=100, msg=_REFUSAL,
+              kind="command", prompt=None):
+    if i is None:
+        need = None
+    else:
+        need = {"kind": kind, "id": i}
+        if kind == "yn":
+            need.update({"prompt": prompt or "Continue?",
+                         "choices": None, "default": None, "numeric": False})
+    rec = obs(seq, need, map_=_LIVE_MAP, pal=_LIVE_PAL,
+              msg=[{"e": seq, "text": msg}] if msg else [])
+    rec["s"] = _status(hp, hp_max, t)
+    return rec
+
+
+def _act_keys(actions):
+    """The outbound action labels in wire order (keys / prompt kinds)."""
+    out = []
+    for a in actions:
+        if a.get("type") != "act":
+            continue
+        action = a.get("action") or {}
+        if "key" in action:
+            out.append(chr(action["key"]))
+        else:
+            out.append(next(iter(action)))
+    return out
+
+
+class LiveWiring(WireHarness):
+    """The real runner proposes, binds, cancels and caps the transaction."""
+
+    def _run(self, recs, max_ticks=200):
+        scenario = b"".join([_line(HELLO)] + [_line(r) for r in recs]
+                            + [_line(CLOSED)])
+        result, actions = self.run_scenario(scenario, max_ticks=max_ticks)
+        return result, _act_keys(actions)
+
+    def test_prefix_then_bound_suffix_succeeds_once(self):
+        recs = [_live_obs(1, 1, t=100), _live_obs(2, 2, t=100),
+                _live_obs(3, 3, t=101), _live_obs(4, None, t=102)]
+        result, keys = self._run(recs)
+        self.assertIn("m", keys)
+        self.assertIn("s", keys)
+        self.assertEqual(result.forced_activations, 1)
+        self.assertEqual(result.forced_suffixes, 1)
+        self.assertEqual(result.forced_successes, 1)
+        # the suffix is the single s bound to the immediately following need
+        self.assertEqual(keys.count("s"), 1)
+
+    def test_activation_cap_persists_and_denies_the_fourth(self):
+        # enough identical trapped command needs to attempt four activations
+        recs = [_live_obs(i, i, t=100 + i) for i in range(1, 12)]
+        result, keys = self._run(recs)
+        self.assertLessEqual(result.forced_activations, fs.ACTIVATION_CAP)
+        self.assertEqual(result.forced_activations, fs.ACTIVATION_CAP)
+        # the fourth attempt is denied by gate 7 and degrades to the trapped
+        # graceful quit, not another search
+        self.assertIn("#", keys)
+        self.assertGreaterEqual(result.forced_denials, 1)
+        self.assertEqual(result.stop_reason, "policy-exhausted")
+
+    def test_hp_exactly_half_denies_the_exception(self):
+        # HP strictly above 50% is required; equality must fail locally, so
+        # the reflex never even nominates and the fallback is the trapped quit
+        recs = [_live_obs(1, 1, hp=5, hp_max=10, t=100),
+                _live_obs(2, 2, hp=5, hp_max=10, t=100)]
+        result, keys = self._run(recs)
+        self.assertNotIn("m", keys)
+        self.assertIn("#", keys)
+        self.assertEqual(result.forced_activations, 0)
+
+    def test_generic_monster_text_does_not_activate(self):
+        # a lookalike that is not the exact correlated refusal never activates
+        recs = [_live_obs(1, 1, msg="You found a monster!", t=100),
+                _live_obs(2, 2, msg="You found a monster!", t=100),
+                _live_obs(3, 3, msg="You found a monster!", t=100)]
+        result, _keys = self._run(recs)
+        self.assertEqual(result.forced_activations, 0)
+
+    def test_no_prefix_leak_when_the_binding_gate_fails(self):
+        # the prefix is armed, but the following need's HP has dropped to 50%:
+        # the suffix cannot bind, so the controller cancels with double-m and
+        # never sends the prefixed search
+        recs = [_live_obs(1, 1, t=100), _live_obs(2, 2, t=100),
+                _live_obs(3, 3, hp=5, hp_max=10, t=100)]
+        result, keys = self._run(recs)
+        self.assertIn("m", keys)
+        self.assertNotIn("s", keys)
+        self.assertEqual(result.forced_suffixes, 0)
+        self.assertGreaterEqual(result.forced_cancels, 1)
+        # the cancellation is the native double-m (two m keys, no time)
+        self.assertEqual(keys.count("m"), 2)
+
+    def test_intervening_prompt_defers_then_binds(self):
+        # an intervening prompt is answered normally (the prefix flag persists
+        # to the *next command*), and the suffix still binds to that command
+        recs = [_live_obs(1, 1, t=100), _live_obs(2, 2, t=100),
+                _live_obs(3, 3, kind="yn", t=100),
+                _live_obs(4, 4, t=101), _live_obs(5, None, t=102)]
+        result, keys = self._run(recs)
+        self.assertIn("m", keys)
+        self.assertIn("yn", keys)
+        self.assertIn("s", keys)
+        # nothing prefixed was sent at the prompt, and the suffix follows it
+        self.assertLess(keys.index("yn"), keys.index("s"))
+        self.assertEqual(result.forced_suffixes, 1)
+        self.assertEqual(result.forced_successes, 1)
+
+    def test_suffix_without_time_advance_fails_and_does_not_repeat(self):
+        recs = [_live_obs(1, 1, t=100), _live_obs(2, 2, t=100),
+                _live_obs(3, 3, t=101), _live_obs(4, 4, t=101),
+                _live_obs(5, 5, t=101)]
+        result, keys = self._run(recs)
+        self.assertIn("s", keys)
+        self.assertEqual(result.forced_successes, 0)
+        self.assertEqual(result.forced_suffixes, 1)
+        # gate 10 refuses to repeat the unchanged failed activation
+        self.assertIn("#", keys)
+
+    def test_tick_cap_after_prefix_cancels_never_quits_prefixed(self):
+        # max_ticks reached after the prefix: the transaction is cancelled
+        # first, and no prefixed quit is ever sent
+        recs = [_live_obs(1, 1, t=100), _live_obs(2, 2, t=100),
+                _live_obs(3, 3, t=100)]
+        result, keys = self._run(recs, max_ticks=2)
+        self.assertIn("m", keys)
+        self.assertNotIn("s", keys)
+        self.assertNotIn("#", keys)
 
 
 if __name__ == "__main__":

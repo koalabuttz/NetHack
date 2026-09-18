@@ -43,7 +43,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from . import arbitration, candidates, instances, protocol, recording
+from . import arbitration, candidates, forced_search, instances
+from . import protocol, recovery, recording
 from . import exploration_metrics
 from . import spectating
 from .budget import BudgetLedger
@@ -51,7 +52,7 @@ from .codec import AssemblerLimit, ChunkError, IncrementalAssembler
 from .directives import DirectiveBook, PreconditionState
 from .events import (BoundaryQueue, EventLedger, directive_event,
                      hunger_index)
-from .policy import INV_STALE_TICKS, ScriptedReflex
+from .policy import INV_STALE_TICKS, ScriptedReflex, condition_texts
 from .protocol import NeedKey, Request, Snapshot
 from .providers import (NullStrategy, ProviderConfig, ReflexContext,
                         ReflexTimeout, ScriptedReflexProvider,
@@ -155,6 +156,18 @@ class EpisodeResult(object):
     # are written on every episode (0/null in none mode).
     spectate_frames_rendered: int = 0
     spectate_disabled_reason: Optional[str] = None
+    # Wave-5 dangerous forced-search telemetry (plan 5.3/5.4).  Activations
+    # count prefixes actually sent (the episode cap); a suffix is a bound,
+    # sent search; a success is an observed, time-advanced suffix.  Denials,
+    # cancels and the trapped quit are counted separately and never merged.
+    forced_activations: int = 0
+    forced_suffixes: int = 0
+    forced_successes: int = 0
+    forced_cancels: int = 0
+    forced_denials: int = 0
+    forced_trapped: int = 0
+    forced_uncleared: int = 0
+    forced_events: List[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -663,6 +676,19 @@ class _EpisodeRunner(object):
         self.reconciliations = 0
         self._last_candidate = None
         self._last_table_id = ""
+        # Wave-5 controller-owned dangerous two-send transaction (plan 5.4).
+        # The episode activation budget persists across instances; the single
+        # live transaction spans the prefix need and the exact following
+        # command need.  ``_forced_next`` is the transaction just proposed at
+        # the current need, installed only once its prefix send completes.
+        self.forced_budget = forced_search.ForcedSearchBudget()
+        self.forced = None
+        self._forced_next = None
+        self._forced_suffix_ordinal = None
+        self._forced_last_report = None
+        # The fingerprint of the last *failed* activation, so gate 10 refuses
+        # an unchanged failed retry (a successful activation clears it).
+        self._forced_failed_fp = None
         self.detected_boundaries = []
         self.need_boundaries = []
         self.low_conf_streak = 0
@@ -998,6 +1024,9 @@ class _EpisodeRunner(object):
                 if self.reflex.quitting and self.reflex.quit_reason == \
                         "tick-cap":
                     self.result.stop_reason = "tick-cap-graceful-quit"
+                elif self.reflex.quitting and self.reflex.quit_reason == \
+                        forced_search.TRAPPED_QUIT_REASON:
+                    self.result.stop_reason = "policy-exhausted"
                 else:
                     self.result.stop_reason = "closed"
             elif self.result.eof:
@@ -1339,9 +1368,18 @@ class _EpisodeRunner(object):
             return
         before = self.attempt_before or {}
         _outcome, kind = self._classify_attempt(before, staged)
+        ordinal = attempt.sent_ordinal
         self.attempt = None
         self.attempt_before = None
         self.reconciliations += 1
+        # The suffix's first observation concludes the dangerous transaction
+        # (5.4): one observed, time-advanced outcome succeeds; anything else
+        # (no-time, unknown, unresolved) fails.  The prefix is never refunded.
+        if (self.forced is not None
+                and self.forced.state == forced_search.STATE_SUFFIX_SENT
+                and self._forced_suffix_ordinal is not None
+                and ordinal == self._forced_suffix_ordinal):
+            self._forced_conclude_suffix(staged, ordinal, before)
         if not signals and hero_usable and kind != "moved":
             # a coherent nonmovement with no arrival signal is affirmative
             # no-arrival evidence (N): keep the old scope, no merge (4.1)
@@ -1349,12 +1387,20 @@ class _EpisodeRunner(object):
         self.instance.observe(tuple(signals), hero_usable)
 
     def _transition_signals(self, staged):
-        """The ``{S, L, O, D}`` transition signals of one observation."""
+        """The ``{S, L, O, D}`` transition signals of one observation.
+
+        Signals are extracted from a *matched sent attempt* plus the temporary
+        observation (plan 4.1), never from an unattributed comparison: with no
+        in-flight attempt no action could have changed the level, so no
+        label-change signal is invented.  (Without this guard the empty
+        pre-action state of a prompt-following observation reads as a level
+        change and spuriously allocates a fresh instance.)
+        """
         out = []
         if self._is_stair_action(self.attempt):
             out.append(instances.S_STAIR)
-        before = self.attempt_before or {}
-        if before.get("dlvl") != staged.status.dlvl:
+        before = self.attempt_before
+        if before and before.get("dlvl") != staged.status.dlvl:
             out.append(instances.S_LABEL)
         if self._arrival_outcome(staged.messages):
             out.append(instances.S_OUTCOME)
@@ -1487,6 +1533,12 @@ class _EpisodeRunner(object):
         # that is true whether or not we have already sent an answer for it.
         if self.req.need is None or self.pending_need is None:
             raise _ProtocolFailure("invalid with no outstanding request")
+        # an invalid for an armed transaction cancels it, including the
+        # `incomplete` delivery-repair case: the dangerous exception is never
+        # continued past a rejection (plan 5.4).  A cancelled armed prefix is
+        # not refunded, so the activation budget is untouched here.
+        if self.forced is not None and self.forced.is_live():
+            self._forced_abort("invalid:%s" % code)
         self._invalids.append(code)
         self.retries += 1
         self.ledger.reflex_invalid += 1
@@ -1527,6 +1579,18 @@ class _EpisodeRunner(object):
         self.instance.stop()
         self.attempt = None
         self.attempt_before = None
+        # A prefix still armed when the episode ends cannot be cleared: record
+        # the un-cleared dangerous prefix honestly rather than pretending a
+        # graceful in-game quit was possible (plan 5.4).  No prefixed action
+        # is ever sent after close.
+        if self.forced is not None and self.forced.is_live():
+            tr = self.forced
+            tr.cancel("episode closed after prefix")
+            self.result.forced_uncleared += 1
+            self._forced_event("closed-uncleared", tr, None)
+        self.forced = None
+        self._forced_next = None
+        self._forced_suffix_ordinal = None
         # one closed/postmortem boundary: detected once, never re-emitted
         self.need_boundaries = self.mem.boundary.check(self.mem.status,
                                                        closed=True)
@@ -2003,6 +2067,228 @@ class _EpisodeRunner(object):
         self.req.mark_page_requested(preq["page"])
         return self._pump(deadline)
 
+    # -- wave-5 dangerous two-send transaction (plan 5.4) ----------------
+    def _forced_transition_pending(self):
+        """A pending/unresolved instance transition blocks activation."""
+        return (self.instance.pending is not None
+                or self.instance.state in (instances.PENDING,
+                                           instances.FRESH_UNRESOLVED))
+
+    def _forced_context(self, need, following):
+        """The authoritative 8-gate activation context (plan 5.3).
+
+        Every public fact is re-derived here from the live observation; the
+        reflex's nomination only supplies its own exhaustion and refusal
+        judgement, so a stale reflex view cannot activate the dangerous
+        exception.  Gates the controller cannot satisfy are fail-closed.
+        """
+        base = getattr(self.reflex, "forced_template", None)
+        if base is None:
+            base = forced_search.ForcedSearchContext()
+        st = self.mem.status
+        kind = need.get("kind")
+        return forced_search.merge_controller_fields(
+            base,
+            hero_confirmed=self.mem.hero is not None,
+            command_need_coherent=kind in ("command", "key", "direction"),
+            instance_resolved=(self.instance.state == instances.ACTIVE),
+            transition_pending=self._forced_transition_pending(),
+            hp=st.hp, hp_max=st.hp_max,
+            hunger=st.hunger,
+            conditions=condition_texts(self.snap),
+            conditions_complete=True,
+            no_pending_intent=(self.attempt is None),
+            transport_healthy=(self.rec_healthy and not self.closed),
+            prefix_contract_verified=forced_search.PREFIX_CONTRACT_VERIFIED,
+            activations_used=self.forced_budget.activations,
+            bound_suffix_need=(),
+            following_need=tuple(following),
+            planned_suffix=forced_search.FORCED_SEARCH_SUFFIX,
+            reassessed=True,
+            unchanged_failed_retry=(self._forced_failed_fp is not None
+                                    and self._forced_failed_fp
+                                    == self._forced_trap_fp()),
+        )
+
+    def _forced_trap_fp(self):
+        """The current pre-action fingerprint a failed retry would repeat."""
+        return self._fingerprint({"hero": self.mem.hero,
+                                  "time": self.mem.status.time})
+
+    def _forced_bindable(self, need, following):
+        """Recheck the still-applicable gates before a suffix send (5.4)."""
+        report = forced_search.evaluate_binding_gates(
+            self._forced_context(need, following))
+        evidence_unchanged = (
+            self.instance.current() == self.forced.instance
+            and not self._forced_transition_pending())
+        return (report, evidence_unchanged)
+
+    def _forced_override(self, need, selected):
+        """Intercept one need for the two-send transaction (plan 5.4).
+
+        Returns ``(action, reason, role)`` where *role* is one of ``prefix``
+        (send ``m``), ``suffix`` (send the bound ``s``), ``cancel`` (clear the
+        armed prefix with native double-``m``) or ``trap`` (no transaction can
+        continue: the trapped graceful quit); ``None`` leaves *selected*
+        unchanged.  A live transaction is always resolved here, so an armed
+        prefix is never handed to a later ordinary command.
+        """
+        kind = need.get("kind")
+        commandish = kind in ("command", "key", "direction")
+        following = candidates.normalize_need_key(self.pending_key)
+        if self.forced is not None:
+            tr = self.forced
+            if tr.state == forced_search.STATE_PREFIX_SENT:
+                if self.tick >= self.reflex.max_ticks:
+                    return ({"key": forced_search.FORCED_SEARCH_PREFIX_CODE},
+                            "forced search: tick cap, cancel", "cancel")
+                if commandish:
+                    report, unchanged = self._forced_bindable(need, following)
+                    if tr.bind_suffix(following, same_instance=True,
+                                      evidence_unchanged=unchanged,
+                                      gates=report):
+                        return (
+                            {"key": forced_search.FORCED_SEARCH_SUFFIX_CODE},
+                            "forced search: suffix s", "suffix")
+                    # cannot bind: cancel the armed prefix
+                    return ({"key": forced_search.FORCED_SEARCH_PREFIX_CODE},
+                            "forced search: cancel (double m)", "cancel")
+                # A non-command need cannot carry the double-m cancellation.
+                # The prefix flag persists until the *next command*, so answer
+                # the prompt normally and clear the prefix at the next command
+                # need; nothing prefixed is ever sent (plan 5.4).
+                return None
+            # a suffix is in flight: hold, never send another prefixed action
+            return None
+        if not commandish or not self._forced_nominated():
+            return None
+        report = forced_search.evaluate_proposal_gates(
+            self._forced_context(need, following))
+        self._forced_last_report = report
+        if not report.ok():
+            self._note_forced_denial(report)
+            return (self._forced_trap_action(),
+                    "forced search denied: trapped", "trap")
+        self._forced_next = forced_search.ForcedSearchTransaction(
+            report, following, self.instance.current() or 0,
+            self.mem.hero or (), self._fingerprint(
+                {"hero": self.mem.hero, "time": self.mem.status.time}),
+            self.forced_budget)
+        return ({"key": forced_search.FORCED_SEARCH_PREFIX_CODE},
+                "forced search: prefix m (dangerous)", "prefix")
+
+    def _forced_nominated(self):
+        """True only when the reflex actually nominated a forced search."""
+        return getattr(self.reflex, "forced_template", None) is not None
+
+    def _note_forced_denial(self, report):
+        self.result.forced_denials += 1
+        self.result.forced_events.append({
+            "event": "denied",
+            "risk_label": forced_search.RISK_LABEL,
+            "failed": [g.gate for g in report.failed()],
+        })
+
+    def _forced_event(self, event, tr, ordinal):
+        self.result.forced_events.append({
+            "event": event,
+            "risk_label": forced_search.RISK_LABEL,
+            "ordinal": ordinal,
+            "activation": tr.telemetry.activation_ordinal if tr else None,
+            "state": tr.state if tr else None,
+        })
+
+    def _forced_after_send(self, role, ordinal):
+        """Advance the transaction once a send has completed (5.4)."""
+        if role == "prefix":
+            tr = self._forced_next
+            self._forced_next = None
+            if tr is None:
+                return
+            tr.on_prefix_sent("m%d" % ordinal)
+            st = self.mem.status
+            tr.note_before(st.hp, st.hp_max, st.time)
+            self.forced = tr
+            self.result.forced_activations += 1
+            self._forced_event("prefix-sent", tr, ordinal)
+        elif role == "suffix":
+            tr = self.forced
+            if tr is None:
+                return
+            tr.on_suffix_sent("s%d" % ordinal)
+            self._forced_suffix_ordinal = ordinal
+            self.result.forced_suffixes += 1
+            self._forced_event("suffix-sent", tr, ordinal)
+        elif role == "cancel":
+            tr = self.forced
+            self.forced = None
+            self._forced_suffix_ordinal = None
+            if tr is not None:
+                tr.cancel("need mismatch or gate change")
+                self.result.forced_cancels += 1
+                self._forced_event("cancelled", tr, ordinal)
+        elif role == "trap":
+            tr = self.forced
+            self.forced = None
+            self._forced_suffix_ordinal = None
+            if tr is not None and tr.is_live():
+                tr.cancel("uncleared prefix")
+                self.result.forced_uncleared += 1
+                self._forced_event("uncleared", tr, ordinal)
+            self.result.forced_trapped += 1
+
+    def _forced_on_write_failed(self, role):
+        """A failed write of the prefix consumes nothing (5.4)."""
+        if role == "prefix" and self._forced_next is not None:
+            self._forced_next.on_prefix_failed("write failed")
+            self._forced_next = None
+
+    def _forced_conclude_suffix(self, staged, ordinal, before):
+        """Conclude the transaction from the observed suffix outcome (5.4)."""
+        tr = self.forced
+        if tr is None:
+            return
+        bt = before.get("time")
+        nt = staged.status.time
+        delta = (nt - bt) if (bt is not None and nt is not None) else None
+        time_advanced = bool(delta is not None and delta > 0)
+        state = tr.on_suffix_outcome(True, time_advanced, after_time=nt,
+                                     after_hp=staged.status.hp)
+        if state == forced_search.STATE_SUCCEEDED:
+            self.result.forced_successes += 1
+            self._forced_failed_fp = None
+        else:
+            # gate 10: an unchanged failed activation must not auto-repeat
+            self._forced_failed_fp = self._forced_trap_fp()
+        self.forced = None
+        self._forced_suffix_ordinal = None
+        self._forced_event("suffix-outcome:%s" % state, tr, ordinal)
+
+    def _forced_abort(self, reason):
+        """Cancel any live transaction without sending a prefixed action."""
+        tr = self.forced
+        self.forced = None
+        self._forced_next = None
+        self._forced_suffix_ordinal = None
+        if tr is not None and tr.is_live():
+            tr.cancel(reason)
+            self.result.forced_cancels += 1
+            self._forced_event("cancelled:%s" % reason, tr, None)
+
+    def _forced_trap_action(self):
+        """The plan's graceful ``policy-exhausted/trapped`` quit (5.3).
+
+        When the hero is genuinely trapped and the exception cannot run, the
+        fallback is a deliberate bounded quit, never endless ordinary search.
+        The quit flag is set on the reflex so the episode's stop reason is
+        reported distinctly rather than as a generic quit.
+        """
+        self.reflex.quitting = True
+        if not self.reflex.quit_reason:
+            self.reflex.quit_reason = forced_search.TRAPPED_QUIT_REASON
+        return {"key": protocol.KEY_HASH}
+
     def _answer_now(self, deadline) -> bool:
         need = self.pending_need
         proposal, provider, reason, latency, usage, decided_low = \
@@ -2032,6 +2318,15 @@ class _EpisodeRunner(object):
             else:
                 selected = proposal
                 sel_reason = reason
+        # Wave 5: the controller-owned two-send transaction overrides the
+        # ordinary selection *after* the final fallback decision, so an armed
+        # prefix is resolved here and never handed to a later command (5.4).
+        role = ""
+        override = self._forced_override(need, selected)
+        if override is not None:
+            selected, sel_reason, role = override
+            provider = "scripted"
+            low = (role == "trap")
         self._note_low_conf(low)
         self._activate_pending_directives(need)
         view = self.book.view(self.tick, self.mem.status.dlvl,
@@ -2046,14 +2341,20 @@ class _EpisodeRunner(object):
             reason=sel_reason, boundaries=boundaries, latency=latency,
             usage=usage, directives=directives)
         obj = protocol.make_act(self.pending_seq, need["id"], selected)
-        ordinal = self._emit("act", obj, need_key=self.pending_key,
-                             write_deadline=write_dl)
+        try:
+            ordinal = self._emit("act", obj, need_key=self.pending_key,
+                                 write_deadline=write_dl)
+        except _TransportFailure:
+            self._forced_on_write_failed(role)
+            raise
         # requested/pending state mutates only after the complete send
         if need.get("kind") in ("command", "key", "direction"):
             # Only a successful complete send arms the single SentAttempt
             # (plan 3.4 step 5); a failed write raised above and armed none.
             self._arm_attempt(ordinal, selected)
             self.tick += 1
+        if role:
+            self._forced_after_send(role, ordinal)
         self.pending = False
         self.force_fallback = False
         return True
@@ -2090,6 +2391,9 @@ class _EpisodeRunner(object):
         st = self.mem.status
         view = self.book.view(self.tick, st.dlvl, self._precondition_state(),
                               instance=self.instance.current())
+        # The reflex's instance scope is the controller's active instance, so
+        # a nomination or directive can never bind to an old level scope.
+        self.reflex.instance_id = self.instance.current() or 0
         rs = self._rejection_for(self.pending_key)
         self.reflex.rejection_version = rs.version
         return ReflexContext(
@@ -2299,6 +2603,20 @@ def _episode_summary(r: EpisodeResult) -> dict:
         "invalids": r.invalids,
         "boundaries": r.boundaries, "strategy_calls": r.strategy_calls,
         "directives_applied": r.directives_applied,
+        # Wave-5 dangerous forced search: activations (prefixes sent), sent
+        # suffixes, time-advanced successes, cancels, gate denials, trapped
+        # quits and un-cleared prefixes are reported separately and never
+        # merged into a single "risky" figure.
+        "forced_search": {
+            "activations": r.forced_activations,
+            "suffixes": r.forced_suffixes,
+            "successes": r.forced_successes,
+            "cancels": r.forced_cancels,
+            "denials": r.forced_denials,
+            "trapped": r.forced_trapped,
+            "uncleared": r.forced_uncleared,
+            "events": list(r.forced_events),
+        },
         # Reported usage, unknown-price calls and unknown *exposure* are three
         # distinct things: the first is asserted cost, the second is a real
         # answer whose price is unknown, the third is a call that reached the
@@ -2331,6 +2649,10 @@ def campaign_summary(results, config, episode_timeout: float) -> dict:
     episodes = [_episode_summary(r) for r in results]
     totals = {"ticks": 0, "needs": 0, "actions": 0, "invalids": 0,
               "boundaries": 0, "strategy_calls": 0, "directives_applied": 0,
+              "forced_activations": 0, "forced_suffixes": 0,
+              "forced_successes": 0, "forced_cancels": 0,
+              "forced_denials": 0, "forced_trapped": 0,
+              "forced_uncleared": 0,
               "prompt_tokens": 0, "completion_tokens": 0,
               "estimated_usd": 0.0, "unknown_price_calls": 0,
               "unknown_exposure_calls": 0, "unknown_exposure_tokens": 0,
@@ -2342,6 +2664,10 @@ def campaign_summary(results, config, episode_timeout: float) -> dict:
         for key in ("ticks", "needs", "actions", "invalids", "boundaries",
                     "strategy_calls", "directives_applied"):
             totals[key] += e[key]
+        f = e["forced_search"]
+        for key in ("activations", "suffixes", "successes", "cancels",
+                    "denials", "trapped", "uncleared"):
+            totals["forced_" + key] += f[key]
         u = e["usage"]
         totals["prompt_tokens"] += u["prompt_tokens"]
         totals["completion_tokens"] += u["completion_tokens"]
