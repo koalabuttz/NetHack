@@ -317,6 +317,32 @@ class TestJevRenderingRefusal(WireHarness):
             self.assertEqual(runner.ledger.reflex_paid_dispatched, 0)
             fake.cancel()
 
+    def test_contradictory_open_door_refuses_wholly_pre_dispatch(self):
+        # (e) a retained table holding one contradictory open-door candidate --
+        # an open-door label on a frozen Eat action -- refuses the *whole*
+        # request before reservation and dispatch: no key is sent to Jev, no
+        # paid call is reserved or attempted, and no endpoint request is made,
+        # even though the genuine open command in the same table is renderable.
+        from test_auto_providers import FakeEndpoint
+
+        with mock.patch.dict(os.environ, {"JEV_API_KEY": "jev-refusal"}):
+            ep = FakeEndpoint()
+            self.addCleanup(ep.close)
+            fake = self._reflex(ep.base_url)
+            table = table_of([cand(KEY.KEY_OPEN, "open-door"),
+                              cand(KEY.KEY_EAT, "open door south")])
+            runner, _ = self._runner(fake)
+            runner.reflex.prepare = lambda ctx: candidates.PreparedReflex(
+                immutable_features=candidates.ReflexFeatures(), table=table)
+            runner.pending_need = COMMAND
+            ctx = runner._reflex_context(COMMAND, None)
+            runner._decide_jev(ctx, None, time.monotonic())
+            self.assertEqual(fake.last_refusal, "unsupported-semantic")
+            self.assertEqual(ep.requests, [])
+            self.assertEqual(runner.ledger.reflex_paid_dispatched, 0)
+            self.assertEqual(runner.ledger.reflex_attempted, 0)
+            fake.cancel()
+
     def test_optional_evidence_missing_degrades_without_refusal(self):
         # absent terrain classification, route purpose and occupant data are
         # *optional*: the shorter template is used and nothing refuses
@@ -452,35 +478,65 @@ class TestJevCriteria(unittest.TestCase):
                          "Move east toward the adjacent closed door; it may "
                          "block movement.")
 
-    def test_open_door_family_renderable(self):
+    def test_open_door_requires_the_open_command(self):
+        # opening semantics come from the frozen canonical action, never from
+        # the semantic label: (a) a frozen open-command initiation
         ctx = context_of(COMMAND)
-        south = cand(KEY.KEY_EAT, "open door south")
-        unbound = cand(KEY.KEY_WAIT, "open-door")
-        # the option keys come from the frozen label, not from a parsed key
-        keys, _key_index, refusal = presentation.option_keys(
-            "command", [south, unbound])
+        initiate = cand(KEY.KEY_OPEN, "open-door")
+        text, refusal = presentation.render_criterion(initiate, "command", ctx)
         self.assertEqual(refusal, "")
-        self.assertEqual(keys, ["open-door-south", "open-door"])
-        # a bound direction selects the untyped directional template
-        text, refusal = presentation.render_criterion(south, "command", ctx)
+        self.assertEqual(text, presentation.DOOR_INITIATE_TEMPLATE)
+        # the option keys still come from the frozen label, not a parsed key
+        south_labelled = cand(KEY.KEY_OPEN, "open door south")
+        keys, _key_index, refusal = presentation.option_keys(
+            "command", [initiate, south_labelled])
+        self.assertEqual(refusal, "")
+        self.assertEqual(keys, ["open-door", "open-door-south"])
+        # (b) a direction bound on the frozen candidate is the directional form
+        bound = cand(KEY.KEY_OPEN, "open-door", direction=(0, 1))
+        text, refusal = presentation.render_criterion(bound, "command", ctx)
         self.assertEqual(refusal, "")
         self.assertEqual(text, "Try to open the door to the south.")
         self.assertNotIn("locked", text)
-        # an exact door-type binding selects the typed template
-        typed = cand(KEY.KEY_EAT, "open door south",
+        # a compass named by the label is the same directional form
+        text, refusal = presentation.render_criterion(south_labelled,
+                                                      "command", ctx)
+        self.assertEqual(refusal, "")
+        self.assertEqual(text, "Try to open the door to the south.")
+        self.assertNotIn("locked", text)
+        # (c) an exact frozen door-type binding selects the typed template
+        typed = cand(KEY.KEY_OPEN, "open-door", direction=(0, 1),
                      effect_payload=({"door_type": "closed"},))
         text, refusal = presentation.render_criterion(typed, "command", ctx)
         self.assertEqual(refusal, "")
         self.assertEqual(text, "Try to open the closed door to the south.")
         self.assertNotIn("locked", text)
-        # a direction bound on the frozen candidate (absent from the label)
-        bound = cand(KEY.KEY_WAIT, "open-door", direction=(0, 1))
-        text, _ = presentation.render_criterion(bound, "command", ctx)
-        self.assertEqual(text, "Try to open the door to the south.")
-        # an unbound member is the initiation form, never a refusal
-        text, refusal = presentation.render_criterion(unbound, "command", ctx)
-        self.assertEqual(refusal, "")
-        self.assertEqual(text, presentation.DOOR_INITIATE_TEMPLATE)
+
+    def test_open_door_label_cannot_override_the_action(self):
+        # (d) any non-open canonical action carrying an open-door label refuses
+        # the whole request: opening prose can never describe Eat, Wait, a
+        # movement step, a search or an arbitrary key.
+        ctx = context_of(COMMAND)
+        contradicting = [
+            cand(KEY.KEY_EAT, "open door south"),
+            cand(KEY.KEY_WAIT, "open-door"),
+            cand(KEY.KEY_L, "open-door"),              # movement key
+            cand(KEY.KEY_SEARCH, "open door north"),   # search key
+            cand(200, "open-door"),                    # arbitrary key
+        ]
+        for member in contradicting:
+            with self.subTest(key=member.action.payload[0]):
+                text, refusal = presentation.render_criterion(
+                    member, "command", ctx)
+                self.assertIsNone(text)
+                self.assertEqual(refusal,
+                                 presentation.REFUSAL_UNSUPPORTED_SEMANTIC)
+        # a mixed table refuses wholly -- never a selective drop of the one
+        # contradictory member while the genuine open command is presented
+        members = [cand(KEY.KEY_OPEN, "open-door"), contradicting[0]]
+        frozen, why = presentation.present("command", members, ctx)
+        self.assertIsNone(frozen)
+        self.assertEqual(why, presentation.REFUSAL_UNSUPPORTED_SEMANTIC)
 
     def test_movement_purpose_families_renderable(self):
         ctx = context_of(COMMAND, terrain={(6, 5): instances.T_FLOOR})

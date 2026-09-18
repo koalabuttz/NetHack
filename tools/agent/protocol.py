@@ -57,6 +57,7 @@ KEY_Y, KEY_U, KEY_B, KEY_N = ord("y"), ord("u"), ord("b"), ord("n")
 KEY_WAIT = ord(".")
 KEY_SEARCH = ord("s")
 KEY_EAT = ord("e")
+KEY_OPEN = ord("o")            # open a door / unlock (cmd.c: "open", doopen)
 KEY_INV = ord("i")
 KEY_PICKUP = ord(",")
 KEY_ESC = 27

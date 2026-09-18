@@ -368,6 +368,30 @@ MOVEMENT_PURPOSE_STEMS = ("escape", "random-move", "recovery-step", "unblock")
 #: by the label, e.g. ``open-door-south``).
 OPEN_DOOR_STEMS = ("open", "open-door")
 
+#: The canonical open-door command: the native ``o`` key (``src/cmd.c`` binds
+#: ``"open"`` to ``doopen``; ``#open`` is the same operation).  Only a key
+#: action carrying this code *establishes opening semantics*: the semantic
+#: label may choose the key *family*, but it can never turn another action
+#: (Eat, Wait, Search, a movement key, an arbitrary key) into an open-door
+#: command.
+OPEN_DOOR_KEY = protocol.KEY_OPEN
+
+
+def open_door_command(candidate) -> bool:
+    """True only when the frozen canonical action *is* the open-door command.
+
+    The action is authoritative and the label is not: opening semantics need a
+    ``key`` action whose code is exactly the native open command.  Every other
+    action shape -- including a movement key, whose immediate effect is a walk
+    -- does not establish opening and must be refused rather than described as
+    opening a door.
+    """
+    action = getattr(candidate, "action", None)
+    if action is None or getattr(action, "tag", None) != "key":
+        return False
+    payload = getattr(action, "payload", ()) or ()
+    return bool(payload) and payload[0] == OPEN_DOOR_KEY
+
 
 def _bound_compass(candidate) -> Optional[str]:
     """The compass bound to a frozen candidate, decoded from the candidate.
@@ -407,15 +431,23 @@ def _bound_door_type(candidate) -> str:
 
 
 def _door_open_text(candidate, stem: str) -> Tuple[str, str]:
-    """The open-door template for one member of the approved family.
+    """The open-door template for a frozen *open command*, or a refusal.
 
-    A bound direction -- taken from the frozen candidate or from the stem
-    itself -- selects the directional template, typed when an exact
-    door-type binding exists and untyped otherwise.  With no bound direction
-    the member is the initiation form, which chooses its direction at the next
-    prompt.  ``locked`` is never fabricated.
+    Opening semantics come from the canonical action alone: a member whose
+    frozen action is not the native open command refuses the whole request
+    (``unsupported-semantic``) however its label reads, so Eat, Wait, Search,
+    movement and arbitrary keys are never described as opening a door.  For the
+    canonical command a bound direction -- the frozen candidate's ``direction``
+    field, or failing that a compass named by the label stem -- selects the
+    directional template, typed when an exact door-type binding exists and
+    untyped otherwise.  With no bound direction the member is the initiation
+    form, which chooses its direction at the next prompt: that direction is a
+    later choice, not a binding required *here*, so the initiation renders
+    rather than refusing.  ``locked`` is never fabricated.
     """
-    direction = open_door_direction(stem) or _bound_compass(candidate)
+    if not open_door_command(candidate):
+        return (None, REFUSAL_UNSUPPORTED_SEMANTIC)
+    direction = _bound_compass(candidate) or open_door_direction(stem)
     if direction is None:
         return (DOOR_INITIATE_TEMPLATE, "")
     door_type = _bound_door_type(candidate)
@@ -582,6 +614,13 @@ def render_criterion(candidate, need_kind: str, context) -> Tuple[
         return (None, REFUSAL_UNSUPPORTED_SEMANTIC)
     stem = command_stem(candidate.semantic_label)
     compass = movement_of(candidate)
+    # The open-door family is judged on the *canonical action*, ahead of every
+    # label- or movement-driven reading: an ``open-door*`` label on a frozen
+    # action that is not the open command refuses the whole request instead of
+    # being described as opening a door -- or, when it is a movement key,
+    # instead of being lossily re-read as a plain walk.
+    if stem is not None and open_door_stem(stem):
+        return _door_open_text(candidate, stem)
     # A withdrawal/recovery label keeps its decoded purpose even when the
     # canonical action is a movement key: the purpose outranks a plain walk.
     if stem is not None and stem in MOVEMENT_PURPOSE_STEMS:
@@ -591,13 +630,10 @@ def render_criterion(candidate, need_kind: str, context) -> Tuple[
         # and its criterion is the walk template (which may name an adjacent
         # *confirmed* closed door, never a remembered doorway).
         return _walk_text(candidate, compass, context)
-    # Non-movement command members: the approved open-door family first, then
-    # the labelled command templates.  A label that cannot be normalized
-    # refuses rather than being lossily aliased.
+    # Non-movement command members: the labelled command templates.  A label
+    # that cannot be normalized refuses rather than being lossily aliased.
     if stem is None:
         return (None, REFUSAL_INVALID_LABEL)
-    if open_door_stem(stem):
-        return _door_open_text(candidate, stem)
     if candidate.action.payload[0] == protocol.KEY_SEARCH \
             and stem != "forced-search":
         return _command_text(candidate, "search-in-place", context)
