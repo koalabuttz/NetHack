@@ -77,7 +77,7 @@ def validate_spectate(destination, interval):
     return None
 
 
-# ------------------------------------------------------------------ fd helpers
+# ---------------------------------------------------------- fd helpers
 
 def _close_fd(fd):
     try:
@@ -143,7 +143,7 @@ def _pipe_buf(fd):
     return value if value > 0 else select.PIPE_BUF
 
 
-# ------------------------------------------------------------------ destination
+# ---------------------------------------------------------- destination
 
 class RenderDestination(object):
     """One owned descriptor for rendered frames, written under a deadline.

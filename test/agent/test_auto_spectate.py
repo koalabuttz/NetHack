@@ -23,6 +23,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -707,6 +708,7 @@ class WriteSeams(object):
         self.select_calls = 0
         self.write_calls = 0
         self.written = []
+        self.view_lengths = []
 
     def select(self, r, w, x, timeout):
         self.select_calls += 1
@@ -722,6 +724,7 @@ class WriteSeams(object):
             raise BlockingIOError
         if self.zero:
             return 0
+        self.view_lengths.append(len(view))
         self.write_calls += 1
         n = min(self.chunk, len(view))
         self.written.append(bytes(view[:n]))
@@ -742,6 +745,10 @@ class BoundedWrites(unittest.TestCase):
         self.assertTrue(dest.write(b"0123456789", deadline=clk() + 100))
         self.assertEqual(seams.written, [b"0123", b"4567", b"89"])
         self.assertEqual(dest.bytes_written, 10)
+        # The destination itself never hands the sink more than the chunk
+        # bound (PIPE_BUF by default); the seam here caps at 4.
+        self.assertTrue(seams.view_lengths)
+        self.assertLessEqual(max(seams.view_lengths), 4)
 
     def test_select_before_every_write(self):
         clk = _Clock()
@@ -1359,6 +1366,13 @@ class IntegrationIsolation(unittest.TestCase):
         self.assertIn(b"auto episode=1", frames)
         self.assertGreaterEqual(spec_res.spectate_frames_rendered, 1)
         self.assertIsNone(spec_res.spectate_disabled_reason)
+        # The final frame is a fresh composition (settled counters, resolved
+        # stop reason and outcome), never a replay of an observation.
+        self.assertIn(b" final stop=", frames)
+        self.assertIn(b"outcome=", frames)
+        # One offer per accepted marker (plus the final frame): a candidate is
+        # never recomposed and re-offered when no new snapshot arrived.
+        self.assertLessEqual(spec_res.spectate_frames_rendered, 5)
 
 
 class HookIsolation(unittest.TestCase):
@@ -1429,6 +1443,90 @@ class HookIsolation(unittest.TestCase):
         self.assertEqual(res.stop_reason, "closed")
         self.assertEqual(res.spectate_disabled_reason, "open-failed")
         self.assertEqual(res.spectate_frames_rendered, 0)
+
+    def test_close_fault_appears_in_meta(self):
+        # A close fault must be recorded in the meta, which is only possible
+        # because the guarded close and its stats copy run BEFORE the
+        # recording is finalized.
+        from tools.agent import controller as C
+        res, _, out_dir = self._inject_and_run(
+            self._fail(spectating.RenderStream, "close"))
+        with open(os.path.join(out_dir, "ep-1.meta.json")) as fh:
+            meta = json.load(fh)
+        self.assertEqual(meta["spectate_disabled_reason"], "close-error")
+        self.assertIn("spectate_frames_rendered", meta)
+
+
+class ReadlineRenderWake(unittest.TestCase):
+    """The _readline select timeout is capped by a due frame."""
+
+    def test_select_timeout_is_capped_by_due_frame(self):
+        from tools.agent import controller as C
+
+        class _Stream(object):
+            def __init__(self, due):
+                self._due = due
+                self.flushes = []
+
+            def next_due(self):
+                return self._due
+
+            def flush(self, force=False, deadline_cap=None):
+                self.flushes.append(deadline_cap)
+
+        runner = object.__new__(C._EpisodeRunner)
+        runner.buf = b""
+        runner.deadline = time.monotonic() + 5.0
+        runner.spectate = _Stream(time.monotonic() + 0.3)
+        runner.proc = types.SimpleNamespace(
+            stdout=types.SimpleNamespace(fileno=lambda: -1))
+
+        calls = []
+
+        class _Stop(Exception):
+            pass
+
+        original = C.select.select
+
+        def fake_select(r, w, x, timeout):
+            calls.append(timeout)
+            raise _Stop()
+
+        C.select.select = fake_select
+        try:
+            with self.assertRaises(_Stop):
+                runner._readline(None)
+        finally:
+            C.select.select = original
+        self.assertTrue(calls)
+        # A due render wake caps the wait well below the 1.0s wire tick.
+        self.assertLess(calls[0], 0.9)
+
+
+class ComparatorNormalizer(unittest.TestCase):
+    """The comparator normalizes ONLY the approved timing fields."""
+
+    def test_approved_timing_fields_are_dropped(self):
+        row = {"schema": 1, "ordinal": 2, "kind": "act", "t": 0.5}
+        self.assertNotIn("t", _normalize_actions([row])[0])
+        dec = {"schema": 1, "reason": "x", "latency": 0.1, "t": 0.2}
+        self.assertNotIn("latency", _normalize_decisions([dec])[0])
+        self.assertNotIn("t", _normalize_decisions([dec])[0])
+        ev = {"schema": 1, "state": "queued", "wall": 1.0}
+        self.assertNotIn("wall", _normalize_events([ev])[0])
+
+    def test_semantic_fields_survive_normalization(self):
+        # A difference in a *semantic* field must remain visible to the
+        # comparator; broadening the normalizer to hide it is a mutation the
+        # suite rejects.
+        a = {"schema": 1, "ordinal": 1, "kind": "act", "reason": "r1",
+             "status": "sent"}
+        b = dict(a, kind="get_page", status="write-failed")
+        self.assertNotEqual(_normalize_actions([a]), _normalize_actions([b]))
+        d1 = {"schema": 1, "reason": "validated", "directives": [{"x": 1}]}
+        d2 = {"schema": 1, "reason": "fallback", "directives": []}
+        self.assertNotEqual(_normalize_decisions([d1]),
+                            _normalize_decisions([d2]))
 
 
 class MultiEpisodeIsolation(unittest.TestCase):
