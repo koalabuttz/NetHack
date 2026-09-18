@@ -1,0 +1,7447 @@
+{
+ "fixtures": {
+  "direction_need": {
+   "canned_response": {
+    "chosen_retained_index": 1,
+    "confidence": 0.9,
+    "probabilities": [
+     0.014285714285714282,
+     0.9,
+     0.014285714285714282,
+     0.014285714285714282,
+     0.014285714285714282,
+     0.014285714285714282,
+     0.014285714285714282,
+     0.014285714285714282
+    ],
+    "usage": {
+     "input_tokens": 312,
+     "output_tokens": 48
+    }
+   },
+   "capture": {
+    "adapter_version": "jev-choice/2",
+    "commit": "20a70154a98ad8a81ee234ff1188ac8a6c6d9ae4",
+    "tick_context": {
+     "need_id": 7,
+     "need_kind": "direction",
+     "tick": 100
+    }
+   },
+   "expected_legacy_parser_selected_index": 1,
+   "expected_outcome": "selected",
+   "frozen_context": {
+    "directives": [],
+    "intent": "",
+    "memory": {
+     "hero": [
+      41,
+      10
+     ],
+     "inventory": {
+      "rows": [
+       {
+        "r": 1,
+        "selectable": true,
+        "text": "a food ration"
+       },
+       {
+        "r": 2,
+        "selectable": true,
+        "text": "b - a dagger"
+       }
+      ],
+      "seen_tick": 100,
+      "seen_time": 100
+     },
+     "messages": [],
+     "stairs_down": [],
+     "stairs_up": [],
+     "status": {
+      "dlvl": "1",
+      "gold": null,
+      "hp": 12,
+      "hp_max": 12,
+      "hunger": "",
+      "level": 3,
+      "time": 100
+     }
+    },
+    "need": {
+     "id": 7,
+     "kind": "direction",
+     "prompt": "In what direction?"
+    },
+    "need_key": [
+     1,
+     1,
+     7
+    ],
+    "pages": [],
+    "snapshot": {
+     "cond": [],
+     "map": {
+      "37,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,10": [
+       "@",
+       "white",
+       0,
+       "none"
+      ],
+      "41,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ]
+     },
+     "msg": [],
+     "s": {
+      "dungeon-level": {
+       "text": "1"
+      },
+      "experience-level": {
+       "text": "3"
+      },
+      "hitpoints": {
+       "text": "12"
+      },
+      "hitpoints-max": {
+       "text": "12"
+      },
+      "hunger": {
+       "text": ""
+      },
+      "time": {
+       "text": "100"
+      }
+     }
+    },
+    "terrain": {
+     "occupancy": {
+      "41,10": "hero-or-human"
+     },
+     "terrain": {
+      "37,10": "floor",
+      "37,11": "floor",
+      "37,12": "floor",
+      "37,13": "floor",
+      "37,7": "floor",
+      "37,8": "floor",
+      "37,9": "floor",
+      "38,10": "floor",
+      "38,11": "floor",
+      "38,12": "floor",
+      "38,13": "floor",
+      "38,7": "floor",
+      "38,8": "floor",
+      "38,9": "floor",
+      "39,10": "floor",
+      "39,11": "floor",
+      "39,12": "floor",
+      "39,13": "floor",
+      "39,7": "floor",
+      "39,8": "floor",
+      "39,9": "floor",
+      "40,10": "floor",
+      "40,11": "floor",
+      "40,12": "floor",
+      "40,13": "floor",
+      "40,7": "floor",
+      "40,8": "floor",
+      "40,9": "floor",
+      "41,10": "unknown",
+      "41,11": "floor",
+      "41,12": "floor",
+      "41,13": "floor",
+      "41,7": "floor",
+      "41,8": "floor",
+      "41,9": "floor",
+      "42,10": "floor",
+      "42,11": "floor",
+      "42,12": "floor",
+      "42,13": "floor",
+      "42,7": "floor",
+      "42,8": "floor",
+      "42,9": "floor",
+      "43,10": "floor",
+      "43,11": "floor",
+      "43,12": "floor",
+      "43,13": "floor",
+      "43,7": "floor",
+      "43,8": "floor",
+      "43,9": "floor",
+      "44,10": "floor",
+      "44,11": "floor",
+      "44,12": "floor",
+      "44,13": "floor",
+      "44,7": "floor",
+      "44,8": "floor",
+      "44,9": "floor",
+      "45,10": "floor",
+      "45,11": "floor",
+      "45,12": "floor",
+      "45,13": "floor",
+      "45,7": "floor",
+      "45,8": "floor",
+      "45,9": "floor"
+     }
+    },
+    "tick": 100
+   },
+   "legacy_body": "bodies/direction_need.json",
+   "retained_table": {
+    "candidates": [
+     {
+      "action": {
+       "key": 107
+      },
+      "action_signature": "40aed197bd15af3e2bad93492c6105d9576da943f3bbb4212b22d644761b6de3",
+      "candidate_id": "d1757669e6c262e5afb36d9c9cbeab8a8a85217d4add16631a92cb88d77d08cb",
+      "direction": [
+       0,
+       -1
+      ],
+      "direction_rank": 1,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 104
+      },
+      "action_signature": "102da1b4731c1fb42c416e01122bf71e99cf05ec14c3cfd515a4fcbd7d905c22",
+      "candidate_id": "7e60c65a48afb8f753b7af502cf0113df3bdd1e7f7003eccb099051379a536f2",
+      "direction": [
+       -1,
+       0
+      ],
+      "direction_rank": 3,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 108
+      },
+      "action_signature": "4581e66cefda5e86b40d915b37f72452ae9d739a69dec1bf332c8ffae14e6bdb",
+      "candidate_id": "6e80a48186940d0688ef1bd41b4341e40b4ed317526f5157ac6d56fa82830c6e",
+      "direction": [
+       1,
+       0
+      ],
+      "direction_rank": 4,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 106
+      },
+      "action_signature": "199cf47021f9e90b7012269bdd9345ebd9f5c989209998fb5e0ced3e6cdf8092",
+      "candidate_id": "f5bd5a633725a4040f000eb775ef02a3f4221e625419adb01f089b41b2351095",
+      "direction": [
+       0,
+       1
+      ],
+      "direction_rank": 6,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 121
+      },
+      "action_signature": "721dd582e06b84c712bd73063520f3a46a4c604bc8ad9f35cc1c604eccf06187",
+      "candidate_id": "41ad56d65b70da83cab6cf3b38675030f40f75787ee938ea107e991fb226769e",
+      "direction": [
+       -1,
+       -1
+      ],
+      "direction_rank": 0,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 497,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 117
+      },
+      "action_signature": "bdb8aae6ef3520a23df555b31da5c02bbd657da538d8381676940cf97d653ad8",
+      "candidate_id": "8fade6a1d22a5c68f1491bf8c3eda92394e949a4d5af11515d09796c2add9ded",
+      "direction": [
+       1,
+       -1
+      ],
+      "direction_rank": 2,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 497,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 98
+      },
+      "action_signature": "59e3ac402e4a07e57bfa2305b71214527a4bb650f75f97a23fb1026bffc30769",
+      "candidate_id": "208f277ec3ea20f5485af7e1fc249302225ec7977bc22392e12654beeaa90b29",
+      "direction": [
+       -1,
+       1
+      ],
+      "direction_rank": 5,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 497,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 110
+      },
+      "action_signature": "b1b3e848fc1e5711eac0369b2f18d4f0895a19700570c930e67f18f155049721",
+      "candidate_id": "c369a3911cbd140d4f2d69671d8906be1b772cd174c22115a2c5bb37bde68c66",
+      "direction": [
+       1,
+       1
+      ],
+      "direction_rank": 7,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 497,
+      "score_components": [],
+      "semantic_label": "navigate"
+     }
+    ],
+    "features_digest": "84fb9ae74734ea74b1131c358db623f239f2da035364589a5c25bff5f1e17464",
+    "jev_eligibility": false,
+    "need_key": [
+     1,
+     1,
+     7
+    ],
+    "rejection_version": 0,
+    "scripted_index": 0,
+    "table_id": "c086cd5468ed5746e688584d4b0ade479adfe3ac94d9433e9b08bb6d1f80363d",
+    "table_version": 1
+   }
+  },
+  "eat_hungry_singleton": {
+   "canned_response": {
+    "chosen_retained_index": 1,
+    "confidence": 0.9,
+    "probabilities": [],
+    "usage": {
+     "input_tokens": 312,
+     "output_tokens": 48
+    }
+   },
+   "capture": {
+    "adapter_version": "jev-choice/2",
+    "commit": "20a70154a98ad8a81ee234ff1188ac8a6c6d9ae4",
+    "tick_context": {
+     "need_id": 5,
+     "need_kind": "command",
+     "tick": 100
+    }
+   },
+   "expected_legacy_parser_selected_index": null,
+   "expected_outcome": "refused:singleton",
+   "frozen_context": {
+    "directives": [],
+    "intent": "",
+    "memory": {
+     "hero": [
+      41,
+      10
+     ],
+     "inventory": {
+      "rows": [
+       {
+        "r": 1,
+        "selectable": true,
+        "text": "a food ration"
+       },
+       {
+        "r": 2,
+        "selectable": true,
+        "text": "b - a dagger"
+       }
+      ],
+      "seen_tick": 100,
+      "seen_time": 100
+     },
+     "messages": [],
+     "stairs_down": [],
+     "stairs_up": [],
+     "status": {
+      "dlvl": "1",
+      "gold": null,
+      "hp": 12,
+      "hp_max": 12,
+      "hunger": "Hungry",
+      "level": 3,
+      "time": 100
+     }
+    },
+    "need": {
+     "id": 5,
+     "kind": "command",
+     "prompt": ""
+    },
+    "need_key": [
+     1,
+     1,
+     5
+    ],
+    "pages": [],
+    "snapshot": {
+     "cond": [],
+     "map": {
+      "37,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,10": [
+       "@",
+       "white",
+       0,
+       "none"
+      ],
+      "41,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ]
+     },
+     "msg": [],
+     "s": {
+      "dungeon-level": {
+       "text": "1"
+      },
+      "experience-level": {
+       "text": "3"
+      },
+      "hitpoints": {
+       "text": "12"
+      },
+      "hitpoints-max": {
+       "text": "12"
+      },
+      "hunger": {
+       "text": "Hungry"
+      },
+      "time": {
+       "text": "100"
+      }
+     }
+    },
+    "terrain": {
+     "occupancy": {
+      "41,10": "hero-or-human"
+     },
+     "terrain": {
+      "37,10": "floor",
+      "37,11": "floor",
+      "37,12": "floor",
+      "37,13": "floor",
+      "37,7": "floor",
+      "37,8": "floor",
+      "37,9": "floor",
+      "38,10": "floor",
+      "38,11": "floor",
+      "38,12": "floor",
+      "38,13": "floor",
+      "38,7": "floor",
+      "38,8": "floor",
+      "38,9": "floor",
+      "39,10": "floor",
+      "39,11": "floor",
+      "39,12": "floor",
+      "39,13": "floor",
+      "39,7": "floor",
+      "39,8": "floor",
+      "39,9": "floor",
+      "40,10": "floor",
+      "40,11": "floor",
+      "40,12": "floor",
+      "40,13": "floor",
+      "40,7": "floor",
+      "40,8": "floor",
+      "40,9": "floor",
+      "41,10": "unknown",
+      "41,11": "floor",
+      "41,12": "floor",
+      "41,13": "floor",
+      "41,7": "floor",
+      "41,8": "floor",
+      "41,9": "floor",
+      "42,10": "floor",
+      "42,11": "floor",
+      "42,12": "floor",
+      "42,13": "floor",
+      "42,7": "floor",
+      "42,8": "floor",
+      "42,9": "floor",
+      "43,10": "floor",
+      "43,11": "floor",
+      "43,12": "floor",
+      "43,13": "floor",
+      "43,7": "floor",
+      "43,8": "floor",
+      "43,9": "floor",
+      "44,10": "floor",
+      "44,11": "floor",
+      "44,12": "floor",
+      "44,13": "floor",
+      "44,7": "floor",
+      "44,8": "floor",
+      "44,9": "floor",
+      "45,10": "floor",
+      "45,11": "floor",
+      "45,12": "floor",
+      "45,13": "floor",
+      "45,7": "floor",
+      "45,8": "floor",
+      "45,9": "floor"
+     }
+    },
+    "tick": 100
+   },
+   "legacy_body": null,
+   "retained_table": {
+    "candidates": [
+     {
+      "action": {
+       "key": 101
+      },
+      "action_signature": "9f7f05c02ae2c3d7e5014dec07bee0b4f8a294276dea8f6b862ee0a559c7d52e",
+      "candidate_id": "2342cc9a8ff2abe59a9c14b136c9924e4f6d68ca1d8eccb204834880ebeeeb5d",
+      "direction": [],
+      "direction_rank": 0,
+      "effect_payload": [],
+      "family": "food",
+      "family_rank": 8,
+      "proposed_effect": "schedule-eat",
+      "reason": "hungry: attempt to eat",
+      "rows": [],
+      "score": 0,
+      "score_components": [],
+      "semantic_label": "eat"
+     }
+    ],
+    "features_digest": "d621c33cb6cead2c4dbf130e01b515db2c4c2b9d1d8dfee6c43e92bb89d2601d",
+    "jev_eligibility": false,
+    "need_key": [
+     1,
+     1,
+     5
+    ],
+    "rejection_version": 0,
+    "scripted_index": 0,
+    "table_id": "6229d10957a455dbc9256774af57de55d2d7f5f64b26ecb258619dcce7c126ae",
+    "table_version": 1
+   }
+  },
+  "key_need": {
+   "canned_response": {
+    "chosen_retained_index": 1,
+    "confidence": 0.9,
+    "probabilities": [
+     0.014285714285714282,
+     0.9,
+     0.014285714285714282,
+     0.014285714285714282,
+     0.014285714285714282,
+     0.014285714285714282,
+     0.014285714285714282,
+     0.014285714285714282
+    ],
+    "usage": {
+     "input_tokens": 312,
+     "output_tokens": 48
+    }
+   },
+   "capture": {
+    "adapter_version": "jev-choice/2",
+    "commit": "20a70154a98ad8a81ee234ff1188ac8a6c6d9ae4",
+    "tick_context": {
+     "need_id": 8,
+     "need_kind": "key",
+     "tick": 100
+    }
+   },
+   "expected_legacy_parser_selected_index": 1,
+   "expected_outcome": "selected",
+   "frozen_context": {
+    "directives": [],
+    "intent": "",
+    "memory": {
+     "hero": [
+      41,
+      10
+     ],
+     "inventory": {
+      "rows": [
+       {
+        "r": 1,
+        "selectable": true,
+        "text": "a food ration"
+       },
+       {
+        "r": 2,
+        "selectable": true,
+        "text": "b - a dagger"
+       }
+      ],
+      "seen_tick": 100,
+      "seen_time": 100
+     },
+     "messages": [],
+     "stairs_down": [],
+     "stairs_up": [],
+     "status": {
+      "dlvl": "1",
+      "gold": null,
+      "hp": 12,
+      "hp_max": 12,
+      "hunger": "",
+      "level": 3,
+      "time": 100
+     }
+    },
+    "need": {
+     "id": 8,
+     "kind": "key",
+     "prompt": ""
+    },
+    "need_key": [
+     1,
+     1,
+     8
+    ],
+    "pages": [],
+    "snapshot": {
+     "cond": [],
+     "map": {
+      "37,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,10": [
+       "@",
+       "white",
+       0,
+       "none"
+      ],
+      "41,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ]
+     },
+     "msg": [],
+     "s": {
+      "dungeon-level": {
+       "text": "1"
+      },
+      "experience-level": {
+       "text": "3"
+      },
+      "hitpoints": {
+       "text": "12"
+      },
+      "hitpoints-max": {
+       "text": "12"
+      },
+      "hunger": {
+       "text": ""
+      },
+      "time": {
+       "text": "100"
+      }
+     }
+    },
+    "terrain": {
+     "occupancy": {
+      "41,10": "hero-or-human"
+     },
+     "terrain": {
+      "37,10": "floor",
+      "37,11": "floor",
+      "37,12": "floor",
+      "37,13": "floor",
+      "37,7": "floor",
+      "37,8": "floor",
+      "37,9": "floor",
+      "38,10": "floor",
+      "38,11": "floor",
+      "38,12": "floor",
+      "38,13": "floor",
+      "38,7": "floor",
+      "38,8": "floor",
+      "38,9": "floor",
+      "39,10": "floor",
+      "39,11": "floor",
+      "39,12": "floor",
+      "39,13": "floor",
+      "39,7": "floor",
+      "39,8": "floor",
+      "39,9": "floor",
+      "40,10": "floor",
+      "40,11": "floor",
+      "40,12": "floor",
+      "40,13": "floor",
+      "40,7": "floor",
+      "40,8": "floor",
+      "40,9": "floor",
+      "41,10": "unknown",
+      "41,11": "floor",
+      "41,12": "floor",
+      "41,13": "floor",
+      "41,7": "floor",
+      "41,8": "floor",
+      "41,9": "floor",
+      "42,10": "floor",
+      "42,11": "floor",
+      "42,12": "floor",
+      "42,13": "floor",
+      "42,7": "floor",
+      "42,8": "floor",
+      "42,9": "floor",
+      "43,10": "floor",
+      "43,11": "floor",
+      "43,12": "floor",
+      "43,13": "floor",
+      "43,7": "floor",
+      "43,8": "floor",
+      "43,9": "floor",
+      "44,10": "floor",
+      "44,11": "floor",
+      "44,12": "floor",
+      "44,13": "floor",
+      "44,7": "floor",
+      "44,8": "floor",
+      "44,9": "floor",
+      "45,10": "floor",
+      "45,11": "floor",
+      "45,12": "floor",
+      "45,13": "floor",
+      "45,7": "floor",
+      "45,8": "floor",
+      "45,9": "floor"
+     }
+    },
+    "tick": 100
+   },
+   "legacy_body": "bodies/key_need.json",
+   "retained_table": {
+    "candidates": [
+     {
+      "action": {
+       "key": 107
+      },
+      "action_signature": "40aed197bd15af3e2bad93492c6105d9576da943f3bbb4212b22d644761b6de3",
+      "candidate_id": "d1757669e6c262e5afb36d9c9cbeab8a8a85217d4add16631a92cb88d77d08cb",
+      "direction": [
+       0,
+       -1
+      ],
+      "direction_rank": 1,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 104
+      },
+      "action_signature": "102da1b4731c1fb42c416e01122bf71e99cf05ec14c3cfd515a4fcbd7d905c22",
+      "candidate_id": "7e60c65a48afb8f753b7af502cf0113df3bdd1e7f7003eccb099051379a536f2",
+      "direction": [
+       -1,
+       0
+      ],
+      "direction_rank": 3,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 108
+      },
+      "action_signature": "4581e66cefda5e86b40d915b37f72452ae9d739a69dec1bf332c8ffae14e6bdb",
+      "candidate_id": "6e80a48186940d0688ef1bd41b4341e40b4ed317526f5157ac6d56fa82830c6e",
+      "direction": [
+       1,
+       0
+      ],
+      "direction_rank": 4,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 106
+      },
+      "action_signature": "199cf47021f9e90b7012269bdd9345ebd9f5c989209998fb5e0ced3e6cdf8092",
+      "candidate_id": "f5bd5a633725a4040f000eb775ef02a3f4221e625419adb01f089b41b2351095",
+      "direction": [
+       0,
+       1
+      ],
+      "direction_rank": 6,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 121
+      },
+      "action_signature": "721dd582e06b84c712bd73063520f3a46a4c604bc8ad9f35cc1c604eccf06187",
+      "candidate_id": "41ad56d65b70da83cab6cf3b38675030f40f75787ee938ea107e991fb226769e",
+      "direction": [
+       -1,
+       -1
+      ],
+      "direction_rank": 0,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 497,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 117
+      },
+      "action_signature": "bdb8aae6ef3520a23df555b31da5c02bbd657da538d8381676940cf97d653ad8",
+      "candidate_id": "8fade6a1d22a5c68f1491bf8c3eda92394e949a4d5af11515d09796c2add9ded",
+      "direction": [
+       1,
+       -1
+      ],
+      "direction_rank": 2,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 497,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 98
+      },
+      "action_signature": "59e3ac402e4a07e57bfa2305b71214527a4bb650f75f97a23fb1026bffc30769",
+      "candidate_id": "208f277ec3ea20f5485af7e1fc249302225ec7977bc22392e12654beeaa90b29",
+      "direction": [
+       -1,
+       1
+      ],
+      "direction_rank": 5,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 497,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 110
+      },
+      "action_signature": "b1b3e848fc1e5711eac0369b2f18d4f0895a19700570c930e67f18f155049721",
+      "candidate_id": "c369a3911cbd140d4f2d69671d8906be1b772cd174c22115a2c5bb37bde68c66",
+      "direction": [
+       1,
+       1
+      ],
+      "direction_rank": 7,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 497,
+      "score_components": [],
+      "semantic_label": "navigate"
+     }
+    ],
+    "features_digest": "3f405aed3f373def1df30e4abf6d8bbb767e2488340a22c9262a99aca13b8d5c",
+    "jev_eligibility": false,
+    "need_key": [
+     1,
+     1,
+     8
+    ],
+    "rejection_version": 0,
+    "scripted_index": 0,
+    "table_id": "697ed739f87a773da908a45c57c68548d97e5c50eb95738672fc8a1c626bc490",
+    "table_version": 1
+   }
+  },
+  "loop_breaker_singleton": {
+   "canned_response": {
+    "chosen_retained_index": 1,
+    "confidence": 0.9,
+    "probabilities": [],
+    "usage": {
+     "input_tokens": 312,
+     "output_tokens": 48
+    }
+   },
+   "capture": {
+    "adapter_version": "jev-choice/2",
+    "commit": "20a70154a98ad8a81ee234ff1188ac8a6c6d9ae4",
+    "tick_context": {
+     "need_id": 4,
+     "need_kind": "command",
+     "tick": 100
+    }
+   },
+   "expected_legacy_parser_selected_index": null,
+   "expected_outcome": "refused:singleton",
+   "frozen_context": {
+    "directives": [],
+    "intent": "",
+    "memory": {
+     "hero": [
+      41,
+      10
+     ],
+     "inventory": {
+      "rows": [
+       {
+        "r": 1,
+        "selectable": true,
+        "text": "a food ration"
+       },
+       {
+        "r": 2,
+        "selectable": true,
+        "text": "b - a dagger"
+       }
+      ],
+      "seen_tick": 100,
+      "seen_time": 100
+     },
+     "messages": [],
+     "stairs_down": [],
+     "stairs_up": [],
+     "status": {
+      "dlvl": "1",
+      "gold": null,
+      "hp": 12,
+      "hp_max": 12,
+      "hunger": "",
+      "level": 3,
+      "time": 100
+     }
+    },
+    "need": {
+     "id": 4,
+     "kind": "command",
+     "prompt": ""
+    },
+    "need_key": [
+     1,
+     1,
+     4
+    ],
+    "pages": [],
+    "snapshot": {
+     "cond": [],
+     "map": {
+      "37,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,10": [
+       "@",
+       "white",
+       0,
+       "none"
+      ],
+      "41,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ]
+     },
+     "msg": [],
+     "s": {
+      "dungeon-level": {
+       "text": "1"
+      },
+      "experience-level": {
+       "text": "3"
+      },
+      "hitpoints": {
+       "text": "12"
+      },
+      "hitpoints-max": {
+       "text": "12"
+      },
+      "hunger": {
+       "text": ""
+      },
+      "time": {
+       "text": "100"
+      }
+     }
+    },
+    "terrain": {
+     "occupancy": {
+      "41,10": "hero-or-human"
+     },
+     "terrain": {
+      "37,10": "floor",
+      "37,11": "floor",
+      "37,12": "floor",
+      "37,13": "floor",
+      "37,7": "floor",
+      "37,8": "floor",
+      "37,9": "floor",
+      "38,10": "floor",
+      "38,11": "floor",
+      "38,12": "floor",
+      "38,13": "floor",
+      "38,7": "floor",
+      "38,8": "floor",
+      "38,9": "floor",
+      "39,10": "floor",
+      "39,11": "floor",
+      "39,12": "floor",
+      "39,13": "floor",
+      "39,7": "floor",
+      "39,8": "floor",
+      "39,9": "floor",
+      "40,10": "floor",
+      "40,11": "floor",
+      "40,12": "floor",
+      "40,13": "floor",
+      "40,7": "floor",
+      "40,8": "floor",
+      "40,9": "floor",
+      "41,10": "unknown",
+      "41,11": "floor",
+      "41,12": "floor",
+      "41,13": "floor",
+      "41,7": "floor",
+      "41,8": "floor",
+      "41,9": "floor",
+      "42,10": "floor",
+      "42,11": "floor",
+      "42,12": "floor",
+      "42,13": "floor",
+      "42,7": "floor",
+      "42,8": "floor",
+      "42,9": "floor",
+      "43,10": "floor",
+      "43,11": "floor",
+      "43,12": "floor",
+      "43,13": "floor",
+      "43,7": "floor",
+      "43,8": "floor",
+      "43,9": "floor",
+      "44,10": "floor",
+      "44,11": "floor",
+      "44,12": "floor",
+      "44,13": "floor",
+      "44,7": "floor",
+      "44,8": "floor",
+      "44,9": "floor",
+      "45,10": "floor",
+      "45,11": "floor",
+      "45,12": "floor",
+      "45,13": "floor",
+      "45,7": "floor",
+      "45,8": "floor",
+      "45,9": "floor"
+     }
+    },
+    "tick": 100
+   },
+   "legacy_body": null,
+   "retained_table": {
+    "candidates": [
+     {
+      "action": {
+       "key": 108
+      },
+      "action_signature": "4581e66cefda5e86b40d915b37f72452ae9d739a69dec1bf332c8ffae14e6bdb",
+      "candidate_id": "765c5d0cc0490bdb1488b11797ef9e8555d9335d8f266ea3c9b8ca46bf360fe8",
+      "direction": [],
+      "direction_rank": 0,
+      "effect_payload": [],
+      "family": "recovery",
+      "family_rank": 7,
+      "proposed_effect": "recovery",
+      "reason": "loop breaker: random walk (known floor)",
+      "rows": [],
+      "score": 0,
+      "score_components": [],
+      "semantic_label": "random-move"
+     }
+    ],
+    "features_digest": "fd5354e7f08fd65566a63b9eeab88b11622d11869b7ee4fe483535aa23b9d590",
+    "jev_eligibility": false,
+    "need_key": [
+     1,
+     1,
+     4
+    ],
+    "rejection_version": 0,
+    "scripted_index": 0,
+    "table_id": "f94dd4190aea0b18c54aa957a8a2c7baf850c93b6e95c0e5cb1f3d1a1c76fa26",
+    "table_version": 1
+   }
+  },
+  "menu_unsupported": {
+   "canned_response": {
+    "chosen_retained_index": 1,
+    "confidence": 0.9,
+    "probabilities": [],
+    "usage": {
+     "input_tokens": 312,
+     "output_tokens": 48
+    }
+   },
+   "capture": {
+    "adapter_version": "jev-choice/2",
+    "commit": "20a70154a98ad8a81ee234ff1188ac8a6c6d9ae4",
+    "tick_context": {
+     "need_id": 9,
+     "need_kind": "menu",
+     "tick": 100
+    }
+   },
+   "expected_legacy_parser_selected_index": null,
+   "expected_outcome": "refused:unsupported-need",
+   "frozen_context": {
+    "directives": [],
+    "intent": "",
+    "memory": {
+     "hero": [
+      41,
+      10
+     ],
+     "inventory": {
+      "rows": [
+       {
+        "r": 1,
+        "selectable": true,
+        "text": "a food ration"
+       },
+       {
+        "r": 2,
+        "selectable": true,
+        "text": "b - a dagger"
+       }
+      ],
+      "seen_tick": 100,
+      "seen_time": 100
+     },
+     "messages": [],
+     "stairs_down": [],
+     "stairs_up": [],
+     "status": {
+      "dlvl": "1",
+      "gold": null,
+      "hp": 12,
+      "hp_max": 12,
+      "hunger": "",
+      "level": 3,
+      "time": 100
+     }
+    },
+    "need": {
+     "content": "c1",
+     "id": 9,
+     "kind": "menu",
+     "menu": "m1",
+     "mode": "one",
+     "pages": 1
+    },
+    "need_key": [
+     1,
+     1,
+     9
+    ],
+    "pages": [],
+    "snapshot": {
+     "cond": [],
+     "map": {
+      "37,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,10": [
+       "@",
+       "white",
+       0,
+       "none"
+      ],
+      "41,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ]
+     },
+     "msg": [],
+     "s": {
+      "dungeon-level": {
+       "text": "1"
+      },
+      "experience-level": {
+       "text": "3"
+      },
+      "hitpoints": {
+       "text": "12"
+      },
+      "hitpoints-max": {
+       "text": "12"
+      },
+      "hunger": {
+       "text": ""
+      },
+      "time": {
+       "text": "100"
+      }
+     }
+    },
+    "terrain": {
+     "occupancy": {
+      "41,10": "hero-or-human"
+     },
+     "terrain": {
+      "37,10": "floor",
+      "37,11": "floor",
+      "37,12": "floor",
+      "37,13": "floor",
+      "37,7": "floor",
+      "37,8": "floor",
+      "37,9": "floor",
+      "38,10": "floor",
+      "38,11": "floor",
+      "38,12": "floor",
+      "38,13": "floor",
+      "38,7": "floor",
+      "38,8": "floor",
+      "38,9": "floor",
+      "39,10": "floor",
+      "39,11": "floor",
+      "39,12": "floor",
+      "39,13": "floor",
+      "39,7": "floor",
+      "39,8": "floor",
+      "39,9": "floor",
+      "40,10": "floor",
+      "40,11": "floor",
+      "40,12": "floor",
+      "40,13": "floor",
+      "40,7": "floor",
+      "40,8": "floor",
+      "40,9": "floor",
+      "41,10": "unknown",
+      "41,11": "floor",
+      "41,12": "floor",
+      "41,13": "floor",
+      "41,7": "floor",
+      "41,8": "floor",
+      "41,9": "floor",
+      "42,10": "floor",
+      "42,11": "floor",
+      "42,12": "floor",
+      "42,13": "floor",
+      "42,7": "floor",
+      "42,8": "floor",
+      "42,9": "floor",
+      "43,10": "floor",
+      "43,11": "floor",
+      "43,12": "floor",
+      "43,13": "floor",
+      "43,7": "floor",
+      "43,8": "floor",
+      "43,9": "floor",
+      "44,10": "floor",
+      "44,11": "floor",
+      "44,12": "floor",
+      "44,13": "floor",
+      "44,7": "floor",
+      "44,8": "floor",
+      "44,9": "floor",
+      "45,10": "floor",
+      "45,11": "floor",
+      "45,12": "floor",
+      "45,13": "floor",
+      "45,7": "floor",
+      "45,8": "floor",
+      "45,9": "floor"
+     }
+    },
+    "tick": 100
+   },
+   "legacy_body": null,
+   "retained_table": {
+    "candidates": [
+     {
+      "action": {
+       "cancel": true
+      },
+      "action_signature": "6edc4790f367d3e9b6441a7e9d2e3cacae0235a7bee101d11b3acd6c37cf2ed9",
+      "candidate_id": "cb03553b0afa2c2e7899bebf8e5e00d158fc662b115fcd73e22edcdbc1bf7b28",
+      "direction": [],
+      "direction_rank": 0,
+      "effect_payload": [],
+      "family": "prompt",
+      "family_rank": 11,
+      "proposed_effect": "prompt",
+      "reason": "unrecognised menu title: cancel",
+      "rows": [],
+      "score": 0,
+      "score_components": [],
+      "semantic_label": "prompt"
+     }
+    ],
+    "features_digest": "7dae13011c1b54d8a3bf76c08c48bb7b8d285a6e51e82699a3ba57a031aec1c6",
+    "jev_eligibility": false,
+    "need_key": [
+     1,
+     1,
+     9
+    ],
+    "rejection_version": 0,
+    "scripted_index": 0,
+    "table_id": "8d6f2034ebbcb6ed1d5bab36e6744f9a22e3ce296c01b9ccfdb55b6859b68aed",
+    "table_version": 1
+   }
+  },
+  "nav_frontier_room": {
+   "canned_response": {
+    "chosen_retained_index": 1,
+    "confidence": 0.9,
+    "probabilities": [
+     0.04999999999999999,
+     0.9,
+     0.04999999999999999
+    ],
+    "usage": {
+     "input_tokens": 312,
+     "output_tokens": 48
+    }
+   },
+   "capture": {
+    "adapter_version": "jev-choice/2",
+    "commit": "20a70154a98ad8a81ee234ff1188ac8a6c6d9ae4",
+    "tick_context": {
+     "need_id": 1,
+     "need_kind": "command",
+     "tick": 100
+    }
+   },
+   "expected_legacy_parser_selected_index": 1,
+   "expected_outcome": "selected",
+   "frozen_context": {
+    "directives": [],
+    "intent": "",
+    "memory": {
+     "hero": [
+      37,
+      7
+     ],
+     "inventory": {
+      "rows": [
+       {
+        "r": 1,
+        "selectable": true,
+        "text": "a food ration"
+       },
+       {
+        "r": 2,
+        "selectable": true,
+        "text": "b - a dagger"
+       }
+      ],
+      "seen_tick": 100,
+      "seen_time": 100
+     },
+     "messages": [
+      "You see here a food ration."
+     ],
+     "stairs_down": [
+      [
+       45,
+       13
+      ]
+     ],
+     "stairs_up": [
+      [
+       37,
+       13
+      ]
+     ],
+     "status": {
+      "dlvl": "1",
+      "gold": null,
+      "hp": 12,
+      "hp_max": 12,
+      "hunger": "",
+      "level": 3,
+      "time": 100
+     }
+    },
+    "need": {
+     "id": 1,
+     "kind": "command",
+     "prompt": ""
+    },
+    "need_key": [
+     1,
+     1,
+     1
+    ],
+    "pages": [],
+    "snapshot": {
+     "cond": [],
+     "map": {
+      "36,7": [
+       "+",
+       "brown",
+       0,
+       "none"
+      ],
+      "37,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,13": [
+       "<",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,7": [
+       "@",
+       "white",
+       0,
+       "none"
+      ],
+      "37,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,13": [
+       ">",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ]
+     },
+     "msg": [
+      {
+       "e": 1,
+       "text": "You see here a food ration."
+      }
+     ],
+     "s": {
+      "dungeon-level": {
+       "text": "1"
+      },
+      "experience-level": {
+       "text": "3"
+      },
+      "hitpoints": {
+       "text": "12"
+      },
+      "hitpoints-max": {
+       "text": "12"
+      },
+      "hunger": {
+       "text": ""
+      },
+      "time": {
+       "text": "100"
+      }
+     }
+    },
+    "terrain": {
+     "occupancy": {
+      "37,7": "hero-or-human"
+     },
+     "terrain": {
+      "36,7": "closed-door",
+      "37,10": "floor",
+      "37,11": "floor",
+      "37,12": "floor",
+      "37,13": "stairs-up",
+      "37,7": "unknown",
+      "37,8": "floor",
+      "37,9": "floor",
+      "38,10": "floor",
+      "38,11": "floor",
+      "38,12": "floor",
+      "38,13": "floor",
+      "38,7": "floor",
+      "38,8": "floor",
+      "38,9": "floor",
+      "39,10": "floor",
+      "39,11": "floor",
+      "39,12": "floor",
+      "39,13": "floor",
+      "39,7": "floor",
+      "39,8": "floor",
+      "39,9": "floor",
+      "40,10": "floor",
+      "40,11": "floor",
+      "40,12": "floor",
+      "40,13": "floor",
+      "40,7": "floor",
+      "40,8": "floor",
+      "40,9": "floor",
+      "41,10": "floor",
+      "41,11": "floor",
+      "41,12": "floor",
+      "41,13": "floor",
+      "41,7": "floor",
+      "41,8": "floor",
+      "41,9": "floor",
+      "42,10": "floor",
+      "42,11": "floor",
+      "42,12": "floor",
+      "42,13": "floor",
+      "42,7": "floor",
+      "42,8": "floor",
+      "42,9": "floor",
+      "43,10": "floor",
+      "43,11": "floor",
+      "43,12": "floor",
+      "43,13": "floor",
+      "43,7": "floor",
+      "43,8": "floor",
+      "43,9": "floor",
+      "44,10": "floor",
+      "44,11": "floor",
+      "44,12": "floor",
+      "44,13": "floor",
+      "44,7": "floor",
+      "44,8": "floor",
+      "44,9": "floor",
+      "45,10": "floor",
+      "45,11": "floor",
+      "45,12": "floor",
+      "45,13": "stairs-down",
+      "45,7": "floor",
+      "45,8": "floor",
+      "45,9": "floor"
+     }
+    },
+    "tick": 100
+   },
+   "legacy_body": "bodies/nav_frontier_room.json",
+   "retained_table": {
+    "candidates": [
+     {
+      "action": {
+       "key": 108
+      },
+      "action_signature": "4581e66cefda5e86b40d915b37f72452ae9d739a69dec1bf332c8ffae14e6bdb",
+      "candidate_id": "6e80a48186940d0688ef1bd41b4341e40b4ed317526f5157ac6d56fa82830c6e",
+      "direction": [
+       1,
+       0
+      ],
+      "direction_rank": 4,
+      "effect_payload": [],
+      "family": "stair",
+      "family_rank": 2,
+      "proposed_effect": "navigate",
+      "reason": "navigate: reachable down stairs",
+      "rows": [],
+      "score": 792,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 106
+      },
+      "action_signature": "199cf47021f9e90b7012269bdd9345ebd9f5c989209998fb5e0ced3e6cdf8092",
+      "candidate_id": "f5bd5a633725a4040f000eb775ef02a3f4221e625419adb01f089b41b2351095",
+      "direction": [
+       0,
+       1
+      ],
+      "direction_rank": 6,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 110
+      },
+      "action_signature": "b1b3e848fc1e5711eac0369b2f18d4f0895a19700570c930e67f18f155049721",
+      "candidate_id": "c369a3911cbd140d4f2d69671d8906be1b772cd174c22115a2c5bb37bde68c66",
+      "direction": [
+       1,
+       1
+      ],
+      "direction_rank": 7,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 494,
+      "score_components": [],
+      "semantic_label": "navigate"
+     }
+    ],
+    "features_digest": "cc95abedb5ffa9ce92f8cf5d46beaa96fbef2453b832c3fe32018d460e64c40b",
+    "jev_eligibility": false,
+    "need_key": [
+     1,
+     1,
+     1
+    ],
+    "rejection_version": 0,
+    "scripted_index": 0,
+    "table_id": "09a6e235fa82fdfe191b8bcfe3677b0af9d68374d8e4eff81cdf3606d94ffd39",
+    "table_version": 1
+   }
+  },
+  "nav_monster_adjacent": {
+   "canned_response": {
+    "chosen_retained_index": 1,
+    "confidence": 0.9,
+    "probabilities": [
+     0.016666666666666663,
+     0.9,
+     0.016666666666666663,
+     0.016666666666666663,
+     0.016666666666666663,
+     0.016666666666666663,
+     0.016666666666666663
+    ],
+    "usage": {
+     "input_tokens": 312,
+     "output_tokens": 48
+    }
+   },
+   "capture": {
+    "adapter_version": "jev-choice/2",
+    "commit": "20a70154a98ad8a81ee234ff1188ac8a6c6d9ae4",
+    "tick_context": {
+     "need_id": 3,
+     "need_kind": "command",
+     "tick": 100
+    }
+   },
+   "expected_legacy_parser_selected_index": 1,
+   "expected_outcome": "selected",
+   "frozen_context": {
+    "directives": [],
+    "intent": "",
+    "memory": {
+     "hero": [
+      41,
+      10
+     ],
+     "inventory": {
+      "rows": [
+       {
+        "r": 1,
+        "selectable": true,
+        "text": "a food ration"
+       },
+       {
+        "r": 2,
+        "selectable": true,
+        "text": "b - a dagger"
+       }
+      ],
+      "seen_tick": 100,
+      "seen_time": 100
+     },
+     "messages": [],
+     "stairs_down": [],
+     "stairs_up": [],
+     "status": {
+      "dlvl": "1",
+      "gold": null,
+      "hp": 12,
+      "hp_max": 12,
+      "hunger": "",
+      "level": 3,
+      "time": 100
+     }
+    },
+    "need": {
+     "id": 3,
+     "kind": "command",
+     "prompt": ""
+    },
+    "need_key": [
+     1,
+     1,
+     3
+    ],
+    "pages": [],
+    "snapshot": {
+     "cond": [],
+     "map": {
+      "37,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,10": [
+       "@",
+       "white",
+       0,
+       "none"
+      ],
+      "41,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,10": [
+       "d",
+       "brown",
+       0,
+       "none"
+      ],
+      "42,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ]
+     },
+     "msg": [],
+     "s": {
+      "dungeon-level": {
+       "text": "1"
+      },
+      "experience-level": {
+       "text": "3"
+      },
+      "hitpoints": {
+       "text": "12"
+      },
+      "hitpoints-max": {
+       "text": "12"
+      },
+      "hunger": {
+       "text": ""
+      },
+      "time": {
+       "text": "100"
+      }
+     }
+    },
+    "terrain": {
+     "occupancy": {
+      "41,10": "hero-or-human",
+      "42,10": "monster"
+     },
+     "terrain": {
+      "37,10": "floor",
+      "37,11": "floor",
+      "37,12": "floor",
+      "37,13": "floor",
+      "37,7": "floor",
+      "37,8": "floor",
+      "37,9": "floor",
+      "38,10": "floor",
+      "38,11": "floor",
+      "38,12": "floor",
+      "38,13": "floor",
+      "38,7": "floor",
+      "38,8": "floor",
+      "38,9": "floor",
+      "39,10": "floor",
+      "39,11": "floor",
+      "39,12": "floor",
+      "39,13": "floor",
+      "39,7": "floor",
+      "39,8": "floor",
+      "39,9": "floor",
+      "40,10": "floor",
+      "40,11": "floor",
+      "40,12": "floor",
+      "40,13": "floor",
+      "40,7": "floor",
+      "40,8": "floor",
+      "40,9": "floor",
+      "41,10": "unknown",
+      "41,11": "floor",
+      "41,12": "floor",
+      "41,13": "floor",
+      "41,7": "floor",
+      "41,8": "floor",
+      "41,9": "floor",
+      "42,10": "unknown",
+      "42,11": "floor",
+      "42,12": "floor",
+      "42,13": "floor",
+      "42,7": "floor",
+      "42,8": "floor",
+      "42,9": "floor",
+      "43,10": "floor",
+      "43,11": "floor",
+      "43,12": "floor",
+      "43,13": "floor",
+      "43,7": "floor",
+      "43,8": "floor",
+      "43,9": "floor",
+      "44,10": "floor",
+      "44,11": "floor",
+      "44,12": "floor",
+      "44,13": "floor",
+      "44,7": "floor",
+      "44,8": "floor",
+      "44,9": "floor",
+      "45,10": "floor",
+      "45,11": "floor",
+      "45,12": "floor",
+      "45,13": "floor",
+      "45,7": "floor",
+      "45,8": "floor",
+      "45,9": "floor"
+     }
+    },
+    "tick": 100
+   },
+   "legacy_body": "bodies/nav_monster_adjacent.json",
+   "retained_table": {
+    "candidates": [
+     {
+      "action": {
+       "key": 107
+      },
+      "action_signature": "40aed197bd15af3e2bad93492c6105d9576da943f3bbb4212b22d644761b6de3",
+      "candidate_id": "d1757669e6c262e5afb36d9c9cbeab8a8a85217d4add16631a92cb88d77d08cb",
+      "direction": [
+       0,
+       -1
+      ],
+      "direction_rank": 1,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 117
+      },
+      "action_signature": "bdb8aae6ef3520a23df555b31da5c02bbd657da538d8381676940cf97d653ad8",
+      "candidate_id": "8fade6a1d22a5c68f1491bf8c3eda92394e949a4d5af11515d09796c2add9ded",
+      "direction": [
+       1,
+       -1
+      ],
+      "direction_rank": 2,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 104
+      },
+      "action_signature": "102da1b4731c1fb42c416e01122bf71e99cf05ec14c3cfd515a4fcbd7d905c22",
+      "candidate_id": "7e60c65a48afb8f753b7af502cf0113df3bdd1e7f7003eccb099051379a536f2",
+      "direction": [
+       -1,
+       0
+      ],
+      "direction_rank": 3,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 106
+      },
+      "action_signature": "199cf47021f9e90b7012269bdd9345ebd9f5c989209998fb5e0ced3e6cdf8092",
+      "candidate_id": "f5bd5a633725a4040f000eb775ef02a3f4221e625419adb01f089b41b2351095",
+      "direction": [
+       0,
+       1
+      ],
+      "direction_rank": 6,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 110
+      },
+      "action_signature": "b1b3e848fc1e5711eac0369b2f18d4f0895a19700570c930e67f18f155049721",
+      "candidate_id": "c369a3911cbd140d4f2d69671d8906be1b772cd174c22115a2c5bb37bde68c66",
+      "direction": [
+       1,
+       1
+      ],
+      "direction_rank": 7,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 121
+      },
+      "action_signature": "721dd582e06b84c712bd73063520f3a46a4c604bc8ad9f35cc1c604eccf06187",
+      "candidate_id": "41ad56d65b70da83cab6cf3b38675030f40f75787ee938ea107e991fb226769e",
+      "direction": [
+       -1,
+       -1
+      ],
+      "direction_rank": 0,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 497,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 98
+      },
+      "action_signature": "59e3ac402e4a07e57bfa2305b71214527a4bb650f75f97a23fb1026bffc30769",
+      "candidate_id": "208f277ec3ea20f5485af7e1fc249302225ec7977bc22392e12654beeaa90b29",
+      "direction": [
+       -1,
+       1
+      ],
+      "direction_rank": 5,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 497,
+      "score_components": [],
+      "semantic_label": "navigate"
+     }
+    ],
+    "features_digest": "af7eb1c227e1a537c145bb01a4ad00cd61d4228616f89c3fa9c4c65912143235",
+    "jev_eligibility": false,
+    "need_key": [
+     1,
+     1,
+     3
+    ],
+    "rejection_version": 0,
+    "scripted_index": 0,
+    "table_id": "0c27158241bb40a22fe33ac5ec35401fe8917b97518f8bfab950edd204105f66",
+    "table_version": 1
+   }
+  },
+  "nav_off_corner": {
+   "canned_response": {
+    "chosen_retained_index": 1,
+    "confidence": 0.9,
+    "probabilities": [
+     0.014285714285714282,
+     0.9,
+     0.014285714285714282,
+     0.014285714285714282,
+     0.014285714285714282,
+     0.014285714285714282,
+     0.014285714285714282,
+     0.014285714285714282
+    ],
+    "usage": {
+     "input_tokens": 312,
+     "output_tokens": 48
+    }
+   },
+   "capture": {
+    "adapter_version": "jev-choice/2",
+    "commit": "20a70154a98ad8a81ee234ff1188ac8a6c6d9ae4",
+    "tick_context": {
+     "need_id": 2,
+     "need_kind": "command",
+     "tick": 100
+    }
+   },
+   "expected_legacy_parser_selected_index": 1,
+   "expected_outcome": "selected",
+   "frozen_context": {
+    "directives": [],
+    "intent": "",
+    "memory": {
+     "hero": [
+      41,
+      10
+     ],
+     "inventory": {
+      "rows": [
+       {
+        "r": 1,
+        "selectable": true,
+        "text": "a food ration"
+       },
+       {
+        "r": 2,
+        "selectable": true,
+        "text": "b - a dagger"
+       }
+      ],
+      "seen_tick": 100,
+      "seen_time": 100
+     },
+     "messages": [],
+     "stairs_down": [],
+     "stairs_up": [],
+     "status": {
+      "dlvl": "1",
+      "gold": null,
+      "hp": 12,
+      "hp_max": 12,
+      "hunger": "",
+      "level": 3,
+      "time": 100
+     }
+    },
+    "need": {
+     "id": 2,
+     "kind": "command",
+     "prompt": ""
+    },
+    "need_key": [
+     1,
+     1,
+     2
+    ],
+    "pages": [],
+    "snapshot": {
+     "cond": [],
+     "map": {
+      "37,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,10": [
+       "@",
+       "white",
+       0,
+       "none"
+      ],
+      "41,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ]
+     },
+     "msg": [],
+     "s": {
+      "dungeon-level": {
+       "text": "1"
+      },
+      "experience-level": {
+       "text": "3"
+      },
+      "hitpoints": {
+       "text": "12"
+      },
+      "hitpoints-max": {
+       "text": "12"
+      },
+      "hunger": {
+       "text": ""
+      },
+      "time": {
+       "text": "100"
+      }
+     }
+    },
+    "terrain": {
+     "occupancy": {
+      "41,10": "hero-or-human"
+     },
+     "terrain": {
+      "37,10": "floor",
+      "37,11": "floor",
+      "37,12": "floor",
+      "37,13": "floor",
+      "37,7": "floor",
+      "37,8": "floor",
+      "37,9": "floor",
+      "38,10": "floor",
+      "38,11": "floor",
+      "38,12": "floor",
+      "38,13": "floor",
+      "38,7": "floor",
+      "38,8": "floor",
+      "38,9": "floor",
+      "39,10": "floor",
+      "39,11": "floor",
+      "39,12": "floor",
+      "39,13": "floor",
+      "39,7": "floor",
+      "39,8": "floor",
+      "39,9": "floor",
+      "40,10": "floor",
+      "40,11": "floor",
+      "40,12": "floor",
+      "40,13": "floor",
+      "40,7": "floor",
+      "40,8": "floor",
+      "40,9": "floor",
+      "41,10": "unknown",
+      "41,11": "floor",
+      "41,12": "floor",
+      "41,13": "floor",
+      "41,7": "floor",
+      "41,8": "floor",
+      "41,9": "floor",
+      "42,10": "floor",
+      "42,11": "floor",
+      "42,12": "floor",
+      "42,13": "floor",
+      "42,7": "floor",
+      "42,8": "floor",
+      "42,9": "floor",
+      "43,10": "floor",
+      "43,11": "floor",
+      "43,12": "floor",
+      "43,13": "floor",
+      "43,7": "floor",
+      "43,8": "floor",
+      "43,9": "floor",
+      "44,10": "floor",
+      "44,11": "floor",
+      "44,12": "floor",
+      "44,13": "floor",
+      "44,7": "floor",
+      "44,8": "floor",
+      "44,9": "floor",
+      "45,10": "floor",
+      "45,11": "floor",
+      "45,12": "floor",
+      "45,13": "floor",
+      "45,7": "floor",
+      "45,8": "floor",
+      "45,9": "floor"
+     }
+    },
+    "tick": 100
+   },
+   "legacy_body": "bodies/nav_off_corner.json",
+   "retained_table": {
+    "candidates": [
+     {
+      "action": {
+       "key": 107
+      },
+      "action_signature": "40aed197bd15af3e2bad93492c6105d9576da943f3bbb4212b22d644761b6de3",
+      "candidate_id": "d1757669e6c262e5afb36d9c9cbeab8a8a85217d4add16631a92cb88d77d08cb",
+      "direction": [
+       0,
+       -1
+      ],
+      "direction_rank": 1,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 104
+      },
+      "action_signature": "102da1b4731c1fb42c416e01122bf71e99cf05ec14c3cfd515a4fcbd7d905c22",
+      "candidate_id": "7e60c65a48afb8f753b7af502cf0113df3bdd1e7f7003eccb099051379a536f2",
+      "direction": [
+       -1,
+       0
+      ],
+      "direction_rank": 3,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 108
+      },
+      "action_signature": "4581e66cefda5e86b40d915b37f72452ae9d739a69dec1bf332c8ffae14e6bdb",
+      "candidate_id": "6e80a48186940d0688ef1bd41b4341e40b4ed317526f5157ac6d56fa82830c6e",
+      "direction": [
+       1,
+       0
+      ],
+      "direction_rank": 4,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 106
+      },
+      "action_signature": "199cf47021f9e90b7012269bdd9345ebd9f5c989209998fb5e0ced3e6cdf8092",
+      "candidate_id": "f5bd5a633725a4040f000eb775ef02a3f4221e625419adb01f089b41b2351095",
+      "direction": [
+       0,
+       1
+      ],
+      "direction_rank": 6,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 121
+      },
+      "action_signature": "721dd582e06b84c712bd73063520f3a46a4c604bc8ad9f35cc1c604eccf06187",
+      "candidate_id": "41ad56d65b70da83cab6cf3b38675030f40f75787ee938ea107e991fb226769e",
+      "direction": [
+       -1,
+       -1
+      ],
+      "direction_rank": 0,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 497,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 117
+      },
+      "action_signature": "bdb8aae6ef3520a23df555b31da5c02bbd657da538d8381676940cf97d653ad8",
+      "candidate_id": "8fade6a1d22a5c68f1491bf8c3eda92394e949a4d5af11515d09796c2add9ded",
+      "direction": [
+       1,
+       -1
+      ],
+      "direction_rank": 2,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 497,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 98
+      },
+      "action_signature": "59e3ac402e4a07e57bfa2305b71214527a4bb650f75f97a23fb1026bffc30769",
+      "candidate_id": "208f277ec3ea20f5485af7e1fc249302225ec7977bc22392e12654beeaa90b29",
+      "direction": [
+       -1,
+       1
+      ],
+      "direction_rank": 5,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 497,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 110
+      },
+      "action_signature": "b1b3e848fc1e5711eac0369b2f18d4f0895a19700570c930e67f18f155049721",
+      "candidate_id": "c369a3911cbd140d4f2d69671d8906be1b772cd174c22115a2c5bb37bde68c66",
+      "direction": [
+       1,
+       1
+      ],
+      "direction_rank": 7,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 497,
+      "score_components": [],
+      "semantic_label": "navigate"
+     }
+    ],
+    "features_digest": "7512021d8112bed0b316f8660902815047f33915839390ecd8b6a37d5a809c71",
+    "jev_eligibility": false,
+    "need_key": [
+     1,
+     1,
+     2
+    ],
+    "rejection_version": 0,
+    "scripted_index": 0,
+    "table_id": "e09771836bc9f191e7178ac3264f8756f24be5ab1b00b9b91ebfe5539d5b6a31",
+    "table_version": 1
+   }
+  },
+  "nav_with_directives": {
+   "canned_response": {
+    "chosen_retained_index": 1,
+    "confidence": 0.9,
+    "probabilities": [
+     0.014285714285714282,
+     0.9,
+     0.014285714285714282,
+     0.014285714285714282,
+     0.014285714285714282,
+     0.014285714285714282,
+     0.014285714285714282,
+     0.014285714285714282
+    ],
+    "usage": {
+     "input_tokens": 312,
+     "output_tokens": 48
+    }
+   },
+   "capture": {
+    "adapter_version": "jev-choice/2",
+    "commit": "20a70154a98ad8a81ee234ff1188ac8a6c6d9ae4",
+    "tick_context": {
+     "need_id": 11,
+     "need_kind": "command",
+     "tick": 100
+    }
+   },
+   "expected_legacy_parser_selected_index": 1,
+   "expected_outcome": "selected",
+   "frozen_context": {
+    "directives": [
+     {
+      "explanation": "head for the stairs",
+      "goals": [
+       "survive",
+       "descend_known_stairs"
+      ],
+      "preconditions": [
+       "hero_known"
+      ],
+      "risk": 0.4,
+      "schema_version": 1,
+      "target": [
+       45,
+       13
+      ],
+      "ttl": 30
+     }
+    ],
+    "intent": "",
+    "memory": {
+     "hero": [
+      41,
+      10
+     ],
+     "inventory": {
+      "rows": [
+       {
+        "r": 1,
+        "selectable": true,
+        "text": "a food ration"
+       },
+       {
+        "r": 2,
+        "selectable": true,
+        "text": "b - a dagger"
+       }
+      ],
+      "seen_tick": 100,
+      "seen_time": 100
+     },
+     "messages": [
+      "You descend the stairs."
+     ],
+     "stairs_down": [
+      [
+       45,
+       13
+      ]
+     ],
+     "stairs_up": [
+      [
+       37,
+       13
+      ]
+     ],
+     "status": {
+      "dlvl": "1",
+      "gold": null,
+      "hp": 12,
+      "hp_max": 12,
+      "hunger": "",
+      "level": 3,
+      "time": 100
+     }
+    },
+    "need": {
+     "id": 11,
+     "kind": "command",
+     "prompt": ""
+    },
+    "need_key": [
+     1,
+     1,
+     11
+    ],
+    "pages": [],
+    "snapshot": {
+     "cond": [],
+     "map": {
+      "36,7": [
+       "+",
+       "brown",
+       0,
+       "none"
+      ],
+      "37,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,13": [
+       "<",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,10": [
+       "@",
+       "white",
+       0,
+       "none"
+      ],
+      "41,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,13": [
+       ">",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ]
+     },
+     "msg": [
+      {
+       "e": 1,
+       "text": "You descend the stairs."
+      }
+     ],
+     "s": {
+      "dungeon-level": {
+       "text": "1"
+      },
+      "experience-level": {
+       "text": "3"
+      },
+      "hitpoints": {
+       "text": "12"
+      },
+      "hitpoints-max": {
+       "text": "12"
+      },
+      "hunger": {
+       "text": ""
+      },
+      "time": {
+       "text": "100"
+      }
+     }
+    },
+    "terrain": {
+     "occupancy": {
+      "41,10": "hero-or-human"
+     },
+     "terrain": {
+      "36,7": "closed-door",
+      "37,10": "floor",
+      "37,11": "floor",
+      "37,12": "floor",
+      "37,13": "stairs-up",
+      "37,7": "floor",
+      "37,8": "floor",
+      "37,9": "floor",
+      "38,10": "floor",
+      "38,11": "floor",
+      "38,12": "floor",
+      "38,13": "floor",
+      "38,7": "floor",
+      "38,8": "floor",
+      "38,9": "floor",
+      "39,10": "floor",
+      "39,11": "floor",
+      "39,12": "floor",
+      "39,13": "floor",
+      "39,7": "floor",
+      "39,8": "floor",
+      "39,9": "floor",
+      "40,10": "floor",
+      "40,11": "floor",
+      "40,12": "floor",
+      "40,13": "floor",
+      "40,7": "floor",
+      "40,8": "floor",
+      "40,9": "floor",
+      "41,10": "unknown",
+      "41,11": "floor",
+      "41,12": "floor",
+      "41,13": "floor",
+      "41,7": "floor",
+      "41,8": "floor",
+      "41,9": "floor",
+      "42,10": "floor",
+      "42,11": "floor",
+      "42,12": "floor",
+      "42,13": "floor",
+      "42,7": "floor",
+      "42,8": "floor",
+      "42,9": "floor",
+      "43,10": "floor",
+      "43,11": "floor",
+      "43,12": "floor",
+      "43,13": "floor",
+      "43,7": "floor",
+      "43,8": "floor",
+      "43,9": "floor",
+      "44,10": "floor",
+      "44,11": "floor",
+      "44,12": "floor",
+      "44,13": "floor",
+      "44,7": "floor",
+      "44,8": "floor",
+      "44,9": "floor",
+      "45,10": "floor",
+      "45,11": "floor",
+      "45,12": "floor",
+      "45,13": "stairs-down",
+      "45,7": "floor",
+      "45,8": "floor",
+      "45,9": "floor"
+     }
+    },
+    "tick": 100
+   },
+   "legacy_body": "bodies/nav_with_directives.json",
+   "retained_table": {
+    "candidates": [
+     {
+      "action": {
+       "key": 108
+      },
+      "action_signature": "4581e66cefda5e86b40d915b37f72452ae9d739a69dec1bf332c8ffae14e6bdb",
+      "candidate_id": "6e80a48186940d0688ef1bd41b4341e40b4ed317526f5157ac6d56fa82830c6e",
+      "direction": [
+       1,
+       0
+      ],
+      "direction_rank": 4,
+      "effect_payload": [],
+      "family": "stair",
+      "family_rank": 2,
+      "proposed_effect": "navigate",
+      "reason": "navigate (survive): reachable down stairs",
+      "rows": [],
+      "score": 826,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 121
+      },
+      "action_signature": "721dd582e06b84c712bd73063520f3a46a4c604bc8ad9f35cc1c604eccf06187",
+      "candidate_id": "41ad56d65b70da83cab6cf3b38675030f40f75787ee938ea107e991fb226769e",
+      "direction": [
+       -1,
+       -1
+      ],
+      "direction_rank": 0,
+      "effect_payload": [],
+      "family": "door",
+      "family_rank": 3,
+      "proposed_effect": "navigate",
+      "reason": "navigate (survive): approach a closed door",
+      "rows": [],
+      "score": 696,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 107
+      },
+      "action_signature": "40aed197bd15af3e2bad93492c6105d9576da943f3bbb4212b22d644761b6de3",
+      "candidate_id": "d1757669e6c262e5afb36d9c9cbeab8a8a85217d4add16631a92cb88d77d08cb",
+      "direction": [
+       0,
+       -1
+      ],
+      "direction_rank": 1,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate (survive): observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 104
+      },
+      "action_signature": "102da1b4731c1fb42c416e01122bf71e99cf05ec14c3cfd515a4fcbd7d905c22",
+      "candidate_id": "7e60c65a48afb8f753b7af502cf0113df3bdd1e7f7003eccb099051379a536f2",
+      "direction": [
+       -1,
+       0
+      ],
+      "direction_rank": 3,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate (survive): observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 106
+      },
+      "action_signature": "199cf47021f9e90b7012269bdd9345ebd9f5c989209998fb5e0ced3e6cdf8092",
+      "candidate_id": "f5bd5a633725a4040f000eb775ef02a3f4221e625419adb01f089b41b2351095",
+      "direction": [
+       0,
+       1
+      ],
+      "direction_rank": 6,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate (survive): observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 117
+      },
+      "action_signature": "bdb8aae6ef3520a23df555b31da5c02bbd657da538d8381676940cf97d653ad8",
+      "candidate_id": "8fade6a1d22a5c68f1491bf8c3eda92394e949a4d5af11515d09796c2add9ded",
+      "direction": [
+       1,
+       -1
+      ],
+      "direction_rank": 2,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate (survive): observation frontier",
+      "rows": [],
+      "score": 497,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 98
+      },
+      "action_signature": "59e3ac402e4a07e57bfa2305b71214527a4bb650f75f97a23fb1026bffc30769",
+      "candidate_id": "208f277ec3ea20f5485af7e1fc249302225ec7977bc22392e12654beeaa90b29",
+      "direction": [
+       -1,
+       1
+      ],
+      "direction_rank": 5,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate (survive): observation frontier",
+      "rows": [],
+      "score": 497,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 110
+      },
+      "action_signature": "b1b3e848fc1e5711eac0369b2f18d4f0895a19700570c930e67f18f155049721",
+      "candidate_id": "c369a3911cbd140d4f2d69671d8906be1b772cd174c22115a2c5bb37bde68c66",
+      "direction": [
+       1,
+       1
+      ],
+      "direction_rank": 7,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate (survive): observation frontier",
+      "rows": [],
+      "score": 497,
+      "score_components": [],
+      "semantic_label": "navigate"
+     }
+    ],
+    "features_digest": "02486e6c469491df74280bc5c087551ce07f9d234db85a135f40392a92e5f568",
+    "jev_eligibility": false,
+    "need_key": [
+     1,
+     1,
+     11
+    ],
+    "rejection_version": 0,
+    "scripted_index": 0,
+    "table_id": "8d0f9103e67c70def8c395443d0a2eb4d1cc913267abd73aadebd9aee86d1b0e",
+    "table_version": 1
+   }
+  },
+  "post_controller_fallback": {
+   "canned_response": {
+    "chosen_retained_index": 1,
+    "confidence": 0.42,
+    "probabilities": [
+     0.08285714285714287,
+     0.42,
+     0.08285714285714287,
+     0.08285714285714287,
+     0.08285714285714287,
+     0.08285714285714287,
+     0.08285714285714287,
+     0.08285714285714287
+    ],
+    "usage": {
+     "input_tokens": 288,
+     "output_tokens": 40
+    }
+   },
+   "capture": {
+    "adapter_version": "jev-choice/2",
+    "commit": "20a70154a98ad8a81ee234ff1188ac8a6c6d9ae4",
+    "tick_context": {
+     "need_id": 10,
+     "need_kind": "command",
+     "tick": 100
+    }
+   },
+   "controller_gate": {
+    "confidence_threshold": 0.8,
+    "eligible": "family != emergency",
+    "rejection_version": 0
+   },
+   "expected_legacy_parser_selected_index": 1,
+   "expected_outcome": "fallback:confidence",
+   "frozen_context": {
+    "directives": [],
+    "intent": "",
+    "memory": {
+     "hero": [
+      41,
+      10
+     ],
+     "inventory": {
+      "rows": [
+       {
+        "r": 1,
+        "selectable": true,
+        "text": "a food ration"
+       },
+       {
+        "r": 2,
+        "selectable": true,
+        "text": "b - a dagger"
+       }
+      ],
+      "seen_tick": 100,
+      "seen_time": 100
+     },
+     "messages": [],
+     "stairs_down": [],
+     "stairs_up": [],
+     "status": {
+      "dlvl": "1",
+      "gold": null,
+      "hp": 12,
+      "hp_max": 12,
+      "hunger": "",
+      "level": 3,
+      "time": 100
+     }
+    },
+    "need": {
+     "id": 10,
+     "kind": "command",
+     "prompt": ""
+    },
+    "need_key": [
+     1,
+     1,
+     10
+    ],
+    "pages": [],
+    "snapshot": {
+     "cond": [],
+     "map": {
+      "37,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,10": [
+       "@",
+       "white",
+       0,
+       "none"
+      ],
+      "41,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ]
+     },
+     "msg": [],
+     "s": {
+      "dungeon-level": {
+       "text": "1"
+      },
+      "experience-level": {
+       "text": "3"
+      },
+      "hitpoints": {
+       "text": "12"
+      },
+      "hitpoints-max": {
+       "text": "12"
+      },
+      "hunger": {
+       "text": ""
+      },
+      "time": {
+       "text": "100"
+      }
+     }
+    },
+    "terrain": {
+     "occupancy": {
+      "41,10": "hero-or-human"
+     },
+     "terrain": {
+      "37,10": "floor",
+      "37,11": "floor",
+      "37,12": "floor",
+      "37,13": "floor",
+      "37,7": "floor",
+      "37,8": "floor",
+      "37,9": "floor",
+      "38,10": "floor",
+      "38,11": "floor",
+      "38,12": "floor",
+      "38,13": "floor",
+      "38,7": "floor",
+      "38,8": "floor",
+      "38,9": "floor",
+      "39,10": "floor",
+      "39,11": "floor",
+      "39,12": "floor",
+      "39,13": "floor",
+      "39,7": "floor",
+      "39,8": "floor",
+      "39,9": "floor",
+      "40,10": "floor",
+      "40,11": "floor",
+      "40,12": "floor",
+      "40,13": "floor",
+      "40,7": "floor",
+      "40,8": "floor",
+      "40,9": "floor",
+      "41,10": "unknown",
+      "41,11": "floor",
+      "41,12": "floor",
+      "41,13": "floor",
+      "41,7": "floor",
+      "41,8": "floor",
+      "41,9": "floor",
+      "42,10": "floor",
+      "42,11": "floor",
+      "42,12": "floor",
+      "42,13": "floor",
+      "42,7": "floor",
+      "42,8": "floor",
+      "42,9": "floor",
+      "43,10": "floor",
+      "43,11": "floor",
+      "43,12": "floor",
+      "43,13": "floor",
+      "43,7": "floor",
+      "43,8": "floor",
+      "43,9": "floor",
+      "44,10": "floor",
+      "44,11": "floor",
+      "44,12": "floor",
+      "44,13": "floor",
+      "44,7": "floor",
+      "44,8": "floor",
+      "44,9": "floor",
+      "45,10": "floor",
+      "45,11": "floor",
+      "45,12": "floor",
+      "45,13": "floor",
+      "45,7": "floor",
+      "45,8": "floor",
+      "45,9": "floor"
+     }
+    },
+    "tick": 100
+   },
+   "legacy_body": "bodies/post_controller_fallback.json",
+   "retained_table": {
+    "candidates": [
+     {
+      "action": {
+       "key": 107
+      },
+      "action_signature": "40aed197bd15af3e2bad93492c6105d9576da943f3bbb4212b22d644761b6de3",
+      "candidate_id": "d1757669e6c262e5afb36d9c9cbeab8a8a85217d4add16631a92cb88d77d08cb",
+      "direction": [
+       0,
+       -1
+      ],
+      "direction_rank": 1,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 104
+      },
+      "action_signature": "102da1b4731c1fb42c416e01122bf71e99cf05ec14c3cfd515a4fcbd7d905c22",
+      "candidate_id": "7e60c65a48afb8f753b7af502cf0113df3bdd1e7f7003eccb099051379a536f2",
+      "direction": [
+       -1,
+       0
+      ],
+      "direction_rank": 3,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 108
+      },
+      "action_signature": "4581e66cefda5e86b40d915b37f72452ae9d739a69dec1bf332c8ffae14e6bdb",
+      "candidate_id": "6e80a48186940d0688ef1bd41b4341e40b4ed317526f5157ac6d56fa82830c6e",
+      "direction": [
+       1,
+       0
+      ],
+      "direction_rank": 4,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 106
+      },
+      "action_signature": "199cf47021f9e90b7012269bdd9345ebd9f5c989209998fb5e0ced3e6cdf8092",
+      "candidate_id": "f5bd5a633725a4040f000eb775ef02a3f4221e625419adb01f089b41b2351095",
+      "direction": [
+       0,
+       1
+      ],
+      "direction_rank": 6,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 499,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 121
+      },
+      "action_signature": "721dd582e06b84c712bd73063520f3a46a4c604bc8ad9f35cc1c604eccf06187",
+      "candidate_id": "41ad56d65b70da83cab6cf3b38675030f40f75787ee938ea107e991fb226769e",
+      "direction": [
+       -1,
+       -1
+      ],
+      "direction_rank": 0,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 497,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 117
+      },
+      "action_signature": "bdb8aae6ef3520a23df555b31da5c02bbd657da538d8381676940cf97d653ad8",
+      "candidate_id": "8fade6a1d22a5c68f1491bf8c3eda92394e949a4d5af11515d09796c2add9ded",
+      "direction": [
+       1,
+       -1
+      ],
+      "direction_rank": 2,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 497,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 98
+      },
+      "action_signature": "59e3ac402e4a07e57bfa2305b71214527a4bb650f75f97a23fb1026bffc30769",
+      "candidate_id": "208f277ec3ea20f5485af7e1fc249302225ec7977bc22392e12654beeaa90b29",
+      "direction": [
+       -1,
+       1
+      ],
+      "direction_rank": 5,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 497,
+      "score_components": [],
+      "semantic_label": "navigate"
+     },
+     {
+      "action": {
+       "key": 110
+      },
+      "action_signature": "b1b3e848fc1e5711eac0369b2f18d4f0895a19700570c930e67f18f155049721",
+      "candidate_id": "c369a3911cbd140d4f2d69671d8906be1b772cd174c22115a2c5bb37bde68c66",
+      "direction": [
+       1,
+       1
+      ],
+      "direction_rank": 7,
+      "effect_payload": [],
+      "family": "frontier",
+      "family_rank": 4,
+      "proposed_effect": "navigate",
+      "reason": "navigate: observation frontier",
+      "rows": [],
+      "score": 497,
+      "score_components": [],
+      "semantic_label": "navigate"
+     }
+    ],
+    "features_digest": "645f7bd993566af66c0ef995fd13116e33a8611bc899e6e7650d2dc02e42db1c",
+    "jev_eligibility": false,
+    "need_key": [
+     1,
+     1,
+     10
+    ],
+    "rejection_version": 0,
+    "scripted_index": 0,
+    "table_id": "394653fa624f5d9842b7862364a1c8076fa688abbce77644f63ba80b81f8a602",
+    "table_version": 1
+   }
+  },
+  "quit_singleton": {
+   "canned_response": {
+    "chosen_retained_index": 1,
+    "confidence": 0.9,
+    "probabilities": [],
+    "usage": {
+     "input_tokens": 312,
+     "output_tokens": 48
+    }
+   },
+   "capture": {
+    "adapter_version": "jev-choice/2",
+    "commit": "20a70154a98ad8a81ee234ff1188ac8a6c6d9ae4",
+    "tick_context": {
+     "need_id": 6,
+     "need_kind": "command",
+     "tick": 100
+    }
+   },
+   "expected_legacy_parser_selected_index": null,
+   "expected_outcome": "refused:singleton",
+   "frozen_context": {
+    "directives": [],
+    "intent": "",
+    "memory": {
+     "hero": [
+      41,
+      10
+     ],
+     "inventory": {
+      "rows": [
+       {
+        "r": 1,
+        "selectable": true,
+        "text": "a food ration"
+       },
+       {
+        "r": 2,
+        "selectable": true,
+        "text": "b - a dagger"
+       }
+      ],
+      "seen_tick": 100,
+      "seen_time": 100
+     },
+     "messages": [],
+     "stairs_down": [],
+     "stairs_up": [],
+     "status": {
+      "dlvl": "1",
+      "gold": null,
+      "hp": 12,
+      "hp_max": 12,
+      "hunger": "",
+      "level": 3,
+      "time": 100
+     }
+    },
+    "need": {
+     "id": 6,
+     "kind": "command",
+     "prompt": ""
+    },
+    "need_key": [
+     1,
+     1,
+     6
+    ],
+    "pages": [],
+    "snapshot": {
+     "cond": [],
+     "map": {
+      "37,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "37,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "38,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "39,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "40,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,10": [
+       "@",
+       "white",
+       0,
+       "none"
+      ],
+      "41,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "41,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "42,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "43,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "44,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,10": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,11": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,12": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,13": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,7": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,8": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ],
+      "45,9": [
+       ".",
+       "gray",
+       0,
+       "none"
+      ]
+     },
+     "msg": [],
+     "s": {
+      "dungeon-level": {
+       "text": "1"
+      },
+      "experience-level": {
+       "text": "3"
+      },
+      "hitpoints": {
+       "text": "12"
+      },
+      "hitpoints-max": {
+       "text": "12"
+      },
+      "hunger": {
+       "text": ""
+      },
+      "time": {
+       "text": "100"
+      }
+     }
+    },
+    "terrain": {
+     "occupancy": {
+      "41,10": "hero-or-human"
+     },
+     "terrain": {
+      "37,10": "floor",
+      "37,11": "floor",
+      "37,12": "floor",
+      "37,13": "floor",
+      "37,7": "floor",
+      "37,8": "floor",
+      "37,9": "floor",
+      "38,10": "floor",
+      "38,11": "floor",
+      "38,12": "floor",
+      "38,13": "floor",
+      "38,7": "floor",
+      "38,8": "floor",
+      "38,9": "floor",
+      "39,10": "floor",
+      "39,11": "floor",
+      "39,12": "floor",
+      "39,13": "floor",
+      "39,7": "floor",
+      "39,8": "floor",
+      "39,9": "floor",
+      "40,10": "floor",
+      "40,11": "floor",
+      "40,12": "floor",
+      "40,13": "floor",
+      "40,7": "floor",
+      "40,8": "floor",
+      "40,9": "floor",
+      "41,10": "unknown",
+      "41,11": "floor",
+      "41,12": "floor",
+      "41,13": "floor",
+      "41,7": "floor",
+      "41,8": "floor",
+      "41,9": "floor",
+      "42,10": "floor",
+      "42,11": "floor",
+      "42,12": "floor",
+      "42,13": "floor",
+      "42,7": "floor",
+      "42,8": "floor",
+      "42,9": "floor",
+      "43,10": "floor",
+      "43,11": "floor",
+      "43,12": "floor",
+      "43,13": "floor",
+      "43,7": "floor",
+      "43,8": "floor",
+      "43,9": "floor",
+      "44,10": "floor",
+      "44,11": "floor",
+      "44,12": "floor",
+      "44,13": "floor",
+      "44,7": "floor",
+      "44,8": "floor",
+      "44,9": "floor",
+      "45,10": "floor",
+      "45,11": "floor",
+      "45,12": "floor",
+      "45,13": "floor",
+      "45,7": "floor",
+      "45,8": "floor",
+      "45,9": "floor"
+     }
+    },
+    "tick": 100
+   },
+   "legacy_body": null,
+   "retained_table": {
+    "candidates": [
+     {
+      "action": {
+       "key": 35
+      },
+      "action_signature": "b81484aaa777dd6480dd2f515c908032154d6703da61fe1e89f9df6211dc76dd",
+      "candidate_id": "02a2f6668917aea777fa5e534cb2f70b55d6993613c2c4024c7df2191d55d2d3",
+      "direction": [],
+      "direction_rank": 0,
+      "effect_payload": [],
+      "family": "other",
+      "family_rank": 12,
+      "proposed_effect": "quit",
+      "reason": "quit",
+      "rows": [],
+      "score": 0,
+      "score_components": [],
+      "semantic_label": "quit"
+     }
+    ],
+    "features_digest": "b7a2e43c822d59065da8116a5bb58d8bfef5d7a7ffcb2662a9f18094125811f8",
+    "jev_eligibility": false,
+    "need_key": [
+     1,
+     1,
+     6
+    ],
+    "rejection_version": 0,
+    "scripted_index": 0,
+    "table_id": "b74128a43c951876c49b4fa1def2e869d4de766acba65d7aebafc42df5219c06",
+    "table_version": 1
+   }
+  }
+ },
+ "provenance": {
+  "adapter_version": "jev-choice/2",
+  "capture": "the real adapter was driven against the loopback FakeEndpoint (test/agent/test_auto_providers.py) and the exact raw POST body bytes it wrote were committed",
+  "kind": "legacy-renderer baseline corpus (Phase 0)",
+  "note": "legacy_body is frozen: after Phase A the renderer emits semantic keys and can no longer reproduce these bytes."
+ },
+ "schema_version": 1
+}

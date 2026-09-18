@@ -1228,5 +1228,123 @@ class StrategyReplayContinuityTest(WireHarness):
             self.assertLessEqual(len(prepared.retained), 1)
 
 
+# ------------------------------------------------- Phase 0 paired corpus
+#
+# The old-renderer baseline corpus under ``fixtures/jev_legacy_requests`` is a
+# set of *self-contained paired records*: the raw legacy body alone cannot
+# reconstruct its context, so every renderer input is frozen beside it.  A
+# fixture that omits one of those load-bearing fields would silently weaken
+# every later old-vs-new comparison, so its absence is a test failure, not a
+# skip.
+
+class TestJevOfflineMetrics(unittest.TestCase):
+    """The Phase-0 corpus schema and (later) the offline comparison report."""
+
+    def test_offline_manifest_schema_rejects_missing_fields(self):
+        import jev_fixtures
+
+        manifest = jev_fixtures.load_manifest()
+        self.assertEqual(jev_fixtures.validate_manifest(manifest), [])
+        self.assertTrue(manifest["fixtures"])
+
+        for field in jev_fixtures.REQUIRED_FIELDS:
+            entry = dict(manifest["fixtures"]["nav_frontier_room"])
+            entry.pop(field, None)
+            problems = jev_fixtures.validate_entry("synthetic", entry)
+            self.assertTrue(
+                any(field in problem for problem in problems),
+                "dropping %r from an entry was not rejected" % (field,))
+
+        # the nested load-bearing records are load bearing too
+        for field in jev_fixtures.TABLE_FIELDS:
+            entry = dict(manifest["fixtures"]["nav_frontier_room"])
+            entry["retained_table"] = dict(entry["retained_table"])
+            entry["retained_table"].pop(field, None)
+            problems = jev_fixtures.validate_entry("synthetic", entry)
+            self.assertTrue(
+                any(field in problem for problem in problems),
+                "dropping retained_table.%r was not rejected" % (field,))
+
+        entry = dict(manifest["fixtures"]["nav_frontier_room"])
+        table = dict(entry["retained_table"])
+        table["candidates"] = [dict(table["candidates"][0])]
+        table["candidates"][0].pop("reason", None)
+        entry["retained_table"] = table
+        self.assertTrue(any("reason" in p for p in
+                            jev_fixtures.validate_entry("synthetic", entry)))
+
+        for field in jev_fixtures.CONTEXT_FIELDS:
+            entry = dict(manifest["fixtures"]["nav_frontier_room"])
+            entry["frozen_context"] = dict(entry["frozen_context"])
+            entry["frozen_context"].pop(field, None)
+            problems = jev_fixtures.validate_entry("synthetic", entry)
+            self.assertTrue(
+                any(field in problem for problem in problems),
+                "dropping frozen_context.%r was not rejected" % (field,))
+
+        for field in jev_fixtures.CANNED_FIELDS:
+            entry = dict(manifest["fixtures"]["nav_frontier_room"])
+            entry["canned_response"] = dict(entry["canned_response"])
+            entry["canned_response"].pop(field, None)
+            problems = jev_fixtures.validate_entry("synthetic", entry)
+            self.assertTrue(
+                any(field in problem for problem in problems),
+                "dropping canned_response.%r was not rejected" % (field,))
+
+        entry = dict(manifest["fixtures"]["nav_frontier_room"])
+        entry["capture"] = dict(entry["capture"])
+        for field in jev_fixtures.CAPTURE_FIELDS:
+            entry["capture"].pop(field, None)
+            problems = jev_fixtures.validate_entry("synthetic", entry)
+            self.assertTrue(any(field in problem for problem in problems),
+                            "dropping capture.%r was not rejected" % (field,))
+
+        for outcome in ("", "refused", "fallback", "selected ", 3):
+            entry = dict(manifest["fixtures"]["nav_frontier_room"])
+            entry["expected_outcome"] = outcome
+            self.assertTrue(
+                jev_fixtures.validate_entry("synthetic", entry),
+                "outcome %r was accepted" % (outcome,))
+
+        entry = dict(manifest["fixtures"]["nav_frontier_room"])
+        entry.pop("expected_legacy_parser_selected_index", None)
+        self.assertTrue(jev_fixtures.validate_entry("synthetic", entry))
+
+    def test_offline_corpus_is_self_contained_and_round_trips(self):
+        import jev_fixtures
+
+        manifest = jev_fixtures.load_manifest()
+        for name in jev_fixtures.fixture_names(manifest):
+            entry = manifest["fixtures"][name]
+            with self.subTest(fixture=name):
+                # the frozen table rebuilds to the identical identity, so the
+                # paired new-wire request re-renders from the same inputs
+                table = jev_fixtures.unfreeze_table(entry["retained_table"])
+                self.assertEqual(table.table_id,
+                                 entry["retained_table"]["table_id"])
+                jev_fixtures.unfreeze_context(entry["frozen_context"])
+                # the probability vector is indexed by retained index exactly
+                canned = entry["canned_response"]
+                if entry["expected_outcome"].startswith("refused:"):
+                    self.assertIsNone(
+                        entry["expected_legacy_parser_selected_index"])
+                else:
+                    self.assertEqual(len(canned["probabilities"]),
+                                     len(table))
+                    chosen = canned["chosen_retained_index"]
+                    self.assertEqual(
+                        canned["probabilities"].index(
+                            max(canned["probabilities"])), chosen)
+                    self.assertEqual(
+                        entry["expected_legacy_parser_selected_index"], chosen)
+                legacy = entry["legacy_body"]
+                if legacy is None:
+                    self.assertTrue(
+                        entry["expected_outcome"].startswith("refused:"))
+                else:
+                    self.assertTrue(os.path.exists(
+                        os.path.join(jev_fixtures.default_root(), legacy)))
+
+
 if __name__ == "__main__":
     unittest.main()
