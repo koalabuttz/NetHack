@@ -185,6 +185,36 @@ def preconditions_met(dset: DirectiveSet,
     return True
 
 
+def _ineligibility_reason(dset: Optional[DirectiveSet],
+                          activated_tick: Optional[int],
+                          activated_level: Optional[str], *,
+                          tick: int, level: Optional[str],
+                          st: PreconditionState) -> Optional[str]:
+    """Why the active set is *not* in force, or None when it is.
+
+    The single eligibility authority: :meth:`DirectiveBook.active` (for the
+    reflex, which expires and logs on a failure) and
+    :meth:`DirectiveBook.peek_view` (for display, which must never mutate)
+    both call this, so their answers cannot drift.  ``None`` means either
+    "no set" or "eligible"; the caller distinguishes those by whether it
+    holds a set at all.  Precedence is level, then TTL, then precondition,
+    and the TTL test keeps the exact ``age > ttl`` semantics (equality is
+    eligible) with the same None-activation and None-level behavior.
+    """
+    if dset is None:
+        return None
+    if activated_level is not None and level is not None \
+            and level != activated_level:
+        return "level-changed"
+    if activated_tick is not None:
+        age = tick - activated_tick
+        if age > dset.ttl:
+            return "ttl-expired"
+    if not preconditions_met(dset, st):
+        return "precondition-failed"
+    return None
+
+
 class DirectiveBook(object):
     """Activation, TTL/level/precondition enforcement for one episode."""
 
@@ -236,21 +266,16 @@ class DirectiveBook(object):
         Enforces, in order: activation exists; the displayed level still
         matches (advice about another level is stale); the tick TTL has not
         run out; every precondition still holds.  Any failure expires the
-        set rather than leaving it half-applied.
+        set rather than leaving it half-applied.  The predicate itself is
+        :func:`_ineligibility_reason`, shared with :meth:`peek_view`.
         """
         if self._active is None:
             return None
-        if self.level is not None and level is not None \
-                and level != self.level:
-            self.expire("level-changed", tick, level)
-            return None
-        if self.activated_tick is not None:
-            age = tick - self.activated_tick
-            if age > self._active.ttl:
-                self.expire("ttl-expired", tick, level)
-                return None
-        if not preconditions_met(self._active, st):
-            self.expire("precondition-failed", tick, level)
+        reason = _ineligibility_reason(
+            self._active, self.activated_tick, self.level,
+            tick=tick, level=level, st=st)
+        if reason is not None:
+            self.expire(reason, tick, level)
             return None
         return self._active
 
@@ -258,6 +283,23 @@ class DirectiveBook(object):
              st: PreconditionState) -> "DirectiveView":
         dset = self.active(tick, level, st)
         return DirectiveView(dset, self.generation if dset else 0)
+
+    def peek_view(self, tick: int, level: Optional[str],
+                  st: PreconditionState) -> "DirectiveView":
+        """The read-only view for *display*: never expires, logs or mutates.
+
+        Same eligibility predicate as :meth:`view` (:func:`active`), but a
+        failing set is reported as inactive without touching book state -- no
+        ``expire``, no lifecycle event, no sink call, no generation change.
+        So a frame can show the directive state a later reflex read will
+        still see, and rendering a frame can never itself advance the book.
+        """
+        dset = self._active
+        if dset is None or _ineligibility_reason(
+                dset, self.activated_tick, self.level,
+                tick=tick, level=level, st=st) is not None:
+            return DirectiveView(None, 0)
+        return DirectiveView(dset, self.generation)
 
     def _log(self, state: str, reason: str, tick: Optional[int] = None,
              level: Optional[str] = None,
