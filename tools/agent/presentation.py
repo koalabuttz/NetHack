@@ -31,14 +31,13 @@ unsupported-      decoded action has no faithful template at this need
 semantic         boundary
 missing-required- a required item/menu-row/direction binding is absent
 binding
-too-many-options the frozen table exceeds the bounded key count
 ===============  =====================================================
 
-``too-many-options`` is an implementation addition: a
-:class:`tools.agent.candidates.CandidateTable` is already capped at
-``MAX_CANDIDATES`` by construction, and the wire contract requires the emitted
-key count to stay within the same bound, so the guard is defensive -- but it
-must refuse (whole request) rather than silently truncate.
+The set is closed by the plan.  A frozen table larger than the bounded key
+count is the same failure as any other table shape the renderer cannot present
+faithfully, so it maps to ``unsupported-semantic`` -- the whole request is
+refused, never silently truncated -- rather than adding a code outside the
+approved vocabulary.
 """
 
 from dataclasses import dataclass
@@ -60,11 +59,10 @@ REFUSAL_SINGLETON = "singleton"
 REFUSAL_INVALID_LABEL = "invalid-label"
 REFUSAL_UNSUPPORTED_SEMANTIC = "unsupported-semantic"
 REFUSAL_MISSING_BINDING = "missing-required-binding"
-REFUSAL_TOO_MANY = "too-many-options"
 
 REFUSAL_CODES = (REFUSAL_UNSUPPORTED_NEED, REFUSAL_SINGLETON,
                  REFUSAL_INVALID_LABEL, REFUSAL_UNSUPPORTED_SEMANTIC,
-                 REFUSAL_MISSING_BINDING, REFUSAL_TOO_MANY)
+                 REFUSAL_MISSING_BINDING)
 
 #: Needs the presentation renderer supports.  Everything else (menus, yn,
 #: line, extcmd, position, ack) stays wholly on the scripted tier.
@@ -207,8 +205,11 @@ def option_keys(need_kind: str,
     members = list(ordered_candidates)
     if need_kind not in SUPPORTED_KINDS:
         return (None, None, REFUSAL_UNSUPPORTED_NEED)
+    # A table above the bounded key count cannot be presented faithfully, so
+    # it refuses the whole request as an unsupported table shape (the closed
+    # vocabulary has no separate bound code) -- never silent truncation.
     if len(members) > MAX_OPTION_KEYS:
-        return (None, None, REFUSAL_TOO_MANY)
+        return (None, None, REFUSAL_UNSUPPORTED_SEMANTIC)
     bases: List[str] = []
     for candidate in members:
         stem, refusal = base_key(need_kind, candidate)
@@ -243,6 +244,7 @@ DESCEND_TEMPLATE = ("Descend the staircase here, going deeper into the "
 DESCEND_FALLBACK = "Attempt to go down here."
 ASCEND_TEMPLATE = ("Ascend the staircase here to the previous dungeon "
                    "level.")
+ASCEND_FALLBACK = "Attempt to go up here."
 ASCEND_LEAVE_DUNGEON = "Go up here; this may leave the dungeon."
 INVENTORY_TEMPLATE = "Review your inventory."
 INVENTORY_FOOD_CLAUSE = "Check what food is available."
@@ -357,8 +359,79 @@ def _bound_item(candidate) -> str:
     return ""
 
 
+#: Command labels whose decoded *purpose* outranks a plain walk reading: a
+#: withdrawal or recovery step keeps its own sentence even when its canonical
+#: action happens to be a movement key.
+MOVEMENT_PURPOSE_STEMS = ("escape", "random-move", "recovery-step", "unblock")
+
+#: The base stems of the approved open-door family (a compass suffix is added
+#: by the label, e.g. ``open-door-south``).
+OPEN_DOOR_STEMS = ("open", "open-door")
+
+
+def _bound_compass(candidate) -> Optional[str]:
+    """The compass bound to a frozen candidate, decoded from the candidate.
+
+    The canonical action and the frozen ``direction`` field are authoritative;
+    an emitted key string is never parsed back.  ``None`` means the candidate
+    carries no bound direction.
+    """
+    step = tuple(getattr(candidate, "direction", ()) or ())
+    if step in COMPASS:
+        return COMPASS[step]
+    return movement_of(candidate)
+
+
+def open_door_direction(stem: str) -> Optional[str]:
+    """The compass name bound in an open-door stem, or ``None``."""
+    for name in DIR_BY_NAME:
+        if stem in ("open-%s" % name, "open-door-%s" % name):
+            return name
+    return None
+
+
+def open_door_stem(stem: str) -> bool:
+    """True for any member of the approved open-door command family."""
+    return stem in OPEN_DOOR_STEMS or open_door_direction(stem) is not None
+
+
+def _bound_door_type(candidate) -> str:
+    """The exact frozen door-type binding, or ``""`` (never fabricated)."""
+    payload = getattr(candidate, "effect_payload", ()) or ()
+    for item in payload:
+        if isinstance(item, dict):
+            text = item.get("door_type") or item.get("door")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+    return ""
+
+
+def _door_open_text(candidate, stem: str) -> Tuple[str, str]:
+    """The open-door template for one member of the approved family.
+
+    A bound direction -- taken from the frozen candidate or from the stem
+    itself -- selects the directional template, typed when an exact
+    door-type binding exists and untyped otherwise.  With no bound direction
+    the member is the initiation form, which chooses its direction at the next
+    prompt.  ``locked`` is never fabricated.
+    """
+    direction = open_door_direction(stem) or _bound_compass(candidate)
+    if direction is None:
+        return (DOOR_INITIATE_TEMPLATE, "")
+    door_type = _bound_door_type(candidate)
+    if door_type:
+        return (DOOR_OPEN_TYPED_TEMPLATE % (door_type, direction), "")
+    return (DOOR_OPEN_TEMPLATE % direction, "")
+
+
 def _walk_text(candidate, compass: str, context) -> Tuple[str, str]:
-    """The navigate template for one movement member."""
+    """The navigate template for one movement member.
+
+    Only a *confirmed* ``T_CLOSED_DOOR`` adjacent cell takes the blocking-door
+    branch: a remembered doorway or open door is not a closed door and never
+    acquires a "closed / may block movement" claim.  Those use their approved
+    remembered-terrain phrases instead.
+    """
     purpose = purpose_of(candidate.reason)
     hero = _hero(context)
     if hero is None:
@@ -368,13 +441,36 @@ def _walk_text(candidate, compass: str, context) -> Tuple[str, str]:
     klass = terrain_class(context, dest)
     occupant = OCCUPANT_CLAUSE if currently_occupied(context, dest, hero) \
         else ""
-    if klass in (T_CLOSED_DOOR, T_DOORWAY):
+    if klass == T_CLOSED_DOOR:
         return (_join(DOOR_TOWARD_TEMPLATE % compass, occupant, purpose), "")
     phrase = TERRAIN_PHRASES.get(klass) if klass is not None else None
     if phrase is None:
         return (_join("Walk %s." % compass, occupant, purpose), "")
     return (_join("Walk %s onto %s." % (compass, phrase), occupant, purpose),
             "")
+
+
+def _dungeon_level(context) -> Optional[int]:
+    """The displayed dungeon level as an int, or ``None`` when unavailable."""
+    st = getattr(getattr(context, "memory", None), "status", None)
+    raw = getattr(st, "dlvl", None)
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str) and raw.strip().isdigit():
+        return int(raw.strip())
+    return None
+
+
+def _exit_possible(context) -> bool:
+    """True only when the up-staircase could leave the dungeon.
+
+    The dungeon exit is reachable only from level 1; from any deeper level an
+    up-staircase leads to the previous level.  Unknown level evidence is never
+    treated as an exit, so the caveat is dropped rather than over-claimed.
+    """
+    return _dungeon_level(context) == 1
 
 
 def _command_text(candidate, stem: str, context) -> Tuple[str, str]:
@@ -399,8 +495,10 @@ def _command_text(candidate, stem: str, context) -> Tuple[str, str]:
         hero = _hero(context)
         on_stairs = (hero is not None
                      and terrain_class(context, hero) == T_STAIRS_UP)
-        return (_join(ASCEND_TEMPLATE,
-                      ASCEND_LEAVE_DUNGEON if on_stairs else ""), "")
+        if not on_stairs:
+            return (ASCEND_FALLBACK, "")
+        caveat = ASCEND_LEAVE_DUNGEON if _exit_possible(context) else ""
+        return (_join(ASCEND_TEMPLATE, caveat), "")
     if stem == "inventory":
         wants_food = any(_wants_food(view)
                          for view in getattr(context, "directives", ()) or ())
@@ -420,9 +518,13 @@ def _command_text(candidate, stem: str, context) -> Tuple[str, str]:
     if stem == "unblock":
         if candidate.action.payload[0] == protocol.KEY_WAIT:
             return (_join(WAIT_TEMPLATE, WAIT_HOLD_CLAUSE), "")
+        compass = movement_of(candidate)
+        if compass is not None:
+            return (_join("Move %s as a recovery step." % compass,
+                          LOOP_BREAKER_CLAUSE if loop_breaker else ""), "")
         return (_join(SEARCH_TEMPLATE,
                       LOOP_BREAKER_CLAUSE if loop_breaker else ""), "")
-    if stem == "random-move":
+    if stem in ("random-move", "recovery-step"):
         compass = movement_of(candidate)
         if compass is not None:
             return (_join("Move %s as a recovery step." % compass,
@@ -433,8 +535,6 @@ def _command_text(candidate, stem: str, context) -> Tuple[str, str]:
         if compass is not None:
             return ("Move %s, %s" % (compass, WITHDRAW_CLAUSE.lower()), "")
         return (WITHDRAW_CLAUSE, "")
-    if stem in ("open", "open-door"):
-        return (DOOR_INITIATE_TEMPLATE, "")
     if label == "forced-search" or stem == "forced-search":
         return (FORCED_SEARCH_TEMPLATE, "")
     return (None, REFUSAL_UNSUPPORTED_SEMANTIC)
@@ -480,12 +580,24 @@ def render_criterion(candidate, need_kind: str, context) -> Tuple[
         return (None, REFUSAL_UNSUPPORTED_SEMANTIC)
     if candidate.action.tag != "key":
         return (None, REFUSAL_UNSUPPORTED_SEMANTIC)
-    compass = movement_of(candidate)
-    if compass is not None:
-        return _walk_text(candidate, compass, context)
     stem = command_stem(candidate.semantic_label)
+    compass = movement_of(candidate)
+    # A withdrawal/recovery label keeps its decoded purpose even when the
+    # canonical action is a movement key: the purpose outranks a plain walk.
+    if stem is not None and stem in MOVEMENT_PURPOSE_STEMS:
+        return _command_text(candidate, stem, context)
+    if compass is not None:
+        # A walk action is a navigate member: its option key is ``navigate-*``
+        # and its criterion is the walk template (which may name an adjacent
+        # *confirmed* closed door, never a remembered doorway).
+        return _walk_text(candidate, compass, context)
+    # Non-movement command members: the approved open-door family first, then
+    # the labelled command templates.  A label that cannot be normalized
+    # refuses rather than being lossily aliased.
     if stem is None:
         return (None, REFUSAL_INVALID_LABEL)
+    if open_door_stem(stem):
+        return _door_open_text(candidate, stem)
     if candidate.action.payload[0] == protocol.KEY_SEARCH \
             and stem != "forced-search":
         return _command_text(candidate, "search-in-place", context)
@@ -552,6 +664,17 @@ def _int_or_none(value):
     return value
 
 
+def _text(value) -> Optional[str]:
+    """A displayed string: ``None`` when unavailable, ``""`` when known empty.
+
+    Presence- and type-sensitive: an absent attribute (``None``) or a non-str
+    value is *unavailable* and renders ``null``; a present ``str`` -- including
+    the empty string -- is preserved exactly.  Truthiness is never consulted,
+    so a known-empty value is never confused with a missing one.
+    """
+    return value if isinstance(value, str) else None
+
+
 def _directive_summaries(context) -> List[str]:
     """Deterministic directive summaries in existing priority order.
 
@@ -582,23 +705,41 @@ def _directive_summaries(context) -> List[str]:
     return out
 
 
+def _row_text(row) -> Optional[str]:
+    """The displayed text of one cached inventory row, or ``None``.
+
+    A row that cannot be rendered as a nonempty string is skipped, but it
+    still occupies its source position: the 40-row window is applied to the
+    *observed listing*, not to the filtered strings, so a skipped row never
+    lets a later row slide into the emitted listing.
+    """
+    text = row.get("text") if isinstance(row, dict) else row
+    if isinstance(text, str) and text:
+        return text
+    return None
+
+
 def _inventory_payload(mem, st) -> Dict[str, Any]:
     inv = getattr(mem, "inventory", None)
     if inv is None or getattr(inv, "seen_tick", None) is None:
         return {"items": None, "cached": False, "age_turns": None,
                 "truncated": False}
-    rendered = []
-    for row in getattr(inv, "rows", None) or []:
-        text = row.get("text") if isinstance(row, dict) else row
-        if isinstance(text, str) and text:
-            rendered.append(text)
+    rows = list(getattr(inv, "rows", None) or [])
+    window = rows[:INVENTORY_LIMIT]
+    items = [text for text in map(_row_text, window) if text is not None]
+    # ``truncated`` is true only when the observed cache holds rows beyond the
+    # window that a full listing would actually show.  A skipped row *inside*
+    # the window displaces that content (so it truncates); a skipped row
+    # *beyond* the window omits nothing, so it does not.
+    beyond = any(_row_text(row) is not None
+                 for row in rows[INVENTORY_LIMIT:])
     age = None
     game_time = _int_or_none(getattr(st, "time", None))
     seen_time = _int_or_none(getattr(inv, "seen_time", None))
     if game_time is not None and seen_time is not None:
         age = max(0, game_time - seen_time)
-    return {"items": rendered[:INVENTORY_LIMIT], "cached": True,
-            "age_turns": age, "truncated": len(rendered) > INVENTORY_LIMIT}
+    return {"items": items, "cached": True,
+            "age_turns": age, "truncated": bool(beyond)}
 
 
 def _messages_payload(mem):
@@ -667,8 +808,8 @@ def render_state(context) -> Dict[str, Any]:
         "status": {
             "hp": _int_or_none(getattr(st, "hp", None)),
             "hp_max": _int_or_none(getattr(st, "hp_max", None)),
-            "hunger": getattr(st, "hunger", "") or "",
-            "dungeon_level": getattr(st, "dlvl", "") or "",
+            "hunger": _text(getattr(st, "hunger", None)),
+            "dungeon_level": _text(getattr(st, "dlvl", None)),
             "experience_level": _int_or_none(getattr(st, "level", None)),
             "conditions": _conditions(getattr(context, "snapshot", None)),
         },
@@ -677,8 +818,8 @@ def render_state(context) -> Dict[str, Any]:
         "directives": _directive_summaries(context),
         "intent": _intent_payload(context),
         "messages": _messages_payload(mem),
-        "need": {"kind": need.get("kind") or "",
-                 "prompt": need.get("prompt") or None},
+        "need": {"kind": _text(need.get("kind")),
+                 "prompt": _text(need.get("prompt"))},
         "map": _map_payload(context, mem),
         "stairs": _stairs_payload(mem),
     }

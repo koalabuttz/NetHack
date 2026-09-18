@@ -92,7 +92,7 @@
    "messages": [],
    "need": {
     "kind": "command",
-    "prompt": null
+    "prompt": ""
    },
    "objective": "Survive, explore safely, and descend when prepared.",
    "stairs": null,
@@ -106,7 +106,7 @@
    }
   }
  },
- "request_body_sha256": "61e647cb88600695e24201eb83862dbeecc9bd24440cdb9b54ab1821a5c97db7",
+ "request_body_sha256": "95da6458187ae2e74b58ff604fee65c141006f5227b4430670d4fb719afa3484",
  "response": {
   "answers": {
    "action": {

@@ -474,8 +474,9 @@ untouched.
   request -- candidates are never selectively dropped.  Conservative
   degradation is not a refusal: absent optional evidence (terrain
   classification, route purpose, occupant data) simply uses the shorter
-  template.  `too-many-options` is an additional defensive code for a frozen
-  table above the 255-key wire bound.
+  template.  A frozen table above the 255-key wire bound is the same kind of
+  unrepresentable table shape and refuses as `unsupported-semantic` rather
+  than adding a code outside the closed vocabulary.
 * **State payload** is one JSON object with `game`, `objective`, a fully
   inlined `legend`, `status` (`hp`, `hp_max`, `hunger`, `dungeon_level`,
   `experience_level`, `conditions`), `hero` (the controller-resolved square
@@ -529,7 +530,13 @@ python3 test/agent/jev_offline_report.py \
 
 The committed `test/agent/fixtures/jev_offline_report.json` is deterministic
 and byte-for-byte reproducible (there is deliberately **no wall-clock field**
-and no latency, token, cost, distribution or survival figure).  Serialized
+and no latency, token, cost, distribution or survival figure).  The report's
+top-level field set is exactly `schema_version`, `per_request` and `summary`.
+The same command also writes one **paired** artifact per fixture under
+`test/agent/fixtures/jev_legacy_requests/paired/`: the exact new
+semantic-wire body the fixture re-renders to, or a **zero-byte** file when the
+renderer refuses it (a refusal carries no wire body; its code lives in the
+report).  Serialized
 byte counts are reported as *bytes* and are never converted to tokens: there
 is no Jev tokenizer in this repository, and the documented 32,000-token Jev
 context window is quoted, not claimed as a measured fit.  Real token counts,

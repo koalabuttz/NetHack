@@ -445,6 +445,87 @@ class TestJevState(unittest.TestCase):
         inv = presentation.render_state(ctx)["inventory"]
         self.assertEqual(inv["age_turns"], 0)
 
+    def test_inventory_truncation_applies_to_observed_listing(self):
+        def inv_of(rows):
+            ctx = context_of(status_text={"time": "100"})
+            ctx.memory.inventory.rows = list(rows)
+            ctx.memory.inventory.seen_tick = 100
+            ctx.memory.inventory.seen_time = 100
+            return presentation.render_state(ctx)["inventory"]
+
+        def row(text):
+            return {"text": text}
+
+        # 41 observed rows with a malformed row among the first 40: the
+        # 40-row window is applied to the *observed* listing, so the malformed
+        # row is skipped but still displaces the 41st, which never slides in
+        rows = [row("row %d" % i) for i in range(40)]
+        rows[7] = {"text": 3}                    # unrenderable
+        rows.append(row("row 40"))
+        inv = inv_of(rows)
+        self.assertEqual(inv["items"],
+                         ["row %d" % i for i in range(40) if i != 7])
+        self.assertNotIn("row 40", inv["items"])
+        self.assertTrue(inv["truncated"])
+        # 41 observed rows with the malformed row last: the window is entirely
+        # renderable, so a full listing would show the same 40 rows
+        rows = [row("row %d" % i) for i in range(40)] + [{"text": 3}]
+        inv = inv_of(rows)
+        self.assertEqual(inv["items"], ["row %d" % i for i in range(40)])
+        self.assertFalse(inv["truncated"])
+        # <=40 rows with an unrenderable row: skipped, and nothing is omitted
+        rows = [row("row %d" % i) for i in range(10)]
+        rows[3] = {"text": None}
+        inv = inv_of(rows)
+        self.assertEqual(inv["items"],
+                         ["row %d" % i for i in range(10) if i != 3])
+        self.assertFalse(inv["truncated"])
+
+    def test_need_nulls_only_when_unavailable(self):
+        # a present-but-empty prompt is *known empty* and preserved exactly
+        ctx = context_of({"id": 1, "kind": "command", "prompt": ""})
+        self.assertEqual(presentation.render_state(ctx)["need"],
+                         {"kind": "command", "prompt": ""})
+        # an absent prompt is *unavailable* -> null
+        ctx = context_of({"id": 1, "kind": "command"})
+        self.assertEqual(presentation.render_state(ctx)["need"],
+                         {"kind": "command", "prompt": None})
+        # an explicit None prompt is unavailable too
+        ctx = context_of({"id": 1, "kind": "command", "prompt": None})
+        self.assertIsNone(presentation.render_state(ctx)["need"]["prompt"])
+        # a missing kind is unavailable, never a known-empty string
+        ctx = context_of({"id": 1, "prompt": ""})
+        self.assertIsNone(presentation.render_state(ctx)["need"]["kind"])
+
+    def test_status_strings_null_vs_empty(self):
+        # a valid empty string is known empty
+        ctx = context_of(status_text={"hunger": "", "dungeon-level": ""})
+        status = presentation.render_state(ctx)["status"]
+        self.assertEqual(status["hunger"], "")
+        self.assertEqual(status["dungeon_level"], "")
+        # a valid non-empty displayed string is preserved verbatim
+        ctx = context_of(status_text={"hunger": "Hungry",
+                                      "dungeon-level": "3"})
+        status = presentation.render_state(ctx)["status"]
+        self.assertEqual(status["hunger"], "Hungry")
+        self.assertEqual(status["dungeon_level"], "3")
+        # no status extraction at all: unavailable, not known empty
+        ctx = context_of(status_text={"hunger": "", "dungeon-level": ""})
+        ctx.memory.status = None
+        status = presentation.render_state(ctx)["status"]
+        self.assertIsNone(status["hunger"])
+        self.assertIsNone(status["dungeon_level"])
+
+        # a status object that never carried a dungeon level: absent, not ""
+        class _HungerOnly(object):
+            hunger = "Not hungry"
+
+        ctx = context_of()
+        ctx.memory.status = _HungerOnly()
+        status = presentation.render_state(ctx)["status"]
+        self.assertEqual(status["hunger"], "Not hungry")
+        self.assertIsNone(status["dungeon_level"])
+
     def test_conditions_messages_null_on_injected_failure(self):
         from unittest import mock
         ctx = context_of(status_text={"time": "7"}, msg=[{"e": 1,
@@ -580,10 +661,36 @@ class TestJevState(unittest.TestCase):
         # the wall from the raw grid never appears
         self.assertNotIn("|", mp["text"])
 
+    #: The plan §5 class -> glyph mapping, hard-coded here so that a missing
+    #: entry or a remapping in the production table cannot pass this test by
+    #: comparing the renderer to the same table it is derived from.
+    PLAN_GLYPHS = {
+        "floor": ".",
+        "corridor": "#",
+        "wall": "|",
+        "open-door": "-",
+        "closed-door": "+",
+        "doorway": "+",
+        "stairs-down": ">",
+        "stairs-up": "<",
+        "tree": "#",
+        "water": "}",
+        "lava": "}",
+        "trap": "^",
+        "bars": "|",
+        "boulder": "0",
+        "fountain": "{",
+        "altar": "_",
+        "unknown": " ",
+    }
+
     def test_map_glyph_per_terrain_class(self):
-        for klass in sorted(state.TERRAIN_GLYPHS):
+        # the production table equals the plan's mapping exactly, over exactly
+        # the classification vocabulary (an independent, hard-coded oracle)
+        self.assertEqual(state.TERRAIN_GLYPHS, self.PLAN_GLYPHS)
+        self.assertEqual(set(state.TERRAIN_GLYPHS), set(self.PLAN_GLYPHS))
+        for klass, expected in sorted(self.PLAN_GLYPHS.items()):
             with self.subTest(terrain=klass):
-                expected = state.TERRAIN_GLYPHS[klass]
                 tm = terrain_of([((6, 5), klass)])
                 ctx = context_of(hero=(5, 5), terrain=tm)
                 mp = presentation.render_state(ctx)["map"]
@@ -591,15 +698,6 @@ class TestJevState(unittest.TestCase):
                        if line.startswith(" 5 ")][0]
                 cell = row[3 + (6 - mp["x_min"])]
                 self.assertEqual(cell, expected)
-        # the documented overrides: an unknown class is a blank, and a
-        # doorway/water/lava collapse onto one canonical glyph
-        self.assertEqual(state.TERRAIN_GLYPHS[I.T_UNKNOWN], " ")
-        self.assertEqual(state.TERRAIN_GLYPHS[I.T_DOORWAY],
-                         state.TERRAIN_GLYPHS[I.T_CLOSED_DOOR])
-        self.assertEqual(state.TERRAIN_GLYPHS[I.T_WATER],
-                         state.TERRAIN_GLYPHS[I.T_LAVA])
-        self.assertEqual(state.TERRAIN_GLYPHS[I.T_TREE],
-                         state.TERRAIN_GLYPHS[I.T_CORRIDOR])
         # monster and hero overlays
         ctx = context_of(hero=(5, 5),
                          terrain=[((5, 5), I.T_FLOOR),
@@ -751,6 +849,8 @@ class TestJevContext(WireHarness):
                           directives_=[directives.DirectiveView(dset, 1)])
         before_terrain = dict(tm.terrain)
         before_occ = dict(tm.occupancy)
+        before_revision = tm.map_revision
+        before_occ_generation = tm.occupancy_generation
         before_grid = dict(mem.grid)
         before_rows = [dict(r) for r in mem.inventory.rows]
         before_msgs = list(mem.messages)
@@ -767,7 +867,8 @@ class TestJevContext(WireHarness):
         self.assertIsNotNone(state_payload["map"])
         self.assertEqual(tm.terrain, before_terrain)
         self.assertEqual(tm.occupancy, before_occ)
-        self.assertEqual(tm.map_revision, tm.map_revision)
+        self.assertEqual(tm.map_revision, before_revision)
+        self.assertEqual(tm.occupancy_generation, before_occ_generation)
         self.assertEqual(mem.grid, before_grid)
         self.assertEqual(mem.inventory.rows, before_rows)
         self.assertEqual(mem.messages, before_msgs)

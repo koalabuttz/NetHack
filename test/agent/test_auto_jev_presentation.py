@@ -188,16 +188,18 @@ class TestJevKeys(unittest.TestCase):
         keys, key_index, refusal = presentation.option_keys("command", many)
         self.assertIsNone(keys)
         self.assertIsNone(key_index)
-        self.assertEqual(refusal, presentation.REFUSAL_TOO_MANY)
+        # the over-bound shape is an unrepresentable table, not a new code
+        self.assertEqual(refusal, presentation.REFUSAL_UNSUPPORTED_SEMANTIC)
         # the bound itself is inclusive
         ok = [cand(KEY.KEY_H, "label-%d" % i) for i in range(255)]
         self.assertEqual(presentation.option_keys("command", ok)[0] is not None,
                          True)
-        # and a frozen table never silently truncates: it refuses
+        # and a frozen table never silently truncates: it refuses the whole
+        # request, emitting no keys and no index
         frozen, why = presentation.present(
             "command", many, context_of(COMMAND))
         self.assertIsNone(frozen)
-        self.assertEqual(why, presentation.REFUSAL_TOO_MANY)
+        self.assertEqual(why, presentation.REFUSAL_UNSUPPORTED_SEMANTIC)
 
 
 # ------------------------------------------------------------------ AC.3
@@ -228,7 +230,12 @@ class TestJevRenderingRefusal(WireHarness):
         return runner, rec
 
     def _refusal_cases(self):
-        """One (label, table, need) triple per closed refusal code."""
+        """One ``(label, code, table, need)`` case per closed refusal code.
+
+        The closed vocabulary holds exactly five codes; the over-bound table
+        shape maps to ``unsupported-semantic`` (whole-request refusal) rather
+        than a sixth code.
+        """
         one = [cand(KEY.KEY_H, "navigate")]
         bad_label = [cand(KEY.KEY_SEARCH, "!!"), cand(KEY.KEY_EAT, "??")]
         semantics = [candidates.make_candidate({"yn": ord("n")}, "prompt"),
@@ -236,26 +243,36 @@ class TestJevRenderingRefusal(WireHarness):
         no_direction = [cand(KEY.KEY_SEARCH, "search"),
                         cand(KEY.KEY_EAT, "eat")]
         # A real CandidateTable is capped at 255 by construction, so the
-        # over-bound guard is exercised against a directly-constructed frozen
+        # over-bound shape is exercised against a directly-constructed frozen
         # table rather than one that could never be built.
         oversized = replace(table_of(one), ordered_candidates=tuple(one * 256))
         return [
-            ("unsupported-need", table_of(one), {"id": 9, "kind": "menu",
-                                                 "menu": "m", "mode": "one",
-                                                 "content": "c", "pages": 1}),
-            ("singleton", table_of(one), COMMAND),
-            ("invalid-label", table_of(bad_label), COMMAND),
-            ("unsupported-semantic", table_of(semantics), COMMAND),
-            ("missing-required-binding", table_of(no_direction), DIRECTION),
-            ("too-many-options", oversized, COMMAND),
+            ("unsupported-need", "unsupported-need", table_of(one),
+             {"id": 9, "kind": "menu", "menu": "m", "mode": "one",
+              "content": "c", "pages": 1}),
+            ("singleton", "singleton", table_of(one), COMMAND),
+            ("invalid-label", "invalid-label", table_of(bad_label), COMMAND),
+            ("unsupported-semantic", "unsupported-semantic",
+             table_of(semantics), COMMAND),
+            ("missing-required-binding", "missing-required-binding",
+             table_of(no_direction), DIRECTION),
+            ("oversized-unsupported-semantic", "unsupported-semantic",
+             oversized, COMMAND),
         ]
+
+    def test_closed_refusal_vocabulary(self):
+        # the vocabulary is closed at exactly the five approved codes
+        self.assertEqual(set(presentation.REFUSAL_CODES),
+                         {"unsupported-need", "singleton", "invalid-label",
+                          "unsupported-semantic", "missing-required-binding"})
+        self.assertFalse(hasattr(presentation, "REFUSAL_TOO_MANY"))
 
     def test_each_refusal_code_recorded_pre_reservation(self):
         from test_auto_providers import FakeEndpoint
 
         with mock.patch.dict(os.environ, {"JEV_API_KEY": "jev-refusal"}):
-            for code, table, need in self._refusal_cases():
-                with self.subTest(code=code):
+            for label, code, table, need in self._refusal_cases():
+                with self.subTest(code=label):
                     ep = FakeEndpoint()
                     self.addCleanup(ep.close)
                     fake = self._reflex(ep.base_url)
@@ -410,6 +427,130 @@ class TestJevCriteria(unittest.TestCase):
         self.assertNotIn("open the door", text)
         self.assertNotIn("locked", text)
         self.assertIn("Approach a known closed door.", text)
+
+    def test_adjacent_doorway_is_not_a_closed_door(self):
+        move = cand(KEY.KEY_L, "navigate")
+        # a remembered doorway is not a confirmed closed door: it uses its own
+        # approved phrase and never gains a "closed / may block" claim
+        ctx = context_of(COMMAND, terrain={(6, 5): instances.T_DOORWAY})
+        text, refusal = presentation.render_criterion(move, "command", ctx)
+        self.assertEqual(refusal, "")
+        self.assertEqual(text, "Walk east onto a remembered open doorway.")
+        self.assertNotIn("closed", text)
+        self.assertNotIn("block", text)
+        # an open door is the same approved phrase, never described as closed
+        ctx = context_of(COMMAND, terrain={(6, 5): instances.T_OPEN_DOOR})
+        text, refusal = presentation.render_criterion(move, "command", ctx)
+        self.assertEqual(refusal, "")
+        self.assertEqual(text, "Walk east onto a remembered open doorway.")
+        self.assertNotIn("closed", text)
+        self.assertNotIn("block", text)
+        # only a *confirmed* closed door takes the blocking-door branch
+        ctx = context_of(COMMAND, terrain={(6, 5): instances.T_CLOSED_DOOR})
+        text, _ = presentation.render_criterion(move, "command", ctx)
+        self.assertEqual(text,
+                         "Move east toward the adjacent closed door; it may "
+                         "block movement.")
+
+    def test_open_door_family_renderable(self):
+        ctx = context_of(COMMAND)
+        south = cand(KEY.KEY_EAT, "open door south")
+        unbound = cand(KEY.KEY_WAIT, "open-door")
+        # the option keys come from the frozen label, not from a parsed key
+        keys, _key_index, refusal = presentation.option_keys(
+            "command", [south, unbound])
+        self.assertEqual(refusal, "")
+        self.assertEqual(keys, ["open-door-south", "open-door"])
+        # a bound direction selects the untyped directional template
+        text, refusal = presentation.render_criterion(south, "command", ctx)
+        self.assertEqual(refusal, "")
+        self.assertEqual(text, "Try to open the door to the south.")
+        self.assertNotIn("locked", text)
+        # an exact door-type binding selects the typed template
+        typed = cand(KEY.KEY_EAT, "open door south",
+                     effect_payload=({"door_type": "closed"},))
+        text, refusal = presentation.render_criterion(typed, "command", ctx)
+        self.assertEqual(refusal, "")
+        self.assertEqual(text, "Try to open the closed door to the south.")
+        self.assertNotIn("locked", text)
+        # a direction bound on the frozen candidate (absent from the label)
+        bound = cand(KEY.KEY_WAIT, "open-door", direction=(0, 1))
+        text, _ = presentation.render_criterion(bound, "command", ctx)
+        self.assertEqual(text, "Try to open the door to the south.")
+        # an unbound member is the initiation form, never a refusal
+        text, refusal = presentation.render_criterion(unbound, "command", ctx)
+        self.assertEqual(refusal, "")
+        self.assertEqual(text, presentation.DOOR_INITIATE_TEMPLATE)
+
+    def test_movement_purpose_families_renderable(self):
+        ctx = context_of(COMMAND, terrain={(6, 5): instances.T_FLOOR})
+        # a directional escape keeps its withdrawal sentence, never a walk
+        escape = cand(KEY.KEY_L, "escape", reason="low HP: flee upstairs")
+        text, refusal = presentation.render_criterion(escape, "command", ctx)
+        self.assertEqual(refusal, "")
+        self.assertEqual(text, "Move east, withdraw from danger.")
+        self.assertNotIn("Walk", text)
+        # a directional random/recovery step keeps its recovery sentence
+        move = cand(KEY.KEY_J, "random-move",
+                    reason="loop breaker: random walk (known floor)")
+        text, refusal = presentation.render_criterion(move, "command", ctx)
+        self.assertEqual(refusal, "")
+        self.assertEqual(text,
+                         "Move south as a recovery step. Try to break the "
+                         "recent lack of progress.")
+        step = cand(KEY.KEY_H, "recovery-step", reason="recovery: random walk")
+        text, refusal = presentation.render_criterion(step, "command", ctx)
+        self.assertEqual(refusal, "")
+        self.assertEqual(text, "Move west as a recovery step.")
+        # a non-directional escape is the bare withdrawal sentence
+        still = cand(KEY.KEY_WAIT, "escape", reason="low HP: hold position")
+        text, _ = presentation.render_criterion(still, "command", ctx)
+        self.assertEqual(text, presentation.WITHDRAW_CLAUSE)
+        # a non-direction unblock falls back to the search sentence
+        unblock = cand(KEY.KEY_SEARCH, "unblock",
+                       reason="loop breaker: unblock")
+        text, _ = presentation.render_criterion(unblock, "command", ctx)
+        self.assertTrue(text.startswith(presentation.SEARCH_TEMPLATE))
+
+    def test_missing_direction_binding_refuses(self):
+        # a direction need with no bound direction is a genuinely required
+        # binding: the whole member refuses rather than fabricating one
+        ctx = context_of(DIRECTION)
+        non_move = cand(KEY.KEY_SEARCH, "search")
+        text, refusal = presentation.render_criterion(non_move, "direction",
+                                                      ctx)
+        self.assertIsNone(text)
+        self.assertEqual(refusal, presentation.REFUSAL_MISSING_BINDING)
+        frozen, why = presentation.present("direction", [non_move], ctx)
+        self.assertIsNone(frozen)
+        self.assertEqual(why, presentation.REFUSAL_MISSING_BINDING)
+
+    def test_ascend_wording_evidence_sensitive(self):
+        up = cand(ord("<"), "go-upstairs")
+        # no confirmed up-stair beneath the hero: the fallback, no stair claim
+        ctx = context_of(COMMAND)
+        text, refusal = presentation.render_criterion(up, "command", ctx)
+        self.assertEqual(refusal, "")
+        self.assertEqual(text, presentation.ASCEND_FALLBACK)
+        self.assertNotIn("staircase", text)
+        self.assertNotIn("leave the dungeon", text)
+        # a confirmed up-stair in a deeper dungeon: definite wording, no caveat
+        deep = state.EpisodeMemory()
+        deep.status.dlvl = "3"
+        deep_ctx = context_of(COMMAND, terrain={(5, 5): instances.T_STAIRS_UP},
+                              memory=deep)
+        text, _ = presentation.render_criterion(up, "command", deep_ctx)
+        self.assertEqual(text, presentation.ASCEND_TEMPLATE)
+        self.assertNotIn("leave the dungeon", text)
+        # a confirmed up-stair at dungeon level 1: the exit is possible, so the
+        # exit caveat is appended
+        top = state.EpisodeMemory()
+        top.status.dlvl = "1"
+        top_ctx = context_of(COMMAND, terrain={(5, 5): instances.T_STAIRS_UP},
+                             memory=top)
+        text, _ = presentation.render_criterion(up, "command", top_ctx)
+        self.assertEqual(text, presentation.ASCEND_TEMPLATE + " "
+                         + presentation.ASCEND_LEAVE_DUNGEON)
 
     def test_unknown_reason_omitted(self):
         ctx = context_of(COMMAND, terrain={(6, 5): instances.T_FLOOR})

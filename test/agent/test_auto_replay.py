@@ -1403,8 +1403,11 @@ class TestJevOfflineMetrics(unittest.TestCase):
         report = json.loads(fresh)
         self.assertEqual(report["schema_version"],
                          jev_offline_report.SCHEMA_VERSION)
-        self.assertEqual(sorted(report), ["fixtures_root", "per_request",
-                                          "schema_version", "summary"])
+        # the approved top-level field set is exactly these three: no
+        # undocumented ``fixtures_root`` extension
+        self.assertEqual(sorted(report), ["per_request", "schema_version",
+                                          "summary"])
+        self.assertNotIn("fixtures_root", report)
         self.assertEqual(sorted(report["summary"]),
                          ["agreement_rate", "refusal_tallies",
                           "total_bytes_legacy", "total_bytes_new"])
@@ -1431,6 +1434,50 @@ class TestJevOfflineMetrics(unittest.TestCase):
         self.assertEqual(sorted(consumed),
                          jev_fixtures.fixture_names(manifest))
         self.assertEqual(len(consumed), len(set(consumed)))
+
+    def test_paired_artifacts_committed_and_match_renderer(self):
+        import jev_fixtures
+        import jev_offline_report
+
+        manifest = jev_fixtures.load_manifest()
+        root = jev_offline_report.default_fixtures()
+        names = jev_fixtures.fixture_names(manifest)
+        for name in names:
+            with self.subTest(fixture=name):
+                path = jev_offline_report.paired_path(root, name)
+                self.assertTrue(os.path.exists(path),
+                                "missing paired artifact %s" % path)
+                with open(path, "rb") as handle:
+                    committed = handle.read()
+                # exactly the in-memory renderer output, byte for byte
+                body, _keys, _index, _refusal = \
+                    jev_offline_report.render_new_wire(manifest["fixtures"][name])
+                self.assertEqual(committed, body)
+                # a refused fixture carries no body
+                if manifest["fixtures"][name]["expected_outcome"].startswith(
+                        "refused:"):
+                    self.assertEqual(committed, b"")
+                else:
+                    self.assertTrue(committed)
+        # exactly one paired artifact per manifest fixture, and no extras
+        paired_dir = os.path.join(root, jev_offline_report.PAIRED_DIR)
+        present = {f[:-len(".json")] for f in os.listdir(paired_dir)
+                   if f.endswith(".json")}
+        self.assertEqual(present, set(names))
+
+    def test_render_new_wire_matches_report_bytes(self):
+        import jev_fixtures
+        import jev_offline_report
+
+        report = jev_offline_report.build_report(
+            jev_offline_report.default_fixtures())
+        manifest = jev_fixtures.load_manifest()
+        by_name = {r["fixture"]: r for r in report["per_request"]}
+        for name in jev_fixtures.fixture_names(manifest):
+            with self.subTest(fixture=name):
+                body = jev_offline_report.render_new_wire(
+                    manifest["fixtures"][name])[0]
+                self.assertEqual(len(body), by_name[name]["bytes_new"])
 
     def test_offline_report_paired_key_to_index_translation(self):
         import jev_fixtures

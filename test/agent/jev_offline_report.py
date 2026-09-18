@@ -25,6 +25,12 @@ real token counts, cost, distribution shapes and gameplay survival are
 live-only, operator-approved metrics and are deliberately not automatable
 here.  Serialized byte counts are reported as *bytes* and are never converted
 to tokens (there is no Jev tokenizer in this repository).
+
+Besides the report it writes the committed **paired** artifact for every
+fixture under ``<fixtures>/paired/``: the exact new semantic-wire body, or a
+zero-byte file for a fixture the renderer refuses (a refusal carries no wire
+body; its code lives in the report).  Both artifacts are byte-for-byte
+deterministic across runs.
 """
 
 import argparse
@@ -45,6 +51,13 @@ SCHEMA_VERSION = 1
 
 #: The committed report artifact this harness generates.
 DEFAULT_REPORT = os.path.join(_HERE, "fixtures", "jev_offline_report.json")
+
+#: The committed paired-artifact directory, relative to the fixtures root: one
+#: file per manifest fixture, holding that fixture's deterministic new
+#: semantic-wire body.  A fixture the renderer refuses has no body, so its
+#: artifact is a zero-byte file (the refusal code lives in the report, never in
+#: the paired body).
+PAIRED_DIR = "paired"
 
 #: Field names that would make the report non-deterministic.  A wall-clock
 #: value anywhere in the artifact would break byte-for-byte reproducibility,
@@ -138,6 +151,47 @@ def _request_bytes(payload):
     return json.dumps(payload).encode("utf-8")
 
 
+def paired_path(root, name):
+    """The committed paired new-wire artifact for one fixture name."""
+    return os.path.join(root, PAIRED_DIR, name + ".json")
+
+
+def render_new_wire(entry):
+    """The deterministic paired representation of one fixture's new request.
+
+    Returns ``(body, option_keys, key_index, refusal)``.  The body is the
+    exact bytes the worker would POST; for a fixture the renderer refuses, the
+    body is the **empty** byte string, because a refusal carries no wire body
+    (its code is recorded in the report).  This is the single source of truth
+    for both the report's ``bytes_new`` and the committed paired artifact.
+    """
+    context = jf.unfreeze_context(entry["frozen_context"])
+    context.prepared = jf.prepared_from_frozen(entry["retained_table"])
+    adapter = providers.JevReflex(providers.ProviderConfig(reflex="jev"),
+                                  jev_dispatch_enabled=True)
+    build = adapter.build_request(context)
+    if build.request is None:
+        return (b"", [], {}, build.refusal or "")
+    return (_request_bytes(build.request.payload),
+            list(build.request.key_index),
+            dict(build.request.key_index), "")
+
+
+def write_paired(root, manifest=None):
+    """Write the paired new-wire artifact for every manifest fixture.
+
+    One file per fixture under ``<root>/paired/``; byte-for-byte deterministic
+    so a re-run reproduces the committed artifacts exactly.
+    """
+    manifest = manifest if manifest is not None else jf.load_manifest(root)
+    out_dir = os.path.join(root, PAIRED_DIR)
+    os.makedirs(out_dir, exist_ok=True)
+    for name in jf.fixture_names(manifest):
+        body = render_new_wire(manifest["fixtures"][name])[0]
+        with open(paired_path(root, name), "wb") as handle:
+            handle.write(body)
+
+
 def _fallback_category(outcome):
     if outcome.startswith(jf.OUTCOME_FALLBACK):
         return outcome[len(jf.OUTCOME_FALLBACK):]
@@ -146,23 +200,11 @@ def _fallback_category(outcome):
 
 def analyse(name, entry, manifest_root):
     table = jf.unfreeze_table(entry["retained_table"])
-    context = jf.unfreeze_context(entry["frozen_context"])
-    context.prepared = jf.prepared_from_frozen(entry["retained_table"])
     canned = entry["canned_response"]
     count = len(table)
 
     # -- the new semantic-wire request, re-rendered from the frozen inputs
-    adapter = providers.JevReflex(providers.ProviderConfig(reflex="jev"),
-                                  jev_dispatch_enabled=True)
-    build = adapter.build_request(context)
-    if build.request is None:
-        new_bytes = b""
-        option_keys = []
-        refusal = build.refusal or ""
-    else:
-        new_bytes = _request_bytes(build.request.payload)
-        option_keys = list(build.request.key_index)
-        refusal = ""
+    new_bytes, option_keys, key_index, refusal = render_new_wire(entry)
 
     # -- the legacy raw body, exactly as committed
     legacy_path = entry["legacy_body"]
@@ -185,7 +227,7 @@ def analyse(name, entry, manifest_root):
     new_index = None
     if option_keys and retained_probabilities(canned, count) is not None:
         body = materialize_semantic_response(canned, option_keys)
-        new_index = parse_semantic(body, dict(build.request.key_index))
+        new_index = parse_semantic(body, key_index)
     if new_index != frozen_legacy:
         raise SystemExit("%s: semantic parser selected %r, fixture froze %r"
                          % (name, new_index, frozen_legacy))
@@ -234,7 +276,6 @@ def build_report(root):
     agreement_rate = (float(agreed) / paired) if paired else None
     return {
         "schema_version": SCHEMA_VERSION,
-        "fixtures_root": os.path.relpath(root, _ROOT),
         "per_request": per_request,
         "summary": {
             "total_bytes_new": total_new,
@@ -262,6 +303,9 @@ def main(argv=None):
             handle.write(text)
     else:
         sys.stdout.write(text)
+    # The paired new-wire artifact for every fixture is part of the Phase D
+    # contract and is committed beside the corpus; write it deterministically.
+    write_paired(args.fixtures)
     return 0
 
 

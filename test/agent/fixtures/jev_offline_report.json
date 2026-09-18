@@ -1,5 +1,4 @@
 {
- "fixtures_root": "test/agent/fixtures/jev_legacy_requests",
  "per_request": [
   {
    "bytes_legacy": 1461,
@@ -39,7 +38,7 @@
   },
   {
    "bytes_legacy": 1443,
-   "bytes_new": 2623,
+   "bytes_new": 2621,
    "canned_usage": {
     "input_tokens": 312,
     "output_tokens": 48,
@@ -94,7 +93,7 @@
   },
   {
    "bytes_legacy": 897,
-   "bytes_new": 2603,
+   "bytes_new": 2601,
    "canned_usage": {
     "input_tokens": 312,
     "output_tokens": 48,
@@ -111,7 +110,7 @@
   },
   {
    "bytes_legacy": 1329,
-   "bytes_new": 3080,
+   "bytes_new": 3078,
    "canned_usage": {
     "input_tokens": 312,
     "output_tokens": 48,
@@ -128,7 +127,7 @@
   },
   {
    "bytes_legacy": 1443,
-   "bytes_new": 3203,
+   "bytes_new": 3201,
    "canned_usage": {
     "input_tokens": 312,
     "output_tokens": 48,
@@ -145,7 +144,7 @@
   },
   {
    "bytes_legacy": 1733,
-   "bytes_new": 3332,
+   "bytes_new": 3330,
    "canned_usage": {
     "input_tokens": 312,
     "output_tokens": 48,
@@ -162,7 +161,7 @@
   },
   {
    "bytes_legacy": 1443,
-   "bytes_new": 3203,
+   "bytes_new": 3201,
    "canned_usage": {
     "input_tokens": 288,
     "output_tokens": 40,
@@ -205,6 +204,6 @@
    "unsupported-need": 1
   },
   "total_bytes_legacy": 9749,
-  "total_bytes_new": 20737
+  "total_bytes_new": 20725
  }
 }
