@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from . import arbitration, candidates, instances, protocol, recording
+from . import exploration_metrics
 from . import spectating
 from .budget import BudgetLedger
 from .codec import AssemblerLimit, ChunkError, IncrementalAssembler
@@ -2386,7 +2387,23 @@ def write_campaign_summary(output_dir: str, results, config,
     except (AttributeError, OSError):
         pass
     with os.fdopen(fd, "w") as fh:
-        json.dump(campaign_summary(results, config, episode_timeout), fh,
-                  indent=2, sort_keys=True)
+        summary = campaign_summary(results, config, episode_timeout)
+        # The section 10.2 measurement set is derived from the wire
+        # recordings already written beside this summary.  It is additive
+        # telemetry: if the recordings are absent or unreadable the campaign
+        # summary is still written, with the reason recorded rather than a
+        # fabricated number.
+        if os.path.isdir(output_dir):
+            try:
+                metrics = exploration_metrics.campaign_metrics(output_dir)
+                # the directory name is a per-run temp path and must not
+                # appear, so two runs' summaries stay byte-identical
+                metrics.pop("campaign_dir", None)
+                summary["exploration"] = metrics
+            except Exception as exc:  # noqa: BLE001 - telemetry only
+                summary["exploration"] = {"error": str(exc)}
+        else:
+            summary["exploration"] = {"error": "no campaign directory"}
+        json.dump(summary, fh, indent=2, sort_keys=True)
         fh.write("\n")
     return path
