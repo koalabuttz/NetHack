@@ -590,12 +590,15 @@ test/agent:
 (files for the engine-free agent port fixtures)
 .gitignore          Makefile            README.md           bench_candidates.py
 driver.py           format_obs.py       gen_profile.py      hostile_matrix.py
-reference_state.c   reference_state.h   schema_check.py     spectate.py
+native_prefix_probe.py                  reference_state.c
+reference_state.h   schema_check.py     spectate.py
 sysconf
-test_auto.py              test_auto_candidates.py
-test_auto_instances.py    test_auto_integration.py
-test_auto_metrics.py      test_auto_providers.py
-test_auto_replay.py       test_auto_spectate.py
+test_auto.py                 test_auto_candidates.py
+test_auto_forced_search.py   test_auto_instances.py
+test_auto_integration.py     test_auto_metrics.py
+test_auto_navigation.py      test_auto_providers.py
+test_auto_recovery.py        test_auto_replay.py
+test_auto_spectate.py        test_auto_wiring.py
 test_menu.c
 test_protocol.c           test_spectate.py
 test_state.c              test_view.c
@@ -609,10 +612,10 @@ tools/agent:
 (files for the autonomous play harness)
 .gitignore          __init__.py         __main__.py         arbitration.py
 budget.py           candidates.py       codec.py            controller.py
-directives.py       evaluate.py         events.py
-exploration_metrics.py
-instances.py        policy.py           protocol.py         providers.py
-recording.py        render.py           spectating.py       state.py
+directives.py       evaluate.py         events.py           forced_search.py
+exploration_metrics.py              instances.py        navigation.py
+policy.py           protocol.py         providers.py        recording.py
+recovery.py         render.py           spectating.py       state.py
 worker.py
 
 util:
