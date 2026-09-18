@@ -684,6 +684,9 @@ class _EpisodeRunner(object):
         self._attempt_effect = None
         self._attempt_label = ""
         self._attempt_kind = ""
+        # The frozen payload of a non-command effect awaiting its reconciled
+        # observation (the observed inventory rows, tick and game time).
+        self._attempt_payload = ()
         self.observation_generation = 0
         self.attempts_armed = 0
         self.reconciliations = 0
@@ -1344,9 +1347,11 @@ class _EpisodeRunner(object):
         if self._attempt_effect:
             self.reflex.commit_effect(
                 self._attempt_effect, self._attempt_label, self.tick,
-                self.mem, observed_kind=self._attempt_kind)
+                self.mem, observed_kind=self._attempt_kind,
+                payload=self._attempt_payload)
         self._attempt_effect = None
         self._attempt_label = ""
+        self._attempt_payload = ()
         # Boundary detection runs once per applied snapshot, on public state
         # only.  An id is emitted once, so re-presenting the same snapshot
         # (or replaying history) yields no new events; simultaneous reasons
@@ -1589,6 +1594,7 @@ class _EpisodeRunner(object):
         # committed only after the reconciled observation (plan 3.1).
         self._attempt_effect = cand.proposed_effect
         self._attempt_label = cand.semantic_label
+        self._attempt_payload = tuple(getattr(cand, "effect_payload", ()))
         table = _StubTable(self._last_table_id)
         hero = before["hero"]
         self.attempt = candidates.make_sent_attempt(
@@ -1599,6 +1605,29 @@ class _EpisodeRunner(object):
         self.attempts_armed += 1
         if self._is_stair_action(self.attempt):
             self.instance.note_transition_sent(True)
+
+    def _freeze_noncommand_effect(self, selected):
+        """Freeze a non-command candidate's effect for the next observation.
+
+        Only a *complete* send reaches here, and only when the sent action
+        still matches the reflex's prepared candidate: a validation fallback
+        (a structurally valid action the reflex never proposed) freezes
+        nothing, exactly as :meth:`_arm_attempt` rebuilds a candidate from the
+        sent action for a command.  The frozen effect -- with any payload --
+        is applied by :meth:`ScriptedReflex.commit_effect` at the next
+        reconciled observation (plan 3.1).
+        """
+        cand = getattr(self.reflex, "last_candidate", None)
+        try:
+            matches = (cand is not None
+                       and candidates.candidate_to_wire(cand) == selected)
+        except Exception:                    # noqa: BLE001 - defensive
+            matches = False
+        if not matches or not getattr(cand, "proposed_effect", ""):
+            return
+        self._attempt_effect = cand.proposed_effect
+        self._attempt_label = cand.semantic_label
+        self._attempt_payload = tuple(getattr(cand, "effect_payload", ()))
 
     def _fingerprint(self, before):
         return "h=%s t=%s hp=%s/%s" % (
@@ -1688,6 +1717,7 @@ class _EpisodeRunner(object):
             # a rejected attempt commits no effect (plan 3.1)
             self._attempt_effect = None
             self._attempt_label = ""
+            self._attempt_payload = ()
             if not had_attempt:
                 self.force_fallback = True
         # the engine left the SAME request outstanding: re-arm it, but keep
@@ -1705,6 +1735,7 @@ class _EpisodeRunner(object):
         # a discarded attempt without a usable observation commits no effect
         self._attempt_effect = None
         self._attempt_label = ""
+        self._attempt_payload = ()
         # A prefix still armed when the episode ends cannot be cleared: record
         # the un-cleared dangerous prefix honestly rather than pretending a
         # graceful in-game quit was possible (plan 5.4).  No prefixed action
@@ -2582,6 +2613,12 @@ class _EpisodeRunner(object):
             # (plan 3.4 step 5); a failed write raised above and armed none.
             self._arm_attempt(ordinal, selected)
             self.tick += 1
+        else:
+            # A non-command send freezes its proposed effect (and any payload)
+            # for the next reconciled observation; no SentAttempt is armed,
+            # because motion/tick semantics belong to gameplay commands only
+            # (plan 3.1).
+            self._freeze_noncommand_effect(selected)
         if role:
             self._forced_after_send(role, ordinal)
         self.pending = False

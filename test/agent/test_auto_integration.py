@@ -33,7 +33,8 @@ from tools.agent import (arbitration, candidates, controller,  # noqa: E402
                          directives, forced_search, instances, policy,
                          protocol, state)
 from tools.agent.providers import ProviderConfig, ReflexContext  # noqa: E402
-from test_auto import CLOSED, HELLO, WireHarness, _line, obs  # noqa: E402
+from test_auto import (CLOSED, HELLO, WireHarness, _line, _parse_actions,
+                       obs)  # noqa: E402
 
 PAL = [[0, " ", "none", 0, "none"],
        [1, ".", "gray", 0, "none"],
@@ -262,13 +263,15 @@ class PreparationPurity(unittest.TestCase):
 
     def _snapshot(self, ref, mem):
         return (ref.intent, ref.quitting, ref.quit_reason, ref.last_eat_tick,
-                ref.last_inv_tick, ref.eat_forced_menu,
+                ref.last_inv_tick, ref.eat_forced_menu, ref.selection_done,
                 len(ref.recovery.search.completed),
                 set(ref.recovery.search.refused),
                 ref.recovery.refused_site, tuple(ref.recovery.cycle.history),
                 ref._cycled, ref.food.inventory_signature,
                 set(ref.food.locations), mem.no_progress,
-                mem.searches_since_progress, dict(mem.visits), mem.hero)
+                mem.searches_since_progress, dict(mem.visits), mem.hero,
+                mem.inventory.seen_tick, mem.inventory.seen_time,
+                tuple(r.get("text") for r in mem.inventory.rows))
 
     def test_prepare_and_decide_leave_state_unchanged(self):
         ref = policy.ScriptedReflex(ProviderConfig())
@@ -359,6 +362,97 @@ class PreparationPurity(unittest.TestCase):
                                    observed_kind=r._attempt_kind)
         self.assertEqual(r.mem.searches_since_progress, 0)
         self.assertEqual(r._attempt_kind, "no-time")
+
+    # -- non-command proposals are frozen effects too (plan 3.1) ---------
+    _FOOD_ROW = {"r": 65, "text": "a - a food ration", "selectable": True}
+
+    def _menu_ctx(self, mem, rows, title, tick=0):
+        snap = protocol.Snapshot()
+        snap.windows = {"c1": {"w": "w1", "kind": "menu", "title": title,
+                               "content": "c1", "pages": 1}}
+        return ReflexContext(
+            episode=1, tick=tick,
+            need={"id": 1, "kind": "menu", "menu": "m1", "mode": "one",
+                  "content": "c1", "pages": 1},
+            need_key=protocol.NeedKey(1, tick, 1), snapshot=snap,
+            pages=list(rows), memory=mem, directives=[], deadline=0.0)
+
+    def _yn_ctx(self, mem, prompt, tick=0):
+        return ReflexContext(
+            episode=1, tick=tick,
+            need={"id": 1, "kind": "yn", "prompt": prompt},
+            need_key=protocol.NeedKey(1, tick, 1),
+            snapshot=protocol.Snapshot(),
+            pages=[], memory=mem, directives=[], deadline=0.0)
+
+    def test_menu_prepare_is_pure_and_freezes_both_its_effects(self):
+        # an inventory menu under the eat intent both refreshes the cache and
+        # transitions the intent: neither may happen during preparation
+        ref = policy.ScriptedReflex(ProviderConfig())
+        mem = self._mem()
+        ref.intent = "eat"
+        ctx = self._menu_ctx(mem, [self._FOOD_ROW], "Inventory", tick=7)
+        before = self._snapshot(ref, mem)
+        prepared = ref.prepare(ctx)
+        ref.decide(ctx)
+        self.assertEqual(self._snapshot(ref, mem), before)
+        self.assertIsNone(mem.inventory.seen_tick)
+        self.assertEqual(ref.intent, "eat")
+        cand = prepared.table.scripted()
+        self.assertEqual(set(cand.proposed_effect.split("+")),
+                         {"refresh-inventory-menu", "eat-menu"})
+        rows, seen_tick, _time = cand.effect_payload
+        self.assertEqual([r.get("text") for r in rows],
+                         ["a - a food ration"])
+        self.assertEqual(seen_tick, 7)
+        # only a reconciled commit applies both effects
+        ref.commit_effect(cand.proposed_effect, cand.semantic_label, 7, mem,
+                          payload=cand.effect_payload)
+        self.assertEqual(ref.intent, "")
+        self.assertEqual(mem.inventory.seen_tick, 7)
+
+    def test_selection_done_is_a_frozen_effect(self):
+        ref = policy.ScriptedReflex(ProviderConfig())
+        mem = self._mem()
+        rows = [{"r": 1, "text": "Yes; start game", "selectable": True}]
+        ctx = self._menu_ctx(mem, rows, "Is this ok? [ynq]", tick=0)
+        before = self._snapshot(ref, mem)
+        cand = ref.prepare(ctx).table.scripted()
+        ref.decide(ctx)
+        self.assertEqual(self._snapshot(ref, mem), before)
+        self.assertFalse(ref.selection_done)
+        self.assertEqual(cand.proposed_effect, "selection-done")
+        ref.commit_effect("selection-done", "prompt", 0, mem)
+        self.assertTrue(ref.selection_done)
+
+    def test_eat_forced_menu_is_a_frozen_effect(self):
+        ref = policy.ScriptedReflex(ProviderConfig())
+        mem = self._mem(messages=["You don't have that object.",
+                                  "You don't have that object."])
+        ref.intent = "eat"
+        ctx = self._yn_ctx(mem, "What do you want to eat? [d or ?*]")
+        before = self._snapshot(ref, mem)
+        cand = ref.prepare(ctx).table.scripted()
+        res = ref.decide(ctx)
+        self.assertEqual(self._snapshot(ref, mem), before)
+        self.assertFalse(ref.eat_forced_menu)
+        self.assertEqual(cand.proposed_effect, "eat-forced-menu")
+        self.assertEqual(res.action, {"yn": ord("*")})
+        ref.commit_effect("eat-forced-menu", "prompt", 0, mem)
+        self.assertTrue(ref.eat_forced_menu)
+
+    def test_controller_freezes_a_noncommand_effect_on_a_matching_send(self):
+        r = _runner()
+        cand = candidates.make_candidate({"yn": protocol.KEY_N}, "prompt",
+                                         proposed_effect="eat-forced-menu")
+        r.reflex.last_candidate = cand
+        r._freeze_noncommand_effect({"yn": protocol.KEY_N})
+        self.assertEqual(r._attempt_effect, "eat-forced-menu")
+        self.assertIsNone(r.attempt)          # no SentAttempt is armed
+        # a fallback send the reflex never proposed freezes nothing
+        r._attempt_effect = None
+        r._freeze_noncommand_effect({"yn": protocol.KEY_ESC})
+        self.assertIsNone(r._attempt_effect)
 
 
 # ---------------------------------------------------------------- HIGH 4
@@ -521,7 +615,7 @@ class DirectiveSourceInstance(unittest.TestCase):
 
 # ---------------------------------------------------------------- MEDIUM 6
 
-class LiveEvaluatorParity(unittest.TestCase):
+class LiveEvaluatorParity(WireHarness):
     """The M21 parity fixture: replay and live agree on table ids, rejection
     sets, fallback choice, lifecycle and usage (plan 6.2)."""
 
@@ -597,6 +691,41 @@ class LiveEvaluatorParity(unittest.TestCase):
         self.assertTrue(rs.excludes_signature(cand.action_signature))
         self.assertIs(arbitration.classify_outcome,
                       arbitration.classify_outcome)
+
+    def _yn(self, seq, t=100):
+        rec = obs(seq, {"id": seq, "kind": "yn", "prompt": "Continue?",
+                        "choices": None, "default": None, "numeric": False},
+                  map_=self._WIRE_MAP, pal=self._WIRE_PAL)
+        rec["s"] = {"hitpoints": {"text": "10"},
+                    "hitpoints-max": {"text": "10"},
+                    "time": {"text": str(t)},
+                    "dungeon-level": {"text": "1"}}
+        return rec
+
+    def test_live_controller_and_replay_select_the_same_actions(self):
+        # M21 parity for the *whole* selection: the live controller and the
+        # offline replay, driven by the same wire, must select the identical
+        # action for every need -- a gameplay command *and* a non-command
+        # prompt -- because they share the prepared table and arbitration.
+        from tools.agent import evaluate
+
+        recs = [self._rec(1, 1, t=100), self._rec(2, 2, t=101),
+                self._yn(3, t=102), self._rec(4, None, t=103)]
+        scenario = b"".join([_line(HELLO)] + [_line(r) for r in recs]
+                            + [_line(CLOSED)])
+        lines = [ln + b"\n" for ln in scenario.split(b"\n") if ln]
+        _result, actions = self.run_scenario(scenario, max_ticks=200)
+        live = [(a.get("seq"), a.get("id"), a.get("action"))
+                for a in actions if a.get("type") == "act"]
+        replay = evaluate.ReplayPass(
+            lines, ProviderConfig(reflex="scripted", strategy="off",
+                                  max_ticks=200), "scripted", "off")
+        replay.run()
+        rg = [(d["need"]["seq"], d["need"]["id"], d["selected"])
+              for d in replay.decisions
+              if d.get("record") == "need" and d.get("selected") is not None]
+        self.assertTrue(live)
+        self.assertEqual(live, rg)
 
 
 if __name__ == "__main__":

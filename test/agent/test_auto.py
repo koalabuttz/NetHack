@@ -776,6 +776,13 @@ class TestScriptedReflex(unittest.TestCase):
         res = self.ref.decide(self.ctx(need, rows,
                                        title="Do you want a tutorial?"))
         self.assertEqual(res.action["commit"], [[2, -1]])
+        # The selection transition is a *frozen proposed effect*, never a
+        # direct mutation of decide(): the chosen candidate carries the tag
+        # and the reflex state is untouched until a reconciled commit.
+        self.assertFalse(self.ref.selection_done)
+        self.assertEqual(self.ref.last_candidate.proposed_effect,
+                         "selection-done")
+        self.ref.commit_effect("selection-done", "prompt", 0, self.mem)
         self.assertTrue(self.ref.selection_done)
         rows2 = [row(3, "an Archeologist"), row(14, "a Valkyrie")]
         res2 = self.ref.decide(self.ctx(menu_need(2, "m2", "c2"), rows2,

@@ -89,6 +89,18 @@ def menu_kind(title: str) -> str:
     return ""
 
 
+def _join_effects(tags) -> str:
+    """Canonical effect tag for a decision's frozen effect set (plan 3.1).
+
+    One non-command decision can commit more than one effect (an inventory
+    refresh together with an intent transition), so the tags are joined by
+    ``+`` in their deterministic construction order; an empty set is the
+    no-op ``"prompt"``.
+    """
+    tags = [t for t in tags if t]
+    return "+".join(tags) if tags else "prompt"
+
+
 def condition_texts(snapshot) -> Tuple[str, ...]:
     """The displayed condition names from an observation (public evidence).
 
@@ -174,32 +186,37 @@ class ScriptedReflex(object):
         self._conditions = condition_texts(context.snapshot)
         self._check_deadline()
         kind = (context.need or {}).get("kind")
-        if kind not in ("command", "key", "direction"):
-            return self._decide_scripted_kind(context, kind)
         prepared = getattr(context, "prepared", None)
         if prepared is None:
             prepared = self.prepare(context)
-        else:
-            self.last_prepared = prepared
+        self.last_prepared = prepared
         cand = self._select(prepared, getattr(context, "rejected", None))
         if cand is None:
             # member exhaustion: a reviewed per-kind structural fallback,
-            # never an infinite `s` (3.5)
+            # never an infinite `s` (3.5).  A non-command table always holds
+            # its single scripted member, so only a gameplay command can
+            # empty out under rejection.
             self.last_candidate = None
-            self.last_prepared = prepared
-            return ReflexResult(action={"key": KEY.KEY_SEARCH},
+            return ReflexResult(action=self._exhausted_action(kind),
                                 confidence=0.5, provider="scripted",
                                 reason="exhausted: structural fallback")
         # The candidate's proposed effect is *frozen* on the candidate (and so
         # on the armed SentAttempt); it is never committed here.  The
         # controller commits it only after a complete send and the
         # corresponding reconciled observation (plan 3.1), so preparation and
-        # proposal stay observational.
-        self.last_prepared = prepared
+        # proposal stay observational -- for gameplay commands *and* for every
+        # non-command need (menu/prompt/ack/line/extcmd/position).
         self.last_candidate = cand
         return ReflexResult(action=candidates.candidate_to_wire(cand),
                             confidence=0.5, provider="scripted",
                             reason=cand.reason or cand.semantic_label)
+
+    @staticmethod
+    def _exhausted_action(kind) -> dict:
+        """The structural fallback for a fully-rejected gameplay table."""
+        if kind in ("command", "key", "direction"):
+            return {"key": KEY.KEY_SEARCH}
+        return {"key": KEY.KEY_ESC}
 
     def prepare(self, context: ReflexContext) -> "candidates.PreparedReflex":
         """Pure multi-candidate preparation into one immutable table (3.1).
@@ -219,10 +236,7 @@ class ScriptedReflex(object):
         if kind in ("command", "key", "direction"):
             cands = self._command_candidates(context)
         else:
-            action, reason = self._noncommand(context, kind)
-            cands = (candidates.make_candidate(
-                action, family="prompt", score=0, reason=reason,
-                proposed_effect="prompt"),)
+            cands = self._noncommand_candidate(context, kind)
         features = self._features(context)
         table = candidates.build_table(
             self._need_key(context), self._table_version, cands,
@@ -232,23 +246,52 @@ class ScriptedReflex(object):
                                          table=table)
 
     def _decide_scripted_kind(self, context, kind):
-        """Menus, prompts and any other non-command need stay scripted."""
-        action, reason = self._noncommand(context, kind)
+        """Compatibility wrapper: the single non-command scripted proposal.
+
+        Production reaches non-command needs through :meth:`prepare` /
+        :meth:`decide`, which freeze the effect on the candidate; this
+        wrapper is kept for direct callers and returns the same action.
+        """
+        action, reason, _effect, _payload = self._noncommand(context, kind)
         return ReflexResult(action=action, confidence=0.5,
                             provider="scripted", reason=reason)
 
+    def _noncommand_candidate(self, context, kind):
+        """The frozen non-command candidate (plan 3.1).
+
+        A menu/prompt/ack/line/extcmd/position need degrades to a one-row
+        table whose member carries the *proposed effect* -- and, for an
+        inventory listing, the frozen payload -- that
+        :meth:`commit_effect` applies only after the controller observes the
+        result of a complete send.  Nothing here mutates reflex or gameplay
+        state.
+        """
+        action, reason, effect, payload = self._noncommand(context, kind)
+        return (candidates.make_candidate(
+            action, "prompt", family="prompt", score=0, reason=reason,
+            proposed_effect=effect, effect_payload=payload),)
+
     def _noncommand(self, context, kind):
+        """A pure non-command proposal: ``(action, reason, effect, payload)``.
+
+        ``effect`` is the canonical effect tag (several tags joined by ``+``
+        when one decision both refreshes the inventory cache and transitions
+        an intent); ``payload`` is the frozen data an inventory refresh needs
+        at its commit boundary.  No state is mutated here (plan 3.1).
+        """
         if kind == "menu":
             return self._menu(context)
         if kind == "yn":
             return self._yn(context)
         if kind == "ack":
-            return {"ack": True}, "acknowledge display"
+            return {"ack": True}, "acknowledge display", "prompt", ()
         if kind in ("line", "extcmd"):
-            return self._textish(context)
+            action, reason = self._textish(context)
+            return action, reason, "prompt", ()
         if kind == "position":
-            return {"key": KEY.KEY_ESC}, "cancel position request"
-        return {"key": KEY.KEY_ESC}, "unknown kind fallback"
+            return {"key": KEY.KEY_ESC}, "cancel position request", \
+                "prompt", ()
+        return {"key": KEY.KEY_ESC}, "unknown kind fallback", "prompt", ()
 
     def _select(self, prepared, rejected):
         """The retained argmax among eligible, unrejected members (3.5)."""
@@ -266,8 +309,13 @@ class ScriptedReflex(object):
         self.commit_effect(cand.proposed_effect, cand.semantic_label,
                            getattr(context, "tick", 0), context.memory)
 
+    #: The non-command effect tags :meth:`commit_effect` applies from the
+    #: frozen proposal rather than during preparation (plan 3.1).
+    _NONCOMMAND_EFFECTS = ("selection-done", "eat-menu", "eat-forced-menu",
+                           "refresh-inventory-menu")
+
     def commit_effect(self, effect, semantic_label, tick, mem,
-                      observed_kind="") -> None:
+                      observed_kind="", payload=()) -> None:
         """Commit one *selected, sent and reconciled* effect (plan 3.1).
 
         This is the single mutation point for reflex-local gameplay/recovery
@@ -277,9 +325,20 @@ class ScriptedReflex(object):
         field here untouched.  A forced-search *nomination* and a prompt
         continuation commit nothing: the controller owns the dangerous prefix
         and only a completed suffix search consumes a search budget.
+
+        ``effect`` is the candidate's frozen tag; a non-command decision may
+        carry several joined by ``+`` (for example an inventory-cache refresh
+        together with the eat-intent transition).  Such an effect set is
+        applied from the frozen tags and ``payload`` here, never during
+        preparation, and -- unlike a gameplay command -- it does not clear a
+        pending intent except through its own ``eat-menu`` tag.
         """
         effect = effect or ""
-        if effect in ("prompt", forced_search.FORCED_SEARCH_EFFECT):
+        if effect in ("", "prompt", forced_search.FORCED_SEARCH_EFFECT):
+            return
+        tags = tuple(t for t in effect.split("+") if t)
+        if tags and all(t in self._NONCOMMAND_EFFECTS for t in tags):
+            self._commit_noncommand(tags, payload, mem)
             return
         self.intent = ""
         no_time = (observed_kind == "no-time")
@@ -308,6 +367,34 @@ class ScriptedReflex(object):
             if effect == "secret-search":
                 mem.searches_since_progress += 1
             self.recovery.note_search_completed(self._search_site(mem.hero))
+
+    def _commit_noncommand(self, tags, payload, mem) -> None:
+        """Apply a frozen non-command effect set (plan 3.1).
+
+        Ordering is deterministic and each tag is independent; an inventory
+        refresh commits the exact rows, tick and game time frozen on the
+        candidate, so a stale or discarded proposal can never refresh the
+        cache.
+        """
+        for tag in tags:
+            if tag == "selection-done":
+                self.selection_done = True
+            elif tag == "eat-menu":
+                self.intent = ""
+                self.eat_forced_menu = False
+            elif tag == "eat-forced-menu":
+                self.eat_forced_menu = True
+            elif tag == "refresh-inventory-menu":
+                rows, seen_tick, game_time = self._refresh_payload(payload)
+                mem.inventory.refresh(rows, seen_tick, game_time)
+
+    @staticmethod
+    def _refresh_payload(payload):
+        """Unpack a frozen inventory-refresh payload into ``refresh`` args."""
+        if not payload:
+            return [], 0, None
+        rows, seen_tick, game_time = payload
+        return list(rows), int(seen_tick), game_time
 
     def _need_key(self, context):
         nk = getattr(context, "need_key", None)
@@ -342,33 +429,40 @@ class ScriptedReflex(object):
     def _menu(self, context: ReflexContext):
         need = context.need or {}
         if self.intent == "quit" or self.quitting:
-            return {"cancel": True}, "dismiss endgame display"
+            return {"cancel": True}, "dismiss endgame display", "prompt", ()
         rows = [r for r in context.pages if r.get("selectable")]
         title = context.snapshot.window_title(need.get("content")) or ""
-        self._maybe_refresh_inventory(context, context.pages, title)
+        refresh = self._inventory_refresh(context, context.pages, title)
+        tags = [] if refresh is None else ["refresh-inventory-menu"]
+        payload = refresh or ()
 
         if self.intent == "eat":
-            self.intent = ""
-            self.eat_forced_menu = False
+            # the eat-intent transition is a frozen effect, not a mutation
+            tags = tags + ["eat-menu"]
             food = [r for r in rows
                     if state.is_known_safe_food(r.get("text"))]
             if food:
-                return {"menu": need.get("menu"),
-                        "commit": [[food[0]["r"], -1]]}, "eat a safe food row"
-            return {"cancel": True}, "no known-safe food row: cancel"
+                return ({"menu": need.get("menu"),
+                         "commit": [[food[0]["r"], -1]]},
+                        "eat a safe food row", _join_effects(tags), payload)
+            return ({"cancel": True}, "no known-safe food row: cancel",
+                    _join_effects(tags), payload)
 
         kind = menu_kind(title)
         if not kind:
             # an unmatched menu is never blindly confirmed
-            return {"cancel": True}, "unrecognised menu title: cancel"
+            return ({"cancel": True}, "unrecognised menu title: cancel",
+                    _join_effects(tags), payload)
         if kind in ("tutorial", "ok"):
-            self.selection_done = True
+            tags = tags + ["selection-done"]
         pick = self._preferred_row(rows, kind)
         if pick is None:
-            return {"cancel": True}, "no matching row in a %s menu: cancel" \
-                % kind
-        return {"menu": need.get("menu"),
-                "commit": [[pick["r"], -1]]}, "select the %s row" % kind
+            return ({"cancel": True},
+                    "no matching row in a %s menu: cancel" % kind,
+                    _join_effects(tags), payload)
+        return ({"menu": need.get("menu"),
+                 "commit": [[pick["r"], -1]]},
+                "select the %s row" % kind, _join_effects(tags), payload)
 
     def _preferred_row(self, rows: List[dict], kind: str) -> Optional[dict]:
         wants: List[str] = []
@@ -389,11 +483,18 @@ class ScriptedReflex(object):
         return None
 
     # -- inventory cache maintenance ------------------------------------
-    def _maybe_refresh_inventory(self, context: ReflexContext, rows, title):
+    def _inventory_refresh(self, context: ReflexContext, rows, title):
+        """The frozen inventory-refresh payload, or ``None`` (plan 3.1).
+
+        Pure: the observed rows, the controller tick and the displayed game
+        time are returned as a frozen payload and applied by
+        :meth:`commit_effect` only after a complete send and its reconciled
+        observation.  Preparation never mutates the cache.
+        """
         if not title or "inventory" not in title.lower():
-            return
-        context.memory.inventory.refresh(
-            list(rows), context.tick, context.snapshot.time_value())
+            return None
+        return (tuple(rows), int(context.tick),
+                context.snapshot.time_value())
 
     # -- yes/no (including the unrestricted getobj prompt) --------------
     def _yn(self, context: ReflexContext):
@@ -403,43 +504,52 @@ class ScriptedReflex(object):
         letters, has_star, _has_q = bracket_info(prompt)
 
         if "shall i pick" in low:
-            return {"yn": KEY.KEY_N}, "decline auto-pick"
+            return {"yn": KEY.KEY_N}, "decline auto-pick", "prompt", ()
         if "really quit" in low or "quit without saving" in low:
-            return {"yn": KEY.KEY_Y}, "confirm quit"
+            return {"yn": KEY.KEY_Y}, "confirm quit", "prompt", ()
         if "save" in low and "really" in low:
-            return {"yn": KEY.KEY_Y}, "confirm save"
+            return {"yn": KEY.KEY_Y}, "confirm save", "prompt", ()
 
         if self.intent == "eat" and "eat" in low:
-            return self._eat_answer(context, letters, has_star)
+            action, reason, effect = self._eat_answer(context, letters,
+                                                      has_star)
+            return action, reason, effect, ()
 
         if need.get("default") is not None:
-            return {"yn": int(need["default"])}, "native default"
+            return ({"yn": int(need["default"])}, "native default",
+                    "prompt", ())
         choices = need.get("choices")
         if choices:
             key = KEY.KEY_N if "n" in choices else ord(choices[0])
-            return {"yn": key}, "visible choice"
+            return {"yn": key}, "visible choice", "prompt", ()
         if "y" in letters and "n" in letters:
-            return {"yn": KEY.KEY_N}, "decline yes/no"
+            return {"yn": KEY.KEY_N}, "decline yes/no", "prompt", ()
         if letters:
-            return {"yn": ord(letters[0])}, "bracketed letter"
-        return {"yn": KEY.KEY_N}, "safe decline"
+            return {"yn": ord(letters[0])}, "bracketed letter", "prompt", ()
+        return {"yn": KEY.KEY_N}, "safe decline", "prompt", ()
 
     def _eat_answer(self, context: ReflexContext, letters: List[str],
                     has_star: bool):
+        """A pure getobj answer: ``(action, reason, effect)`` (plan 3.1)."""
         rejected = sum(1 for m in context.memory.messages
                        if "don't have that object" in m) \
             - self.eat_reject_base
         if rejected >= 2 or self.eat_forced_menu:
-            self.eat_forced_menu = True
-            return {"yn": ord("*")}, "eat loop breaker: open inventory menu"
+            # the forced-menu transition is a frozen effect: applied only
+            # once this answer is sent and its result observed
+            return ({"yn": ord("*")},
+                    "eat loop breaker: open inventory menu",
+                    "eat-forced-menu")
         # only answer a letter the cached inventory already confirmed is safe
         known = {l.lower() for l in context.memory.inventory.food_letters()}
         safe = [c for c in letters if c.lower() in known]
         if safe:
-            return {"yn": ord(safe[0])}, "eat a known-safe cached food letter"
+            return ({"yn": ord(safe[0])},
+                    "eat a known-safe cached food letter", "prompt")
         if has_star:
-            return {"yn": ord("*")}, "open the food menu"
-        return {"yn": KEY.KEY_ESC}, "no known-safe food answer: cancel eat"
+            return {"yn": ord("*")}, "open the food menu", "prompt"
+        return ({"yn": KEY.KEY_ESC},
+                "no known-safe food answer: cancel eat", "prompt")
 
     # -- gameplay commands: candidate generation ------------------------
     def _command_candidates(self, context: ReflexContext):
