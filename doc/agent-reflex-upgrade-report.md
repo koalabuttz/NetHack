@@ -315,7 +315,36 @@ edited; no engine or profile changes; `make install` was never run;
    agent-only worker bootstraps** (this session's is broken for every engine
    fixture; see §10.6), then re-populate §8.
 
-## 13. What was not measured
+## 13. Post-wiring campaign results (step 3 completed)
+
+The previously blocked campaigns were completed after re-staging game data (the
+original blocker was stale staged data, not the binaries; verified by a clean
+mktemp-staged episode run at the same HEAD).
+
+Zero-key x3 post-wiring (same config as /tmp/nh-reflex-baseline-pre):
+- ep-1: death (closed) at 1892 ticks. The 14,042-tick loop is gone.
+- ep-2: policy-exhausted/trapped at 73 ticks -- the forced-search exception
+  fired LIVE 3 times (3 activations, 3 successful time-advancing searches),
+  then gracefully quit on cap exhaustion. This is the wired transaction
+  working end-to-end: nominate -> gates -> prefix -> suffix -> observed.
+- ep-3: death (closed) at 1875 ticks.
+- All 3: closed, 0 invalids, recordings complete.
+
+DeepSeek x2 post-wiring (live strategy tier + upgraded reflexes):
+- 2/2 closed (deaths), 6 strategy calls, 2 directives applied, cache 30.1%,
+  unknown_exposure_calls 2 (the known episode-end cancellation), 0 forced
+  activations (the trapped state did not occur -- directives routed
+  differently than the zero-key heuristic).
+
+Honest comparison vs baseline:
+- The 14,042/14,101-tick zero-time loops: ELIMINATED (worst span now 6).
+- Tick-cap survival: replaced by genuine deaths and one policy-exhausted
+  quit -- the hero now spends turns playing rather than looping.
+- Depth: still 1 in all episodes. Exploration coverage remains the
+  frontier, as the plan predicted. The forced-search exception proved the
+  trapped-state mechanism but did not by itself unlock deeper dungeons.
+
+## 14. What was not measured
 
 * live forced-search activation counts, cancellations, cap denials and
   trapped quits **at campaign scale** — the live wiring is unit-tested through
