@@ -190,10 +190,11 @@ class ScriptedReflex(object):
             return ReflexResult(action={"key": KEY.KEY_SEARCH},
                                 confidence=0.5, provider="scripted",
                                 reason="exhausted: structural fallback")
-        self._note_selection(cand, context)
-        # Expose the prepared table and the retained candidate so the
-        # controller can own the SentAttempt lifecycle (3.4) without
-        # rebuilding or re-selecting anything.
+        # The candidate's proposed effect is *frozen* on the candidate (and so
+        # on the armed SentAttempt); it is never committed here.  The
+        # controller commits it only after a complete send and the
+        # corresponding reconciled observation (plan 3.1), so preparation and
+        # proposal stay observational.
         self.last_prepared = prepared
         self.last_candidate = cand
         return ReflexResult(action=candidates.candidate_to_wire(cand),
@@ -256,48 +257,57 @@ class ScriptedReflex(object):
         return prepared.table.scripted()
 
     def _note_selection(self, cand, context):
-        """Commit the *selection-time* reflex bookkeeping for a candidate.
+        """Compatibility wrapper: commit a chosen candidate's effect.
 
-        Nothing here touches gameplay memory.  Only the chosen candidate's
-        recorded effect is applied, so a discarded proposal can never advance
-        an intent, a search counter or an inventory refresh.
+        Production no longer reaches here from :meth:`decide`; the controller
+        commits the frozen effect at its reconciliation boundary through
+        :meth:`commit_effect` (plan 3.1).  Kept for direct callers.
         """
-        effect = cand.proposed_effect
+        self.commit_effect(cand.proposed_effect, cand.semantic_label,
+                           getattr(context, "tick", 0), context.memory)
+
+    def commit_effect(self, effect, semantic_label, tick, mem,
+                      observed_kind="") -> None:
+        """Commit one *selected, sent and reconciled* effect (plan 3.1).
+
+        This is the single mutation point for reflex-local gameplay/recovery
+        bookkeeping.  The controller calls it only after a complete send
+        *and* the corresponding reconciled observation, so a local-invalid,
+        write-failed, discarded or Jev-unselected candidate leaves every
+        field here untouched.  A forced-search *nomination* and a prompt
+        continuation commit nothing: the controller owns the dangerous prefix
+        and only a completed suffix search consumes a search budget.
+        """
+        effect = effect or ""
         if effect in ("prompt", forced_search.FORCED_SEARCH_EFFECT):
-            # a prompt continuation and a forced-search *nomination* commit no
-            # reflex-local gameplay bookkeeping: the controller owns whether
-            # the dangerous prefix is actually sent, and only a completed
-            # suffix search consumes a search budget (records it on its own
-            # outcome), never the nomination
             return
         self.intent = ""
+        no_time = (observed_kind == "no-time")
         if effect == "quit":
             self.quitting = True
             if self.quit_reason == "":
-                if cand.semantic_label == "trapped":
+                if semantic_label == "trapped":
                     # the exhaustion fallback is the plan's graceful
                     # `policy-exhausted/trapped` quit, not a generic quit
                     self.quit_reason = forced_search.TRAPPED_QUIT_REASON
                 else:
-                    self.quit_reason = ("tick-cap" if context.tick
+                    self.quit_reason = ("tick-cap" if tick
                                         >= self.max_ticks else "quit")
         elif effect == "schedule-eat":
-            self.last_eat_tick = context.tick
+            self.last_eat_tick = tick
             self.intent = "eat"
             self.eat_reject_base = sum(
-                1 for m in context.memory.messages
-                if "don't have that object" in m)
+                1 for m in mem.messages if "don't have that object" in m)
             self.eat_forced_menu = False
         elif effect in ("refresh-inventory", "refresh-inventory-periodic"):
-            self.last_inv_tick = context.tick
-        elif effect == "secret-search":
-            context.memory.searches_since_progress += 1
-            self.recovery.note_search_completed(
-                self._search_site(context.memory.hero))
-        elif effect == "site-search":
-            # a completed loop-breaker search consumes the site's budget
-            self.recovery.note_search_completed(
-                self._search_site(context.memory.hero))
+            self.last_inv_tick = tick
+        elif effect in ("secret-search", "site-search") and not no_time:
+            # a completed search consumes its budget; a no-time outcome is a
+            # refusal/no-progress (recorded by note_observation), never a
+            # completed search (plan 5.1)
+            if effect == "secret-search":
+                mem.searches_since_progress += 1
+            self.recovery.note_search_completed(self._search_site(mem.hero))
 
     def _need_key(self, context):
         nk = getattr(context, "need_key", None)
@@ -443,7 +453,6 @@ class ScriptedReflex(object):
         mem = context.memory
         st = mem.status
         hero = mem.hero
-        self._observe(mem, hero)
         if self.quitting or context.tick >= self.max_ticks:
             why = ("tick cap: request quit" if context.tick >= self.max_ticks
                    else "quit")
@@ -489,8 +498,7 @@ class ScriptedReflex(object):
             return (self._cand({"key": key}, "random-move", "recovery", 0,
                                "loop breaker: %s" % why, "recovery"),)
         if np >= 3:
-            site = self._search_site(hero)
-            if self.recovery.allows_search(site) and not self._cycled:
+            if self._allows_search(mem, hero) and not self._cycled:
                 return (self._cand({"key": KEY.KEY_SEARCH}, "search",
                                    "recovery", 0, "loop breaker: search",
                                    "site-search"),)
@@ -546,7 +554,7 @@ class ScriptedReflex(object):
         if cands:
             return tuple(cands)
         if mem.searches_since_progress < 3 \
-                and self.recovery.allows_search(self._search_site(hero)) \
+                and self._allows_search(mem, hero) \
                 and not self._cycled:
             return (self._cand({"key": KEY.KEY_SEARCH}, "search-secret",
                                "secret-search", 300,
@@ -626,28 +634,95 @@ class ScriptedReflex(object):
         return self.forced_template
 
     def _observe(self, mem, hero):
-        """Fold public messages into the bounded-recovery scoped evidence."""
+        """Fold public messages into the bounded-recovery scoped evidence.
+
+        Retained as the compatibility entry point; production folds once per
+        *committed observation* through :meth:`note_observation` at the
+        controller's reconciliation boundary, never during candidate
+        construction (plan 3.1)."""
+        self.note_observation(mem)
+
+    def note_observation(self, mem) -> None:
+        """Fold one *committed* observation into the scoped recovery evidence.
+
+        Called exactly once per applied snapshot by the controller, after the
+        observation has been reconciled and committed.  Candidate construction
+        and proposal never reach here, so a discarded proposal, an invalid or
+        write-failed candidate or a Jev-unselected member cannot advance the
+        cycle/refusal/food state (plan 3.1).
+        """
+        hero = mem.hero
         recent = mem.recent_messages(6)
         self.recovery.observe(recent, hero, self._search_site(hero))
         self._cycled = self.recovery.note_cycle(hero)
+        instance = getattr(mem, "instance", None)
+        if instance is None:
+            instance = self.instance_id
         for text in recent:
             kind = recovery.classify_food_negative(text)
             if kind == recovery.FOOD_NEG_INVENTORY:
                 self.food.note_inventory_negative(mem.inventory_signature())
             elif kind == recovery.FOOD_NEG_LOCATION and hero is not None:
-                self.food.note_location_negative(self.instance_id, hero, 0)
+                self.food.note_location_negative(instance or 0, hero, 0)
+
+    def begin_instance(self, iid) -> None:
+        """Start a fresh level-instance scope (plan 4.1 rule 6).
+
+        The old instance's reflex-local recovery budgets, scoped food
+        negatives, cycle history and pending intent are expired -- only the
+        episode's committed inventory observations legitimately survive an
+        arrival.
+        """
+        self.instance_id = int(iid or 0)
+        self.recovery = recovery.RecoveryState()
+        self.food = recovery.FoodNegatives()
+        self._cycled = False
+        self.stuck = 0
+        self.last_hero = None
+        self.intent = ""
+        self.eat_forced_menu = False
+        self.forced_template = None
+        self.last_prepared = None
+        self.last_candidate = None
 
     def _may_eat(self, mem, hero) -> bool:
         """True unless scoped negatives already prove there is nothing to eat.
 
         An inventory-negative for the current signature blocks a blind eat;
         a known floor ration may still authorise a location-specific eat while
-        the inventory stays negative (5.2).
+        the inventory stays negative (5.2).  The evidence is derived purely
+        from the committed messages and the persisted negative, so the answer
+        never depends on a fold performed during candidate construction.
         """
         sig = mem.inventory_signature()
-        if not self.food.inventory_negative(sig):
+        if self._food_negative(mem, sig):
+            return bool(mem.inventory.food_rows())
+        return True
+
+    def _food_negative(self, mem, sig) -> bool:
+        """Current inventory-negative evidence, pure (persisted + current)."""
+        if self.food.inventory_negative(sig):
             return True
-        return bool(mem.inventory.food_rows())
+        if sig is None:
+            return False
+        for text in mem.recent_messages(6):
+            if recovery.classify_food_negative(text) \
+                    == recovery.FOOD_NEG_INVENTORY:
+                return True
+        return False
+
+    def _allows_search(self, mem, hero) -> bool:
+        """True only while a justified ordinary search is still bounded here.
+
+        Combines the persisted per-site budget with the *current* refusal
+        evidence derived purely from the recent messages (plan 5.1), so the
+        decision is a pure function of public memory and needs no fold during
+        candidate construction (plan 3.1).
+        """
+        site = self._search_site(hero)
+        if recovery.refusal_in(mem.recent_messages(6)) is not None:
+            return False
+        return self.recovery.allows_search(site)
 
     def _terrain(self, mem):
         """Build one classified terrain view from remembered raw cells."""
