@@ -799,6 +799,27 @@ class _EpisodeRunner(object):
         finally:
             self._spectate_sync()
 
+    def _spectate_next_due(self):
+        """Guarded due-time retrieval: a render-only call that never raises.
+
+        Returns the absolute monotonic due time of a pending frame, or None
+        when spectating is off, disabled, or has nothing pending.  Retrieving
+        it reads an injected clock, so an ordinary fault disables rendering
+        once with the fixed ``schedule-error`` category and returns None: it
+        must never abort the campaign, emit an event, or touch recorder
+        health, the wire or the provider.  ``KeyboardInterrupt`` and
+        ``SystemExit`` still propagate.
+        """
+        if self.spectate is None or self.spectate.disabled:
+            return None
+        try:
+            return self.spectate.next_due()
+        except Exception:                    # noqa: BLE001 - render only
+            self._spectate_fail("schedule-error")
+            return None
+        finally:
+            self._spectate_sync()
+
     def _spectate_readline_flush(self, bound):
         """Service a due frame from the select loop, capped by the wire bound.
 
@@ -1046,8 +1067,7 @@ class _EpisodeRunner(object):
             # without a new wire record.  The wire bounds `remaining` itself
             # are never extended.
             wait = min(remaining, 1.0)
-            due = self.spectate.next_due() if self.spectate is not None \
-                else None
+            due = self._spectate_next_due()
             if due is not None:
                 wait = min(wait, max(0.0, due - time.monotonic()))
             r, _, _ = select.select([self.proc.stdout], [], [], wait)
