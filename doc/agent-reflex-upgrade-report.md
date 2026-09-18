@@ -19,17 +19,17 @@ this report).
 | 2 | Instance/terrain/hero + pre-observe reconciliation | **complete** (`d821ae180`) |
 | 3 | One-Dijkstra candidates/navigation + wiring | **complete** (`5d0b8df38`, `47aa7bf9f`) |
 | 4 | Scoped recovery/search/door/food budgets | **complete** (`091088770`) |
-| 5 | Isolated dangerous two-send transaction | **partial** — the native prefix/cancellation fixture is built and **passing** through the real adapter; the ten gates and the `PROPOSED…SUCCEEDED\|FAILED` transaction are implemented and exhaustively tested; **live controller wiring is not done**, so the exception is not yet live-active (see §7.6) |
-| 6 | Jev, replay/evaluation, measurement migration | **partial** — the streaming metrics are now wired into `campaign.json`; post-change zero-key and real DeepSeek campaigns were run and measured (see §8); the **Jev raw-choice migration and the `evaluate.py` migration + parity fixture are not done** (see §10) |
+| 5 | Isolated dangerous two-send transaction | **complete** — the native fixture passes, the ten gates and the transaction are implemented and tested, and the transaction is now **wired into the live controller** (`d605212cf`): the reflex nominates, the controller owns the two-send across the two needs, consumes the cap at the first sent prefix, binds the exact following command need, cancels with native double-`m` and degrades to `policy-exhausted/trapped` |
+| 6 | Jev, replay/evaluation, measurement migration | **partial** — the streaming metrics are wired into `campaign.json`; the **Jev raw-choice migration is complete** (`fe5dd6808`, Jev stays DISABLED for real play); the **`evaluate.py` migration and the live/replay parity fixture (M21) are not done** (see §10); post-change campaigns were not re-run in this session (see §12) |
 
-**Test totals (this tree):** **670** tests green across the agent suites
+**Test totals (this tree):** **679** tests green across the agent suites
 (`test_auto` 102, `test_auto_candidates` 54, `test_auto_instances` 39,
 `test_auto_metrics` 8, `test_auto_navigation` 22, `test_auto_recovery` 23,
-`test_auto_wiring` 15, `test_auto_providers` 217, `test_auto_replay` 52,
-`test_auto_spectate` 92, **`test_auto_forced_search` 46 new**);
-`test_spectate.py --selftest` **43** green; `make -C test/agent check` green
-(manifest + header + schema + `test_view/menu/protocol/state`).  Pre-change
-baseline was 463 across the four original suites; every delta is additive.
+`test_auto_wiring` 15, `test_auto_providers` 220, `test_auto_replay` 52,
+`test_auto_spectate` 92, `test_auto_forced_search` 54 — of which **8 are new
+live-wiring cases** through the real runner); `test_spectate.py --selftest`
+**43** green; `make -C test/agent check` green.  Pre-change baseline was 463
+across the four original suites; every delta is additive.
 
 ## 2. Immutable pre-change baseline campaign (unchanged)
 
@@ -151,13 +151,28 @@ Applied, observed red, then restored to green (verified):
 
 ### 7.6 What Wave 5 does **not** do
 
-The transaction is **not wired into the live controller**.  The reflex still
-degrades member exhaustion to a single structural `s` proposal (`policy.py`
-`decide`), and no live code path proposes or sends the `m`/`s` pair.  The
-exception is therefore implemented, fixture-proven and unit-tested but **not
-live-active** (risky-search activations are correctly 0 in §8).  This is a
-real deviation from the plan's wave-5 change list and is **not** a claim of
-completion (see §10).
+### 7.6 The live controller wiring (plan 5.4) — now complete
+
+The transaction is **wired into the live controller** (`d605212cf`).  The
+reflex nominates the dangerous exception only when its own gates 1-5 hold (it
+attaches a `ForcedSearchContext` template with the controller-only gates left
+fail-closed); the controller then re-derives every public gate from the live
+observation (`_forced_context` / `merge_controller_fields`), evaluates the
+proposal gates (1-8 + 10) and, only if all hold, sends the `m` prefix and
+installs the `ForcedSearchTransaction`.  The cap is consumed at the first
+successfully sent prefix and never refunded; the suffix `s` binds only to the
+exact immediately following command need with the binding gates (1-3, 6, 8)
+rechecked; any nonmatching need, gate change, invalid, tick cap, shutdown or
+unchanged failed retry cancels with native double-`m`, never reusing the armed
+prefix; and once the three-activation cap is reached gate 7 denies and the
+fallback is the `policy-exhausted/trapped` graceful quit.  Telemetry records
+activations, suffixes, successes, cancels, gate denials, trapped quits and
+un-cleared prefixes as separate counters (never merged).  Eight live-wiring
+cases drive the real runner (`test_auto_forced_search.LiveWiring`); the two
+M14 controller-level mutations (no cap consumption, leaked prefix) turn them
+red.  A latent transition bug was also fixed: `_transition_signals` emitted a
+spurious level-change signal when no attempt was in flight, which spuriously
+allocated a fresh level instance after any prompt.
 
 ## 8. Wave 6 — metrics migration and measurement
 
@@ -172,6 +187,12 @@ would otherwise have broken (it did during development and was fixed).  A
 missing directory or a read failure is recorded, never fabricated.
 
 ### 8.2 Post-change zero-key campaign vs the baseline
+
+**Note (this session):** these figures were captured after waves 1-4, i.e.
+*before* the wave-5 live wiring and the Jev migration.  They were **not
+re-measured** — every engine fixture fails at spawn in this session's
+environment (§10.6) — so this section is carried forward unchanged and its
+numbers do not reflect the live forced search.
 
 Post-change campaign (`/tmp/nh-reflex-post`, identical role/config to the
 baseline, `--episodes 3 --max-ticks 15000 --episode-timeout 300`, zero keys /
@@ -236,25 +257,33 @@ records the spend.  `estimated_usd` is `0.0` because no tariff was configured
 
 ## 10. Deviations and deferred work (explicit)
 
-1. **Live controller wiring of the wave-5 transaction is not done.**  The
-   module, gates, transaction and the native fixture are complete and tested,
-   but no live code path proposes or sends the `m`/`s` pair, so the exception
-   is not active in play.  The plan's wave-5 change list requires the
-   controller two-send ownership; that remains the next step.
-2. **Jev raw-choice migration (§6.1) is not done.**  `JevReflex.decide` still
-   returns a mapped `ReflexResult` and maps the index inside the adapter; the
-   `ReflexChoiceResult` raw path, `ReflexContext.prepared`-based
-   `build_choices`, central `validate_raw_choice` mapping and the
-   skip-before-reserve/billing changes are not implemented.  Jev remains
-   DISABLED for real play; the existing fake-endpoint provider tests (217,
-   including the Jev block) remain green and unmodified.
-3. **`evaluate.py` migration (§6.2) and the live/replay parity fixture are
-   not done.**  `evaluate.py` still applies a snapshot and immediately calls
-   `mem.observe`.  M21 cannot be demonstrated because its subject is unmigrated.
-4. **M11 is not re-demonstrated** beyond the wave-1 evidence already in the
-   prior report: central live validation/mapping (its wave-6 home) is unmigrated.
-5. **M14 is demonstrated only at the module level** (M14-A, M14-C above); the
-   controller-level M14 variants depend on deviation 1.
+1. **Live controller wiring of the wave-5 transaction — DONE** (`d605212cf`,
+   see §7.6).  The controller now owns the two-send across the two needs.
+2. **Jev raw-choice migration (§6.1) — DONE** (`fe5dd6808`, see §14.1).  Jev
+   returns a raw `ReflexChoiceResult`; the controller validates and maps
+   centrally; unsupported/singleton tables are skipped before reserve; usage
+   is billed exactly once on every paid rejection.  Jev remains DISABLED for
+   real play and the fake-endpoint adapter tests are migrated to the raw
+   contract.  Two controller-level cases re-demonstrate M11.
+3. **`evaluate.py` migration (§6.2) and the live/replay parity fixture (M21)
+   are NOT done.**  `evaluate.py` still applies a snapshot and immediately
+   calls `mem.observe`, does not carry a per-need `RejectionSet`, and does not
+   model sent actions from sidecars.  M21 cannot be demonstrated because its
+   subject is unmigrated.  This is the largest remaining piece of the plan.
+4. **M11 is now re-demonstrated at the controller level** (`fe5dd6808`): the
+   central `validate_raw_choice` confidence gate and the stale-table-identity
+   rejection both fall back to scripted while still billing usage, and a
+   mutation that bypasses the confidence gate turns the controller case (and
+   the helper case) red.
+5. **M14 is now demonstrated at the controller level** (`d605212cf`): M14-wire-A
+   (do not consume the cap) and M14-wire-C (leak the armed prefix as a quit)
+   both turn the live-wiring cases red, then were restored green.
+6. **The post-change campaigns were not re-run in this session.**  Every
+   engine fixture (including the plain `episode` driver fixture and the
+   `native-prefix` target) fails at spawn in this environment with
+   `hello=0` / `'closed' record before hello`; the same failure reproduces at
+   HEAD with these changes stashed, so it is an environment condition, not a
+   regression.  §8.2/§8.3 therefore still carry the earlier session's numbers.
 
 ## 11. Commits
 
@@ -263,6 +292,9 @@ records the spend.  `estimated_usd` is `0.0` because no tariff was configured
 | `c1af01f92` | agent: native prefix fixture + forced-search gates |
 | `d654f3f0c` | agent: wire streaming metrics into campaign summary |
 | `432cbedfb` | agent: add native-prefix fixture make target |
+| `ac46b95af` | agent: report waves 5-6 (fixture, gates, measurement) |
+| `d605212cf` | agent: wire the dangerous forced search live |
+| `fe5dd6808` | agent: migrate the Jev boundary to raw choices |
 
 All use explicit-path staging, author `NetHack Agent <agent@localhost>`,
 subject <= 50 and body wrapped at 72.  `AGENTS.md`, `build.log`,
@@ -272,24 +304,64 @@ edited; no engine or profile changes; `make install` was never run;
 
 ## 12. Recommended next steps (dependency-ordered)
 
-1. **Wire the wave-5 transaction into the controller**: have the reflex
-   propose the forced search only when the recovery ladder is genuinely
-   exhausted, and give the `_EpisodeRunner` ownership of the
-   `ForcedSearchTransaction` and `ForcedSearchBudget` across the two needs
-   (`_answer_now` prefix send, the following command need's suffix send),
-   with the native-verified double-`m` cancellation used on every abort path.
-2. **Migrate the Jev boundary (§6.1)** and **`evaluate.py` (§6.2)** onto the
-   shared `arbitration` helpers, then land the parity fixture (M21) and
-   re-demonstrate M11.
-3. Re-run the post-change campaigns after (1)/(2) and re-populate §8.
+1. ~~Wire the wave-5 transaction into the controller~~ — **done**
+   (`d605212cf`).
+2. ~~Migrate the Jev boundary (§6.1)~~ — **done** (`fe5dd6808`).  **Next**:
+   migrate `evaluate.py` (§6.2) onto the same `arbitration` helpers (stage ->
+   reconcile -> instance/hero resolution -> commit, a per-need
+   `RejectionSet` via `classify_invalid`/`select_retained`), model *sent*
+   actions from sidecars, and land the live/replay parity fixture (M21).
+3. Re-run the post-change campaigns after (2) **in an environment where the
+   agent-only worker bootstraps** (this session's is broken for every engine
+   fixture; see §10.6), then re-populate §8.
 
 ## 13. What was not measured
 
 * live forced-search activation counts, cancellations, cap denials and
-  trapped quits (the exception is not live-active);
+  trapped quits **at campaign scale** — the live wiring is unit-tested through
+  the real runner (§7.6) but no campaign was run (see §10.6), so the
+  per-episode counts are **pending**;
 * door/search/food attempt budgets at campaign scale (unit-tested only);
-* live/replay parity and evaluator determinism under the new semantics;
+* live/replay parity and evaluator determinism under the new semantics
+  (`evaluate.py` is unmigrated);
 * USD cost of the DeepSeek campaign (no tariff configured; `estimated_usd`
   is `0.0` and no cost is asserted).
 
 No number in this report is a projection or an estimate.
+
+## 14. Wave 6 — Jev raw-choice migration (this session)
+
+### 14.1 `ReflexChoiceResult` and central validation
+
+`JevReflex.decide` now returns a `ReflexChoiceResult` -- the raw index or an
+abstention/parse error, the request and retained-table identity
+(`table_id`/`need_key`/`table_version`), the confidence, returned `usage`,
+`latency` and `dispatched` -- and never a mapped action.
+`build_choices(ctx)` serializes the already-canonical retained table
+(`candidates.jev_payload`, no re-serialization) and returns `None` for a need
+or table it must not choose (line/extcmd/position, a singleton/mandatory/
+emergency table, an over-cap menu), so the controller **skips before it
+reserves**.  The controller (`_decide_jev`) prepares the table once into
+`ReflexContext.prepared`, calls the provider, and validates centrally with
+`arbitration.validate_raw_choice` against the exact retained table and the
+controller-owned `RejectionSet`: table/need/version identity, non-bool integer
+index in bounds, finite confidence meeting the threshold, unrejected
+membership and member safety; only an accepted member is mapped to its
+immutable wire action.  A stale whole-context choice is discarded, never sent.
+The returned usage is added to the ledger exactly once on every paid rejection.
+
+### 14.2 Verification
+
+* `test_auto_providers`: **220** green (the adapter cases migrated to the raw
+  contract, plus controller-level low-confidence and stale-identity rejection
+  cases that re-demonstrate M11).
+* whole `test_auto*` suite: **679** green.
+* M11 mutation (bypass the confidence gate in `validate_raw_choice`) turns the
+  controller case **and** the helper case (`test_auto_candidates`) red, then
+  was restored green.
+
+### 14.3 Deferred within wave 6
+
+* the `evaluate.py` migration and the live/replay parity fixture (M21);
+* live Jev enablement (terms/endpoint remain unapproved, as required);
+* re-running the campaigns (environment blocker, §10.6).
