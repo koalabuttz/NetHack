@@ -117,6 +117,24 @@ def _int_or_none(value: Any) -> Optional[int]:
     return value
 
 
+def _payload_item(value: Any) -> Any:
+    """A JSON-serializable view of one frozen effect-payload item."""
+    if isinstance(value, (tuple, list)):
+        return [_payload_item(v) for v in value]
+    return value
+
+
+def _payload_json(payload: tuple) -> list:
+    """A JSON-serializable view of a frozen effect payload (plan 3.1).
+
+    Tuples become arrays and the observed row dicts pass through unchanged;
+    the canonical encoder sorts object keys, so the identity stays
+    deterministic.  Only a non-empty payload is ever hashed, so a command
+    candidate's identity is untouched by its introduction.
+    """
+    return [_payload_item(v) for v in payload]
+
+
 # -- immutable action model ----------------------------------------------
 
 @dataclass(frozen=True)
@@ -157,13 +175,18 @@ class ImmutableAction:
         return cls("ack", ())
 
     @classmethod
-    def menu(cls, generation: int,
+    def menu(cls, generation: Any,
              rows: Sequence[Sequence[int]]) -> "ImmutableAction":
         """A menu commit.  Rows are sorted so a selection *set* canonicalizes
         identically regardless of the order the caller listed it in -- a
-        reordered commit must not become a different identity (3.2)."""
+        reordered commit must not become a different identity (3.2).
+
+        ``generation`` is the menu's identifier as it appears on the wire: a
+        native content id (``"m2"``) for a live menu, or an opaque token; it
+        is preserved verbatim so :meth:`to_wire` round-trips exactly.
+        """
         pairs = tuple(sorted((int(r), int(c)) for r, c in rows))
-        return cls("menu", (int(generation), pairs))
+        return cls("menu", (generation, pairs))
 
     # -- canonical form --------------------------------------------------
     def canonical(self) -> dict:
@@ -277,6 +300,11 @@ class ActionCandidate:
     score_components: tuple
     reason: str
     proposed_effect: str
+    # An optional frozen payload for a non-command effect that must carry data
+    # to its commit boundary (the observed inventory rows, tick and game
+    # time).  Empty for every command candidate, so a command identity is
+    # unchanged by its introduction (plan 3.1).
+    effect_payload: tuple = ()
 
     def order_key(self) -> tuple:
         """The deterministic ordering key: score desc, then explicit ranks."""
@@ -299,6 +327,9 @@ class ActionCandidate:
             "reason": self.reason,
             "effect": self.proposed_effect,
         }
+        if self.effect_payload:
+            rec["effect_payload"] = _payload_json(self.effect_payload)
+        return rec
 
     def to_wire(self) -> dict:
         return self.action.to_wire()
@@ -310,12 +341,15 @@ def make_candidate(action: Any, semantic_label: str, family: str = "other",
                    score: int = 0,
                    score_components: Sequence[Sequence[Any]] = (),
                    reason: str = "",
-                   proposed_effect: str = "") -> ActionCandidate:
+                   proposed_effect: str = "",
+                   effect_payload: tuple = ()) -> ActionCandidate:
     """Build a content-addressed candidate from an action and its metadata.
 
     Scores must be integers (3.2).  ``direction_rank`` is normally supplied
     by the caller from a fixed direction table; ``direction`` is informational
-    and participates only through the action itself.
+    and participates only through the action itself.  ``effect_payload``
+    freezes the data a non-command effect needs at its commit boundary; it is
+    empty for every command candidate.
     """
     if isinstance(score, bool) or not isinstance(score, int):
         raise ValueError("score must be an integer, not %r" % (score,))
@@ -325,6 +359,8 @@ def make_candidate(action: Any, semantic_label: str, family: str = "other",
     direction = tuple(direction)
     body = {"s": CANDIDATE_SCHEMA_VERSION, "a": imm.canonical(),
             "l": semantic_label, "e": proposed_effect}
+    if effect_payload:
+        body["p"] = _payload_json(effect_payload)
     cid = sha256_hex(canonical_bytes(body))
     return ActionCandidate(
         candidate_id=cid, action=imm, action_signature=imm.signature(),
@@ -332,7 +368,7 @@ def make_candidate(action: Any, semantic_label: str, family: str = "other",
         family_rank=family_rank(family), direction=direction,
         direction_rank=int(direction_rank), rows=rows, score=int(score),
         score_components=comps, reason=reason,
-        proposed_effect=proposed_effect)
+        proposed_effect=proposed_effect, effect_payload=tuple(effect_payload))
 
 
 def candidate_to_wire(candidate: ActionCandidate) -> dict:
