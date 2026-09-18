@@ -43,7 +43,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from . import protocol, recording, spectating
+from . import arbitration, candidates, instances, protocol, recording
+from . import spectating
 from .budget import BudgetLedger
 from .codec import AssemblerLimit, ChunkError, IncrementalAssembler
 from .directives import DirectiveBook, PreconditionState
@@ -529,6 +530,22 @@ def _is_int(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
 
 
+class _StubTable(object):
+    """A table-shaped identity carrier for a frozen :class:`SentAttempt`."""
+
+    def __init__(self, table_id: str) -> None:
+        self.table_id = table_id
+
+
+def _classified_terrain(raw) -> str:
+    """The full-cell terrain class of one raw ``(g, color, style, other)``."""
+    glyph = raw[0] if raw else " "
+    color = raw[1] if len(raw) > 1 else ""
+    style = raw[2] if len(raw) > 2 else ""
+    other = raw[3] if len(raw) > 3 else ""
+    return instances.classify_cell(glyph, color, style, other).terrain
+
+
 def _directive_dicts(dsets) -> list:
     """The complete validated directive set(s) as plain dicts.
 
@@ -631,6 +648,20 @@ class _EpisodeRunner(object):
             emergency_wall=controller.config.boundary_emergency_wall,
             ledger=self.ledger, event_ledger=self.event_ledger)
         self.book = DirectiveBook()
+        # Wave-3 controller ownership (the deferred wave-2 activation): one
+        # in-flight SentAttempt, a per-NeedKey rejection set that preserves
+        # the original content deadline, the level-instance automaton and the
+        # classified terrain view, all fed from applied observations.
+        self.attempt = None
+        self.attempt_before = None
+        self.rejections = {}
+        self.instance = instances.LevelInstanceAutomaton()
+        self.terrain = instances.TerrainMemory()
+        self.observation_generation = 0
+        self.attempts_armed = 0
+        self.reconciliations = 0
+        self._last_candidate = None
+        self._last_table_id = ""
         self.detected_boundaries = []
         self.need_boundaries = []
         self.low_conf_streak = 0
@@ -797,7 +828,8 @@ class _EpisodeRunner(object):
             episode=self.result.index, seq=self._spectate_accepted,
             tick=self.tick, need=need, windows=self._spectate_windows,
             directives=self.book.peek_view(
-                self.tick, self.mem.status.dlvl, self._precondition_state()),
+                self.tick, self.mem.status.dlvl, self._precondition_state(),
+                instance=self.instance.current()),
             strategy_calls=self.ledger.strategy_dispatched,
             usage=self.ledger.as_dict()["usage"],
             final_reason=self.result.stop_reason if final else None,
@@ -1238,12 +1270,17 @@ class _EpisodeRunner(object):
         # are caught -- never control-flow or system exceptions.
         try:
             self.snap.apply(rec)
-            self.mem.observe(self.snap)
+            staged = self.mem.stage(self.snap)
         except protocol.ProtocolError as exc:
             raise _ProtocolFailure("invalid snapshot: %s" % exc)
         except (IndexError, KeyError, TypeError, ValueError,
                 AttributeError) as exc:
             raise _ProtocolFailure("malformed snapshot: %s" % exc)
+        # Parse is not commit: the temporary presentation is reconciled
+        # against the single in-flight SentAttempt BEFORE hero/level/map
+        # memory commits (plan 3.4).  Then memory is committed exactly once.
+        self._reconcile_observation(staged)
+        self.mem.commit(staged)
         # Boundary detection runs once per applied snapshot, on public state
         # only.  An id is emitted once, so re-presenting the same snapshot
         # (or replaying history) yields no new events; simultaneous reasons
@@ -1280,6 +1317,144 @@ class _EpisodeRunner(object):
         # reaches here, so the previous accepted candidate is retained and no
         # success marker is advanced.
         self._spectate_capture(seq, need)
+
+    # -- pre-observe reconciliation (plan 3.4) ---------------------------
+    def _reconcile_observation(self, staged):
+        """Reconcile the in-flight attempt before any memory commit (3.4).
+
+        The classified terrain is fed from the staged cells; the single
+        in-flight SentAttempt is classified into a terminal outcome, released
+        and counted exactly once; and the level-instance automaton is settled
+        from the transition signals.  Parse is never commit and no gameplay
+        success is credited here.
+        """
+        self.observation_generation += 1
+        signals = self._transition_signals(staged)
+        self.terrain.merge(staged.cells)
+        hero_usable = staged.hero is not None
+        attempt = self.attempt
+        if attempt is None:
+            self.instance.observe(tuple(signals), hero_usable)
+            return
+        before = self.attempt_before or {}
+        _outcome, kind = self._classify_attempt(before, staged)
+        self.attempt = None
+        self.attempt_before = None
+        self.reconciliations += 1
+        if not signals and hero_usable and kind != "moved":
+            # a coherent nonmovement with no arrival signal is affirmative
+            # no-arrival evidence (N): keep the old scope, no merge (4.1)
+            signals = (instances.S_NOARRIVAL,)
+        self.instance.observe(tuple(signals), hero_usable)
+
+    def _transition_signals(self, staged):
+        """The ``{S, L, O, D}`` transition signals of one observation."""
+        out = []
+        if self._is_stair_action(self.attempt):
+            out.append(instances.S_STAIR)
+        before = self.attempt_before or {}
+        if before.get("dlvl") != staged.status.dlvl:
+            out.append(instances.S_LABEL)
+        if self._arrival_outcome(staged.messages):
+            out.append(instances.S_OUTCOME)
+        if self._structural_conflict(staged):
+            out.append(instances.S_DISCONT)
+        return out
+
+    def _is_stair_action(self, attempt):
+        if attempt is None or attempt.action.tag != "key":
+            return False
+        return attempt.action.payload[0] in (ord(">"), ord("<"))
+
+    def _arrival_outcome(self, messages):
+        """Allowlisted, source-derived arrival recognizer (4.1 ``O``).
+
+        Only a current public arrival outcome counts; quoted/look/history
+        text never becomes authoritative here.
+        """
+        for _eid, text in messages:
+            low = (text or "").lower()
+            if ("you materialize" in low or "you fall" in low
+                    or "you are now on level" in low
+                    or "you climb down" in low or "you descend" in low):
+                return True
+        return False
+
+    def _structural_conflict(self, staged):
+        """An unexplained conflict in stable terrain (4.1 ``D``)."""
+        for pos, raw in staged.cells.items():
+            klass = _classified_terrain(raw)
+            if klass not in instances.FIXED_TERRAIN:
+                continue
+            old = self.terrain.terrain.get(pos)
+            if old in instances.FIXED_TERRAIN and old != klass:
+                return True
+        return False
+
+    def _classify_attempt(self, before, staged):
+        hero = staged.hero
+        resolved = hero is not None
+        same = (hero is not None and hero == before.get("hero"))
+        bt = before.get("time")
+        nt = staged.status.time
+        delta = (nt - bt) if (bt is not None and nt is not None) else None
+        return arbitration.classify_outcome(same, resolved, delta)
+
+    def _arm_attempt(self, ordinal, selected):
+        """Create the single frozen SentAttempt for a successful send.
+
+        Only a *complete* send reaches here (3.4 step 5); a local validation
+        failure or a failed write arms nothing.  The candidate identity is the
+        reflex's retained candidate when the sent action still matches it, and
+        otherwise a deterministic candidate built from the exact sent action,
+        so an equivalent action can never evade rejection.
+        """
+        before = {"hero": self.mem.hero, "time": self.mem.status.time,
+                  "dlvl": self.mem.status.dlvl}
+        prepared = getattr(self.reflex, "last_prepared", None)
+        self._last_table_id = \
+            prepared.table_id if prepared is not None else ""
+        cand = getattr(self.reflex, "last_candidate", None)
+        try:
+            matches = (cand is not None
+                       and candidates.candidate_to_wire(cand) == selected)
+        except Exception:                    # noqa: BLE001 - defensive
+            matches = False
+        if not matches:
+            cand = candidates.make_candidate(selected, "sent")
+        table = _StubTable(self._last_table_id)
+        hero = before["hero"]
+        self.attempt = candidates.make_sent_attempt(
+            self.pending_key, table, cand, int(ordinal),
+            self._fingerprint(before), (hero,) if hero else (),
+            self.instance.current() or 0, cand.proposed_effect)
+        self.attempt_before = before
+        self.attempts_armed += 1
+        if self._is_stair_action(self.attempt):
+            self.instance.note_transition_sent(True)
+
+    def _fingerprint(self, before):
+        return "h=%s t=%s hp=%s/%s" % (
+            before.get("hero"), before.get("time"),
+            self.mem.status.hp, self.mem.status.hp_max)
+
+    def _rejection_for(self, need_key):
+        key = candidates.normalize_need_key(need_key)
+        rs = self.rejections.get(key)
+        if rs is None:
+            rs = arbitration.RejectionSet()
+            self.rejections[key] = rs
+        return rs
+
+    def _exclude_attempt(self):
+        """Terminally exclude the in-flight attempt's canonical action."""
+        attempt = self.attempt
+        if attempt is None:
+            return
+        rs = self._rejection_for(self.pending_key)
+        rs.ids.add(attempt.candidate_id)
+        rs.signatures.add(attempt.action.signature())
+        rs.version += 1
 
     def _on_page(self, rec):
         if not self.pending or self.req.need is None:
@@ -1324,11 +1499,21 @@ class _EpisodeRunner(object):
                 "request id %r rejected %d times (last code %r)"
                 % (self.req.id, self.retries, code))
         if code == "incomplete":
-            # pages were not all delivered: drop the request bookkeeping so
-            # the page obligation is re-issued
+            # delivery-repair, not a gameplay rejection (3.5): drop the
+            # request bookkeeping so the page obligation is re-issued, and do
+            # NOT exclude the candidate from gameplay
             self.req.reset_delivery()
         else:
-            self.force_fallback = True
+            # an ordinary/engine invalid terminally excludes the exact
+            # in-flight attempt's canonical action for this NeedKey, so the
+            # retry reselects the next member of the retained table rather
+            # than resending the same winner (3.5)
+            had_attempt = self.attempt is not None
+            self._exclude_attempt()
+            self.attempt = None
+            self.attempt_before = None
+            if not had_attempt:
+                self.force_fallback = True
         # the engine left the SAME request outstanding: re-arm it, but keep
         # the ORIGINAL need deadline -- the retry shares the first budget
         self.pending = True
@@ -1336,6 +1521,11 @@ class _EpisodeRunner(object):
     def _on_closed(self, rec):
         self.closed = True
         self.reflex_provider.on_closed()
+        # a closed episode stops further gameplay commits: discard any
+        # in-flight attempt without crediting a gameplay outcome (3.4)
+        self.instance.stop()
+        self.attempt = None
+        self.attempt_before = None
         # one closed/postmortem boundary: detected once, never re-emitted
         self.need_boundaries = self.mem.boundary.check(self.mem.status,
                                                        closed=True)
@@ -1553,7 +1743,8 @@ class _EpisodeRunner(object):
                 and level != dispatched_level:
             self.boundary_queue.finish(False, "stale-level")
             return
-        self.book.activate(dset, self.tick, level)
+        self.book.activate(dset, self.tick, level,
+                           instance=self.instance.current())
         self.boundary_queue.finish(True)
 
     def _remaining_budget(self):
@@ -1578,7 +1769,8 @@ class _EpisodeRunner(object):
         # applicability rules (level/TTL/preconditions), not merely the last
         # response received; an advisory that is no longer applicable is not
         # reported as active.
-        view = self.book.view(self.tick, st.dlvl, self._precondition_state())
+        view = self.book.view(self.tick, st.dlvl, self._precondition_state(),
+                              instance=self.instance.current())
         return StrategyContext(
             episode=self.result.index, tick=self.tick,
             summary={"hp": st.hp, "hp_max": st.hp_max, "dlvl": st.dlvl},
@@ -1707,7 +1899,8 @@ class _EpisodeRunner(object):
         """
         st = self.mem.status
         r = self.result
-        view = self.book.view(self.tick, st.dlvl, self._precondition_state())
+        view = self.book.view(self.tick, st.dlvl, self._precondition_state(),
+                              instance=self.instance.current())
         return {
             "outcome": r.outcome,
             "stop_reason": r.stop_reason,
@@ -1841,7 +2034,8 @@ class _EpisodeRunner(object):
         self._note_low_conf(low)
         self._activate_pending_directives(need)
         view = self.book.view(self.tick, self.mem.status.dlvl,
-                              self._precondition_state())
+                              self._precondition_state(),
+                              instance=self.instance.current())
         boundaries = [b.eid for b in self.need_boundaries]
         # The complete validated set is recorded, not just its goals: the
         # target, risk, TTL, preconditions and explanation round-trip.
@@ -1851,10 +2045,13 @@ class _EpisodeRunner(object):
             reason=sel_reason, boundaries=boundaries, latency=latency,
             usage=usage, directives=directives)
         obj = protocol.make_act(self.pending_seq, need["id"], selected)
-        self._emit("act", obj, need_key=self.pending_key,
-                   write_deadline=write_dl)
+        ordinal = self._emit("act", obj, need_key=self.pending_key,
+                             write_deadline=write_dl)
         # requested/pending state mutates only after the complete send
         if need.get("kind") in ("command", "key", "direction"):
+            # Only a successful complete send arms the single SentAttempt
+            # (plan 3.4 step 5); a failed write raised above and armed none.
+            self._arm_attempt(ordinal, selected)
             self.tick += 1
         self.pending = False
         self.force_fallback = False
@@ -1890,13 +2087,16 @@ class _EpisodeRunner(object):
 
     def _reflex_context(self, need, reflex_dl):
         st = self.mem.status
-        view = self.book.view(self.tick, st.dlvl, self._precondition_state())
+        view = self.book.view(self.tick, st.dlvl, self._precondition_state(),
+                              instance=self.instance.current())
+        rs = self._rejection_for(self.pending_key)
+        self.reflex.rejection_version = rs.version
         return ReflexContext(
             episode=self.result.index, tick=self.tick, need=need,
             need_key=self.pending_key, snapshot=self.snap,
             pages=self.req.page_rows(), memory=self.mem,
             directives=[view] if view.active else [],
-            deadline=reflex_dl or 0.0)
+            deadline=reflex_dl or 0.0, rejected=rs)
 
     def _decide_scripted(self, ctx, reflex_dl, t0):
         """The always-available tier, bounded by the reflex deadline.

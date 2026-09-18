@@ -189,7 +189,9 @@ def _ineligibility_reason(dset: Optional[DirectiveSet],
                           activated_tick: Optional[int],
                           activated_level: Optional[str], *,
                           tick: int, level: Optional[str],
-                          st: PreconditionState) -> Optional[str]:
+                          st: PreconditionState,
+                          activated_instance: Optional[int] = None,
+                          instance: Optional[int] = None) -> Optional[str]:
     """Why the active set is *not* in force, or None when it is.
 
     The single eligibility authority: :meth:`DirectiveBook.active` (for the
@@ -197,12 +199,18 @@ def _ineligibility_reason(dset: Optional[DirectiveSet],
     :meth:`DirectiveBook.peek_view` (for display, which must never mutate)
     both call this, so their answers cannot drift.  ``None`` means either
     "no set" or "eligible"; the caller distinguishes those by whether it
-    holds a set at all.  Precedence is level, then TTL, then precondition,
-    and the TTL test keeps the exact ``age > ttl`` semantics (equality is
-    eligible) with the same None-activation and None-level behavior.
+    holds a set at all.  Precedence is instance, level, TTL, then
+    precondition; the TTL test keeps the exact ``age > ttl`` semantics
+    (equality is eligible) with the same None-activation and None-level
+    behavior.  An instance mismatch is the level-instance scope of plan 4.4:
+    advice produced for a different instance is stale even on the same
+    displayed level, and a ``None`` on either side means "no instance check".
     """
     if dset is None:
         return None
+    if activated_instance is not None and instance is not None \
+            and instance != activated_instance:
+        return "instance-changed"
     if activated_level is not None and level is not None \
             and level != activated_level:
         return "level-changed"
@@ -232,6 +240,7 @@ class DirectiveBook(object):
         self._active: Optional[DirectiveSet] = None
         self.activated_tick: Optional[int] = None
         self.level: Optional[str] = None
+        self.active_instance: Optional[int] = None
         self.generation = 0
         self.events: List[Dict[str, Any]] = []
 
@@ -240,11 +249,13 @@ class DirectiveBook(object):
         return self._active is not None
 
     def activate(self, dset: DirectiveSet, tick: int, level: Optional[str],
-                 reason: str = "activated") -> None:
+                 reason: str = "activated",
+                 instance: Optional[int] = None) -> None:
         self.generation += 1
         self._active = dset
         self.activated_tick = tick
         self.level = level
+        self.active_instance = instance
         self._log("applied", reason, tick, level, dset.to_dict())
 
     def expire(self, reason: str, tick: Optional[int] = None,
@@ -257,35 +268,41 @@ class DirectiveBook(object):
             self._active = None
             self.activated_tick = None
             self.level = None
+            self.active_instance = None
             self._log("expired", reason, tick, level)
 
     def active(self, tick: int, level: Optional[str],
-               st: PreconditionState) -> Optional[DirectiveSet]:
+               st: PreconditionState,
+               instance: Optional[int] = None) -> Optional[DirectiveSet]:
         """The directive set in force right now, or None.
 
-        Enforces, in order: activation exists; the displayed level still
-        matches (advice about another level is stale); the tick TTL has not
-        run out; every precondition still holds.  Any failure expires the
-        set rather than leaving it half-applied.  The predicate itself is
-        :func:`_ineligibility_reason`, shared with :meth:`peek_view`.
+        Enforces, in order: activation exists; the instance still matches; the
+        displayed level still matches (advice about another level is stale);
+        the tick TTL has not run out; every precondition still holds.  Any
+        failure expires the set rather than leaving it half-applied.  The
+        predicate itself is :func:`_ineligibility_reason`, shared with
+        :meth:`peek_view`.
         """
         if self._active is None:
             return None
         reason = _ineligibility_reason(
             self._active, self.activated_tick, self.level,
-            tick=tick, level=level, st=st)
+            tick=tick, level=level, st=st,
+            activated_instance=self.active_instance, instance=instance)
         if reason is not None:
             self.expire(reason, tick, level)
             return None
         return self._active
 
     def view(self, tick: int, level: Optional[str],
-             st: PreconditionState) -> "DirectiveView":
-        dset = self.active(tick, level, st)
+             st: PreconditionState,
+             instance: Optional[int] = None) -> "DirectiveView":
+        dset = self.active(tick, level, st, instance)
         return DirectiveView(dset, self.generation if dset else 0)
 
     def peek_view(self, tick: int, level: Optional[str],
-                  st: PreconditionState) -> "DirectiveView":
+                  st: PreconditionState,
+                  instance: Optional[int] = None) -> "DirectiveView":
         """The read-only view for *display*: never expires, logs or mutates.
 
         Same eligibility predicate as :meth:`view` (:func:`active`), but a
@@ -297,7 +314,9 @@ class DirectiveBook(object):
         dset = self._active
         if dset is None or _ineligibility_reason(
                 dset, self.activated_tick, self.level,
-                tick=tick, level=level, st=st) is not None:
+                tick=tick, level=level, st=st,
+                activated_instance=self.active_instance,
+                instance=instance) is not None:
             return DirectiveView(None, 0)
         return DirectiveView(dset, self.generation)
 

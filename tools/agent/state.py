@@ -281,6 +281,24 @@ class Inventory(object):
         return letters
 
 
+@dataclass(frozen=True)
+class StagedObservation(object):
+    """A parsed-but-uncommitted observation (plan 3.4: parse is not commit).
+
+    Produced by :meth:`EpisodeMemory.stage` and consumed exactly once by
+    :meth:`EpisodeMemory.commit`.  Every field is a plain immutable value, so
+    the controller can reconcile an in-flight attempt against it before any of
+    it reaches durable memory.
+    """
+
+    cells: Dict[Tuple[int, int], tuple]
+    stairs_down: frozenset
+    stairs_up: frozenset
+    hero: Optional[Tuple[int, int]]
+    status: "Status"
+    messages: tuple
+
+
 class EpisodeMemory(object):
     """All mutable per-episode public memory.  Reset wholesale per episode."""
 
@@ -306,14 +324,49 @@ class EpisodeMemory(object):
         self.messages: List[str] = []
 
     def observe(self, snap: protocol.Snapshot) -> None:
-        """Fold one applied snapshot into durable memory."""
+        """Fold one applied snapshot into durable memory.
+
+        Kept as the composition of :meth:`stage` and :meth:`commit` so a
+        caller (the controller) that must reconcile an in-flight attempt
+        *before* memory commits can stage the parse, reconcile, then commit
+        (plan 3.4).  Messages stay event-id deduplicated.
+        """
+        self.commit(self.stage(snap))
+
+    def stage(self, snap: protocol.Snapshot) -> "StagedObservation":
+        """Parse one snapshot into a temporary presentation (no mutation).
+
+        Everything here is pure: terrain cells, stairs, the hero square, the
+        parsed status and the *new* event-id-deduplicated messages are read
+        out without touching durable memory, so the caller can reconcile the
+        in-flight attempt and only then commit.
+        """
+        cells: Dict[Tuple[int, int], tuple] = {}
+        stairs_down: Set[Tuple[int, int]] = set()
+        stairs_up: Set[Tuple[int, int]] = set()
         for pos, cell in snap.map.items():
-            self.grid[pos] = cell
+            cells[pos] = cell
             if cell and cell[0] == STAIRS_DOWN:
-                self.stairs_down.add(pos)
+                stairs_down.add(pos)
             elif cell and cell[0] == STAIRS_UP:
-                self.stairs_up.add(pos)
-        hero = hero_position(snap)
+                stairs_up.add(pos)
+        messages = []
+        for m in snap.msg or []:
+            e = m.get("e")
+            if e is not None and e not in self.seen_msgs:
+                messages.append((e, m.get("text") or ""))
+        return StagedObservation(
+            cells=cells, stairs_down=frozenset(stairs_down),
+            stairs_up=frozenset(stairs_up), hero=hero_position(snap),
+            status=parse_status(snap), messages=tuple(messages))
+
+    def commit(self, staged: "StagedObservation") -> None:
+        """Fold a staged observation into durable memory (the one commit)."""
+        for pos, cell in staged.cells.items():
+            self.grid[pos] = cell
+        self.stairs_down |= set(staged.stairs_down)
+        self.stairs_up |= set(staged.stairs_up)
+        hero = staged.hero
         if hero is not None:
             if hero == self.last_hero:
                 self.no_progress += 1
@@ -323,12 +376,11 @@ class EpisodeMemory(object):
             self.last_hero = hero
             self.hero = hero
             self.visits[hero] = self.visits.get(hero, 0) + 1
-        self.status = parse_status(snap)
-        for m in snap.msg or []:
-            e = m.get("e")
-            if e is not None and e not in self.seen_msgs:
+        self.status = staged.status
+        for e, text in staged.messages:
+            if e not in self.seen_msgs:
                 self.seen_msgs.add(e)
-                self.messages.append(m.get("text") or "")
+                self.messages.append(text)
         if len(self.messages) > 200:
             self.messages = self.messages[-200:]
 

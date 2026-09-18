@@ -243,6 +243,8 @@ class ReflexContext(object):
     directives: List[Any] = field(default_factory=list)
     candidates: List[str] = field(default_factory=list)
     deadline: float = 0.0
+    rejected: Any = None
+    prepared: Any = None
 
 
 @dataclass

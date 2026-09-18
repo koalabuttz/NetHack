@@ -128,6 +128,10 @@ class ScriptedReflex(object):
         self.recovery = recovery.RecoveryState()
         self.food = recovery.FoodNegatives()
         self._cycled = False
+        # The last prepared table and retained candidate, exposed for the
+        # controller-owned SentAttempt lifecycle (set in decide()).
+        self.last_prepared = None
+        self.last_candidate = None
 
     # -- provider surface ------------------------------------------------
     def _check_deadline(self) -> None:
@@ -144,14 +148,23 @@ class ScriptedReflex(object):
         prepared = getattr(context, "prepared", None)
         if prepared is None:
             prepared = self.prepare(context)
+        else:
+            self.last_prepared = prepared
         cand = self._select(prepared, getattr(context, "rejected", None))
         if cand is None:
             # member exhaustion: a reviewed per-kind structural fallback,
             # never an infinite `s` (3.5)
+            self.last_candidate = None
+            self.last_prepared = prepared
             return ReflexResult(action={"key": KEY.KEY_SEARCH},
                                 confidence=0.5, provider="scripted",
                                 reason="exhausted: structural fallback")
         self._note_selection(cand, context)
+        # Expose the prepared table and the retained candidate so the
+        # controller can own the SentAttempt lifecycle (3.4) without
+        # rebuilding or re-selecting anything.
+        self.last_prepared = prepared
+        self.last_candidate = cand
         return ReflexResult(action=candidates.candidate_to_wire(cand),
                             confidence=0.5, provider="scripted",
                             reason=cand.reason or cand.semantic_label)
