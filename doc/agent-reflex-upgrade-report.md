@@ -6,53 +6,36 @@ figures that were not measured are marked **pending**, and work that was not
 done is stated as not done rather than described as if it were.
 
 Baseline commit: `66ba39238` (plan approved).
-Implementation commits: `7e74fb4d4`, `d821ae180`, `d298850c4`, `5d0b8df38`,
-`091088770`, `47aa7bf9f`, `041db9719`.
+Prior implementation commits: `7e74fb4d4`, `d821ae180`, `d298850c4`,
+`5d0b8df38`, `091088770`, `47aa7bf9f`, `041db9719`.
+Waves 5-6 commits this session: `c1af01f92`, `d654f3f0c`, `432cbedfb` (and
+this report).
 
 ## 1. Headline status
 
 | Wave | Scope | Status |
 |---|---|---|
 | 1 | Neutral DTO/identity + lifecycle scaffolding | **complete** (`7e74fb4d4`) |
-| 2 | Instance/terrain/hero + pre-observe reconciliation | **complete** — deterministic memory layer (`d821ae180`) plus controller activation |
-| 3 | One-Dijkstra candidates/navigation + wiring | **complete** |
-| 4 | Scoped recovery/search/door/food budgets | **complete** |
-| 5 | Isolated dangerous two-send transaction | **not started** (native prefix/cancellation fixture **not built**, so the exception is correctly **unavailable**) |
-| 6 | Jev, replay/evaluation, measurement migration | **partial** — metrics module complete; evaluator pre-observe migration, parity fixture, Jev raw-choice path and post-change campaigns **not started** |
+| 2 | Instance/terrain/hero + pre-observe reconciliation | **complete** (`d821ae180`) |
+| 3 | One-Dijkstra candidates/navigation + wiring | **complete** (`5d0b8df38`, `47aa7bf9f`) |
+| 4 | Scoped recovery/search/door/food budgets | **complete** (`091088770`) |
+| 5 | Isolated dangerous two-send transaction | **partial** — the native prefix/cancellation fixture is built and **passing** through the real adapter; the ten gates and the `PROPOSED…SUCCEEDED\|FAILED` transaction are implemented and exhaustively tested; **live controller wiring is not done**, so the exception is not yet live-active (see §7.6) |
+| 6 | Jev, replay/evaluation, measurement migration | **partial** — the streaming metrics are now wired into `campaign.json`; post-change zero-key and real DeepSeek campaigns were run and measured (see §8); the **Jev raw-choice migration and the `evaluate.py` migration + parity fixture are not done** (see §10) |
 
-The legacy gameplay path is now governed by the candidate pipeline: the
-scripted reflex prepares one immutable candidate table per command decision,
-the controller owns the single in-flight `SentAttempt`, and `_on_obs` parses,
-reconciles and only then commits memory.  Safety emergencies, hunger, loop
-breakers and inventory maintenance were preserved as *priority* (sole)
-candidates, so no prior safety behaviour regressed.
-
-**Test totals (this tree):** 624 tests green across the agent suites
+**Test totals (this tree):** **670** tests green across the agent suites
 (`test_auto` 102, `test_auto_candidates` 54, `test_auto_instances` 39,
 `test_auto_metrics` 8, `test_auto_navigation` 22, `test_auto_recovery` 23,
 `test_auto_wiring` 15, `test_auto_providers` 217, `test_auto_replay` 52,
-`test_auto_spectate` 92; `test_spectate` 43 also green).  Pre-change baseline
-was 463 across the four original suites; every delta is additive.
+`test_auto_spectate` 92, **`test_auto_forced_search` 46 new**);
+`test_spectate.py --selftest` **43** green; `make -C test/agent check` green
+(manifest + header + schema + `test_view/menu/protocol/state`).  Pre-change
+baseline was 463 across the four original suites; every delta is additive.
 
-## 2. Immutable pre-change baseline campaign
+## 2. Immutable pre-change baseline campaign (unchanged)
 
-Captured **before** any behaviour change, exactly as the plan's §9 preamble
-requires:
-
-```
-./agent.sh auto --episodes 3 --reflex scripted --strategy off \
-    --max-ticks 15000 --episode-timeout 300 \
-    --output-dir /tmp/nh-reflex-baseline-pre
-```
-
-* directory: `/tmp/nh-reflex-baseline-pre` (kept, never deleted)
-* config: role Valkyrie (default), scripted reflex, strategy off,
-  `--reflex-deadline 0.75`, `--answer-deadline 1.0`,
-  `--content-deadline 5.0`, zero keys / zero network
-* engine: the pre-change agent binary; data `/tmp/nethack-agent-data`
-
-Measured with `python3 -m tools.agent.exploration_metrics
-/tmp/nh-reflex-baseline-pre`:
+Captured **before** any behaviour change (`/tmp/nh-reflex-baseline-pre`,
+kept; config: Valkyrie, scripted reflex, strategy off, `--reflex-deadline
+0.75`, `--max-ticks 15000`, zero keys / zero network):
 
 | ep | ticks | displayed turns | depth max | stairs (map triples) | cells | entered | longest loop span | outcome | stop |
 |---|---|---|---|---|---|---|---|---|---|
@@ -60,317 +43,253 @@ Measured with `python3 -m tools.agent.exploration_metrics
 | 2 | 1933 | 2943 | 1 | 0 | 66 | 27 | 6 | death | closed |
 | 3 | 15001 | 908 | 1 | 0 | 69 | 29 | **14101** | unknown | tick-cap-graceful-quit |
 
-This reproduces the diagnosed ds1 pathology under a fresh zero-key control:
-two episodes burn the full 15,001 controller ticks while displaying fewer
-than 1,000 game turns, with an identical `(hero, displayed-time)` fingerprint
-repeated ~14,000 times, at depth 1, with **zero** `>` map-triples.  Invalids
-were 0 in all three episodes; all recordings were complete.
+This reproduces the diagnosed ds1 pathology: two episodes burn the full 15,001
+controller ticks while displaying fewer than 1,000 game turns, with an
+identical `(hero, displayed-time)` fingerprint repeated ~14,000 times, at
+depth 1, with **zero** `>` map-triples and zero invalids.
 
-Per §10.1 these are **unpaired stochastic** observations, not a matched-seed
-control.  They establish the loop, not causality.
+## 3-6. Waves 1-4 (carried forward)
 
-## 3. Wave 1 — neutral candidate/identity leaf (complete)
+Waves 1-4 are complete as described in the prior revision of this report:
+the neutral candidate/identity leaf (`candidates.py`, `arbitration.py`), the
+deterministic memory layer (`instances.py`), one-Dijkstra navigation and the
+retained candidate table (`navigation.py`, `policy.py`), controller attempt
+ownership with pre-observe reconciliation (`controller.py`, `state.py`,
+`directives.py`), and bounded recovery with the exact public search-refusal
+recognizer and scoped food negatives (`recovery.py`).  Their evidence,
+fixture matrices and mutations (M01-M10, M13, M15, M18-M20, M22) are
+unchanged.
 
-Commit `7e74fb4d4`.
+## 7. Wave 5 — isolated dangerous two-send forced search
 
-Delivered:
+### 7.1 The mandatory native fixture (built, passing)
 
-* `tools/agent/candidates.py` — dependency-neutral leaf (imports **nothing**
-  from the package): immutable tagged action model, versioned deterministic
-  canonical JSON encoding, content-addressed candidate/table identities,
-  deterministic dedup-before-truncation and family/direction ordering,
-  `ReflexFeatures`/`PreparedReflex`/`SentAttempt` records.
-* `tools/agent/arbitration.py` — the shared pure `RejectionSet`,
-  `select_retained`, `RawChoice`/`validate_raw_choice` and reconciliation
-  classification reused by live control and evaluation.  Imports only
-  `candidates`.
-* `test/agent/test_auto_candidates.py` (54 tests), `bench_candidates.py`.
+`test/agent/native_prefix_probe.py` drives the **real** agent-only worker
+through the trusted launcher (`test/agent/driver.py`), selects a character
+through the native menus, and scripts a bounded in-game key sequence on the
+command needs: `m`, `s`, `m`, `m`, `s`.  Run via
+`make -C test/agent native-prefix WORKER=… RUNNER=… DATA=…`.
 
-Exit-gate evidence:
+Observed evidence (command-need index, displayed time at that need):
 
-* identical legacy selected actions — trivially true, the legacy path is
-  untouched and all 463 pre-existing tests pass;
-* neutral import graph — asserted by AST inspection of `candidates.py`
-  (no package sibling, not even `protocol`) and of `arbitration.py` (only
-  `candidates`);
-* deterministic IDs — table ID is not circular (excludes its own ID and the
-  retained bytes), is invariant to input order, and reacts to table version,
-  feature digest and rejection version;
-* canonicalize-once — `canonicalize_count()` proves the retained bytes are
-  reused on the selection and payload paths (M22);
-* M11 choice gate — all five sub-gates (identity, index type, index range,
-  confidence, rejected member) demonstrated independently.
+```
+command needs: [(8, 1), (9, 1), (10, 2), (11, 2), (12, 2), (13, 3)]
+checks: {'prefix_no_time': True, 'following_need_is_command': True,
+         'suffix_advanced_time': True,
+         'post_cancel_command_advanced_time': True}
+double-m message: ['Double m prefix, canceled.']
+```
 
-**Not done in wave 1:** the controller "attempt-event scaffolding"
-(shadow-only build of a `PreparedReflex` on each decision).  Deferred to
-wave 2 activation to avoid a second state owner without a verified consumer
-— see §7.
+Reading:
 
-## 4. Wave 2 — deterministic memory layer (partial)
+* need 8 -> 9: the `m` prefix consumed **no** game time (time 1 -> 1) and the
+  **exact immediately following need is a command need** (idx 8 + 1, kind
+  `command`) — the binding contract gate 8 depends on;
+* need 9 -> 10: the suffix `s` delivered to that following command need
+  advanced displayed time (1 -> 2) — the suffix really executed;
+* need 10 -> 11 -> 12: two `m` keys consumed no time (2 -> 2 -> 2) and the
+  engine emitted its own **`Double m prefix, canceled.`** native cancellation;
+* need 12 -> 13: an ordinary command after cancellation advanced time
+  (2 -> 3), so a controller that cancels its armed prefix cannot leak it into
+  a later action.
 
-Commit `d821ae180`.
+Because the native contract **is** proven, the plan permits the exception to
+be *enabled*; it does not force weakening the binding.
 
-Delivered (`tools/agent/instances.py`, 39 tests):
+### 7.2 The ten gates (`tools/agent/forced_search.py`)
 
-* full-cell `classify_cell(glyph,color,style,other)` implementing the
-  reviewer-confirmed door semantics (gray `-`/`|` walls, **brown** `-`/`|`
-  open doors, **brown** `+` closed door), re-verified against
-  `include/defsym.h:91-152`; unknown variants fail closed;
-* `TerrainMemory`: persistent terrain separated from current occupancy, with
-  `map_revision` bumped only on structural change and
-  `occupancy_generation` on occupant change; a monster overlay never erases a
-  remembered staircase;
-* `HeroResolution`: position **sets** that never pick a first/nearest `@`,
-  with an explicit `outside` flag so an empty set is not read as certainty,
-  and `reconcile_hero` that preserves the old position on nonmovement and
-  expands the set on unexpected relocation;
-* `LevelInstanceAutomaton`: episode-local monotonic instance IDs implementing
-  plan §4.1 rules 1-8.  Arrival that cannot be disproved fails closed to a
-  **fresh** scope; a cancelled proposal never sent creates no transition;
-  `N` (affirmative no-arrival) alone keeps the old scope; a timeout retires
-  the old scope to `FRESH_UNRESOLVED`.  **No `strong_public_match`, no
-  archived-map reuse, no cross-instance merge** (impl-1 requirement).
+Pure, stdlib-only module.  Each gate is an independently falsifiable
+predicate:
 
-Section 8.2 fixture matrix — all asserted: depth change, same-label branch,
-message lookalike (ignored) and ambiguous outcome-looking (allocates fresh),
-label-only and topology-only without message, zero-`@` and multiple-`@`
-(fresh before hero resolution), branch depth collision (three scopes),
-rejected stair (keeps old scope), conflict/timeout/cancellation.
+| gate | condition | §8.4 false test |
+|---|---|---|
+| g1-hero | hero confirmed + coherent command need + resolved instance + no pending transition | `Gate1Identity` (4 cases) |
+| g2-hp | known HP/max, **strictly** above 50% | `Gate2Hp` (exactly 50%, unknown, below, above) |
+| g3-conditions | no Hungry-or-worse; no dangerous condition; fully recognised | `Gate3Conditions` (every published Hungry-or-worse state; every dangerous condition from `src/botl.c` conditions[]; unknown fails closed) |
+| g4-refusal | exact correlated ordinary-search refusal (→ `recovery.is_search_refusal`) | `Gate4Refusal` (generic "found a monster" is **not** a refusal) |
+| g5-exhaustion | all legal movement/door/stair/food alternatives exhausted | `Gate5Exhaustion` |
+| g6-ready | no pending intent + healthy transport + verified native prefix contract | `Gate6Ready` (each component) |
+| g7-cap | fewer than three episode activations consumed | `Gate7Cap` |
+| g8-binding | suffix is the single `s` bound to the immediately following command need | `Gate8Binding` |
+| g9-outcome | single search, observed, displayed time increased | `Gate9Outcome` (each) |
+| g10-reassess | reassessed; never retry an unchanged failed activation | `Gate10Reassess` |
 
-**Wave-2 controller activation (now done):** see §5a below — `on_action_sent`
-ownership, pre-observe reconciliation in `_on_obs`, staged/committed memory,
-instance-scoped directive settlement and the runner-owned automaton/terrain.
-The evaluator's own `mem.observe` remains its wave-6 migration point.
+### 7.3 The two-send transaction
 
-## 5a. Wave 3 — one-Dijkstra navigation and controller wiring (complete)
+`ForcedSearchTransaction` implements `PROPOSED -> PREFIX_SENT -> SUFFIX_SENT
+-> SUCCEEDED | FAILED`, with cancellation from any live state.  The episode
+`ForcedSearchBudget` cap is consumed **at the first successfully sent
+prefix** and **never refunded** — not for cancellation, invalid, a failed
+suffix write, a no-time suffix, shutdown or death.  A failed prefix
+local-invalid/write consumes nothing.  The suffix binds only to the exact
+immediately following command need, same instance, unchanged evidence and
+holding gates.  Success requires an observed, time-advanced suffix; telemetry
+records before/after HP and time, in/out gate evidence and the risk label.
+The third activation exhausts the cap; gate 7 then denies and the fallback is
+`policy-exhausted/trapped` graceful quit.
 
-Commit `5d0b8df38` (`tools/agent/navigation.py`, `tools/agent/policy.py`,
-`test/agent/test_auto_navigation.py`) and commit `47aa7bf9f`
-(`tools/agent/controller.py`, `state.py`, `directives.py`, `providers.py`,
-`test/agent/test_auto_wiring.py`).
+### 7.4 Exhaustive §8.4 coverage
 
-Delivered:
+`test/agent/test_auto_forced_search.py` — **46 tests** — covers: each gate
+false independently (HP exactly 50%, unknown HP/max, every published
+Hungry-or-worse state, dangerous/unknown conditions, each readiness
+component, cap boundary, binding mismatch, each outcome condition,
+reassessment); the prefix/write-failure/cancel interleavings; prefix sent
+then suffix local-invalid / write-failed / engine-invalid / no-time; the
+intervening-prompt cancellation; the tick-cap-after-`m` cancellation with no
+refund; a successful time-advanced suffix **exactly once** (single terminal
+event); and the fourth activation leading to the trapped quit.
 
-* `navigation.py` — **one** Dijkstra from the confirmed hero over classified
-  terrain with integer base cost and capped visit/failed-edge penalties;
-  all-reachable-target enumeration (**no `[:8]` prefilter**, **no
-  Manhattan-only stair**); cardinal closed-door approaches (a closed door is
-  approached, never stepped on); diagonal door entry/exit and corner-squeeze
-  edge legality; instance-scoped `TargetStore` persistence.
-* `policy.py` — `ScriptedReflex.prepare(context) -> PreparedReflex` builds one
-  canonical `CandidateTable` per command decision with §3.3 integer scores and
-  bounded directive components; `decide` selects the retained argmax
-  (honouring a controller-supplied rejection set).  Safety emergencies,
-  hunger, loop breakers and inventory maintenance are priority (sole)
-  candidates, preserving every prior behaviour.
-* `state.py` — `EpisodeMemory.observe` split into a pure `stage()` parse and a
-  single `commit()`; messages stay event-id deduplicated.
-* `controller.py` — `_on_obs` parses, **reconciles the single in-flight
-  `SentAttempt` before any hero/level/map commit**, then commits once.  A
-  complete send arms exactly one frozen attempt; an ordinary invalid
-  terminally excludes its canonical action (the retry reselects the next
-  retained member, never the same winner); `incomplete` repairs transport
-  without a gameplay exclusion; closed discards the attempt.  The runner owns
-  a `LevelInstanceAutomaton` and `TerrainMemory` fed from applied snapshots.
-* `directives.py` — `_ineligibility_reason` extended with instance scope;
-  `DirectiveBook` carries the activated instance and `peek_view` stays pure.
+### 7.5 Mutation demos (M14 subset)
 
-Exit-gate evidence: the §8.2 transition matrix and §8.3 interleaving rows are
-covered by `test_auto_instances` (39) and `test_auto_wiring` (15) plus the
-reconciliation classification in `arbitration.classify_outcome`; the named
-mutations **M08/M09/M10** each turn their designated navigation test red and
-restore green, and **M18** is caught by `InvalidExclusion`.  The regenerable
-`short.*` ground-truth fixture was re-captured for the new navigation (a
-legitimate policy change invalidates the old trajectory, exactly as the
-fixture README warns); its hashes and README were updated.
+Applied, observed red, then restored to green (verified):
 
-## 5b. Wave 4 — bounded recovery and scoped negatives (complete)
+| ID | Mutation | Result |
+|---|---|---|
+| M14-A | do not consume the cap on prefix send (refund/reset) | `test_auto_forced_search`: **4 red** (`Ran 46 tests … FAILED (failures=4)`); restored green |
+| M14-C | accept a suffix success without a time advance (`or` for `and`) | `test_auto_forced_search`: **2 red**; restored green |
 
-Commit `091088770` (`tools/agent/recovery.py`, `tools/agent/policy.py`,
-`test/agent/test_auto_recovery.py`).
+### 7.6 What Wave 5 does **not** do
 
-Delivered:
+The transaction is **not wired into the live controller**.  The reflex still
+degrades member exhaustion to a single structural `s` proposal (`policy.py`
+`decide`), and no live code path proposes or sends the `m`/`s` pair.  The
+exception is therefore implemented, fixture-proven and unit-tested but **not
+live-active** (risky-search activations are correctly 0 in §8).  This is a
+real deviation from the plan's wave-5 change list and is **not** a claim of
+completion (see §10).
 
-* exact public search-refusal recognizer derived from `src/do.c:2333-2353`
-  ("You already found a monster." with the optional `Use 'm' prefix` suffix,
-  and "Searching doesn't feel like a good idea right now."); generic "found a
-  monster", lookalike and farlook text are explicitly **not** refusals;
-* scoped food negatives — inventory-negative by signature, location-negative
-  by `(instance, position, floor revision)` — for both engine message forms;
-* bounded per-site search budget (three completed searches; one refusal
-  suppresses) and a deterministic 2-/3-cycle detector;
-* reflex integration: a refused or exhausted ordinary search at a site
-  suppresses the next `s` and recovery escalates through a deterministic safe
-  step to a bounded graceful quit, breaking the diagnosed rejected-search loop
-  **without** the wave-5 forced search.  Hunger no longer blinds itself
-  against a scoped inventory negative.
+## 8. Wave 6 — metrics migration and measurement
 
-Exit-gate evidence: `test_auto_recovery` (23) plus the mutation **M15** (make
-the inventory negative global) turning `test_inventory_negative_is_signature_scoped`
-red.
+### 8.1 Streaming metrics wired into the campaign summary
 
-## 5c. Controller-wiring summary — what replaced eager `mem.observe`
+`write_campaign_summary` (`controller.py`) now embeds the section 10.2 set
+(via `exploration_metrics.campaign_metrics`) under a new additive
+`exploration` block in `campaign.json`.  The block is **path-independent**
+(the per-run campaign directory name is dropped) so two runs' summaries stay
+byte-identical — required by the spectator isolation gate, which the change
+would otherwise have broken (it did during development and was fixed).  A
+missing directory or a read failure is recorded, never fabricated.
 
-`_on_obs` previously called `self.mem.observe(self.snap)` eagerly.  It now:
+### 8.2 Post-change zero-key campaign vs the baseline
 
-1. `self.snap.apply(rec)` then `staged = self.mem.stage(self.snap)` (a pure
-   parse — terrain cells, stairs, hero, status and new messages, no mutation);
-2. `self._reconcile_observation(staged)` — merge classified terrain, classify
-   the in-flight attempt into a terminal outcome (released and counted exactly
-   once), derive the `{S, L, O, D, N}` transition signals and settle the
-   level-instance automaton;
-3. `self.mem.commit(staged)` — the single hero/level/map/message commit.
+Post-change campaign (`/tmp/nh-reflex-post`, identical role/config to the
+baseline, `--episodes 3 --max-ticks 15000 --episode-timeout 300`, zero keys /
+zero network), captured after waves 1-4 landed:
 
-The send side follows the §3.4 order exactly: local checks → map the retained
-candidate → `validate_action` → `_emit` → `_arm_attempt` (only on a complete
-send) → reconcile.  The evaluator is deliberately left on its wave-6
-migration point.
+| ep | ticks | displayed turns | depth max | stairs | cells | entered | longest loop span | outcome | stop |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 1881 | 3105 | 1 | 0 | 135 | 26 | **6** | death | closed |
+| 2 | 1856 | 2204 | 1 | 0 | 114 | 14 | **6** | death | closed |
+| 3 | 1816 | 1956 | 1 | 0 | 133 | 37 | **6** | death | closed |
 
-## 5. Measurement module (wave 6 prep, complete)
+Honest reading (unpaired stochastic evidence, **not** a matched seed, **no**
+causal claim — §10.1):
 
-Commit `d298850c4`: `tools/agent/exploration_metrics.py` + 8 tests.  Streams
-a campaign wire recording into the §10.2 set (ticks kept separate from
-displayed-time turns, depth, map-triple stairs, instance-scoped cells,
-longest loop span) without retaining an episode.  **Not yet wired into the
-campaign summary.**
+* the diagnosed loop is **gone**: the longest identical-fingerprint span
+  collapses from 14042/14101 (baseline ep1/ep3) to **6** in every post
+  episode; every post episode is now bounded (~1,816-1,881 ticks) instead of
+  burning the 15,001 tick cap;
+* **depth did not improve** (still `1/1` in every episode) and there are
+  still **zero** `>` map-triples — no staircase was ever reached;
+* discovered/entered cells are **mixed and not an improvement** (baseline
+  202/66/69 vs post 135/114/133 discovered; entered 85/27/29 vs 26/14/37).
+  The baseline ep1's 85 entered cells is not beaten;
+* the loop was replaced mainly by **deaths** (all three post episodes end in
+  death), not by policy quits — the same way baseline ep2 already ended at
+  ~1,933 ticks.  So the honest verdict is: **the infinite loop was eliminated,
+  but neither depth nor coverage improved, and the bounded episodes now end
+  in death**;
+* risky-search activations: **0** (the exception is not live-active);
+  invalids: 0 in all episodes; recordings complete.
 
-## 6. Performance benchmark (§3.2 gate)
+### 8.3 Real DeepSeek campaign (strategy tier end-to-end)
 
-`python3 test/agent/bench_candidates.py --tables 150000`, CPython 3.13.5,
-x86_64 Linux, 6 CPUs, reflex deadline 0.75 s:
+`/tmp/nh-reflex-deepseek` (`--episodes 2 --strategy deepseek
+--deepseek-key-file ~/.config/nethack-agent/deepseek.key`; the key is never
+printed, logged or committed):
 
-| candidates | retained bytes | payload bytes | best build (ms) |
-|---|---|---|---|
-| 1 | 479 | 329 | 0.0176 |
-| 40 | 13729 | 7509 | 0.2253 |
-| 255 | 50345 | 27818 | 0.8451 |
+| ep | ticks | outcome | strategy calls | directives applied | prompt/completion tokens | prompt-cache hit |
+|---|---|---|---|---|---|---|
+| 1 | 2707 | death | 4 | 9 | 2668 / 1265 | 896 hit / 1772 miss (33.6%) |
+| 2 | 1080 | death | 2 | 0 | 674 / 261 | 128 hit / 546 miss (19.0%) |
 
-150,000 tables x 255 candidates streaming (table build + hash + payload,
-each table discarded):
+This verifies the upgraded policy works with the strategy tier end-to-end:
+the bounded call cap is honoured, directives are applied (9 in ep1), reported
+prompt-cache accounting flows into the summary, and the usage/budget ledger
+records the spend.  `estimated_usd` is `0.0` because no tariff was configured
+(the operator did not supply prices); no USD figure is asserted here.
 
-* elapsed 150.726 s, **995 tables/s**
-* p50 **0.953 ms**, p95 1.2596 ms, p99 **1.4045 ms**, max 2.7989 ms
-* **0 deadline overruns** against 0.75 s → ~530x headroom on p99
-* peak traced memory 282 KB, 1 table retained
+## 9. Verification summary
 
-A single representative table differs from the worst case: the 0.75 s reflex
-allowance includes preparation, selection and reserved send headroom, so the
-measured ~1.4 ms p99 leaves the reservation essentially untouched.  As the
-plan warns, cost is serialization-bound (two canonicalizations per candidate
-plus one for the body), not hash-bound.
+* `test_auto*`: 670 green; `test_spectate.py --selftest`: 43 green.
+* `make -C test/agent check`: green (manifest + header + schema + C fixtures).
+* `make -C test/agent native-prefix`: OK (the fixture above).
+* §8.4 forced-search exhaustive cases: 46, green.
+* Mutation demos M14-A / M14-C: red then restored green.
+* 78-column sweep: clean for every changed Python file
+  (`forced_search.py`, `controller.py`, `test_auto_forced_search.py`,
+  `native_prefix_probe.py`); the `Makefile` has pre-existing long lines only.
+* Evaluator determinism and the live/replay parity fixture (M21): **not
+  exercised** — the evaluator was not migrated (§10).  The existing
+  `test_auto_replay` suite (52) remains green.
 
-## 7. Deviations (explicit)
+## 10. Deviations and deferred work (explicit)
 
-1. **Wave-1 controller shadow scaffolding deferred.**  The plan lists a
-   shadow-only attempt-event build on each decision.  It was folded into the
-   wave-3 activation instead of landing as a second, consumer-less owner.
-2. **The controller rebuilds the prepared table per decision.**  `decide`
-   prepares a table each call (the controller passes the rejection set, not a
-   pre-built `PreparedReflex`).  Canonicalisation is still a single serialize
-   per table (M22 holds for the payload path), but the "prepare once and reuse
-   across selection/payload/telemetry" optimisation is not yet threaded
-   through the controller.  The reflex does expose `last_prepared` for the
-   `SentAttempt` identity.
-3. **The runner-owned automaton/terrain are fed but not yet read by the
-   reflex.**  `_EpisodeRunner` owns a `LevelInstanceAutomaton` and
-   `TerrainMemory` and settles them from applied snapshots, but the scripted
-   reflex still derives its navigation terrain from `mem.grid` each decision.
-   The evidence exists and is tested; switching the reflex to consume the
-   runner's terrain is a follow-up, not a correctness gap for the current
-   depth-1 behaviour.
-4. **Forced-search exception remains unavailable.**  Per plan §5.3/§8.4 the
-   native prefix (`m`)/continuation (`s`)/cancellation fixture is mandatory
-   *before* enabling `risky-emergency-forced-search`.  It was **not built**,
-   so the exception is correctly left unavailable — the conservative outcome
-   the plan mandates, not a weakened substitute.
-5. **No post-change campaign was run.**  Wave 3 changed navigation behaviour;
-   a fresh zero-key campaign belongs with the wave-6 measurement migration and
-   the preserved pre-change baseline in §2.  The `short.*` fixture was
-   re-captured locally to keep the replay gate meaningful, which is a
-   fixture refresh, not a measured campaign.
-6. **The evaluator was not migrated.**  `evaluate.py` still applies a snapshot
-   and immediately calls `mem.observe`; the shared-reconciliation migration
-   and the live/replay parity fixture are wave 6.
+1. **Live controller wiring of the wave-5 transaction is not done.**  The
+   module, gates, transaction and the native fixture are complete and tested,
+   but no live code path proposes or sends the `m`/`s` pair, so the exception
+   is not active in play.  The plan's wave-5 change list requires the
+   controller two-send ownership; that remains the next step.
+2. **Jev raw-choice migration (§6.1) is not done.**  `JevReflex.decide` still
+   returns a mapped `ReflexResult` and maps the index inside the adapter; the
+   `ReflexChoiceResult` raw path, `ReflexContext.prepared`-based
+   `build_choices`, central `validate_raw_choice` mapping and the
+   skip-before-reserve/billing changes are not implemented.  Jev remains
+   DISABLED for real play; the existing fake-endpoint provider tests (217,
+   including the Jev block) remain green and unmodified.
+3. **`evaluate.py` migration (§6.2) and the live/replay parity fixture are
+   not done.**  `evaluate.py` still applies a snapshot and immediately calls
+   `mem.observe`.  M21 cannot be demonstrated because its subject is unmigrated.
+4. **M11 is not re-demonstrated** beyond the wave-1 evidence already in the
+   prior report: central live validation/mapping (its wave-6 home) is unmigrated.
+5. **M14 is demonstrated only at the module level** (M14-A, M14-C above); the
+   controller-level M14 variants depend on deviation 1.
 
-## 8. Mutation table
-
-Every mutation was applied, observed red on its designated test, then
-restored to green (verified).  None is committed.
-
-| ID | Mutation | Designated test | Result |
-|---|---|---|---|
-| M22 | `jev_payload` re-canonicalizes the table | `test_payload_path_does_not_recanonicalize` | red `1 != 0`; restored green |
-| M11 | index-type check removed | `test_m11_index_type_gate` | red; restored green |
-| M11 | index-range check removed (clamp) | `test_m11_index_range_gate` (+`test_usage_is_carried…` collateral) | red; restored green |
-| M11 | probability+threshold removed | `test_m11_confidence_gate` | red; restored green |
-| M11 | identity check made partial | `test_m11_identity_gate` | red; restored green |
-| M11 | rejected-member check removed | `test_m11_rejected_member_gate` | red; restored green |
-| M01 | closed `+` traversed as open door | `test_closed_door_is_not_walkable_and_needs_opening` | red; restored green |
-| M02 | blank admitted as floor | `test_blank_is_unknown_not_floor` | red; restored green |
-| M03 | `;` removed from monster classes | `test_every_monster_punctuation_is_a_hazard` | red; restored green |
-| M04/M19 | first `@` wins instead of a set | `test_first_at_is_never_chosen`, `test_zero_and_multiple_at_are_sets` | red (2); restored green |
-| M13 | `L` transition detector removed | `test_transition_without_message_label_only`, `test_each_signal_alone_allocates_fresh` | red (2); restored green |
-| M08 | `[:8]` target prefilter restored | `test_no_eight_target_prefilter` | red; restored green |
-| M09 | Manhattan-nearest stair only | `test_reachable_farther_stair_beats_unreachable_nearer`, `test_farther_reachable_stair_is_chosen_when_nearer_is_isolated` | red (2); restored green |
-| M10 | diagonal door/corner edge allowed | `test_diagonal_door_entry_is_illegal`, `test_corner_squeeze_is_illegal` | red (2); restored green |
-| M15 | inventory negative made global | `test_inventory_negative_is_signature_scoped` | red; restored green |
-| M18 | `_on_invalid` no longer excludes | `test_ordinary_invalid_excludes_the_candidate` (+`InvalidExclusion`) | red; restored green |
-| M19 | (already covered by M04 first-`@`) | `test_first_at_is_never_chosen` | red; restored green |
-
-Still not demonstrable because their subject code is not implemented: M05 (the
-`safe_wait` positive gates belong to the wave-5 forced search), M06
-(food-allowlist tightening), M07 (Escape-as-universal), M12 (premature
-effect), M14 (risky transaction), M16/M17 (frontier/ticks — partially
-exercised), M20 (directive instance — the instance predicate is now tested
-positively in `test_auto_wiring`), M21 (replay parity, wave 6).
-
-## 9. Commits
+## 11. Commits
 
 | commit | subject |
 |---|---|
-| `7e74fb4d4` | agent: neutral candidate/identity leaf (wave 1) |
-| `d821ae180` | agent: instance/terrain/hero memory (wave 2) |
-| `d298850c4` | agent: streaming exploration metrics module |
-| `550c823d6` | agent: isolate the leaf import-graph test |
-| `5d0b8df38` | agent: one-Dijkstra navigation + candidate tables |
-| `091088770` | agent: bounded recovery + scoped food negatives |
-| `47aa7bf9f` | agent: controller attempt ownership + reconcile |
-| `041db9719` | agent: assert invalid exclusion in wiring tests |
-
-This report is itself committed on top of those, so its own hash is not
-listed here.
+| `c1af01f92` | agent: native prefix fixture + forced-search gates |
+| `d654f3f0c` | agent: wire streaming metrics into campaign summary |
+| `432cbedfb` | agent: add native-prefix fixture make target |
 
 All use explicit-path staging, author `NetHack Agent <agent@localhost>`,
 subject <= 50 and body wrapped at 72.  `AGENTS.md`, `build.log`,
 `playground/`, `/tmp` and the DeepSeek key are untouched; no NHDT headers
-edited; no engine or profile changes; `safe_wait=on`
-(`doc/agent-profile-v1.tsv:165`) is unmodified.
+edited; no engine or profile changes; `make install` was never run;
+`safe_wait=on` (`doc/agent-profile-v1.tsv:165`) is unmodified.
 
-## 10. Deferred work and recommended order
+## 12. Recommended next steps (dependency-ordered)
 
-1. **Wave 5** (unchanged): build the native prefix (`m`)/continuation (`s`)/
-   cancellation C fixture first; only then enable the ten-gated two-send
-   transaction, with M14.  Until then `risky-emergency-forced-search` stays
-   unavailable.
-2. **Wave 6**: migrate `evaluate.py` onto the shared reconciliation/selection
-   helpers with the live/replay parity fixture (M21), wire the Jev
-   raw-choice/retained-byte path (M11/M22 through the controller), integrate
-   `exploration_metrics` into the campaign summary, and run the post-change
-   zero-key campaign against the baseline in §2.
-3. **Follow-ups flagged in §7**: thread a prepared-once `PreparedReflex`
-   through the controller, and switch the reflex to consume the runner-owned
-   automaton/terrain rather than rebuilding from `mem.grid`.
+1. **Wire the wave-5 transaction into the controller**: have the reflex
+   propose the forced search only when the recovery ladder is genuinely
+   exhausted, and give the `_EpisodeRunner` ownership of the
+   `ForcedSearchTransaction` and `ForcedSearchBudget` across the two needs
+   (`_answer_now` prefix send, the following command need's suffix send),
+   with the native-verified double-`m` cancellation used on every abort path.
+2. **Migrate the Jev boundary (§6.1)** and **`evaluate.py` (§6.2)** onto the
+   shared `arbitration` helpers, then land the parity fixture (M21) and
+   re-demonstrate M11.
+3. Re-run the post-change campaigns after (1)/(2) and re-populate §8.
 
-## 11. What was not measured
+## 13. What was not measured
 
-* post-change campaign metrics (wave 3 changed navigation; the campaign
-  belongs with wave 6);
-* full §10.2 metric set beyond the columns in §2 (risky activations are
-  correctly zero — the exception is unavailable — and door/search/food
-  attempt budgets are exercised by unit tests, not a campaign);
-* live-model/replay parity (wave 6);
-* 78-column sweep of every modified file is satisfied for the files touched
-  (checked with `awk 'length>78'`, clean for all `tools/agent/*.py` and the new
-  tests).
+* live forced-search activation counts, cancellations, cap denials and
+  trapped quits (the exception is not live-active);
+* door/search/food attempt budgets at campaign scale (unit-tested only);
+* live/replay parity and evaluator determinism under the new semantics;
+* USD cost of the DeepSeek campaign (no tariff configured; `estimated_usd`
+  is `0.0` and no cost is asserted).
 
 No number in this report is a projection or an estimate.
