@@ -29,7 +29,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import protocol, state
+from . import candidates, protocol, state
 from .budget import Tariff
 from .directives import MAX_TTL, validate_directive_set
 from .worker import INVOCATION_MARKER, MAX_JOB_BYTES
@@ -255,6 +255,31 @@ class ReflexResult(object):
     reason: str = ""
     usage: Dict[str, Any] = field(default_factory=dict)
     latency: float = 0.0
+
+
+@dataclass
+class ReflexChoiceResult(object):
+    """A paid provider's *raw* choice, before any controller mapping (6.1).
+
+    Carries the raw index (or an abstention / parse error), the request and
+    table identity the answer is bound to, the confidence, returned usage,
+    latency and dispatch status.  It never carries a mapped action: the
+    controller validates it against the retained table (identity, index
+    type/range, confidence, rejection set, member safety) and maps it
+    centrally, so no adapter can invent a live action.
+    """
+
+    table_id: str = ""
+    need_key: tuple = ()
+    table_version: int = -1
+    index: Optional[int] = None
+    confidence: Any = None
+    abstain: bool = False
+    parse_error: str = ""
+    reason: str = ""
+    usage: Dict[str, Any] = field(default_factory=dict)
+    latency: float = 0.0
+    dispatched: bool = False
 
 
 @dataclass
@@ -1375,38 +1400,47 @@ class JevReflex(ReflexProvider):
             sup.cancel()
 
     def build_choices(self, context: ReflexContext):
-        """Return ``(options, mapping)`` or ``None`` when Jev cannot help.
+        """Serialize the retained table for Jev, or ``None`` (skip reserve).
 
-        Unsuitable needs (line/extcmd, position, an oversized menu) return
-        None so the caller uses the scripted fallback without a paid call.
+        A need Jev must not choose (line/extcmd/position) and any table that
+        does not present a real choice -- a singleton prompt/mandatory/
+        emergency table, which the scripted tier owns -- return ``None`` so
+        the caller skips the paid dispatch entirely and never reserves
+        against it (6.1).  The payload is built from the already-canonical
+        table records, so it re-serializes nothing (M22).
         """
         kind = (context.need or {}).get("kind")
         if kind not in JEV_SUPPORTED_KINDS:
+            return None
+        prepared = getattr(context, "prepared", None)
+        if prepared is None or prepared.table is None:
+            return None
+        table = prepared.table
+        # < 2 members is a singleton/mandatory/emergency table: scripted only
+        if len(table.ordered_candidates) < 2:
             return None
         if kind == "menu":
             rows = [r for r in context.pages if r.get("selectable")]
             if not rows or len(rows) > JEV_MAX_MENU_ROWS:
                 return None
-            options = [{"index": i, "label": str(r.get("text") or "")[:80],
-                        "row": r.get("r")} for i, r in enumerate(rows)]
-            mapping = {"kind": "menu", "rows": [r.get("r") for r in rows]}
-            return options, mapping
-        if kind == "yn":
-            options = [{"index": 0, "label": "yes", "value": 121},
-                       {"index": 1, "label": "no", "value": 110}]
-            return options, {"kind": "yn", "values": [121, 110]}
-        options = [{"index": i, "label": label, "value": val}
-                   for i, (label, val) in enumerate(KEY_CHOICES)]
-        return options, {"kind": "key",
-                         "values": [val for _l, val in KEY_CHOICES]}
+        return candidates.jev_payload(table)
 
     def decide(self, context: ReflexContext, deadline: float = 0.0) -> \
-            Optional[ReflexResult]:
+            Optional[ReflexChoiceResult]:
+        """Return the provider's *raw* choice, never a mapped action (6.1).
+
+        ``None`` means no body arrived at all (unsupported need, refused
+        spawn, timeout or worker error) -- there is no usage to preserve.  A
+        body that *did* arrive always yields a :class:`ReflexChoiceResult`
+        carrying its usage, even for an abstaining, malformed, out-of-range
+        or low-confidence answer, so the caller bills the spend before the
+        controller rejects it.
+        """
         built = self.build_choices(context)
         if built is None:
             self.last_error = "unsupported-need"
             return None
-        options, mapping = built
+        table = context.prepared.table
         try:
             key = load_secret(self.config.jev_key_file, "JEV_API_KEY")
         except SecretError as exc:
@@ -1423,7 +1457,8 @@ class JevReflex(ReflexProvider):
                "payload": {"v": 1, "kind": "choice",
                            "need_kind": (context.need or {}).get("kind"),
                            "prompt": (context.need or {}).get("prompt") or "",
-                           "options": options, "abstain": True},
+                           "table": built, "options": built.get("candidates"),
+                           "abstain": True},
                "api_key": key,
                "timeout": max(0.5, ddl - now + 0.25),
                "max_bytes": self.config.provider_max_bytes}
@@ -1456,67 +1491,46 @@ class JevReflex(ReflexProvider):
         if res is None:
             self.last_error = "timeout"
             return None
-        return self._result_from(res, context, options, mapping)
+        return self._choice_from(res, table)
 
-    def _result_from(self, res: WorkerResult, context: ReflexContext,
-                     options, mapping) -> Optional[ReflexResult]:
-        """Turn one worker response into a reflex result.
+    def _choice_from(self, res: WorkerResult, table
+                     ) -> ReflexChoiceResult:
+        """Extract the raw fields from one worker body (6.1).
 
-        Once a body comes back the paid call has already happened, so every
-        path that has a body returns a ``ReflexResult`` carrying its
-        ``usage`` -- with ``action`` set on acceptance and ``None`` on
-        rejection.  Returning bare ``None`` for a low-confidence, abstaining,
-        out-of-range or action-less answer would drop the spend, so the
-        method contract is "accepted or not" and the caller accounts usage
-        regardless.  ``None`` is returned only when *no body arrived at all*
-        (worker error or timeout), where there is no usage to preserve.
+        No acceptance decision is made here: the confidence, index/abstention
+        and parse error are surfaced raw and the controller validates them
+        against the retained table.  A body that arrived always carries its
+        usage so the spend is never dropped.
         """
+        base = ReflexChoiceResult(
+            table_id=table.table_id, need_key=tuple(table.need_key),
+            table_version=table.table_version,
+            latency=getattr(res, "latency", 0.0), dispatched=True)
         if not res.ok or res.json is None:
             self.last_error = res.error or "error"
-            return None
+            return _choice_replace(base, parse_error=self.last_error,
+                                   reason="transport")
         body = res.json
         usage = body.get("usage")
         usage = usage if isinstance(usage, dict) else {}
-        choice = body.get("option")
         conf = body.get("confidence")
-        if conf is None:
-            conf = 0.0
-        if isinstance(conf, bool) or not isinstance(conf, (int, float)) \
-                or conf != conf or conf in (float("inf"), float("-inf")):
-            return self._rejected("invalid-confidence", usage, res.latency)
-        conf = float(conf)
-        if not (0.0 <= conf <= 1.0):
-            return self._rejected("invalid-confidence", usage, res.latency)
-        if conf < self.config.confidence_threshold:
-            return self._rejected("low-confidence", usage, res.latency)
+        choice = body.get("option")
         if choice is None:
-            return self._rejected("abstain", usage, res.latency)
-        if not isinstance(choice, int) or isinstance(choice, bool) \
-                or not (0 <= choice < len(options)):
-            return self._rejected("invalid-option", usage, res.latency)
-        action = self._action_for(mapping, options[choice], context)
-        if action is None:
-            return self._rejected("invalid-action", usage, res.latency)
-        return ReflexResult(action=action, confidence=conf,
-                            provider=self.name,
-                            reason="jev choice", latency=res.latency,
-                            usage=usage)
+            return _choice_replace(base, abstain=True, confidence=conf,
+                                   usage=usage, reason="abstain")
+        if isinstance(choice, bool) or not isinstance(choice, int):
+            return _choice_replace(base, parse_error="invalid-option",
+                                   confidence=conf, usage=usage,
+                                   reason="invalid-option")
+        return _choice_replace(base, index=choice, confidence=conf,
+                               usage=usage, reason="choice")
 
-    def _rejected(self, why: str, usage: Dict[str, Any],
-                  latency: float) -> ReflexResult:
-        """A paid answer that is not usable, still carrying its usage."""
-        self.last_error = why
-        return ReflexResult(action=None, confidence=None, provider=self.name,
-                            reason=why, latency=latency, usage=usage)
 
-    @staticmethod
-    def _action_for(mapping, option, context) -> Optional[dict]:
-        if mapping["kind"] == "menu":
-            return {"menu": (context.need or {}).get("menu"),
-                    "commit": [[option["row"], -1]]}
-        if mapping["kind"] == "yn":
-            return {"yn": option["value"]}
-        return {"key": option["value"]}
+def _choice_replace(base: ReflexChoiceResult, **fields) -> ReflexChoiceResult:
+    """A copy of a raw choice result with *fields* overlaid."""
+    data = dict(base.__dict__)
+    data.update(fields)
+    return ReflexChoiceResult(**data)
 
 
 # --------------------------------------------------------------- factories

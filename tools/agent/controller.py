@@ -2447,12 +2447,17 @@ class _EpisodeRunner(object):
         """Optional paid reflex: one immutable job, bounded, else scripted.
 
         Scripted safety is computed first and answers immediately if the paid
-        tier is unavailable, capped or wrong -- never await a paid tier to
-        answer a crisis.  Any paid result, accepted or not, contributes its
-        *returned usage* to the episode's token/USD accounting, so a paid
-        reflex cannot spend outside the budget.
+        tier is unavailable, capped or unsupported -- never await a paid tier
+        to answer a crisis.  The paid tier returns a *raw* choice (6.1): the
+        controller validates its identity, index type/range, confidence,
+        rejection set and member safety against the retained table and maps an
+        accepted member to its immutable action.  Any paid body, accepted or
+        not, contributes its returned usage to the episode's accounting, so a
+        paid reflex cannot spend outside the budget.
         """
-        scripted = self.reflex.fallback(ctx)
+        prepared = self.reflex.prepare(ctx)
+        ctx.prepared = prepared
+        scripted = self.reflex.decide(ctx)
         fallback_action = scripted.action if scripted is not None else None
         if not self.rec_healthy:
             # A recorder that has already failed this episode disables all
@@ -2473,6 +2478,12 @@ class _EpisodeRunner(object):
             return (fallback_action, "scripted",
                     "jev paid-reflex cap reached",
                     0.0, {}, True)
+        # Skip before reserve (6.1): an unsupported need or a table without a
+        # real choice is never paid for, so no reservation is made.
+        if self.reflex_provider.build_choices(ctx) is None:
+            self.ledger.reflex_fallback += 1
+            return (fallback_action, "scripted",
+                    "jev skipped: no eligible choice", 0.0, {}, True)
         self.ledger.reserve_reflex_paid()
         self.ledger.reflex_attempted += 1
         call = _ReflexCall(
@@ -2488,20 +2499,32 @@ class _EpisodeRunner(object):
         usage = res.usage if res is not None else {}
         # exactly once: a paid body is billed whether or not it is accepted
         self.ledger.add_usage(usage)
-        if res is None or res.action is None:
+        if res is None:
             self.ledger.reflex_fallback += 1
             why = getattr(self.reflex_provider, "last_error", "") \
-                or (res.reason if res is not None else "") or "no answer"
+                or "no answer"
             return (fallback_action, "scripted", "jev fallback: %s" % why,
                     latency, usage, True)
+        # Central validation: the raw choice is checked against the exact
+        # retained table and the controller-owned rejection set, then mapped.
+        raw = arbitration.RawChoice(
+            table_id=res.table_id, need_key=tuple(res.need_key),
+            table_version=res.table_version, index=res.index,
+            confidence=res.confidence, abstain=res.abstain,
+            parse_error=res.parse_error, latency=res.latency,
+            dispatched=res.dispatched)
+        outcome = arbitration.validate_raw_choice(
+            prepared.table, raw, self._rejection_for(self.pending_key),
+            threshold=self.c.config.confidence_threshold,
+            eligible=lambda cand: cand.family != "emergency")
+        if not outcome.accepted:
+            self.ledger.reflex_fallback += 1
+            return (fallback_action, "scripted",
+                    "jev rejected: %s" % (outcome.reason or outcome.code),
+                    latency, usage, True)
         self.ledger.reflex_successful += 1
-        conf = res.confidence
-        numeric = (isinstance(conf, (int, float))
-                   and not isinstance(conf, bool))
-        low = not (numeric
-                   and conf >= self.c.config.confidence_threshold)
-        return (res.action, res.provider, res.reason, latency, res.usage,
-                low)
+        return (candidates.candidate_to_wire(outcome.candidate), "jev",
+                "jev choice", latency, usage, False)
 
     def _safe_fallback(self, need) -> dict:
         """A structurally valid, non-blocking answer for any need kind.

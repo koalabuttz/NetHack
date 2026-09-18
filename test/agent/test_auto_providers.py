@@ -32,12 +32,13 @@ from test_auto import (BLANK, CLOSED, HELLO, WireHarness,  # noqa: E402
                        _FakeStderr, _FakeStdin, _FakeStdout, _line,
                        _parse_actions, _read_jsonl, _wait_gone, ack_need,
                        hello)
-from tools.agent import (budget, controller, directives, events,  # noqa
-                         policy, protocol, providers, recording, state,
-                         worker)
+from tools.agent import (budget, candidates, controller, directives,  # noqa
+                         events, policy, protocol, providers, recording,
+                         state, worker)
 from tools.agent.providers import (Availability, ProviderConfig,  # noqa
-                                   ReflexContext, ReflexResult,
-                                   StrategyContext, StrategyResult)
+                                   ReflexChoiceResult, ReflexContext,
+                                   ReflexResult, StrategyContext,
+                                   StrategyResult)
 
 DSEV = directives
 
@@ -1184,10 +1185,21 @@ class TestJevAdapter(unittest.TestCase):
         return ProviderConfig(**base)
 
     def ctx(self, need):
-        return ReflexContext(episode=1, tick=1, need=need,
-                             need_key=protocol.NeedKey(1, 1, need.get("id")),
-                             snapshot=protocol.Snapshot(), pages=[],
-                             memory=state.EpisodeMemory())
+        ctx = ReflexContext(episode=1, tick=1, need=need,
+                            need_key=protocol.NeedKey(1, 1, need.get("id")),
+                            snapshot=protocol.Snapshot(), pages=[],
+                            memory=state.EpisodeMemory())
+        # The retained table is a controller-owned preparation; a paid choice
+        # is validated against it, so a real one is attached here (6.1).
+        cands = [candidates.make_candidate({"key": protocol.KEY_H},
+                                           "west"),
+                 candidates.make_candidate({"key": protocol.KEY_L},
+                                           "east")]
+        table = candidates.build_table(protocol.NeedKey(1, 1, need.get("id")),
+                                       1, cands)
+        ctx.prepared = candidates.PreparedReflex(
+            immutable_features=candidates.ReflexFeatures(), table=table)
+        return ctx
 
     def test_ships_disabled_without_terms(self):
         prov = providers.JevReflex(ProviderConfig(reflex="jev"))
@@ -1207,19 +1219,26 @@ class TestJevAdapter(unittest.TestCase):
         prov = providers.JevReflex(self.cfg(reflex_call_cap=1))
         self.assertTrue(prov.available(prov.config).enabled)
 
-    def test_valid_choice(self):
+    def test_valid_choice_is_raw(self):
         self.ep.responder = lambda p, b: (
             200, json.dumps({"option": 1, "confidence": 0.9}).encode())
         prov = providers.JevReflex(self.cfg())
-        res = prov.decide(self.ctx(command_need(1)), time.monotonic() + 2.0)
+        ctx = self.ctx(command_need(1))
+        res = prov.decide(ctx, time.monotonic() + 2.0)
         self.assertIsNotNone(res)
+        # the adapter returns a *raw* index, never a mapped action (6.1)
+        self.assertEqual(res.index, 1)
         self.assertEqual(res.confidence, 0.9)
-        self.assertEqual(res.action,
-                         {"key": providers.KEY_CHOICES[1][1]})
+        self.assertFalse(res.abstain)
+        self.assertEqual(res.parse_error, "")
+        self.assertTrue(res.dispatched)
+        self.assertEqual(res.table_id, ctx.prepared.table.table_id)
+        self.assertEqual(res.need_key, tuple(ctx.prepared.table.need_key))
         prov.cancel()
 
-    def test_confidence_nan_and_out_of_range_fall_back(self):
-        # a rejected answer still carries its usage: the call was paid
+    def test_confidence_is_surfaced_raw(self):
+        # the adapter does not judge the confidence: it is surfaced raw with
+        # its usage, and the controller rejects it centrally (6.1)
         for conf in (float("nan"), 1.5, -0.1, "high", None):
             with self.subTest(conf=conf):
                 self.ep.responder = lambda p, b, c=conf: (
@@ -1231,14 +1250,12 @@ class TestJevAdapter(unittest.TestCase):
                 res = prov.decide(self.ctx(command_need(1)),
                                   time.monotonic() + 2.0)
                 self.assertIsNotNone(res)
-                self.assertIsNone(res.action)
-                self.assertIn(res.reason,
-                              ("invalid-confidence", "low-confidence"))
+                self.assertEqual(res.index, 0)
                 self.assertEqual(res.usage, {"prompt_tokens": 7,
                                              "completion_tokens": 2})
                 prov.cancel()
 
-    def test_low_confidence_falls_back(self):
+    def test_low_confidence_is_surfaced_raw(self):
         self.ep.responder = lambda p, b: (
             200, json.dumps({"option": 0, "confidence": 0.2,
                              "usage": {"prompt_tokens": 3}}).encode())
@@ -1246,12 +1263,12 @@ class TestJevAdapter(unittest.TestCase):
         res = prov.decide(self.ctx(command_need(1)),
                           time.monotonic() + 2.0)
         self.assertIsNotNone(res)
-        self.assertIsNone(res.action)
-        self.assertEqual(res.reason, "low-confidence")
+        self.assertEqual(res.index, 0)
+        self.assertEqual(res.confidence, 0.2)
         self.assertEqual(res.usage.get("prompt_tokens"), 3)
         prov.cancel()
 
-    def test_unknown_option_falls_back(self):
+    def test_out_of_range_option_is_surfaced_raw(self):
         self.ep.responder = lambda p, b: (
             200, json.dumps({"option": 999, "confidence": 0.99,
                              "usage": {"prompt_tokens": 4}}).encode())
@@ -1259,8 +1276,7 @@ class TestJevAdapter(unittest.TestCase):
         res = prov.decide(self.ctx(command_need(1)),
                           time.monotonic() + 2.0)
         self.assertIsNotNone(res)
-        self.assertIsNone(res.action)
-        self.assertEqual(res.reason, "invalid-option")
+        self.assertEqual(res.index, 999)   # the controller bounds the index
         self.assertEqual(res.usage.get("prompt_tokens"), 4)
         prov.cancel()
 
@@ -1274,8 +1290,8 @@ class TestJevAdapter(unittest.TestCase):
         res = prov.decide(self.ctx(command_need(1)),
                           time.monotonic() + 2.0)
         self.assertIsNotNone(res)
-        self.assertIsNone(res.action)
-        self.assertEqual(res.reason, "abstain")
+        self.assertTrue(res.abstain)
+        self.assertIsNone(res.index)
         self.assertEqual(res.usage, {"prompt_tokens": 5,
                                      "completion_tokens": 1})
         prov.cancel()
@@ -1292,7 +1308,20 @@ class TestJevAdapter(unittest.TestCase):
         self.assertEqual(self.ep.requests, [])
         prov.cancel()
 
-    def test_oversized_menu_is_scripted(self):
+    def test_singleton_table_is_skipped_before_reserve(self):
+        # no retained choice -> build_choices is None and no call is made
+        prov = providers.JevReflex(self.cfg())
+        ctx = self.ctx(command_need(1))
+        one = [candidates.make_candidate({"key": protocol.KEY_H}, "west")]
+        ctx.prepared = candidates.PreparedReflex(
+            immutable_features=candidates.ReflexFeatures(),
+            table=candidates.build_table((1, 1, 1), 1, one))
+        self.assertIsNone(prov.build_choices(ctx))
+        self.assertIsNone(prov.decide(ctx, time.monotonic() + 2.0))
+        self.assertEqual(self.ep.requests, [])
+        prov.cancel()
+
+    def test_menu_stays_scripted_over_the_row_cap(self):
         prov = providers.JevReflex(self.cfg())
         need = {"id": 1, "kind": "menu", "menu": "m1", "mode": "one",
                 "content": "c1", "pages": 1}
@@ -1303,9 +1332,9 @@ class TestJevAdapter(unittest.TestCase):
         self.assertEqual(self.ep.requests, [])
         prov.cancel()
 
-    def test_small_menu_choice_maps_to_a_row(self):
+    def test_small_menu_choice_is_offered_raw(self):
         self.ep.responder = lambda p, b: (
-            200, json.dumps({"option": 2, "confidence": 0.95}).encode())
+            200, json.dumps({"option": 1, "confidence": 0.95}).encode())
         prov = providers.JevReflex(self.cfg())
         need = {"id": 1, "kind": "menu", "menu": "m1", "mode": "one",
                 "content": "c1", "pages": 1}
@@ -1313,7 +1342,8 @@ class TestJevAdapter(unittest.TestCase):
         ctx.pages = [{"r": 10 + i, "text": "row %d" % i, "selectable": True}
                      for i in range(4)]
         res = prov.decide(ctx, time.monotonic() + 2.0)
-        self.assertEqual(res.action, {"menu": "m1", "commit": [[12, -1]]})
+        self.assertEqual(res.index, 1)
+        self.assertEqual(res.table_id, ctx.prepared.table.table_id)
         prov.cancel()
 
 
@@ -2157,18 +2187,32 @@ class _FakeJev(object):
     version = "fake/1"
     last_error = ""
 
-    def __init__(self, action=None, confidence=0.9, usage=None):
-        self.action = action or {"key": protocol.KEY_SEARCH}
+    def __init__(self, confidence=0.9, usage=None, index=0, abstain=False):
+        # ``index`` selects the retained-table member the controller maps
+        # centrally; ``abstain`` models a paid abstention.
+        self.index = index
         self.confidence = confidence
+        self.abstain = abstain
         self.usage = usage or {}
         self.cancelled = 0
 
     def available(self, config):
         return Availability(True, "fake jev")
 
+    def build_choices(self, ctx):
+        # A non-None payload is the "there is a real choice" signal; the
+        # controller validates against the *real* retained table regardless.
+        return {"table_id": "fake", "candidates": []}
+
     def decide(self, ctx, deadline=0.0):
-        return ReflexResult(action=self.action, confidence=self.confidence,
-                            provider="jev", reason="fake", usage=self.usage)
+        table = getattr(getattr(ctx, "prepared", None), "table", None)
+        return ReflexChoiceResult(
+            table_id=(table.table_id if table is not None else ""),
+            need_key=(tuple(table.need_key) if table is not None else ()),
+            table_version=(table.table_version if table is not None else -1),
+            index=None if self.abstain else self.index,
+            confidence=self.confidence, abstain=self.abstain,
+            usage=self.usage, dispatched=True, reason="fake")
 
     def fallback(self, ctx):
         return None
@@ -3360,8 +3404,7 @@ class TestJevFallbackUsage(WireHarness):
     def test_rejected_answer_is_billed_once_and_falls_back(self):
         usage = {"prompt_tokens": 1000000, "completion_tokens": 0,
                  "reported": True}
-        fake = _FakeJev(usage=usage)
-        fake.action = None                   # low confidence / abstain shape
+        fake = _FakeJev(usage=usage, abstain=True)
         runner, rec = self._runner(fake)
         proposal, provider, reason, latency, u, low = runner._decide(
             runner.pending_need)
@@ -3388,15 +3431,54 @@ class TestJevFallbackUsage(WireHarness):
         self.assertEqual(runner.ledger.prompt_tokens, 1000000)
         self.assertAlmostEqual(runner.ledger.estimated_usd, 1.0)
 
+    def test_low_confidence_choice_is_rejected_but_billed(self):
+        # M11 at the controller: the central confidence gate rejects the raw
+        # choice, yet the paid usage is still billed exactly once (6.1)
+        usage = {"prompt_tokens": 1000000, "completion_tokens": 0,
+                 "reported": True}
+        fake = _FakeJev(confidence=0.2, usage=usage)
+        runner, rec = self._runner(fake)
+        proposal, provider, reason, latency, u, low = runner._decide(
+            runner.pending_need)
+        rec.finalize({})
+        self.assertEqual(provider, "scripted")     # rejected centrally
+        self.assertIn("confidence", reason)
+        self.assertTrue(low)
+        self.assertEqual(runner.ledger.reflex_successful, 0)
+        self.assertEqual(runner.ledger.prompt_tokens, 1000000)
+
+    def test_stale_table_identity_is_rejected_but_billed(self):
+        # a choice bound to a table the controller no longer holds is stale
+        # and must be discarded, never sent (6.1); its usage is still billed
+        usage = {"prompt_tokens": 500, "completion_tokens": 0,
+                 "reported": True}
+
+        class _Stale(_FakeJev):
+            def decide(self, ctx, deadline=0.0):
+                res = super().decide(ctx, deadline)
+                return providers._choice_replace(res, table_id="stale")
+
+        runner, rec = self._runner(_Stale(usage=usage))
+        proposal, provider, reason, latency, u, low = runner._decide(
+            runner.pending_need)
+        rec.finalize({})
+        self.assertEqual(provider, "scripted")
+        self.assertIn("stale", reason)
+        self.assertEqual(runner.ledger.prompt_tokens, 500)
+
     def test_each_rejection_shape_carries_usage(self):
-        prov = providers.JevReflex(ProviderConfig(reflex="jev"))
-        for reason in ("low-confidence", "abstain", "invalid-option",
-                       "invalid-action", "invalid-confidence"):
-            with self.subTest(reason=reason):
-                res = prov._rejected(reason, {"prompt_tokens": 9}, 0.01)
-                self.assertIsNone(res.action)
-                self.assertEqual(res.reason, reason)
+        # every non-accepted raw shape still carries its usage and identity so
+        # the controller can bill it once before it rejects it (6.1)
+        for kw in ({"abstain": True}, {"parse_error": "transport"},
+                   {"parse_error": "invalid-option"}):
+            with self.subTest(**kw):
+                base = providers.ReflexChoiceResult(
+                    table_id="t", need_key=(1, 1, 1), table_version=1)
+                res = providers._choice_replace(
+                    base, usage={"prompt_tokens": 9}, **kw)
                 self.assertEqual(res.usage, {"prompt_tokens": 9})
+                self.assertEqual(res.table_id, "t")
+                self.assertEqual(res.need_key, (1, 1, 1))
 
 
 # ================================================== cancellation races (M4)
