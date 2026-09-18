@@ -27,7 +27,8 @@ for _p in (_ROOT, _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from tools.agent import evaluate  # noqa: E402
+from tools.agent import (candidates, controller, evaluate,  # noqa: E402
+                         instances, protocol)
 from tools.agent.providers import ProviderConfig  # noqa: E402
 from test_auto import (CLOSED, HELLO, WireHarness, _line, obs,  # noqa: E402
                        obs_menu, page, row)
@@ -585,6 +586,199 @@ class RetryGroundTruthTest(unittest.TestCase):
         summary = [x for x in records if x.get("record") == "summary"][-1]
         self.assertEqual(summary["actual_known"], 1)
         self.assertEqual(summary["agreement"]["scripted"]["total"], 1)
+
+
+# ---------------------------------- invalid retry reconciliation (plan 6.2)
+
+class InvalidRetryReconciliationTest(WireHarness):
+    """A rejected attempt is discarded and the accepted retry is the send.
+
+    Plan 6.2: only recorded/modeled *sent* actions drive recorded-state
+    reconciliation, and plan 3.5: an ordinary engine ``invalid`` terminally
+    excludes the rejected winner, so the retry reselects a different member.
+    The replay must therefore drop the modeled attempt its ``invalid``
+    rejected -- committing no effect and reconciling no evidence from it --
+    and model the *accepted* retry in its place.
+    """
+
+    PAL = [[0, " ", "none", 0, "none"], [1, ".", "gray", 0, "none"],
+           [2, "@", "white", 0, "none"]]
+    # hero at (10, 10) with open floor on all four sides: the navigation
+    # table holds one candidate per reachable frontier direction, so a
+    # rejection reselects an alternate *direction*.
+    MAP = [[10, 9, 1], [9, 10, 1], [10, 10, 2], [11, 10, 1], [10, 11, 1]]
+    MENU = obs_menu(1, 1, "m1", "c1", "tutorial", pages=1)
+    ROWS = [row(1, "no, just start play"), row(2, "yes; start game")]
+    STALE = {"v": 1, "ch": "control", "type": "invalid", "d": 1,
+             "code": "stale"}
+    KIND = {"v": 1, "ch": "control", "type": "invalid", "d": 1,
+            "code": "kind"}
+
+    def _rec(self, seq, i, t):
+        rec = obs(seq, {"kind": "command", "id": i} if i else None,
+                  map_=self.MAP, pal=self.PAL)
+        rec["s"] = {"hitpoints": {"text": "10"},
+                    "hitpoints-max": {"text": "10"},
+                    "time": {"text": str(t)},
+                    "dungeon-level": {"text": "1"}}
+        return rec
+
+    def _live(self, recs):
+        """Run the real runner over ``recs`` and capture what it did.
+
+        Returns the live runner, its result, its wire acts and the ordinal of
+        every armed ``SentAttempt`` -- the one place the live controller
+        advances a sent ordinal (plan 3.4/6.2).
+        """
+        captured = {}
+        armed = []
+        base = controller._EpisodeRunner
+        orig_arm = base._arm_attempt
+
+        class Capture(base):
+            def __init__(self, *args, **kwargs):
+                base.__init__(self, *args, **kwargs)
+                captured["runner"] = self
+
+        def spy(self, ordinal, selected):
+            armed.append((ordinal, selected))
+            return orig_arm(self, ordinal, selected)
+
+        with mock.patch.object(controller, "_EpisodeRunner", Capture):
+            with mock.patch.object(Capture, "_arm_attempt", spy):
+                result, actions = self.run_scenario(
+                    b"".join(_line(r) for r in recs), max_ticks=50)
+        return captured["runner"], result, actions, armed
+
+    @staticmethod
+    def _sidecar(recs, actions):
+        """The actions sidecar the live controller would have written.
+
+        An act carries the *outstanding* request's ``seq``, so a retry shares
+        its rejected predecessor's need key and the accepted retry is the
+        second attempt recorded for it.
+        """
+        by_seq = {r["seq"]: r["need"].get("id") for r in recs
+                  if r.get("type") == "obs" and r.get("need")}
+        index = evaluate._ActionsIndex()
+        for act in actions:
+            if act.get("type") != "act":
+                continue
+            seq = act.get("seq")
+            if by_seq.get(seq) is not None:
+                index.add((seq, by_seq[seq]), act["action"])
+        return index
+
+    def _replay(self, recs, index):
+        cfg = ProviderConfig(reflex="scripted", strategy="off", max_ticks=50)
+        p = evaluate.ReplayPass([_line(r) for r in recs], cfg, "scripted",
+                                "off", actions_index=index)
+        p.run()
+        return p
+
+    @staticmethod
+    def _acts(actions):
+        return [a for a in actions if a.get("type") == "act"]
+
+    @staticmethod
+    def _rows(p, record):
+        return [d for d in p.decisions if d.get("record") == record]
+
+    @staticmethod
+    def _policy_state(reflex, mem):
+        """The reflex-local effects a send may commit (plan 3.1)."""
+        search = reflex.recovery.search
+        return (reflex.selection_done, reflex.intent, reflex.quitting,
+                reflex.eat_forced_menu, reflex.last_eat_tick,
+                reflex.last_inv_tick, dict(search.completed),
+                set(search.refused), mem.searches_since_progress)
+
+    @staticmethod
+    def _hero(herores):
+        return (herores.status, herores.confirmed,
+                tuple(sorted(herores.possible)))
+
+    def test_same_id_menu_retry_commits_no_rejected_effect(self):
+        recs = [HELLO, self.MENU, page("c1", 0, 1, self.ROWS), self.STALE,
+                obs_menu(2, 1, "m1", "c1", "tutorial", pages=1),
+                page("c1", 0, 1, self.ROWS), CLOSED]
+        runner, result, actions, armed = self._live(recs)
+        acts = self._acts(actions)
+        rejected = acts[0]["action"]
+        retry = acts[1]["action"]
+        # live: the rejected selection was never committed, and the retry is
+        # the cancel/fallback -- never the same winner again
+        self.assertEqual(result.invalids, 1)
+        self.assertFalse(runner.reflex.selection_done)
+        self.assertEqual(rejected, {"menu": "m1", "commit": [[1, -1]]})
+        self.assertEqual(retry, {"cancel": True})
+        self.assertEqual(runner.attempts_armed, 0)   # non-command: no attempt
+        # the replay, driven by the same recorded sends, must agree
+        p = self._replay(recs, self._sidecar(recs, actions))
+        self.assertIsNone(p.protocol_failure)
+        self.assertFalse(p.reflex.selection_done,
+                         "the rejected effect must not be committed")
+        rows = self._rows(p, "need")
+        first, invalid = rows[0], rows[1]
+        self.assertEqual(first["selected"], rejected)
+        self.assertFalse(first["agreement"])
+        self.assertEqual(first["rejected_attempts"], [rejected])
+        self.assertEqual(invalid["reason"], "invalid:stale")
+        self.assertEqual(invalid["rejected_action"], rejected)
+        # the accepted retry -- not the rejected winner -- is the ground truth
+        self.assertEqual(invalid["retry_action"], retry)
+        self.assertEqual(invalid["sent_ordinal"], 2)
+        self.assertEqual(first["actual_action"], retry)
+        self.assertEqual(first["actual_action_source"], "sidecar")
+        self.assertEqual(p._sent_ordinal, len(acts))
+
+    def test_command_retry_mirrors_live_exclusion(self):
+        recs = [HELLO, self._rec(1, 1, 100), self._rec(2, None, 101),
+                self._rec(3, 2, 102), self.KIND, self._rec(4, 2, 103),
+                CLOSED]
+        runner, result, actions, armed = self._live(recs)
+        acts = self._acts(actions)
+        rejected = acts[1]["action"]
+        retry = acts[2]["action"]
+        # live: the winner is excluded for its NeedKey and the retry is the
+        # next retained member -- an alternate direction
+        key = candidates.normalize_need_key(protocol.NeedKey(1, 3, 2))
+        self.assertEqual(result.invalids, 1)
+        self.assertIn(rejected["key"], protocol.DIR_KEYS.values())
+        self.assertIn(retry["key"], protocol.DIR_KEYS.values())
+        self.assertNotEqual(rejected, retry)
+        self.assertEqual(
+            runner.rejections[key].signatures,
+            {candidates.wire_to_action(rejected).signature()})
+        # the armed ordinals: the accepted retry is sent with the next one
+        self.assertEqual(armed[1], (2, rejected))
+        self.assertEqual(armed[2], (3, retry))
+        p = self._replay(recs, self._sidecar(recs, actions))
+        self.assertIsNone(p.protocol_failure)
+        rows = self._rows(p, "need")
+        retried = [r for r in rows if r["need"]["seq"] == 3
+                   and r.get("selected") is not None][0]
+        invalid = [r for r in rows if str(r.get("reason", "")).startswith(
+            "invalid:")][0]
+        # identical rejection set
+        self.assertEqual(
+            {candidates.wire_to_action(a).signature()
+             for a in retried["rejected_attempts"]},
+            runner.rejections[key].signatures)
+        # identical selected retry and sent ordinal
+        self.assertEqual(retried["actual_action"], retry)
+        self.assertEqual(retried["actual_action_source"], "sidecar")
+        self.assertEqual(invalid["retry_action"], retry)
+        self.assertEqual(invalid["sent_ordinal"], armed[2][0])
+        self.assertEqual(result.actions, p._sent_ordinal)
+        # identical hero possibilities, terminal lifecycle and policy effects
+        self.assertEqual(self._hero(runner.herores), self._hero(p.herores))
+        self.assertEqual(runner.instance.state, p.instance.state)
+        self.assertEqual(runner.instance.state, instances.STOPPED)
+        self.assertEqual(result.stop_reason, "closed")
+        self.assertTrue(p.closed)
+        self.assertEqual(self._policy_state(runner.reflex, runner.mem),
+                         self._policy_state(p.reflex, p.mem))
 
 
 # ------------------------------------------------- page strictness (L5)
