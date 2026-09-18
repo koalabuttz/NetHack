@@ -67,7 +67,8 @@ wizard3.lua   wizhelp
 doc:
 (files for all versions)
 agent-autoplay.md   agent-interface.md  agent-llm-quickstart.md
-agent-profile-v1.tsv  agent-v1.schema.json
+agent-profile-v1.tsv  agent-reflex-upgrade-report.md
+agent-v1.schema.json
 Gbk-1pg-pfx.mn     Gbk-1pg-sfx.mn     Guidebook.mn       Guidebook.tex
 Guidebook.txt      config.nh          dlb.6              dlb.txt
 fixes1-0.txt       fixes1-4-f.txt     fixes2-2.txt       fixes2-3-e.txt
