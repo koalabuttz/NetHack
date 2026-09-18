@@ -500,5 +500,68 @@ class TestJevVersion(WireHarness):
         self.assertNotIn("adapter_version", blob)
 
 
+# ----------------------------------------------------------------- AC.11
+
+class TestJevConfidence(unittest.TestCase):
+    """The confidence gate is untouched; its measurement plan is documented."""
+
+    def test_confidence_gate_threshold_unchanged_for_spread_distribution(self):
+        from tools.agent import arbitration
+
+        cands = [cand(KEY.KEY_H, "navigate", family="frontier"),
+                 cand(KEY.KEY_L, "navigate", family="frontier"),
+                 cand(KEY.KEY_J, "navigate", family="frontier")]
+        table = table_of(cands, need_key=(1, 1, 1))
+
+        def outcome(confidence, threshold):
+            raw = arbitration.RawChoice(
+                table_id=table.table_id, need_key=tuple(table.need_key),
+                table_version=table.table_version, index=0,
+                confidence=confidence, dispatched=True)
+            return arbitration.validate_raw_choice(
+                table, raw, arbitration.RejectionSet(),
+                threshold=threshold, eligible=lambda c: True)
+
+        # a spread distribution over several acceptable navigation
+        # alternatives is legitimately low-concentration: the gate reads the
+        # selected member's own probability against the threshold, unchanged
+        spread = 1.0 / 3.0
+        rejected = outcome(spread, 0.8)
+        self.assertFalse(rejected.accepted)
+        self.assertEqual(rejected.code, "confidence")
+        self.assertIn("confidence", rejected.reason)
+        # the same distribution passes an honest lower threshold
+        self.assertTrue(outcome(spread, 0.3).accepted)
+        # exactly at the threshold is accepted; just below is rejected
+        self.assertTrue(outcome(0.8, 0.8).accepted)
+        self.assertFalse(outcome(0.799, 0.8).accepted)
+        # a concentrated distribution is unaffected
+        self.assertTrue(outcome(0.96, 0.8).accepted)
+
+    def test_agent_docs_describe_jev_confidence_and_live_distribution_measurement(
+            self):
+        docs = os.path.join(_ROOT, "doc", "agent-autoplay.md")
+        with open(docs) as handle:
+            text = handle.read()
+        lowered = " ".join(text.lower().split())
+        # concentration, not permission to act
+        self.assertIn("concentration", lowered)
+        self.assertIn("not permission", lowered)
+        # live-only and operator-gated distribution measurement
+        self.assertIn("live-only", lowered)
+        self.assertIn("operator-gated", lowered)
+        self.assertIn("distribution", lowered)
+        # the docs quote the documented context window and never claim a
+        # measured fit
+        self.assertIn("32,000", text)
+        # and the offline report schema carries no synthetic distribution
+        # field, so a distribution can never be mistaken for a measurement
+        with open(os.path.join(_HERE, "fixtures", "jev_offline_report.json")) \
+                as handle:
+            report = handle.read()
+        self.assertNotIn("distribution", report.lower())
+        self.assertNotIn('"distribution"', report)
+
+
 if __name__ == "__main__":
     unittest.main()

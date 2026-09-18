@@ -1,0 +1,210 @@
+{
+ "fixtures_root": "test/agent/fixtures/jev_legacy_requests",
+ "per_request": [
+  {
+   "bytes_legacy": 1461,
+   "bytes_new": 2693,
+   "canned_usage": {
+    "input_tokens": 312,
+    "output_tokens": 48,
+    "synthetic": true
+   },
+   "fallback_category": null,
+   "fixture": "direction_need",
+   "refusal_codes": {},
+   "selected_retained_indices": {
+    "legacy": 1,
+    "new": 1
+   },
+   "synthetic": true
+  },
+  {
+   "bytes_legacy": 0,
+   "bytes_new": 0,
+   "canned_usage": {
+    "input_tokens": 312,
+    "output_tokens": 48,
+    "synthetic": true
+   },
+   "fallback_category": null,
+   "fixture": "eat_hungry_singleton",
+   "refusal_codes": {
+    "singleton": 1
+   },
+   "selected_retained_indices": {
+    "legacy": null,
+    "new": null
+   },
+   "synthetic": true
+  },
+  {
+   "bytes_legacy": 1443,
+   "bytes_new": 2623,
+   "canned_usage": {
+    "input_tokens": 312,
+    "output_tokens": 48,
+    "synthetic": true
+   },
+   "fallback_category": null,
+   "fixture": "key_need",
+   "refusal_codes": {},
+   "selected_retained_indices": {
+    "legacy": 1,
+    "new": 1
+   },
+   "synthetic": true
+  },
+  {
+   "bytes_legacy": 0,
+   "bytes_new": 0,
+   "canned_usage": {
+    "input_tokens": 312,
+    "output_tokens": 48,
+    "synthetic": true
+   },
+   "fallback_category": null,
+   "fixture": "loop_breaker_singleton",
+   "refusal_codes": {
+    "singleton": 1
+   },
+   "selected_retained_indices": {
+    "legacy": null,
+    "new": null
+   },
+   "synthetic": true
+  },
+  {
+   "bytes_legacy": 0,
+   "bytes_new": 0,
+   "canned_usage": {
+    "input_tokens": 312,
+    "output_tokens": 48,
+    "synthetic": true
+   },
+   "fallback_category": null,
+   "fixture": "menu_unsupported",
+   "refusal_codes": {
+    "unsupported-need": 1
+   },
+   "selected_retained_indices": {
+    "legacy": null,
+    "new": null
+   },
+   "synthetic": true
+  },
+  {
+   "bytes_legacy": 897,
+   "bytes_new": 2603,
+   "canned_usage": {
+    "input_tokens": 312,
+    "output_tokens": 48,
+    "synthetic": true
+   },
+   "fallback_category": null,
+   "fixture": "nav_frontier_room",
+   "refusal_codes": {},
+   "selected_retained_indices": {
+    "legacy": 1,
+    "new": 1
+   },
+   "synthetic": true
+  },
+  {
+   "bytes_legacy": 1329,
+   "bytes_new": 3080,
+   "canned_usage": {
+    "input_tokens": 312,
+    "output_tokens": 48,
+    "synthetic": true
+   },
+   "fallback_category": null,
+   "fixture": "nav_monster_adjacent",
+   "refusal_codes": {},
+   "selected_retained_indices": {
+    "legacy": 1,
+    "new": 1
+   },
+   "synthetic": true
+  },
+  {
+   "bytes_legacy": 1443,
+   "bytes_new": 3203,
+   "canned_usage": {
+    "input_tokens": 312,
+    "output_tokens": 48,
+    "synthetic": true
+   },
+   "fallback_category": null,
+   "fixture": "nav_off_corner",
+   "refusal_codes": {},
+   "selected_retained_indices": {
+    "legacy": 1,
+    "new": 1
+   },
+   "synthetic": true
+  },
+  {
+   "bytes_legacy": 1733,
+   "bytes_new": 3332,
+   "canned_usage": {
+    "input_tokens": 312,
+    "output_tokens": 48,
+    "synthetic": true
+   },
+   "fallback_category": null,
+   "fixture": "nav_with_directives",
+   "refusal_codes": {},
+   "selected_retained_indices": {
+    "legacy": 1,
+    "new": 1
+   },
+   "synthetic": true
+  },
+  {
+   "bytes_legacy": 1443,
+   "bytes_new": 3203,
+   "canned_usage": {
+    "input_tokens": 288,
+    "output_tokens": 40,
+    "synthetic": true
+   },
+   "fallback_category": "confidence",
+   "fixture": "post_controller_fallback",
+   "refusal_codes": {},
+   "selected_retained_indices": {
+    "legacy": 1,
+    "new": 1
+   },
+   "synthetic": true
+  },
+  {
+   "bytes_legacy": 0,
+   "bytes_new": 0,
+   "canned_usage": {
+    "input_tokens": 312,
+    "output_tokens": 48,
+    "synthetic": true
+   },
+   "fallback_category": null,
+   "fixture": "quit_singleton",
+   "refusal_codes": {
+    "singleton": 1
+   },
+   "selected_retained_indices": {
+    "legacy": null,
+    "new": null
+   },
+   "synthetic": true
+  }
+ ],
+ "schema_version": 1,
+ "summary": {
+  "agreement_rate": 1.0,
+  "refusal_tallies": {
+   "singleton": 3,
+   "unsupported-need": 1
+  },
+  "total_bytes_legacy": 9749,
+  "total_bytes_new": 20737
+ }
+}

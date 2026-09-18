@@ -1228,6 +1228,30 @@ class StrategyReplayContinuityTest(WireHarness):
             self.assertLessEqual(len(prepared.retained), 1)
 
 
+def _peaked(count, index, top=0.9):
+    """A deterministic distribution over *count* keys peaking at *index*."""
+    if count == 1:
+        return [1.0]
+    rest = (1.0 - top) / float(count - 1)
+    return [top if i == index else rest for i in range(count)]
+
+
+def _assert_no_wallclock(case, obj, path="$"):
+    """No wall-clock field or timestamp-like value anywhere in *obj*."""
+    import jev_offline_report
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            case.assertNotIn(key, jev_offline_report.FORBIDDEN_FIELDS,
+                             "%s.%s is a wall-clock field" % (path, key))
+            _assert_no_wallclock(case, value, "%s.%s" % (path, key))
+    elif isinstance(obj, list):
+        for i, value in enumerate(obj):
+            _assert_no_wallclock(case, value, "%s[%d]" % (path, i))
+    elif isinstance(obj, float):
+        case.assertLess(abs(obj), 1e9,
+                        "%s looks like a wall-clock value" % path)
+
+
 # ------------------------------------------------- Phase 0 paired corpus
 #
 # The old-renderer baseline corpus under ``fixtures/jev_legacy_requests`` is a
@@ -1344,6 +1368,180 @@ class TestJevOfflineMetrics(unittest.TestCase):
                 else:
                     self.assertTrue(os.path.exists(
                         os.path.join(jev_fixtures.default_root(), legacy)))
+
+    # -- the offline comparison harness (AC.10) ---------------------------
+
+    def _committed_report(self):
+        import jev_offline_report
+        with open(jev_offline_report.DEFAULT_REPORT, "rb") as handle:
+            return handle.read()
+
+    def _regenerate(self, path):
+        import jev_offline_report
+        return jev_offline_report.main(["--fixtures",
+                                        jev_offline_report.default_fixtures(),
+                                        "--out", path])
+
+    def test_offline_report_schema_and_no_network(self):
+        import jev_offline_report
+
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "report.json")
+
+            def refuse(*a, **kw):
+                raise AssertionError("the offline harness opened a socket")
+
+            with mock.patch("socket.socket", side_effect=refuse), \
+                    mock.patch("socket.create_connection",
+                               side_effect=refuse), \
+                    mock.patch("ssl.SSLContext.wrap_socket",
+                               side_effect=refuse):
+                self.assertEqual(self._regenerate(out), 0)
+            with open(out, "rb") as handle:
+                fresh = handle.read()
+        self.assertEqual(fresh, self._committed_report())
+        report = json.loads(fresh)
+        self.assertEqual(report["schema_version"],
+                         jev_offline_report.SCHEMA_VERSION)
+        self.assertEqual(sorted(report), ["fixtures_root", "per_request",
+                                          "schema_version", "summary"])
+        self.assertEqual(sorted(report["summary"]),
+                         ["agreement_rate", "refusal_tallies",
+                          "total_bytes_legacy", "total_bytes_new"])
+        for record in report["per_request"]:
+            self.assertEqual(sorted(record), [
+                "bytes_legacy", "bytes_new", "canned_usage",
+                "fallback_category", "fixture", "refusal_codes",
+                "selected_retained_indices", "synthetic"])
+        # a second run is byte-identical (no wall clock, no ordering drift)
+        with tempfile.TemporaryDirectory() as d:
+            again = os.path.join(d, "again.json")
+            self._regenerate(again)
+            with open(again, "rb") as handle:
+                self.assertEqual(handle.read(), fresh)
+
+    def test_offline_report_consumes_every_manifest_input(self):
+        import jev_fixtures
+        import jev_offline_report
+
+        manifest = jev_fixtures.load_manifest()
+        report = jev_offline_report.build_report(
+            jev_offline_report.default_fixtures())
+        consumed = [r["fixture"] for r in report["per_request"]]
+        self.assertEqual(sorted(consumed),
+                         jev_fixtures.fixture_names(manifest))
+        self.assertEqual(len(consumed), len(set(consumed)))
+
+    def test_offline_report_paired_key_to_index_translation(self):
+        import jev_fixtures
+        import jev_offline_report
+
+        manifest = jev_fixtures.load_manifest()
+        for name in jev_fixtures.fixture_names(manifest):
+            entry = manifest["fixtures"][name]
+            if entry["legacy_body"] is None:
+                continue
+            with self.subTest(fixture=name):
+                table = jev_fixtures.unfreeze_table(entry["retained_table"])
+                context = jev_fixtures.unfreeze_context(
+                    entry["frozen_context"])
+                context.prepared = jev_fixtures.prepared_from_frozen(
+                    entry["retained_table"])
+                adapter = jev_offline_report.providers.JevReflex(
+                    jev_offline_report.providers.ProviderConfig(reflex="jev"),
+                    jev_dispatch_enabled=True)
+                built = adapter.build_request(context).request
+                self.assertIsNotNone(built)
+                keys = list(built.key_index)
+                self.assertEqual(len(keys), len(table))
+                # every retained index is recoverable in *both* namespaces
+                for index in range(len(table)):
+                    self.assertEqual(built.key_index[keys[index]], index)
+                    legacy = jev_offline_report.materialize_legacy_response(
+                        dict(entry["canned_response"],
+                             chosen_retained_index=index,
+                             confidence=0.9,
+                             probabilities=_peaked(len(table), index)),
+                        len(table))
+                    self.assertEqual(
+                        jev_offline_report.parse_legacy(
+                            legacy, jev_offline_report.legacy_keys(len(table))),
+                        index)
+                    semantic = jev_offline_report.materialize_semantic_response(
+                        dict(entry["canned_response"],
+                             chosen_retained_index=index,
+                             confidence=0.9,
+                             probabilities=_peaked(len(table), index)),
+                        keys)
+                    self.assertEqual(
+                        jev_offline_report.parse_semantic(
+                            semantic, dict(built.key_index)), index)
+
+    def test_baseline_vs_new_selection_agreement(self):
+        import jev_offline_report
+
+        report = jev_offline_report.build_report(
+            jev_offline_report.default_fixtures())
+        paired = []
+        for record in report["per_request"]:
+            legacy = record["selected_retained_indices"]["legacy"]
+            new = record["selected_retained_indices"]["new"]
+            if legacy is not None and new is not None:
+                paired.append(record)
+                self.assertEqual(legacy, new)
+            else:
+                # refusals are tallied separately and are not disagreements
+                self.assertIsNone(legacy)
+                self.assertIsNone(new)
+                self.assertTrue(record["refusal_codes"])
+        summary = report["summary"]
+        self.assertEqual(summary["agreement_rate"], 1.0)
+        self.assertTrue(paired)
+        # the denominator is exactly the both-present fixtures
+        self.assertEqual(len(paired), len(report["per_request"])
+                         - len([r for r in report["per_request"]
+                                if r["refusal_codes"]]))
+        # a parsed index survives a post-controller fallback: the selection
+        # field stays the parser-level choice, never the fallback
+        fallbacks = [r for r in report["per_request"]
+                     if r["fallback_category"]]
+        self.assertTrue(fallbacks)
+        for record in fallbacks:
+            self.assertIsNotNone(
+                record["selected_retained_indices"]["legacy"])
+            self.assertIsNotNone(record["selected_retained_indices"]["new"])
+
+    def test_canned_usage_and_synthetic_label_present(self):
+        import jev_offline_report
+
+        report = jev_offline_report.build_report(
+            jev_offline_report.default_fixtures())
+        for record in report["per_request"]:
+            with self.subTest(fixture=record["fixture"]):
+                self.assertIs(record["synthetic"], True)
+                usage = record["canned_usage"]
+                self.assertIs(usage["synthetic"], True)
+                self.assertIsInstance(usage["input_tokens"], int)
+                self.assertIsInstance(usage["output_tokens"], int)
+                self.assertIsInstance(record["bytes_new"], int)
+                self.assertIsInstance(record["bytes_legacy"], int)
+                # refusals carry no bytes and no selection
+                if record["refusal_codes"]:
+                    self.assertEqual(record["bytes_new"], 0)
+                    self.assertEqual(record["bytes_legacy"], 0)
+
+    def test_no_wallclock_field_in_report(self):
+        import jev_offline_report
+
+        text = self._committed_report().decode()
+        report = json.loads(text)
+        _assert_no_wallclock(self, report)
+        # serialized byte counts are never converted to tokens
+        lowered = text.lower()
+        for word in ("latency", "tokens_per", "cost", "distribution",
+                     "survival"):
+            self.assertNotIn(word, lowered)
+        self.assertIn("bytes", lowered)
 
 
 if __name__ == "__main__":

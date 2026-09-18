@@ -424,19 +424,123 @@ discards the plan; the controller's scripted directives continue.
 choice table, a finite `[0,1]` confidence check, and fallback on any
 malformed or unknown value.  It posts the documented typesafe.ai body to
 `(--jev-base-url or the official https://api.typesafe.ai/v1) + /systemone`:
-a top-level `state` (the structured game context), `model` (`"jev-latest"`),
-and a `questions.action` object carrying the fixed `instructions`, `type`
-(`"choice"`) and a `criteria` map from each `opt-N` key to its deterministic
-candidate line (label | direction | canonical action | reason).  The answer
-is read from `answers.action`: `choice` names one offered `opt-N` key,
+a top-level `state` (the compact remembered-state payload), `model`
+(`"jev-latest"`), and a `questions.action` object carrying the fixed
+`instructions`, `type` (`"choice"`) and a `criteria` JSON object mapping each
+**semantic kebab-case option key** to a grounded criterion sentence.  The
+answer is read from `answers.action`: `choice` names one offered key,
 `probabilities` is the full distribution over exactly those keys, and
 `confidence` is the score -- the selected key's probability stands in when
-the body carries none.  Keys 1..255 fit one <= 255-way choice; menus are
-limited to 128 selectable rows; position, `line` and `extcmd` are never sent
-to Jev.
+the body carries none.  Nothing is sent to Jev for `position`, `line` or
+`extcmd`, and menus, yes/no prompts and acknowledgements stay wholly on the
+scripted tier.
+
+### Jev presentation contract
+
+The presentation layer (`tools/agent/presentation.py`) names and describes
+candidates the policy has already built; it never changes *what* candidates
+exist.  The retained-table `key_index` -> original candidate mapping, the
+candidate semantic labels/actions/ordering, `candidate_id`/`table_id`
+identity and every safety/dispatch gate are unchanged, and `policy.py` is
+untouched.
+
+* **Option keys** are derived from `(need, frozen candidate)` and are
+  need-aware: a `command`-need movement action is `navigate-<compass>`, a
+  `direction` need is `direction-<compass>` (never `navigate-*`), and a `key`
+  need is `key-<semantic>`.  The closed normalization is ASCII-only
+  lowercase with runs of non-alphanumerics collapsed to `-`; an empty,
+  non-ASCII or already `--`-bearing label is rejected rather than lossily
+  aliased.  A closed alias table maps the policy's own labels
+  (`eat` -> `eat-food`, `search`/`search-secret` -> `search-in-place`,
+  `descend` -> `descend-stairs`, `inspect-inventory`/`refresh-inventory`
+  -> `inventory`, `rest` -> `wait`).  Collisions take `--1`, `--2`, ... in
+  retained-table order; the double hyphen is reserved for that suffix, and
+  the emitted key count is asserted to equal the retained-table length and
+  to stay within the 255-way bound before dispatch.  `key_index` is
+  authoritative -- a returned key is never parsed back into an action.
+* **Criteria** are per-family grounded templates.  Remembered terrain comes
+  only from the runner-owned persistent classified `TerrainMemory`, so
+  ground under a current occupant survives; current occupancy comes only from
+  the current snapshot and never infers hostility from a glyph; a
+  direction/key need is never described as walking or opening; an `eat`
+  command is never bound to an item without an exact frozen binding; quit is
+  conspicuous; and an unrecognized policy reason omits its purpose clause
+  rather than dumping raw metadata.  The canonical action JSON and heuristic
+  scores are no longer model-facing.
+* **Refusals** are fixed, nonsecret codes recorded in the decision sidecar
+  *before* any reservation, with zero dispatch and zero endpoint requests:
+  `unsupported-need`, `singleton`, `invalid-label`, `unsupported-semantic`,
+  `missing-required-binding`.  A refusal always refuses the **whole**
+  request -- candidates are never selectively dropped.  Conservative
+  degradation is not a refusal: absent optional evidence (terrain
+  classification, route purpose, occupant data) simply uses the shorter
+  template.  `too-many-options` is an additional defensive code for a frozen
+  table above the 255-key wire bound.
+* **State payload** is one JSON object with `game`, `objective`, a fully
+  inlined `legend`, `status` (`hp`, `hp_max`, `hunger`, `dungeon_level`,
+  `experience_level`, `conditions`), `hero` (the controller-resolved square
+  only), `inventory` (`items`/`cached`/`age_turns`/`truncated`),
+  deterministic `directives` summaries, `intent`, `messages`, `need`, a
+  bounded remembered `map` and any remembered `stairs`.  Required fields are
+  present with `null` when unavailable; a list is `null` when unavailable and
+  `[]` only when genuinely empty.  The map's terrain glyphs come from the
+  persistent classified terrain, occupancy only from the current snapshot
+  (every observed non-hero creature collapses to one canonical `*` marker),
+  and the confirmed hero renders `@` with final precedence; the crop is
+  clamped to the protocol rectangle and is `null` with no evidence.
+* **No synthetic option** is ever added to a Choice table: the retained set
+  is the complete candidate set and a synthetic member would have no retained
+  index.  Coverage is handled by the refusal codes plus the existing scripted
+  fallback paths.
+
+The wire contract is the official one: `criteria` is a JSON object whose
+member order is the retained-table order (the worker serializes with
+insertion-order-preserving JSON), and the response parser keeps requiring an
+explicit `answers.action.type == "choice"`.  The local snapshot test
+`TestJevWireContract` pins the exact serialized request bytes against
+`test/agent/fixtures/jev_golden_request.json`; that catches **local
+serializer drift only** -- an upstream official-contract change is caught
+only by a manual documentation review at each TypeSafe release.
+
+### Jev confidence
+
+`confidence` is a distribution-derived score: the documented
+`answers.action.confidence` when present, else the selected key's own
+probability.  It measures **concentration, not correctness**, and it is
+**not permission to act**: several legitimately acceptable navigation
+alternatives can spread probability, so an honest multi-alternative table
+looks low-confidence.  The existing global confidence threshold is preserved
+unchanged, and the safety and eligibility gates remain authoritative
+independently of it.  Any threshold change or bypass is an operator decision
+backed by measured data.  Distribution-shape measurement across
+multi-alternative navigation tables is a **live-only, operator-gated** metric
+and is never fabricated offline.
+
+### Offline measurement
+
+`test/agent/jev_offline_report.py` compares the pre-migration baseline corpus
+against the migrated presentation with **no network**:
+
+```sh
+python3 test/agent/jev_offline_report.py \
+    --fixtures test/agent/fixtures/jev_legacy_requests \
+    --out test/agent/fixtures/jev_offline_report.json
+```
+
+The committed `test/agent/fixtures/jev_offline_report.json` is deterministic
+and byte-for-byte reproducible (there is deliberately **no wall-clock field**
+and no latency, token, cost, distribution or survival figure).  Serialized
+byte counts are reported as *bytes* and are never converted to tokens: there
+is no Jev tokenizer in this repository, and the documented 32,000-token Jev
+context window is quoted, not claimed as a measured fit.  Real token counts,
+latency, billed cost, distribution shapes and gameplay progress/survival are
+**live-only, operator-gated** metrics; an optional live A/B smoke is manual
+and reports its own limitations.
 
 Secrets come only from `DEEPSEEK_API_KEY` / `JEV_API_KEY` or a **0600 key
-file**.  The key never appears in a log line, a recording, a structured
+file** (`--jev-key-file PATH`); the repository has no default key path (an
+operator may keep one at `~/.config/nethack-agent/jev.key` as a local
+convention).  The key never appears in a log line, a recording, a structured
 error or an exception message.  It is stripped from the game child's
 environment by construction, and the provider **worker** likewise inherits
 only a minimal runtime environment (PATH and locale): the selected key

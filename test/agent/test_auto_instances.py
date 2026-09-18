@@ -589,11 +589,8 @@ class TestJevState(unittest.TestCase):
                 mp = presentation.render_state(ctx)["map"]
                 row = [line for line in mp["text"].split("\n")
                        if line.startswith(" 5 ")][0]
-                cell = mp["text"] and row[3 + (6 - mp["x_min"])]
-                if expected == " ":
-                    self.assertEqual(cell, "@" if (6, 5) == (5, 5) else " ")
-                else:
-                    self.assertEqual(cell, expected)
+                cell = row[3 + (6 - mp["x_min"])]
+                self.assertEqual(cell, expected)
         # the documented overrides: an unknown class is a blank, and a
         # doorway/water/lava collapse onto one canonical glyph
         self.assertEqual(state.TERRAIN_GLYPHS[I.T_UNKNOWN], " ")

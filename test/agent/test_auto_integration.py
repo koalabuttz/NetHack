@@ -18,6 +18,8 @@ engine), so a regression that re-merges an old coordinate, adopts a first
 on a mere proposal or binds the dangerous suffix to a non-command need fails.
 """
 
+import hashlib
+import json
 import os
 import sys
 import types
@@ -726,6 +728,67 @@ class LiveEvaluatorParity(WireHarness):
               if d.get("record") == "need" and d.get("selected") is not None]
         self.assertTrue(live)
         self.assertEqual(live, rg)
+
+
+# ---------------------------------------------------------------- AC.12
+
+class JevPresentationIsolation(WireHarness):
+    """The Jev presentation migration touches Jev presentation only.
+
+    The DeepSeek strategy rendering (and therefore its cache-plan history
+    invariants) must be byte-identical to the pre-migration snapshot, and no
+    Jev presentation field may leak into it.
+    """
+
+    #: sha256 of ``tools.agent.providers._render_strategy_prompt`` for the
+    #: frozen context below.  Pinned so any drift in the strategy rendering --
+    #: a field reorder, a renamed line or a stray Jev field -- fails here.
+    PROMPT_SHA256 = (
+        "6d9219dce073b328dc4554afde2baea41222ae95376951c1509a27b7e7e462a5")
+
+    def _ctx(self):
+        from tools.agent.providers import StrategyContext
+        return StrategyContext(
+            episode=1, tick=17, role="explore",
+            map_text=" 0 hello\n 1 world",
+            status_text="HP 12/20  Dlvl:1",
+            recent_messages=["You see here a food ration.",
+                             "You hear a noise."],
+            inventory=["a food ration", "b - a dagger"],
+            history=[{"eid": "b1", "reason": "hunger", "tick": 4,
+                      "level": "1"}],
+            boundaries=["b2"],
+            level="1", remaining_budget=7,
+            directives=[{"schema_version": 1, "goals": ["survive"],
+                         "ttl": 5, "explanation": "fake"}])
+
+    def test_deepseek_rendering_snapshot_unchanged(self):
+        from tools.agent import providers
+        ctx = self._ctx()
+        rendered = providers._render_strategy_prompt(ctx)
+        self.assertEqual(hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
+                         self.PROMPT_SHA256)
+        # the documented, cache-friendly field order is intact
+        lines = rendered.split("\n")
+        self.assertTrue(lines[0].startswith("GAME STATE (untrusted data):"))
+        self.assertTrue(lines[-1].startswith("remaining strategy calls: "))
+        self.assertIn("active directives: ", rendered)
+        # no Jev presentation field leaks into the strategy prompt
+        for token in ("criteria", "navigate-north", "presentation_version",
+                      "legend", "objective", "state.hero"):
+            self.assertNotIn(token, rendered)
+
+        # the frozen DeepSeek request payload is unchanged too
+        cfg = providers.ProviderConfig(strategy="deepseek",
+                                       deepseek_model="deepseek-chat")
+        prepared = providers.prepare_strategy_request(cfg, ctx)
+        body = json.dumps(prepared.payload(), separators=(",", ":"))
+        self.assertEqual(
+            hashlib.sha256(body.encode("utf-8")).hexdigest(),
+            "9dc0e7c032da118f5bd5e00a531f73553b32797190bb2cfb551756abef566792")
+        # rendering the same context twice is byte-identical (render-once)
+        self.assertEqual(providers._render_strategy_prompt(self._ctx()),
+                         rendered)
 
 
 if __name__ == "__main__":
