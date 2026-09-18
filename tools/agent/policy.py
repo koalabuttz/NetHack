@@ -35,7 +35,7 @@ import random
 import time
 from typing import Dict, List, Optional, Tuple
 
-from . import candidates, navigation, protocol, state
+from . import candidates, navigation, protocol, recovery, state
 from .arbitration import select_retained
 from .directives import DirectiveView
 from .providers import ReflexContext, ReflexResult, ReflexTimeout
@@ -122,6 +122,12 @@ class ScriptedReflex(object):
         self._table_version = 1
         self.rejection_version = 0
         self.instance_id = 0
+        # Wave-4 bounded recovery: the per-site search budget, refusal
+        # fingerprint, cycle detector and scoped food negatives.  Reflex-local
+        # only; a proposal never mutates gameplay memory here.
+        self.recovery = recovery.RecoveryState()
+        self.food = recovery.FoodNegatives()
+        self._cycled = False
 
     # -- provider surface ------------------------------------------------
     def _check_deadline(self) -> None:
@@ -230,6 +236,12 @@ class ScriptedReflex(object):
             self.last_inv_tick = context.tick
         elif effect == "secret-search":
             context.memory.searches_since_progress += 1
+            self.recovery.note_search_completed(
+                self._search_site(context.memory.hero))
+        elif effect == "site-search":
+            # a completed loop-breaker search consumes the site's budget
+            self.recovery.note_search_completed(
+                self._search_site(context.memory.hero))
 
     def _need_key(self, context):
         nk = getattr(context, "need_key", None)
@@ -375,6 +387,7 @@ class ScriptedReflex(object):
         mem = context.memory
         st = mem.status
         hero = mem.hero
+        self._observe(mem, hero)
         if self.quitting or context.tick >= self.max_ticks:
             why = ("tick cap: request quit" if context.tick >= self.max_ticks
                    else "quit")
@@ -385,9 +398,11 @@ class ScriptedReflex(object):
             action, why = self._escape(mem, hero)
             return (self._cand(action, "escape", "emergency", 0, why,
                                "emergency"),)
-        # 2. hunger: schedule a known-safe food intent
+        # 2. hunger: schedule a known-safe food intent, unless scoped
+        #    evidence already shows there is nothing to eat here
         if self._hungry(st) and \
-                (context.tick - self.last_eat_tick) > self._eat_interval():
+                (context.tick - self.last_eat_tick) > self._eat_interval() \
+                and self._may_eat(mem, hero):
             return (self._cand({"key": KEY.KEY_EAT}, "eat", "food", 0,
                                "hungry: attempt to eat", "schedule-eat"),)
         if self.directives.wants_food() and hero is not None \
@@ -418,9 +433,14 @@ class ScriptedReflex(object):
             return (self._cand({"key": key}, "random-move", "recovery", 0,
                                "loop breaker: %s" % why, "recovery"),)
         if np >= 3:
-            return (self._cand({"key": KEY.KEY_SEARCH}, "search",
-                               "recovery", 0, "loop breaker: search",
-                               "recovery"),)
+            site = self._search_site(hero)
+            if self.recovery.allows_search(site) and not self._cycled:
+                return (self._cand({"key": KEY.KEY_SEARCH}, "search",
+                                   "recovery", 0, "loop breaker: search",
+                                   "site-search"),)
+            # a refused search at this site is suppressed (5.1): fall through
+            # to navigation / a non-search recovery step, never another `s`
+            return self._navigation_candidates(context, mem, hero)
         # 4. inventory cache maintenance (never preempts safety or progress)
         if mem.inventory.stale(context.tick, INV_STALE_TICKS) \
                 and (context.tick - self.last_inv_tick) \
@@ -469,14 +489,58 @@ class ScriptedReflex(object):
                 direction_rank=navigation.DIR_RANK[target.first_step]))
         if cands:
             return tuple(cands)
-        if mem.searches_since_progress < 3:
+        if mem.searches_since_progress < 3 \
+                and self.recovery.allows_search(self._search_site(hero)) \
+                and not self._cycled:
             return (self._cand({"key": KEY.KEY_SEARCH}, "search-secret",
                                "secret-search", 300,
                                "search for secret doors",
                                "secret-search"),)
+        return self._search_fallback(mem, hero)
+
+    def _search_site(self, hero):
+        """The deterministic site key for the ordinary-search budget."""
+        return tuple(hero) if hero is not None else None
+
+    def _search_fallback(self, mem, hero):
+        """A non-search recovery step, or a graceful quit when none exists.
+
+        Command ``s`` is never an exhaustion fallback (3.5): once the site's
+        ordinary search is suppressed, recovery uses a deterministic safe
+        alternative step, and when even that is unavailable the reflex
+        requests a bounded graceful quit instead of looping.
+        """
         key, why = self._random_move(mem, hero)
-        return (self._cand({"key": key}, "random-move", "recovery", 200, why,
-                           "recovery"),)
+        if key != KEY.KEY_SEARCH:
+            return (self._cand({"key": key}, "recovery-step", "recovery", 0,
+                               "recovery: %s" % why, "recovery"),)
+        return (self._cand({"key": KEY.KEY_HASH}, "trapped", "other", 0,
+                           "search suppressed and no safe alternative: "
+                           "request quit", "quit"),)
+
+    def _observe(self, mem, hero):
+        """Fold public messages into the bounded-recovery scoped evidence."""
+        recent = mem.recent_messages(6)
+        self.recovery.observe(recent, hero, self._search_site(hero))
+        self._cycled = self.recovery.note_cycle(hero)
+        for text in recent:
+            kind = recovery.classify_food_negative(text)
+            if kind == recovery.FOOD_NEG_INVENTORY:
+                self.food.note_inventory_negative(mem.inventory_signature())
+            elif kind == recovery.FOOD_NEG_LOCATION and hero is not None:
+                self.food.note_location_negative(self.instance_id, hero, 0)
+
+    def _may_eat(self, mem, hero) -> bool:
+        """True unless scoped negatives already prove there is nothing to eat.
+
+        An inventory-negative for the current signature blocks a blind eat;
+        a known floor ration may still authorise a location-specific eat while
+        the inventory stays negative (5.2).
+        """
+        sig = mem.inventory_signature()
+        if not self.food.inventory_negative(sig):
+            return True
+        return bool(mem.inventory.food_rows())
 
     def _terrain(self, mem):
         """Build one classified terrain view from remembered raw cells."""
