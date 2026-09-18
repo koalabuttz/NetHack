@@ -272,6 +272,19 @@ class PreparationPurity(unittest.TestCase):
 
     def test_prepare_and_decide_leave_state_unchanged(self):
         ref = policy.ScriptedReflex(ProviderConfig())
+        # a refresh-inventory decision would otherwise stamp last_inv_tick
+        mem = self._mem(messages=[])
+        before = self._snapshot(ref, mem)
+        ref.prepare(self._ctx(mem))
+        res = ref.decide(self._ctx(mem))
+        self.assertEqual(self._snapshot(ref, mem), before)
+        # and the chosen effect is only frozen on the candidate, not applied
+        self.assertEqual(res.action, {"key": protocol.KEY_INV})
+
+    def test_decide_does_not_commit_a_search_or_eat_intent(self):
+        ref = policy.ScriptedReflex(ProviderConfig())
+        # a refused ordinary search at a boxed-in site selects a real step;
+        # the *refusal* evidence is derived purely, so no fold is needed
         mem = self._mem(messages=["You already found a monster."])
         mem.no_progress = 3
         before = self._snapshot(ref, mem)

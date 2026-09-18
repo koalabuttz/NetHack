@@ -243,9 +243,9 @@ records the spend.  `estimated_usd` is `0.0` because no tariff was configured
 
 ## 9. Verification summary
 
-* `test_auto*`: 670 green at this revision; **706** green after the follow-up
+* `test_auto*`: 670 green at this revision; **707** green after the follow-up
   wiring session (§14.3) -- the same 681 tests (670 + the later additions) plus
-  25 new `test_auto_integration` cases.
+  26 new `test_auto_integration` cases.
 * `test_spectate.py --selftest`: 43 green.
 * `make -C test/agent check`: green (manifest + header + schema + C fixtures).
 * `make -C test/agent native-prefix`: OK (the fixture above).
@@ -259,6 +259,9 @@ records the spend.  `estimated_usd` is `0.0` because no tariff was configured
   reconciliation helpers (§14.3), the parity fixture passes and two replays of
   the same wire are byte-identical.  At this revision the evaluator was
   unmigrated (§10.3) and `test_auto_replay` (52) was the coverage.
+* Mutation demos in the follow-up session: per-instance map scoping,
+  `HeroResolution` live wiring, preparation purity and forced-search binding
+  each turn their focused case red, then were restored green.
 
 ## 10. Deviations and deferred work (explicit)
 
