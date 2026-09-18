@@ -31,7 +31,7 @@ for _p in (_ROOT, _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from tools.agent import arbitration, candidates  # noqa: E402
+from tools.agent import arbitration, candidates, presentation  # noqa: E402
 
 # Every sibling module the neutral leaf must NOT import, directly or
 # indirectly (section 3.1: "import neither policy nor providers").
@@ -563,6 +563,85 @@ class ReflexFeaturesDigest(unittest.TestCase):
         prep = candidates.PreparedReflex(f, t)
         self.assertEqual(prep.table_id, t.table_id)
         self.assertEqual(prep.canonical_bytes, t.canonical_bytes)
+
+
+# --------------------------------------------------- Jev presentation identity
+
+class JevPresentationIdentity(unittest.TestCase):
+    """AC.1/AC.8: presentation never changes candidate or table identity.
+
+    The presentation layer names and describes candidates the policy already
+    built; it must leave the retained table byte-identical, never re-dedup,
+    never reorder and never mint an identity of its own.
+    """
+
+    def _table(self):
+        cands = [
+            candidates.make_candidate({"key": 104}, "navigate", "frontier",
+                                      (1, 0), 1, 500, [("b", 500)],
+                                      "navigate: observation frontier",
+                                      "navigate"),
+            candidates.make_candidate({"key": 106}, "navigate", "stair",
+                                      (0, 1), 2, 400, [("b", 400)],
+                                      "navigate: reachable down stairs",
+                                      "navigate"),
+            candidates.make_candidate({"key": 115}, "search", "recovery", (),
+                                      0, 300, [("b", 300)],
+                                      "loop breaker: search", "site-search"),
+            candidates.make_candidate({"key": 115}, "search-secret",
+                                      "secret-search", (), 0, 200,
+                                      [("b", 200)], "search for secret doors",
+                                      "secret-search"),
+        ]
+        return candidates.build_table((1, 1, 1), 1, cands,
+                                      rejection_version=2)
+
+    def _identity(self, table):
+        return {
+            "table_id": table.table_id,
+            "canonical_bytes": table.canonical_bytes,
+            "candidate_ids": [c.candidate_id for c in table.ordered_candidates],
+            "labels": [c.semantic_label for c in table.ordered_candidates],
+            "actions": [c.action.canonical()
+                        for c in table.ordered_candidates],
+            "signatures": [c.action_signature
+                           for c in table.ordered_candidates],
+            "rejection_version": table.rejection_version,
+        }
+
+    def test_candidate_identity_unchanged_under_jev_presentation(self):
+        from test_auto_jev_presentation import context_of
+
+        table = self._table()
+        before = self._identity(table)
+        frozen, refusal = presentation.present(
+            "command", table.ordered_candidates, context_of(
+                {"id": 1, "kind": "command", "prompt": ""}))
+        self.assertEqual(refusal, "")
+        self.assertIsNotNone(frozen)
+        after = self._identity(table)
+        self.assertEqual(before, after)
+        # the presentation keys are a *separate* namespace from the identity
+        self.assertEqual(len(frozen.keys), len(table.ordered_candidates))
+        for key in frozen.keys:
+            self.assertNotIn(key, before["candidate_ids"])
+
+        # identical policy input still yields byte-identical identity
+        again = self._table()
+        self.assertEqual(again.table_id, table.table_id)
+        self.assertEqual(before, self._identity(again))
+
+    def test_table_id_and_candidate_ids_stable(self):
+        table = self._table()
+        ids = [c.candidate_id for c in table.ordered_candidates]
+        # the duplicate search actions are deduplicated exactly once by the
+        # builder; presentation must not dedup a second time
+        self.assertEqual(len(ids), 3)
+        self.assertEqual(ids, [c.candidate_id
+                               for c in table.ordered_candidates])
+        self.assertEqual(table.table_id, self._table().table_id)
+        self.assertEqual(len(table.canonical_bytes),
+                         len(self._table().canonical_bytes))
 
 
 if __name__ == "__main__":

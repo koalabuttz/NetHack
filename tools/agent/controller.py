@@ -2666,6 +2666,14 @@ class _EpisodeRunner(object):
             episode=self.result.index, tick=self.tick, need=need,
             need_key=self.pending_key, snapshot=self.snap,
             pages=self.req.page_rows(), memory=self.mem,
+            # The runner-owned persistent classified terrain: criterion and
+            # state rendering read remembered ground from here, never from
+            # mem.grid (whose raw cells a current occupant overwrites).
+            terrain=self.terrain,
+            # The real pending operation lives on the scripted reflex; wire it
+            # so the presentation can describe a pending eat/quit rather than
+            # repeating boilerplate.
+            intent=getattr(self.reflex, "intent", "") or "",
             directives=[view] if view.active else [],
             deadline=reflex_dl or 0.0, rejected=rs)
 
@@ -2744,12 +2752,17 @@ class _EpisodeRunner(object):
             return (fallback_action, "scripted",
                     "jev paid-reflex cap reached",
                     0.0, {}, True)
-        # Skip before reserve (6.1): an unsupported need or a table without a
-        # real choice is never paid for, so no reservation is made.
-        if self.reflex_provider.build_choices(ctx) is None:
+        # Skip before reserve (6.1): an unsupported need, a table without a
+        # real choice, or a table whose presentation cannot be rendered
+        # faithfully is never paid for, so no reservation is made.  The
+        # refusal code is recorded distinctly in the decision sidecar in place
+        # of the old generic message; a refusal is always whole-request.
+        build = self.reflex_provider.build_request(ctx)
+        if build.request is None:
             self.ledger.reflex_fallback += 1
+            why = build.refusal or "no eligible choice"
             return (fallback_action, "scripted",
-                    "jev skipped: no eligible choice", 0.0, {}, True)
+                    "jev skipped: %s" % why, 0.0, {}, True)
         handle = self.ledger.reserve_reflex_paid()
         if handle is None:
             # The cap is spent, or a USD/token cap refuses a Jev call whose

@@ -1020,6 +1020,10 @@ class ReplayPass(object):
             episode=1, tick=self.tick, need=need.need,
             need_key=NeedKey(1, need.seq, need.nid), snapshot=self.snap,
             pages=rows, memory=self.mem,
+            # Same wiring as the live controller: the persistent classified
+            # terrain and the scripted reflex's pending intent.
+            terrain=self.terrain,
+            intent=getattr(self.reflex, "intent", "") or "",
             directives=[view] if view.active else [], deadline=0.0)
         proposal, provider_label, reason, fallback = \
             self._propose(ctx)

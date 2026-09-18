@@ -260,6 +260,12 @@ def command_need(i):
     return {"id": i, "kind": "command", "prompt": ""}
 
 
+#: Sentinels for the Jev response builders: "use the default choice" versus
+#: "omit the choice entirely" (a deliberate paid abstention).
+_DEFAULT_CHOICE = object()
+_ABSTAIN = None
+
+
 # ============================================================ directives
 
 class TestDirectiveValidation(unittest.TestCase):
@@ -1281,18 +1287,25 @@ class TestJevAdapter(unittest.TestCase):
         return providers.JevReflex(self.cfg(**over),
                                    jev_dispatch_enabled=True)
 
-    def _respond(self, choice="opt-1", probs=None, action_type="choice",
+    def _respond(self, choice=_DEFAULT_CHOICE, probs=None, action_type="choice",
                  usage=None, confidence=None):
+        if choice is _DEFAULT_CHOICE:
+            choice = self.KEYS[1]
         if probs is None:
-            probs = {"opt-0": 0.1, "opt-1": 0.9}
-        answer = {"action": {"type": action_type}, "choice": choice,
-                  "probabilities": probs}
+            probs = {self.KEYS[0]: 0.1, self.KEYS[1]: 0.9}
+        answer = {"action": {"type": action_type}, "probabilities": probs}
+        if choice is not None:
+            answer["choice"] = choice
         if confidence is not None:
             answer["confidence"] = confidence
         body = {"answers": [answer]}
         if usage is not None:
             body["usage"] = usage
         self.ep.responder = lambda path, b: (200, json.dumps(body).encode())
+
+    # The semantic option keys the two-candidate command table below renders
+    # to, in retained-table order: two movement members of a ``command`` need.
+    KEYS = ("navigate-east", "navigate-west")
 
     def ctx(self, need):
         ctx = ReflexContext(episode=1, tick=1, need=need,
@@ -1375,14 +1388,16 @@ class TestJevAdapter(unittest.TestCase):
         self.assertEqual(self.ep.requests[-1]["path"], "/systemone")
         prov.cancel()
 
-    def test_criteria_are_positional_opt_keys(self):
+    def test_criteria_use_semantic_keys_in_retained_order(self):
         prov = self.prov()
         built = prov.build_choices(self.ctx(command_need(1)))
-        self.assertEqual(list(built.criteria.keys()), ["opt-0", "opt-1"])
-        self.assertEqual(built.key_index, {"opt-0": 0, "opt-1": 1})
-        self.assertIn("direction=", built.criteria["opt-0"])
-        self.assertIn("action=", built.criteria["opt-0"])
-        self.assertIn("reason=", built.criteria["opt-0"])
+        self.assertEqual(list(built.criteria.keys()), list(self.KEYS))
+        self.assertEqual(built.key_index, {self.KEYS[0]: 0, self.KEYS[1]: 1})
+        # the canonical action JSON and the heuristic scores are not
+        # model-facing any more: the criterion is a grounded sentence
+        self.assertNotIn("action=", built.criteria[self.KEYS[0]])
+        self.assertNotIn("direction=[", built.criteria[self.KEYS[0]])
+        self.assertTrue(built.criteria[self.KEYS[0]].startswith("Walk "))
         self.assertEqual(built.payload["model"], "jev-latest")
         # the documented /systemone body: state, model and one action question
         self.assertIn("state", built.payload)
@@ -1391,13 +1406,16 @@ class TestJevAdapter(unittest.TestCase):
         self.assertEqual(question["criteria"], built.criteria)
         self.assertIn("untrusted", question["instructions"])
 
-    def _respond_nested(self, choice="opt-1", probs=None,
+    def _respond_nested(self, choice=_DEFAULT_CHOICE, probs=None,
                         action_type="choice", usage=None, confidence=None):
         """The documented nesting: choice/probs live in ``answers.action``."""
+        if choice is _DEFAULT_CHOICE:
+            choice = self.KEYS[1]
         if probs is None:
-            probs = {"opt-0": 0.1, "opt-1": 0.9}
-        action = {"type": action_type, "choice": choice,
-                  "probabilities": probs}
+            probs = {self.KEYS[0]: 0.1, self.KEYS[1]: 0.9}
+        action = {"type": action_type, "probabilities": probs}
+        if choice is not None:
+            action["choice"] = choice
         if confidence is not None:
             action["confidence"] = confidence
         body = {"model": "jev-latest", "answers": {"action": action}}
@@ -1407,7 +1425,7 @@ class TestJevAdapter(unittest.TestCase):
 
     def test_documented_nested_response_is_parsed(self):
         # the real schema: answers.action.{choice,probabilities,confidence}
-        self._respond_nested(probs={"opt-0": 0.04, "opt-1": 0.96},
+        self._respond_nested(probs={self.KEYS[0]: 0.04, self.KEYS[1]: 0.96},
                              confidence=0.82,
                              usage={"input_tokens": 312,
                                     "output_tokens": 48})
@@ -1423,7 +1441,7 @@ class TestJevAdapter(unittest.TestCase):
 
     def test_nested_confidence_falls_back_to_selected_probability(self):
         # a nested body with no confidence still yields probabilities[choice]
-        self._respond_nested(probs={"opt-0": 0.1, "opt-1": 0.9})
+        self._respond_nested(probs={self.KEYS[0]: 0.1, self.KEYS[1]: 0.9})
         prov = self.prov()
         res = prov.decide(self.ctx(command_need(1)),
                           time.monotonic() + 2.0)
@@ -1434,7 +1452,8 @@ class TestJevAdapter(unittest.TestCase):
     def test_confidence_is_the_selected_probability(self):
         # an answer-level confidence is never read; with none on the action
         # object the confidence falls back to probabilities[choice]
-        self._respond(probs={"opt-0": 0.2, "opt-1": 0.8}, confidence=0.99)
+        self._respond(probs={self.KEYS[0]: 0.2, self.KEYS[1]: 0.8},
+                      confidence=0.99)
         prov = self.prov()
         res = prov.decide(self.ctx(command_need(1)),
                           time.monotonic() + 2.0)
@@ -1443,7 +1462,8 @@ class TestJevAdapter(unittest.TestCase):
         prov.cancel()
 
     def test_selected_key_must_be_the_maximum(self):
-        self._respond(choice="opt-0", probs={"opt-0": 0.2, "opt-1": 0.8},
+        self._respond(choice=self.KEYS[0],
+                      probs={self.KEYS[0]: 0.2, self.KEYS[1]: 0.8},
                       usage={"prompt_tokens": 7})
         prov = self.prov()
         res = prov.decide(self.ctx(command_need(1)),
@@ -1454,7 +1474,8 @@ class TestJevAdapter(unittest.TestCase):
         prov.cancel()
 
     def test_a_tie_is_accepted(self):
-        self._respond(choice="opt-0", probs={"opt-0": 0.5, "opt-1": 0.5})
+        self._respond(choice=self.KEYS[0],
+                      probs={self.KEYS[0]: 0.5, self.KEYS[1]: 0.5})
         prov = self.prov()
         res = prov.decide(self.ctx(command_need(1)),
                           time.monotonic() + 2.0)
@@ -1463,10 +1484,11 @@ class TestJevAdapter(unittest.TestCase):
         prov.cancel()
 
     def test_probabilities_must_match_offered_keys(self):
-        for probs in ({"opt-0": 1.0},
-                      {"opt-0": 0.5, "opt-1": 0.4, "opt-2": 0.1}):
+        for probs in ({self.KEYS[0]: 1.0},
+                      {self.KEYS[0]: 0.5, self.KEYS[1]: 0.4,
+                       "navigate-south": 0.1}):
             with self.subTest(probs=probs):
-                self._respond(choice="opt-0", probs=probs)
+                self._respond(choice=self.KEYS[0], probs=probs)
                 prov = self.prov()
                 res = prov.decide(self.ctx(command_need(1)),
                                   time.monotonic() + 2.0)
@@ -1474,7 +1496,7 @@ class TestJevAdapter(unittest.TestCase):
                 prov.cancel()
 
     def test_probabilities_must_sum_to_one(self):
-        self._respond(probs={"opt-0": 0.5, "opt-1": 0.4})
+        self._respond(probs={self.KEYS[0]: 0.5, self.KEYS[1]: 0.4})
         prov = self.prov()
         res = prov.decide(self.ctx(command_need(1)),
                           time.monotonic() + 2.0)
@@ -1487,7 +1509,7 @@ class TestJevAdapter(unittest.TestCase):
                             ("x", "probability-type"),
                             (True, "probability-type")):
             with self.subTest(value=value):
-                self._respond(probs={"opt-0": value, "opt-1": 1.0})
+                self._respond(probs={self.KEYS[0]: value, self.KEYS[1]: 1.0})
                 prov = self.prov()
                 res = prov.decide(self.ctx(command_need(1)),
                                   time.monotonic() + 2.0)
@@ -2428,6 +2450,11 @@ class _FakeJev(object):
         # A non-None payload is the "there is a real choice" signal; the
         # controller validates against the *real* retained table regardless.
         return {"table_id": "fake", "candidates": []}
+
+    def build_request(self, ctx):
+        # The coded-refusal surface the controller reads: this double always
+        # has a choice to offer, so it carries no refusal code.
+        return providers.JevBuild({"table_id": "fake", "candidates": []}, "")
 
     def decide(self, ctx, deadline=0.0):
         table = getattr(getattr(ctx, "prepared", None), "table", None)
