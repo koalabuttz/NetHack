@@ -1329,6 +1329,15 @@ def run_evaluation(a) -> int:
         print("error: --strategy deepseek requires --allow-network "
               "(offline evaluation makes no provider calls)", file=sys.stderr)
         return 2
+    if a.reflex == "jev" and allow_network:
+        # The Jev reflex is replay-incompatible: an offline replay of a Jev
+        # episode is a scripted fallback with zero paid calls, and a live
+        # networked Jev evaluation is refused outright (the adapter's Wave-A
+        # dispatch barrier and accounting/evaluator gates must pass first).
+        print("error: --reflex jev with --allow-network is not supported "
+              "(offline Jev replay falls back to the scripted tier)",
+              file=sys.stderr)
+        return 2
     wire_lines = _read_wire(a.wire)
     actions_index = load_actions_index(a.actions)
     decisions_file = load_decisions(a.decisions)

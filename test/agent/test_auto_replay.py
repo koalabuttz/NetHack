@@ -210,6 +210,31 @@ class EvaluatorValidationTest(unittest.TestCase):
                            "--deepseek-price-cache-hit", "2")
         self.assertIn("cache-hit", err)
 
+    def test_jev_with_network_is_rejected(self):
+        # a live networked Jev evaluation is refused at argument validation
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "e.jsonl")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = _run([STARTUP, "--reflex", "jev", "--allow-network",
+                           "--output", out])
+            self.assertEqual(rc, 2)
+            self.assertFalse(os.path.exists(out))
+            self.assertIn("jev", err.getvalue())
+
+    def test_offline_jev_replay_makes_no_paid_calls(self):
+        # offline, the Jev tier degrades to the scripted fallback: exit 0 and
+        # no row is attributed to the paid provider
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "e.jsonl")
+            rc = _run([STARTUP, "--reflex", "jev", "--strategy", "off",
+                       "--output", out])
+            self.assertEqual(rc, 0)
+            with open(out) as fh:
+                rows = [json.loads(line) for line in fh if line.strip()]
+            providers = {r.get("provider") for r in rows if "provider" in r}
+            self.assertNotIn("jev", providers)
+
     def test_a_partial_tariff_is_accepted(self):
         # a partial (no USD cap) tariff is a valid configuration: the run
         # proceeds offline and writes its artifact

@@ -2750,7 +2750,14 @@ class _EpisodeRunner(object):
             self.ledger.reflex_fallback += 1
             return (fallback_action, "scripted",
                     "jev skipped: no eligible choice", 0.0, {}, True)
-        self.ledger.reserve_reflex_paid()
+        handle = self.ledger.reserve_reflex_paid()
+        if handle is None:
+            # The cap is spent, or a USD/token cap refuses a Jev call whose
+            # service bound is not established (fail-closed).
+            self.ledger.reflex_fallback += 1
+            return (fallback_action, "scripted",
+                    "jev paid-reflex unavailable (cap or fail-closed)",
+                    0.0, {}, True)
         self.ledger.reflex_attempted += 1
         call = _ReflexCall(
             lambda: self.reflex_provider.decide(ctx, reflex_dl or 0.0))
@@ -2763,8 +2770,9 @@ class _EpisodeRunner(object):
             self.reflex_timeouts += 1
             self.ledger.reflex_timeout += 1
         usage = res.usage if res is not None else {}
-        # exactly once: a paid body is billed whether or not it is accepted
-        self.ledger.add_usage(usage)
+        # exactly once: a paid body is billed whether or not it is accepted,
+        # settled under the reservation handle's own (Jev) tariff snapshot
+        self.ledger.commit_strategy(handle, usage)
         if res is None:
             self.ledger.reflex_fallback += 1
             why = getattr(self.reflex_provider, "last_error", "") \

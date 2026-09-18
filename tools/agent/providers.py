@@ -19,6 +19,7 @@ a cooldown after a timeout; the controller never hands the wire to it.
 """
 
 import json
+import math
 import os
 import signal
 import stat
@@ -1344,28 +1345,133 @@ KEY_CHOICES = (("north", 107), ("south", 106), ("east", 108),
                ("southwest", 98), ("northwest", 121), ("wait", 46),
                ("search", 115))
 JEV_MAX_MENU_ROWS = 128
-JEV_SUPPORTED_KINDS = ("command", "key", "direction", "yn", "menu")
+# Only command/key/direction needs are offered to Jev.  Menus, yes/no prompts,
+# line/extcmd prompts and position requests stay entirely on the scripted
+# tier, so the adapter never has to map a row/coordinate answer.
+JEV_SUPPORTED_KINDS = ("command", "key", "direction")
+JEV_MODEL = "jev-latest"
+JEV_ADAPTER_VERSION = "jev-choice/2"
+# The official service.  An explicit ``--jev-base-url`` overrides it (the
+# loopback fake endpoint in tests); the resolved request URL always ends in
+# ``/systemone``.
+JEV_OFFICIAL_BASE_URL = "https://api.typesafe.ai/v1"
+
+
+def jev_endpoint(base_url: Optional[str]) -> str:
+    """The full Jev request URL: ``(override or official) + '/systemone'``."""
+    return (base_url or JEV_OFFICIAL_BASE_URL).rstrip("/") + "/systemone"
+
+
+def _criterion_text(cand) -> str:
+    """The deterministic ``opt-N`` value: label, direction, action, reason.
+
+    The exact canonical action JSON is embedded so the value names the action
+    that would actually execute, not merely a label Jev might misread.
+    """
+    direction = list(cand.direction)
+    if len(direction) != 2:
+        direction = [None, None]
+    action = json.dumps(cand.action.canonical(), sort_keys=True,
+                        separators=(",", ":"))
+    return "%s | direction=[%s,%s] | action=%s | reason=%s" % (
+        cand.semantic_label, direction[0], direction[1], action, cand.reason)
+
+
+def _jev_answer_of(body) -> Optional[Dict[str, Any]]:
+    """The single answer object from a Jev body (``answers``/``answer``)."""
+    answers = body.get("answers")
+    if isinstance(answers, list):
+        for entry in answers:
+            if isinstance(entry, dict):
+                return entry
+        return None
+    if isinstance(answers, dict):
+        return answers
+    answer = body.get("answer")
+    if isinstance(answer, dict):
+        return answer
+    return None
+
+
+def _check_probabilities(probs, keys) -> Tuple[bool, str]:
+    """Validate a probability vector over *exactly* the offered *keys* (6.1).
+
+    Keys must match exactly (no missing, no extra), every value must be a
+    finite number in ``[0, 1]`` and the total must be 1 within 1e-5, so a
+    truncated, padded or non-normalized vector is rejected rather than
+    partially trusted.
+    """
+    if not isinstance(probs, dict):
+        return (False, "invalid-probabilities")
+    if set(probs.keys()) != set(keys):
+        return (False, "probability-keys")
+    total = 0.0
+    for value in probs.values():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return (False, "probability-type")
+        f = float(value)
+        if not math.isfinite(f) or not (0.0 <= f <= 1.0):
+            return (False, "probability-range")
+        total += f
+    if abs(total - 1.0) > 1e-5:
+        return (False, "probability-sum")
+    return (True, "")
+
+
+@dataclass
+class PreparedJevRequest(object):
+    """One frozen Jev request plus its option-key -> table-index map (6.1).
+
+    ``criteria`` is the only thing Jev chooses between: an ``opt-N`` key
+    mapped to a deterministic criterion string carrying the semantic label,
+    the movement direction, the exact canonical action JSON and the policy
+    reason.  ``key_index`` records the explicit ``opt-N`` -> retained-table
+    index binding, so an answer is mapped by identity rather than by
+    re-deriving an order from the serialized payload.
+    """
+
+    table_id: str
+    need_key: tuple
+    table_version: int
+    prompt: str
+    state: Dict[str, Any]
+    criteria: Dict[str, str]
+    key_index: Dict[str, int]
+    payload: Dict[str, Any]
 
 
 class JevReflex(ReflexProvider):
-    """Typed-choice reflex adapter.  Ships DISABLED pending official terms.
+    """Typed-choice reflex adapter (``jev-choice/2``).
 
-    The adapter contract is implemented and fake-endpoint-tested; the real
-    service is never contacted because no official endpoint/contract has been
-    supplied.  ``--reflex jev`` therefore fails with a clear message unless
-    ``JEV_API_KEY`` **and** ``--i-accept-jev-terms`` are both present -- and
-    even then it only routes to this fake-testable adapter.
+    The request carries a structured game state and a bounded table of
+    ``opt-N`` criteria; the response names one ``opt-N`` key and offers a full
+    probability vector over exactly the offered keys.  The adapter returns the
+    *raw* choice (index + confidence) and the controller maps and validates it
+    against the retained table (6.1) -- no adapter ever invents a live action.
+
+    Wave A ships with :attr:`jev_dispatch_enabled` **False**: the adapter is
+    fully wired and fake-endpoint-tested, but production dispatch is barred
+    until the accounting, evaluator and parser gates pass.  A test may pass
+    ``jev_dispatch_enabled=True`` (keyword-only) to exercise the wire path.
     """
 
     name = "jev"
-    version = "jev-choice/1"
+    version = JEV_ADAPTER_VERSION
+    # Wave-A dispatch barrier.  Wave B flips this default to True once every
+    # accounting/evaluator/parser gate has passed.
+    jev_dispatch_enabled = False
 
     def __init__(self, config: Optional[ProviderConfig] = None,
                  worker_argv: Optional[List[str]] = None,
-                 now=time.monotonic):
+                 now=time.monotonic, *,
+                 jev_dispatch_enabled: Optional[bool] = None):
         self.config = config or ProviderConfig()
         self.worker_argv = list(worker_argv or default_worker_argv())
         self.now = now
+        if jev_dispatch_enabled is not None:
+            if not isinstance(jev_dispatch_enabled, bool):
+                raise ValueError("jev_dispatch_enabled must be a bool")
+            self.jev_dispatch_enabled = jev_dispatch_enabled
         self._sup: Optional[_WorkerSupervisor] = None
         self.last_error = ""
         self._lock = threading.Lock()
@@ -1381,10 +1487,69 @@ class JevReflex(ReflexProvider):
                                        "(pass --i-accept-jev-terms)")
         if not _key_present(config, config.jev_key_file, "JEV_API_KEY"):
             return Availability(False, "no JEV_API_KEY configured")
-        if not config.jev_base_url:
-            return Availability(False, "no Jev endpoint configured; the "
-                                       "adapter is fake-endpoint-tested only")
-        return Availability(True, "Jev adapter (fake-endpoint testing only)")
+        # The official endpoint is the default, so an explicit override is
+        # never required; the request URL always resolves to /systemone.
+        return Availability(True, "Jev adapter (%s)" % self.version)
+
+    def _render_state(self, context: ReflexContext) -> Dict[str, Any]:
+        """The structured, untrusted game state sent with every request.
+
+        Populated from the same production values the scripted policy reads:
+        the policy intent, the active directive set
+        (:meth:`DirectiveSet.to_dict`), the controller's displayed condition
+        names (:func:`condition_texts`), the cached inventory rows, the hero
+        square, HP, hunger, game time, the displayed level, the recent
+        event-deduplicated messages (six) and the need prompt.  Every lookup
+        is guarded so a partial context renders a partial state rather than
+        raising.
+        """
+        mem = getattr(context, "memory", None)
+        st = getattr(mem, "status", None)
+        hero = getattr(mem, "hero", None)
+        try:
+            from .policy import condition_texts
+            conditions = list(condition_texts(context.snapshot))
+        except Exception:
+            conditions = []
+        directives = []
+        for view in getattr(context, "directives", ()) or ():
+            dset = getattr(view, "dset", None)
+            if dset is None:
+                dset = view
+            to_dict = getattr(dset, "to_dict", None)
+            if callable(to_dict):
+                try:
+                    directives.append(to_dict())
+                except Exception:
+                    continue
+        inventory = []
+        rows = getattr(getattr(mem, "inventory", None), "rows", None) or []
+        for row in rows[:40]:
+            text = row.get("text") if isinstance(row, dict) else str(row)
+            if text:
+                inventory.append(text)
+        recent = []
+        recent_fn = getattr(mem, "recent_messages", None)
+        if callable(recent_fn):
+            try:
+                recent = [str(m) for m in recent_fn(6)]
+            except Exception:
+                recent = []
+        return {
+            "intent": getattr(context, "intent", "") or "",
+            "active_directives": directives,
+            "inventory": inventory,
+            "need": (context.need or {}).get("prompt") or "",
+            "recent_messages": recent,
+            "map_text": getattr(context, "map_text", "") or "",
+            "displayed_level": getattr(st, "dlvl", "") or "",
+            "hero": list(hero) if hero else None,
+            "hp": getattr(st, "hp", None),
+            "hp_max": getattr(st, "hp_max", None),
+            "hunger": getattr(st, "hunger", "") or "",
+            "conditions": conditions,
+            "game_time": getattr(st, "time", None),
+        }
 
     def cancel(self) -> None:
         """Cancel in-flight paid work and refuse to start any more (sticky).
@@ -1399,16 +1564,21 @@ class JevReflex(ReflexProvider):
         if sup is not None:
             sup.cancel()
 
-    def build_choices(self, context: ReflexContext):
-        """Serialize the retained table for Jev, or ``None`` (skip reserve).
+    def build_choices(self, context: ReflexContext
+                      ) -> Optional["PreparedJevRequest"]:
+        """Freeze the request for Jev, or ``None`` to skip the paid tier.
 
-        A need Jev must not choose (line/extcmd/position) and any table that
-        does not present a real choice -- a singleton prompt/mandatory/
-        emergency table, which the scripted tier owns -- return ``None`` so
-        the caller skips the paid dispatch entirely and never reserves
-        against it (6.1).  The payload is built from the already-canonical
-        table records, so it re-serializes nothing (M22).
+        A need Jev must not answer (menu/yn/line/extcmd/position) and any
+        table that does not present a real choice -- a singleton prompt that
+        the scripted tier owns -- return ``None`` so the caller skips the paid
+        dispatch entirely and never reserves against it (6.1).  A disabled
+        adapter (the Wave-A barrier) likewise returns ``None``, so production
+        never reserves or dispatches a Jev call.  The request is bound to the
+        already-canonical table records and carries an explicit ``opt-N`` ->
+        index map, so a returned choice is mapped by identity.
         """
+        if not self.jev_dispatch_enabled:
+            return None
         kind = (context.need or {}).get("kind")
         if kind not in JEV_SUPPORTED_KINDS:
             return None
@@ -1419,28 +1589,52 @@ class JevReflex(ReflexProvider):
         # < 2 members is a singleton/mandatory/emergency table: scripted only
         if len(table.ordered_candidates) < 2:
             return None
-        if kind == "menu":
-            rows = [r for r in context.pages if r.get("selectable")]
-            if not rows or len(rows) > JEV_MAX_MENU_ROWS:
-                return None
-        return candidates.jev_payload(table)
+        criteria = {}
+        key_index = {}
+        for i, cand in enumerate(table.ordered_candidates):
+            key = "opt-%d" % i
+            criteria[key] = _criterion_text(cand)
+            key_index[key] = i
+        state = self._render_state(context)
+        prompt = (context.need or {}).get("prompt") or ""
+        payload = {
+            "v": 1, "kind": "choice", "model": JEV_MODEL,
+            "need_kind": kind, "prompt": prompt,
+            "state": state, "options": criteria, "abstain": True,
+        }
+        return PreparedJevRequest(
+            table_id=table.table_id, need_key=tuple(table.need_key),
+            table_version=table.table_version, prompt=prompt, state=state,
+            criteria=criteria, key_index=key_index, payload=payload)
 
     def decide(self, context: ReflexContext, deadline: float = 0.0) -> \
             Optional[ReflexChoiceResult]:
         """Return the provider's *raw* choice, never a mapped action (6.1).
 
-        ``None`` means no body arrived at all (unsupported need, refused
-        spawn, timeout or worker error) -- there is no usage to preserve.  A
-        body that *did* arrive always yields a :class:`ReflexChoiceResult`
-        carrying its usage, even for an abstaining, malformed, out-of-range
-        or low-confidence answer, so the caller bills the spend before the
-        controller rejects it.
+        ``None`` means no body reached the wire (unsupported need, refused
+        spawn, timeout or worker error).  The Wave-A barrier is checked
+        *first*: a disabled adapter returns a structured ``jev-not-enabled``
+        parse error with no dispatch and empty usage, before any preparation,
+        key load, supervisor or spawn.  A body that *did* arrive always yields
+        a :class:`ReflexChoiceResult` carrying its usage, even for an
+        abstaining, malformed or rejected answer, so the caller bills the
+        spend before the controller rejects it.
         """
+        if not self.jev_dispatch_enabled:
+            self.last_error = "jev-not-enabled"
+            table = getattr(getattr(context, "prepared", None), "table", None)
+            base = ReflexChoiceResult(
+                table_id=(table.table_id if table is not None else ""),
+                need_key=(tuple(table.need_key) if table is not None else ()),
+                table_version=(table.table_version if table is not None
+                               else -1),
+                dispatched=False)
+            return _choice_replace(base, parse_error="jev-not-enabled",
+                                   reason="disabled", usage={})
         built = self.build_choices(context)
         if built is None:
             self.last_error = "unsupported-need"
             return None
-        table = context.prepared.table
         try:
             key = load_secret(self.config.jev_key_file, "JEV_API_KEY")
         except SecretError as exc:
@@ -1452,13 +1646,8 @@ class JevReflex(ReflexProvider):
         now = self.now()
         ddl = deadline or (now + self.config.reflex_deadline)
         job = {"v": 1, "provider": self.name,
-               "url": (self.config.jev_base_url or "").rstrip("/")
-               + "/choice",
-               "payload": {"v": 1, "kind": "choice",
-                           "need_kind": (context.need or {}).get("kind"),
-                           "prompt": (context.need or {}).get("prompt") or "",
-                           "table": built, "options": built.get("candidates"),
-                           "abstain": True},
+               "url": jev_endpoint(self.config.jev_base_url),
+               "payload": built.payload,
                "api_key": key,
                "timeout": max(0.5, ddl - now + 0.25),
                "max_bytes": self.config.provider_max_bytes}
@@ -1491,20 +1680,27 @@ class JevReflex(ReflexProvider):
         if res is None:
             self.last_error = "timeout"
             return None
-        return self._choice_from(res, table)
+        return self._choice_from(res, built)
 
-    def _choice_from(self, res: WorkerResult, table
-                     ) -> ReflexChoiceResult:
+    def _choice_from(self, res: WorkerResult,
+                     built: "PreparedJevRequest") -> ReflexChoiceResult:
         """Extract the raw fields from one worker body (6.1).
 
-        No acceptance decision is made here: the confidence, index/abstention
-        and parse error are surfaced raw and the controller validates them
-        against the retained table.  A body that arrived always carries its
-        usage so the spend is never dropped.
+        Usage is extracted *first*, before any structural validation, so a
+        paid body always carries its spend even when it is malformed.  The
+        answer is accepted only when ``answers.action.type`` is ``choice``,
+        the chosen key is a string naming exactly one offered ``opt-N`` key,
+        and ``probabilities`` is a full, finite, ``[0, 1]`` distribution over
+        exactly the offered keys summing to 1 within 1e-5.  The selected key
+        must be a maximum of that distribution (a tie is accepted); the
+        confidence is ``probabilities[choice]`` -- never the API's separate,
+        unverified ``confidence`` field.  No acceptance decision beyond those
+        structural checks is made here: the controller validates the index
+        against the retained table and maps it centrally.
         """
         base = ReflexChoiceResult(
-            table_id=table.table_id, need_key=tuple(table.need_key),
-            table_version=table.table_version,
+            table_id=built.table_id, need_key=tuple(built.need_key),
+            table_version=built.table_version,
             latency=getattr(res, "latency", 0.0), dispatched=True)
         if not res.ok or res.json is None:
             self.last_error = res.error or "error"
@@ -1513,17 +1709,35 @@ class JevReflex(ReflexProvider):
         body = res.json
         usage = body.get("usage")
         usage = usage if isinstance(usage, dict) else {}
-        conf = body.get("confidence")
-        choice = body.get("option")
+        answer = _jev_answer_of(body)
+        if answer is None:
+            return _choice_replace(base, parse_error="no-answer", usage=usage,
+                                   reason="no-answer")
+        action = answer.get("action")
+        if not isinstance(action, dict) or action.get("type") != "choice":
+            return _choice_replace(base, parse_error="invalid-action",
+                                   usage=usage, reason="invalid-action")
+        choice = answer.get("choice")
         if choice is None:
-            return _choice_replace(base, abstain=True, confidence=conf,
-                                   usage=usage, reason="abstain")
-        if isinstance(choice, bool) or not isinstance(choice, int):
-            return _choice_replace(base, parse_error="invalid-option",
-                                   confidence=conf, usage=usage,
-                                   reason="invalid-option")
-        return _choice_replace(base, index=choice, confidence=conf,
-                               usage=usage, reason="choice")
+            # a deliberate paid abstention: usage is preserved, no index
+            return _choice_replace(base, abstain=True, usage=usage,
+                                   reason="abstain")
+        if (isinstance(choice, bool) or not isinstance(choice, str)
+                or choice not in built.key_index):
+            return _choice_replace(base, parse_error="invalid-choice",
+                                   usage=usage, reason="invalid-choice")
+        probs = answer.get("probabilities")
+        ok, why = _check_probabilities(probs, built.key_index.keys())
+        if not ok:
+            return _choice_replace(base, parse_error=why, usage=usage,
+                                   reason=why)
+        selected = float(probs[choice])
+        if selected < max(float(v) for v in probs.values()):
+            return _choice_replace(base, parse_error="not-max", usage=usage,
+                                   reason="not-max")
+        return _choice_replace(base, index=built.key_index[choice],
+                               confidence=selected, usage=usage,
+                               reason="choice")
 
 
 def _choice_replace(base: ReflexChoiceResult, **fields) -> ReflexChoiceResult:

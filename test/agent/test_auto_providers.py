@@ -1166,6 +1166,96 @@ class TestDeepSeekWorkerSupervised(unittest.TestCase):
         self.assertEqual(providers._usage_of({"usage": "nope"}), {})
 
 
+# =================================================== mixed-provider budget
+
+class TestMixedProviderReservations(unittest.TestCase):
+    """Provider-scoped handles: one ledger, two tariffs, one aggregate cap."""
+
+    def led(self, **over):
+        base = dict(strategy_cap=8, postmortem_reserve=0, reflex_cap=5,
+                    tariff=budget.Tariff(prompt_per_mtok=1.0,
+                                         completion_per_mtok=2.0))
+        base.update(over)
+        return budget.BudgetLedger(**base)
+
+    def test_handles_are_provider_scoped(self):
+        led = self.led()
+        s = led.reserve_strategy(prompt_tokens=10, completion_tokens=5)
+        j = led.reserve_reflex_paid(prompt_bound=20, completion_bound=0)
+        self.assertNotEqual(s, j)
+        self.assertTrue(s.startswith("deepseek"))
+        self.assertTrue(j.startswith("jev"))
+        self.assertEqual(led._reservations[s]["provider"], "deepseek")
+        self.assertEqual(led._reservations[j]["provider"], "jev")
+        self.assertEqual(led._reservations[j]["call_class"], "reflex")
+
+    def test_each_handle_settles_at_its_own_tariff(self):
+        led = self.led()
+        # the same 1M prompt tokens: strategy at $1.0/Mtok, Jev at $0.042/Mtok
+        s = led.reserve_strategy(prompt_tokens=1000000, completion_tokens=0)
+        j = led.reserve_reflex_paid(prompt_bound=1000000, completion_bound=0)
+        led.commit_strategy(s, {"prompt_tokens": 1000000,
+                                "completion_tokens": 0, "reported": True})
+        led.commit_strategy(j, {"prompt_tokens": 1000000,
+                                "completion_tokens": 0, "reported": True})
+        self.assertAlmostEqual(led.estimated_usd, 1.0 + 0.042)
+
+    def test_per_provider_totals_are_reported(self):
+        led = self.led()
+        j = led.reserve_reflex_paid(prompt_bound=1000000, completion_bound=0)
+        led.commit_strategy(j, {"prompt_tokens": 1000000,
+                                "completion_tokens": 0, "reported": True})
+        s = led.reserve_strategy(prompt_tokens=500000, completion_tokens=0)
+        led.commit_strategy(s, {"prompt_tokens": 500000,
+                                "completion_tokens": 0, "reported": True})
+        by_provider = led.as_dict()["providers"]
+        self.assertEqual(by_provider["jev"]["prompt_tokens"], 1000000)
+        self.assertEqual(by_provider["deepseek"]["prompt_tokens"], 500000)
+        self.assertAlmostEqual(by_provider["jev"]["estimated_usd"], 0.042)
+        self.assertAlmostEqual(by_provider["deepseek"]["estimated_usd"], 0.5)
+
+    def test_usd_cap_refuses_jev_but_still_bounds_strategy(self):
+        led = self.led(strategy_cap=100, usd_cap=1.0)
+        # a Jev call cannot be bounded by a USD cap: fail-closed
+        self.assertIsNone(led.reserve_reflex_paid(prompt_bound=100,
+                                                  completion_bound=0))
+        # the strategy tariff still enumerates the aggregate headroom
+        self.assertTrue(led.reserve_strategy(prompt_tokens=900000,
+                                             completion_tokens=0))
+        self.assertFalse(led.reserve_strategy(prompt_tokens=200000,
+                                              completion_tokens=0))
+
+    def test_token_cap_refuses_jev(self):
+        led = self.led(token_cap=1000)
+        self.assertIsNone(led.reserve_reflex_paid(prompt_bound=1,
+                                                  completion_bound=0))
+        self.assertTrue(led.reserve_strategy(prompt_tokens=10,
+                                             completion_tokens=0))
+
+    def test_release_names_one_handle(self):
+        led = self.led()
+        s = led.reserve_strategy(prompt_tokens=10, completion_tokens=0)
+        j = led.reserve_reflex_paid(prompt_bound=10, completion_bound=0)
+        led.release_strategy(s)
+        self.assertEqual(led.strategy_reserved, 0)
+        self.assertNotIn(s, led._reservations)
+        self.assertIn(j, led._reservations)     # the Jev handle is untouched
+
+    def test_unknown_handle_settles_nothing_but_bills_usage(self):
+        led = self.led()
+        led.commit_strategy("nope", {"prompt_tokens": 5, "reported": True})
+        self.assertEqual(led.strategy_dispatched, 0)
+        self.assertEqual(led._reservations, {})
+        self.assertEqual(led.prompt_tokens, 5)
+
+    def test_reflex_cap_is_separate_and_counts_handles(self):
+        led = self.led(reflex_cap=2)
+        self.assertIsNotNone(led.reserve_reflex_paid())
+        self.assertIsNotNone(led.reserve_reflex_paid())
+        self.assertIsNone(led.reserve_reflex_paid())
+        self.assertEqual(led.reflex_paid_dispatched, 2)
+
+
 # ============================================================ Jev
 
 class TestJevAdapter(unittest.TestCase):
@@ -1183,6 +1273,26 @@ class TestJevAdapter(unittest.TestCase):
                     confidence_threshold=0.8)
         base.update(over)
         return ProviderConfig(**base)
+
+    def prov(self, **over):
+        # A test provider always exercises the wire path: the Wave-A dispatch
+        # barrier is overridden explicitly (keyword-only), which is the only
+        # way to enable it before Wave B flips the default.
+        return providers.JevReflex(self.cfg(**over),
+                                   jev_dispatch_enabled=True)
+
+    def _respond(self, choice="opt-1", probs=None, action_type="choice",
+                 usage=None, confidence=None):
+        if probs is None:
+            probs = {"opt-0": 0.1, "opt-1": 0.9}
+        answer = {"action": {"type": action_type}, "choice": choice,
+                  "probabilities": probs}
+        if confidence is not None:
+            answer["confidence"] = confidence
+        body = {"answers": [answer]}
+        if usage is not None:
+            body["usage"] = usage
+        self.ep.responder = lambda path, b: (200, json.dumps(body).encode())
 
     def ctx(self, need):
         ctx = ReflexContext(episode=1, tick=1, need=need,
@@ -1211,18 +1321,41 @@ class TestJevAdapter(unittest.TestCase):
             prov = providers.JevReflex(self.cfg())
             self.assertFalse(prov.available(prov.config).enabled)
 
-    def test_disabled_without_endpoint(self):
+    def test_official_endpoint_is_the_default(self):
+        # no override: the official service is used, and the request URL is
+        # always the /systemone endpoint
         prov = providers.JevReflex(self.cfg(jev_base_url=None))
-        self.assertFalse(prov.available(prov.config).enabled)
+        self.assertTrue(prov.available(prov.config).enabled)
+        self.assertEqual(providers.jev_endpoint(None),
+                         "https://api.typesafe.ai/v1/systemone")
+        self.assertEqual(providers.jev_endpoint("https://x/v1/"),
+                         "https://x/v1/systemone")
 
-    def test_enabled_only_with_terms_key_and_endpoint(self):
+    def test_enabled_with_terms_key_and_official_endpoint(self):
         prov = providers.JevReflex(self.cfg(reflex_call_cap=1))
         self.assertTrue(prov.available(prov.config).enabled)
+        self.assertEqual(prov.version, "jev-choice/2")
+
+    def test_dispatch_barrier_blocks_before_any_work(self):
+        # the Wave-A default: decide returns a structured, undispatched
+        # jev-not-enabled result and build_choices skips before reserve
+        prov = providers.JevReflex(self.cfg())     # barrier default False
+        ctx = self.ctx(command_need(1))
+        self.assertIsNone(prov.build_choices(ctx))
+        res = prov.decide(ctx, time.monotonic() + 2.0)
+        self.assertIsNotNone(res)
+        self.assertEqual(res.parse_error, "jev-not-enabled")
+        self.assertFalse(res.dispatched)
+        self.assertEqual(res.usage, {})
+        self.assertEqual(self.ep.requests, [])
+
+    def test_barrier_override_must_be_boolean(self):
+        with self.assertRaises(ValueError):
+            providers.JevReflex(self.cfg(), jev_dispatch_enabled="yes")
 
     def test_valid_choice_is_raw(self):
-        self.ep.responder = lambda p, b: (
-            200, json.dumps({"option": 1, "confidence": 0.9}).encode())
-        prov = providers.JevReflex(self.cfg())
+        self._respond()
+        prov = self.prov()
         ctx = self.ctx(command_need(1))
         res = prov.decide(ctx, time.monotonic() + 2.0)
         self.assertIsNotNone(res)
@@ -1234,71 +1367,126 @@ class TestJevAdapter(unittest.TestCase):
         self.assertTrue(res.dispatched)
         self.assertEqual(res.table_id, ctx.prepared.table.table_id)
         self.assertEqual(res.need_key, tuple(ctx.prepared.table.need_key))
+        # the request is the official-style /systemone endpoint
+        self.assertEqual(self.ep.requests[-1]["path"], "/systemone")
         prov.cancel()
 
-    def test_confidence_is_surfaced_raw(self):
-        # the adapter does not judge the confidence: it is surfaced raw with
-        # its usage, and the controller rejects it centrally (6.1)
-        for conf in (float("nan"), 1.5, -0.1, "high", None):
-            with self.subTest(conf=conf):
-                self.ep.responder = lambda p, b, c=conf: (
-                    200, json.dumps({"option": 0, "confidence": c,
-                                     "usage": {"prompt_tokens": 7,
-                                               "completion_tokens": 2}})
-                    .encode())
-                prov = providers.JevReflex(self.cfg())
+    def test_criteria_are_positional_opt_keys(self):
+        prov = self.prov()
+        built = prov.build_choices(self.ctx(command_need(1)))
+        self.assertEqual(list(built.criteria.keys()), ["opt-0", "opt-1"])
+        self.assertEqual(built.key_index, {"opt-0": 0, "opt-1": 1})
+        self.assertIn("direction=", built.criteria["opt-0"])
+        self.assertIn("action=", built.criteria["opt-0"])
+        self.assertIn("reason=", built.criteria["opt-0"])
+        self.assertEqual(built.payload["model"], "jev-latest")
+        self.assertEqual(built.payload["options"], built.criteria)
+
+    def test_confidence_is_the_selected_probability(self):
+        # the confidence is probabilities[choice]; the API's separate,
+        # unverified confidence field is ignored entirely
+        self._respond(probs={"opt-0": 0.2, "opt-1": 0.8}, confidence=0.99)
+        prov = self.prov()
+        res = prov.decide(self.ctx(command_need(1)),
+                          time.monotonic() + 2.0)
+        self.assertEqual(res.index, 1)
+        self.assertEqual(res.confidence, 0.8)
+        prov.cancel()
+
+    def test_selected_key_must_be_the_maximum(self):
+        self._respond(choice="opt-0", probs={"opt-0": 0.2, "opt-1": 0.8},
+                      usage={"prompt_tokens": 7})
+        prov = self.prov()
+        res = prov.decide(self.ctx(command_need(1)),
+                          time.monotonic() + 2.0)
+        self.assertIsNone(res.index)
+        self.assertEqual(res.parse_error, "not-max")
+        self.assertEqual(res.usage.get("prompt_tokens"), 7)
+        prov.cancel()
+
+    def test_a_tie_is_accepted(self):
+        self._respond(choice="opt-0", probs={"opt-0": 0.5, "opt-1": 0.5})
+        prov = self.prov()
+        res = prov.decide(self.ctx(command_need(1)),
+                          time.monotonic() + 2.0)
+        self.assertEqual(res.index, 0)
+        self.assertEqual(res.confidence, 0.5)
+        prov.cancel()
+
+    def test_probabilities_must_match_offered_keys(self):
+        for probs in ({"opt-0": 1.0},
+                      {"opt-0": 0.5, "opt-1": 0.4, "opt-2": 0.1}):
+            with self.subTest(probs=probs):
+                self._respond(choice="opt-0", probs=probs)
+                prov = self.prov()
                 res = prov.decide(self.ctx(command_need(1)),
                                   time.monotonic() + 2.0)
-                self.assertIsNotNone(res)
-                self.assertEqual(res.index, 0)
-                self.assertEqual(res.usage, {"prompt_tokens": 7,
-                                             "completion_tokens": 2})
+                self.assertEqual(res.parse_error, "probability-keys")
                 prov.cancel()
 
-    def test_low_confidence_is_surfaced_raw(self):
-        self.ep.responder = lambda p, b: (
-            200, json.dumps({"option": 0, "confidence": 0.2,
-                             "usage": {"prompt_tokens": 3}}).encode())
-        prov = providers.JevReflex(self.cfg())
+    def test_probabilities_must_sum_to_one(self):
+        self._respond(probs={"opt-0": 0.5, "opt-1": 0.4})
+        prov = self.prov()
         res = prov.decide(self.ctx(command_need(1)),
                           time.monotonic() + 2.0)
-        self.assertIsNotNone(res)
-        self.assertEqual(res.index, 0)
-        self.assertEqual(res.confidence, 0.2)
-        self.assertEqual(res.usage.get("prompt_tokens"), 3)
+        self.assertEqual(res.parse_error, "probability-sum")
         prov.cancel()
 
-    def test_out_of_range_option_is_surfaced_raw(self):
-        self.ep.responder = lambda p, b: (
-            200, json.dumps({"option": 999, "confidence": 0.99,
-                             "usage": {"prompt_tokens": 4}}).encode())
-        prov = providers.JevReflex(self.cfg())
+    def test_probabilities_must_be_finite_in_range(self):
+        for value, code in ((-0.1, "probability-range"),
+                            (1.5, "probability-range"),
+                            ("x", "probability-type"),
+                            (True, "probability-type")):
+            with self.subTest(value=value):
+                self._respond(probs={"opt-0": value, "opt-1": 1.0})
+                prov = self.prov()
+                res = prov.decide(self.ctx(command_need(1)),
+                                  time.monotonic() + 2.0)
+                self.assertEqual(res.parse_error, code)
+                prov.cancel()
+
+    def test_action_type_must_be_choice(self):
+        self._respond(action_type="free")
+        prov = self.prov()
         res = prov.decide(self.ctx(command_need(1)),
                           time.monotonic() + 2.0)
-        self.assertIsNotNone(res)
-        self.assertEqual(res.index, 999)   # the controller bounds the index
-        self.assertEqual(res.usage.get("prompt_tokens"), 4)
+        self.assertEqual(res.parse_error, "invalid-action")
+        prov.cancel()
+
+    def test_choice_must_name_an_offered_key(self):
+        self._respond(choice="opt-9")
+        prov = self.prov()
+        res = prov.decide(self.ctx(command_need(1)),
+                          time.monotonic() + 2.0)
+        self.assertEqual(res.parse_error, "invalid-choice")
         prov.cancel()
 
     def test_abstain_carries_usage(self):
         # a paid abstention is still a paid call: its usage is preserved
-        self.ep.responder = lambda p, b: (
-            200, json.dumps({"option": None, "confidence": 0.99,
-                             "usage": {"prompt_tokens": 5,
-                                       "completion_tokens": 1}}).encode())
-        prov = providers.JevReflex(self.cfg())
+        self._respond(choice=None,
+                      usage={"prompt_tokens": 5, "completion_tokens": 1})
+        prov = self.prov()
         res = prov.decide(self.ctx(command_need(1)),
                           time.monotonic() + 2.0)
-        self.assertIsNotNone(res)
         self.assertTrue(res.abstain)
         self.assertIsNone(res.index)
         self.assertEqual(res.usage, {"prompt_tokens": 5,
                                      "completion_tokens": 1})
         prov.cancel()
 
+    def test_usage_is_preserved_even_when_malformed(self):
+        self._respond(choice="opt-9",
+                      usage={"prompt_tokens": 5, "completion_tokens": 1})
+        prov = self.prov()
+        res = prov.decide(self.ctx(command_need(1)),
+                          time.monotonic() + 2.0)
+        self.assertEqual(res.usage, {"prompt_tokens": 5,
+                                     "completion_tokens": 1})
+        prov.cancel()
+
     def test_unsupported_needs_never_call_jev(self):
-        prov = providers.JevReflex(self.cfg())
-        for kind in ("line", "extcmd", "position"):
+        prov = self.prov()
+        for kind in ("line", "extcmd", "position", "menu", "yn"):
             need = {"id": 1, "kind": kind, "prompt": ""}
             if kind == "position":
                 need.update({"x0": 1, "y0": 0, "x1": 2, "y1": 1})
@@ -1310,7 +1498,7 @@ class TestJevAdapter(unittest.TestCase):
 
     def test_singleton_table_is_skipped_before_reserve(self):
         # no retained choice -> build_choices is None and no call is made
-        prov = providers.JevReflex(self.cfg())
+        prov = self.prov()
         ctx = self.ctx(command_need(1))
         one = [candidates.make_candidate({"key": protocol.KEY_H}, "west")]
         ctx.prepared = candidates.PreparedReflex(
@@ -1321,29 +1509,17 @@ class TestJevAdapter(unittest.TestCase):
         self.assertEqual(self.ep.requests, [])
         prov.cancel()
 
-    def test_menu_stays_scripted_over_the_row_cap(self):
-        prov = providers.JevReflex(self.cfg())
-        need = {"id": 1, "kind": "menu", "menu": "m1", "mode": "one",
-                "content": "c1", "pages": 1}
-        ctx = self.ctx(need)
-        ctx.pages = [{"r": i, "text": "row", "selectable": True}
-                     for i in range(200)]
-        self.assertIsNone(prov.decide(ctx, time.monotonic() + 2.0))
-        self.assertEqual(self.ep.requests, [])
-        prov.cancel()
-
-    def test_small_menu_choice_is_offered_raw(self):
-        self.ep.responder = lambda p, b: (
-            200, json.dumps({"option": 1, "confidence": 0.95}).encode())
-        prov = providers.JevReflex(self.cfg())
+    def test_menu_stays_scripted(self):
+        # menus are no longer offered to Jev at all, at any row count
+        prov = self.prov()
         need = {"id": 1, "kind": "menu", "menu": "m1", "mode": "one",
                 "content": "c1", "pages": 1}
         ctx = self.ctx(need)
         ctx.pages = [{"r": 10 + i, "text": "row %d" % i, "selectable": True}
                      for i in range(4)]
-        res = prov.decide(ctx, time.monotonic() + 2.0)
-        self.assertEqual(res.index, 1)
-        self.assertEqual(res.table_id, ctx.prepared.table.table_id)
+        self.assertIsNone(prov.build_choices(ctx))
+        self.assertIsNone(prov.decide(ctx, time.monotonic() + 2.0))
+        self.assertEqual(self.ep.requests, [])
         prov.cancel()
 
 
@@ -2321,7 +2497,9 @@ class TestLowConfidenceEscalation(WireHarness):
         rec.finalize({})
         self.assertEqual(provider, "jev")
         self.assertEqual(runner.ledger.prompt_tokens, 1000000)
-        self.assertAlmostEqual(runner.ledger.estimated_usd, 1.0)
+        # the Jev reflex settles at the built-in official Jev tariff
+        # ($0.042/MTok input, free output), not the DeepSeek strategy tariff
+        self.assertAlmostEqual(runner.ledger.estimated_usd, 0.042)
         self.assertEqual(runner.ledger.reflex_paid_dispatched, 1)
 
 
@@ -3413,9 +3591,9 @@ class TestJevFallbackUsage(WireHarness):
         self.assertTrue(low)
         self.assertEqual(runner.ledger.reflex_fallback, 1)
         self.assertEqual(runner.ledger.reflex_successful, 0)
-        # exactly once: one full prompt is billed, not two
+        # exactly once: one full prompt is billed, not two, at the Jev tariff
         self.assertEqual(runner.ledger.prompt_tokens, 1000000)
-        self.assertAlmostEqual(runner.ledger.estimated_usd, 1.0)
+        self.assertAlmostEqual(runner.ledger.estimated_usd, 0.042)
 
     def test_accepted_answer_is_billed_once(self):
         usage = {"prompt_tokens": 1000000, "completion_tokens": 0,
@@ -3429,7 +3607,7 @@ class TestJevFallbackUsage(WireHarness):
         self.assertFalse(low)
         self.assertEqual(runner.ledger.reflex_successful, 1)
         self.assertEqual(runner.ledger.prompt_tokens, 1000000)
-        self.assertAlmostEqual(runner.ledger.estimated_usd, 1.0)
+        self.assertAlmostEqual(runner.ledger.estimated_usd, 0.042)
 
     def test_low_confidence_choice_is_rejected_but_billed(self):
         # M11 at the controller: the central confidence gate rejects the raw

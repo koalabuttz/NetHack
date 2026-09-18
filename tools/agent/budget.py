@@ -151,6 +151,20 @@ def _check_tariff(tariff) -> None:
             "bound" % (hit, prompt))
 
 
+# Official Jev (typesafe.ai) pricing: input is billed at $0.042/MTok and the
+# response is free.  Unlike the DeepSeek tariff this is *built in* rather than
+# operator-configured -- it is part of the adapter's published contract, so a
+# Jev call is priced even when no operator tariff is set.
+JEV_PROMPT_PER_MTOK = 0.042
+JEV_COMPLETION_PER_MTOK = 0.0
+
+
+def jev_tariff() -> Tariff:
+    """The official Jev tariff: priced input, free output."""
+    return Tariff(prompt_per_mtok=JEV_PROMPT_PER_MTOK,
+                  completion_per_mtok=JEV_COMPLETION_PER_MTOK)
+
+
 class BudgetLedger(object):
     """One episode's counters, reservations and estimated cost."""
 
@@ -203,9 +217,18 @@ class BudgetLedger(object):
         self.cache_miss_tokens = 0
         self.cache_unclassified_tokens = 0
         self.reasoning_tokens = 0
+        # Provider-scoped reservation handles: each names the provider, its
+        # conservative token bound, its call class and the tariff snapshot in
+        # force at reservation, so a call settles under the tariff it was
+        # admitted with even if the ledger's tariff later changes.
+        self._reservations: Dict[str, Dict[str, Any]] = {}
+        self._reservation_seq = 0
+        self.jev_tariff = jev_tariff()
+        # Per-provider reported-usage totals; the flat counters below remain
+        # the aggregate authority.
+        self._provider_usage: Dict[str, Dict[str, Any]] = {}
         # Exposure from committed calls that returned *no usage at all*: the
         # conservative bound is carried rather than dropped.
-        self._reserved_bounds: List[Tuple[int, int]] = []
         self.unknown_exposure_calls = 0
         self.unknown_prompt_tokens = 0
         self.unknown_completion_tokens = 0
@@ -255,24 +278,28 @@ class BudgetLedger(object):
         setattr(self, attr, getattr(self, attr) + int(n))
 
     # -- strategy reservations ------------------------------------------
-    def _price(self, prompt_tokens: int, completion_tokens: int) -> float:
-        """The USD cost of a token count under the configured tariff.
+    def _price(self, prompt_tokens: int, completion_tokens: int,
+               tariff: Optional[Tariff] = None) -> float:
+        """The USD cost of a token count under *tariff* (or the ledger's).
 
         Only *configured* components are priced: an absent price is not
         fabricated as zero, so a partial tariff simply leaves that side of
         the spend unrepresented here.  The settled-cost and
         unknown-exposure callers route the unpriced component to
         unknown-priced accounting instead, so a partial tariff never looks
-        numerically complete.
+        numerically complete.  Passing an explicit *tariff* is how a
+        reservation's own snapshot (for example the built-in Jev tariff)
+        prices it independently of the operator's DeepSeek tariff.
         """
-        if self.tariff is None:
+        rate = self.tariff if tariff is None else tariff
+        if rate is None:
             return 0.0
         total = 0.0
-        if self.tariff.prompt_per_mtok is not None:
-            total += prompt_tokens / 1000000.0 * self.tariff.prompt_per_mtok
-        if self.tariff.completion_per_mtok is not None:
+        if rate.prompt_per_mtok is not None:
+            total += prompt_tokens / 1000000.0 * rate.prompt_per_mtok
+        if rate.completion_per_mtok is not None:
             total += completion_tokens / 1000000.0 \
-                * self.tariff.completion_per_mtok
+                * rate.completion_per_mtok
         return total
 
     @property
@@ -282,14 +309,23 @@ class BudgetLedger(object):
 
     def _effective_tokens(self) -> int:
         """Tokens already billed, carried as unknown, or still reserved."""
-        reserved = sum(p + c for p, c in self._reserved_bounds)
+        reserved = sum(r["prompt_bound"] + r["completion_bound"]
+                       for r in self._reservations.values())
         return (self.prompt_tokens + self.completion_tokens
                 + self.unknown_prompt_tokens + self.unknown_completion_tokens
                 + reserved)
 
     def _effective_usd(self) -> float:
-        """USD already billed, carried as unknown, or still reserved."""
-        reserved = sum(self._price(p, c) for p, c in self._reserved_bounds)
+        """USD already billed, carried as unknown, or still reserved.
+
+        Every outstanding reservation is priced with its own tariff snapshot,
+        so a Jev reservation (built-in tariff) and a DeepSeek reservation
+        (operator tariff) are both represented in the one aggregate the caps
+        are enforced against.
+        """
+        reserved = sum(self._price(r["prompt_bound"], r["completion_bound"],
+                                   r["tariff_snapshot"])
+                       for r in self._reservations.values())
         return self.estimated_usd + self.unknown_estimated_usd + reserved
 
     def cache_hit_rate(self) -> Optional[float]:
@@ -335,84 +371,149 @@ class BudgetLedger(object):
                 return False
         return True
 
+    @property
+    def _reserved_bounds(self) -> List[Tuple[int, int]]:
+        """The bounds of every outstanding reservation (reporting/compat).
+
+        The reservations themselves live in :attr:`_reservations`, keyed by
+        handle; this view preserves the older ``(prompt, completion)`` tuple
+        form for callers and tests that only need the bounds.
+        """
+        return [(r["prompt_bound"], r["completion_bound"])
+                for r in self._reservations.values()]
+
+    def _new_handle(self, provider: str, prompt_bound: int,
+                    completion_bound: int, call_class: str,
+                    tariff: Optional[Tariff]) -> str:
+        """Register one reservation and return its provider-scoped handle."""
+        self._reservation_seq += 1
+        handle = "%s-%d" % (provider, self._reservation_seq)
+        self._reservations[handle] = {
+            "provider": provider,
+            "prompt_bound": int(prompt_bound),
+            "completion_bound": int(completion_bound),
+            "call_class": call_class,
+            "tariff_snapshot": tariff,
+        }
+        return handle
+
+    def _strategy_handle(self) -> Optional[str]:
+        """The oldest outstanding strategy/postmortem handle, if any."""
+        for handle, rec in self._reservations.items():
+            if rec["call_class"] in ("strategy", "postmortem"):
+                return handle
+        return None
+
     def reserve_strategy(self, postmortem: bool = False,
                          prompt_tokens: int = 0,
-                         completion_tokens: int = 0) -> bool:
+                         completion_tokens: int = 0,
+                         provider: str = "deepseek") -> Optional[str]:
         """Charge one strategy call and its conservative bound up front.
 
-        Returns False -- charging nothing -- when the cap is spent or the
-        bound cannot be covered by the remainder, so a request that could not
-        conservatively fit is refused *before* any worker is spawned.
+        Returns a provider-scoped *handle* (or None on refusal -- charging
+        nothing -- when the cap is spent or the bound cannot be covered by the
+        remainder, so a request that could not conservatively fit is refused
+        *before* any worker is spawned).  The handle names the call for
+        :meth:`commit_strategy`/:meth:`release_strategy` and carries the
+        tariff snapshot it was admitted under.
         """
         if not self.strategy_available(
                 postmortem=postmortem, prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens):
-            return False
+            return None
         self.strategy_reserved += 1
-        self._reserved_bounds.append((int(prompt_tokens),
-                                      int(completion_tokens)))
-        return True
+        return self._new_handle(
+            provider, int(prompt_tokens), int(completion_tokens),
+            "postmortem" if postmortem else "strategy", self.tariff)
 
-    def commit_strategy(self, usage: Optional[Dict[str, Any]] = None,
+    def commit_strategy(self, handle: Any = None,
+                        usage: Optional[Dict[str, Any]] = None,
                         postmortem: bool = False) -> None:
-        """Settle a reserved call.
+        """Settle the reserved call named by *handle*.
 
-        The reservation was made before dispatch, so this always consumes it
-        -- including a timeout that returned no usage.  Reported tokens are
-        added and, when a tariff is configured, priced.  A call whose reported
-        usage does not establish *both* prompt and completion totals retains
-        the conservative bound as *unknown exposure* for whichever component
-        is missing: the spend was real even though no figure came back for it,
-        so it is never silently dropped merely because some other field
-        arrived.
+        The handle's own tariff snapshot prices the reported usage, so a call
+        admitted under one tariff can never be settled under another.  The
+        reservation was made before dispatch, so this always consumes it --
+        including a timeout that returned no usage, which keeps its bound as
+        *unknown exposure*.  A call whose reported usage does not establish
+        *both* prompt and completion totals retains the bound for whichever
+        component is missing: the spend was real even though no figure came
+        back for it, so it is never silently dropped.
+
+        For backwards compatibility a lone positional argument that is not a
+        handle string is treated as the pre-handle ``usage`` form; it then
+        settles the oldest outstanding strategy/postmortem reservation (or,
+        with none outstanding, only records the usage).
         """
-        if self.strategy_reserved > 0:
-            self.strategy_reserved -= 1
-        bound = self._reserved_bounds.pop(0) if self._reserved_bounds \
-            else (0, 0)
-        self.strategy_dispatched += 1
-        if postmortem:
-            self.postmortem_dispatched += 1
-        prompt_known, completion_known = self._settle_reported(usage)
+        if usage is None and not isinstance(handle, str):
+            usage, handle = handle, None
+        provider = "deepseek"
+        bound = (0, 0)
+        tariff = None
+        call_class = ""
+        if handle is None:
+            handle = self._strategy_handle()
+        if handle is not None and handle in self._reservations:
+            rec = self._reservations.pop(handle)
+            provider = rec["provider"]
+            bound = (rec["prompt_bound"], rec["completion_bound"])
+            tariff = rec["tariff_snapshot"]
+            call_class = rec["call_class"]
+            if call_class in ("strategy", "postmortem"):
+                self.strategy_reserved = max(0, self.strategy_reserved - 1)
+                self.strategy_dispatched += 1
+                if postmortem or call_class == "postmortem":
+                    self.postmortem_dispatched += 1
+        prompt_known, completion_known = self._settle_reported(
+            usage, tariff, provider)
         if not (prompt_known and completion_known):
             # carry the bound for the missing component(s) only; a component
             # that *was* reported is already billed above
             self._note_unknown_exposure(
                 (0 if prompt_known else bound[0],
-                 0 if completion_known else bound[1]))
+                 0 if completion_known else bound[1]), tariff)
 
-    def release_strategy(self) -> None:
-        """Drop a reservation that never reached the wire.
+    def release_strategy(self, handle: Optional[str] = None) -> None:
+        """Drop the reservation named by *handle* that never reached the wire.
 
         Only for a call that was *reserved but never dispatched* (for
         example a reserve that succeeded and then failed local validation
         before any process was spawned).  A dispatched-but-failed call must
-        settle with :meth:`commit_strategy` instead.
+        settle with :meth:`commit_strategy` instead.  With no handle the
+        oldest outstanding strategy/postmortem reservation is dropped
+        (compatibility with the pre-handle callers).
         """
-        if self.strategy_reserved > 0:
-            self.strategy_reserved -= 1
-        if self._reserved_bounds:
-            self._reserved_bounds.pop(0)
+        if handle is None:
+            handle = self._strategy_handle()
+        if handle is None or handle not in self._reservations:
+            return
+        rec = self._reservations.pop(handle)
+        if rec["call_class"] in ("strategy", "postmortem"):
+            self.strategy_reserved = max(0, self.strategy_reserved - 1)
 
-    def _note_unknown_exposure(self, bound) -> None:
+    def _note_unknown_exposure(self, bound,
+                               tariff: Optional[Tariff] = None) -> None:
         prompt, completion = bound
         self.unknown_prompt_tokens += int(prompt)
         self.unknown_completion_tokens += int(completion)
-        self.unknown_estimated_usd += self._price(prompt, completion)
+        self.unknown_estimated_usd += self._price(prompt, completion, tariff)
         self.unknown_exposure_calls += 1
 
     def add_usage(self, usage: Optional[Dict[str, Any]]) -> None:
-        """Record reported usage (wraps :meth:`_settle_reported`).
+        """Record reported usage (a wrapper over :meth:`commit_strategy`).
 
         Kept as the public entry point for callers that only have usage to
-        report (a reflex answer); settling a *reserved* strategy call goes
-        through :meth:`commit_strategy`, which also carries any missing
-        component's bound as unknown exposure.
+        report (a reflex answer).  A bare usage record consumes no
+        reservation; a caller settling a named paid call passes a handle to
+        :meth:`commit_strategy`, which carries a missing component's bound as
+        unknown exposure.
         """
-        self._settle_reported(usage)
+        self.commit_strategy(None, usage)
 
-    def _settle_reported(self, usage: Optional[Dict[str, Any]]) \
-            -> Tuple[bool, bool]:
+    def _settle_reported(self, usage: Optional[Dict[str, Any]],
+                         tariff: Optional[Tariff] = None,
+                         provider: str = "deepseek"
+                         ) -> Tuple[bool, bool]:
         """Add reported usage; return ``(prompt_known, completion_known)``.
 
         Every cache field is re-normalized here as well as at the provider, so
@@ -421,12 +522,15 @@ class BudgetLedger(object):
         reported *zero* is genuinely known and distinct from a missing field;
         only a complete consistent partition (``H + M == P``) earns the cache
         discount, and everything else is priced at the full input price and
-        counted as unclassified.  A component the configured tariff does not
-        price is counted as unknown-priced rather than billed as a fabricated
-        zero, so a partial tariff cannot present a complete-looking total.
+        counted as unclassified.  A component the *tariff* does not price is
+        counted as unknown-priced, not billed as a fabricated zero, so a
+        partial tariff cannot present a complete-looking total.  *tariff* is
+        the pricing in force for the settling reservation (defaulting to the
+        ledger's), and *provider* attributes the reported totals.
         """
         if not usage:
             return (False, False)
+        rate = self.tariff if tariff is None else tariff
         prompt = _opt_int(usage.get("prompt_tokens"))
         completion = _opt_int(usage.get("completion_tokens"))
         hit = _opt_int(usage.get("prompt_cache_hit_tokens"))
@@ -452,9 +556,17 @@ class BudgetLedger(object):
             self.reasoning_tokens += reasoning
         if prompt is not None or completion is not None \
                 or usage.get("reported"):
-            self.estimated_usd += self._reported_price(
-                classified_hit, prompt or 0, completion or 0)
-            if self._has_unpriced_component(prompt, completion):
+            price = self._reported_price(classified_hit, prompt or 0,
+                                         completion or 0, rate)
+            self.estimated_usd += price
+            stat = self._provider_usage.setdefault(
+                provider, {"calls": 0, "prompt_tokens": 0,
+                           "completion_tokens": 0, "estimated_usd": 0.0})
+            stat["calls"] += 1
+            stat["prompt_tokens"] += prompt or 0
+            stat["completion_tokens"] += completion or 0
+            stat["estimated_usd"] += price
+            if self._has_unpriced_component(prompt, completion, rate):
                 # A reported component with no configured price is never
                 # priced as a fabricated zero: the call is counted as
                 # unknown-priced so a partial tariff never yields a
@@ -463,7 +575,8 @@ class BudgetLedger(object):
         return (prompt is not None, completion is not None)
 
     def _has_unpriced_component(self, prompt: Optional[int],
-                                completion: Optional[int]) -> bool:
+                                completion: Optional[int],
+                                tariff: Optional[Tariff] = None) -> bool:
         """True when a *reported* component has no configured price.
 
         With no tariff at all every reported call is unknown-priced.  With a
@@ -471,17 +584,19 @@ class BudgetLedger(object):
         an absent *usage* component (``None``) is not a pricing gap here --
         the reservation path already carries its bound as unknown exposure.
         """
-        if self.tariff is None:
+        rate = self.tariff if tariff is None else tariff
+        if rate is None:
             return True
-        if prompt is not None and self.tariff.prompt_per_mtok is None:
+        if prompt is not None and rate.prompt_per_mtok is None:
             return True
         if completion is not None \
-                and self.tariff.completion_per_mtok is None:
+                and rate.completion_per_mtok is None:
             return True
         return False
 
     def _reported_price(self, hit_tokens: int, prompt_tokens: int,
-                        completion_tokens: int) -> float:
+                        completion_tokens: int,
+                        tariff: Optional[Tariff] = None) -> float:
         """Cache-aware USD cost of one *reported* call.
 
         Cached prompt tokens are billed at the effective cache-hit price, the
@@ -494,7 +609,8 @@ class BudgetLedger(object):
         function from :meth:`_price`, which stays the conservative
         full-price figure used for reservations and unknown exposure.
         """
-        if self.tariff is None:
+        rate = self.tariff if tariff is None else tariff
+        if rate is None:
             return 0.0
         total = 0.0
         # Known cache-hit tokens are priced whenever a hit rate is
@@ -502,16 +618,16 @@ class BudgetLedger(object):
         # documented fallback -- even when the rest of the prompt has no
         # configured rate (a cache-only tariff prices its one known
         # component and leaves misses unknown-priced).
-        hit_rate = self.tariff.effective_cache_hit_per_mtok()
+        hit_rate = rate.effective_cache_hit_per_mtok()
         if hit_rate is not None:
             total += hit_tokens / 1000000.0 * hit_rate
-        prompt_rate = self.tariff.prompt_per_mtok
+        prompt_rate = rate.prompt_per_mtok
         if prompt_rate is not None:
             missed = max(0, prompt_tokens - hit_tokens)
             total += missed / 1000000.0 * prompt_rate
-        if self.tariff.completion_per_mtok is not None:
+        if rate.completion_per_mtok is not None:
             total += completion_tokens / 1000000.0 \
-                * self.tariff.completion_per_mtok
+                * rate.completion_per_mtok
         return total
 
     # -- reflex paid bound (Jev) ----------------------------------------
@@ -520,11 +636,27 @@ class BudgetLedger(object):
             return False
         return self.reflex_paid_dispatched < self.reflex_cap
 
-    def reserve_reflex_paid(self) -> bool:
+    def reserve_reflex_paid(self, prompt_bound: int = 0,
+                            completion_bound: int = 0) -> Optional[str]:
+        """Reserve one paid reflex (Jev) call; return its handle, or None.
+
+        Admission is against the *aggregate* headroom: the strategy and any
+        outstanding reflex reservations share one ledger, so a Jev call
+        cannot slip past a cap a strategy call already committed to.  A USD
+        cap cannot bound a Jev call -- its service-side token accounting is
+        not yet established -- so Jev dispatch is refused outright under a
+        USD cap, and a token-capped episode is likewise fail-closed until
+        that bound exists.
+        The returned handle carries the built-in official Jev tariff snapshot.
+        """
         if not self.reflex_paid_available():
-            return False
+            return None
+        if self.usd_cap is not None or self.token_cap:
+            return None
         self.reflex_paid_dispatched += 1
-        return True
+        return self._new_handle("jev", int(prompt_bound),
+                                int(completion_bound), "reflex",
+                                self.jev_tariff)
 
     # -- reporting -------------------------------------------------------
     def as_dict(self) -> Dict[str, Any]:
@@ -571,6 +703,15 @@ class BudgetLedger(object):
                 "tariff": self.tariff.to_dict() if self.tariff else None,
                 "usd_cap": self.usd_cap,
                 "token_cap": self.token_cap,
+            },
+            # Per-provider reported-usage totals (the flat ``usage`` block
+            # above stays the aggregate authority; these never replace it).
+            "providers": {
+                name: {"calls": stat["calls"],
+                       "prompt_tokens": stat["prompt_tokens"],
+                       "completion_tokens": stat["completion_tokens"],
+                       "estimated_usd": round(stat["estimated_usd"], 6)}
+                for name, stat in sorted(self._provider_usage.items())
             },
         }
         return out
