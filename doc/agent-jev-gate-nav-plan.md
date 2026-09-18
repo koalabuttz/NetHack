@@ -1,6 +1,6 @@
-# Jev Acceptance, Applied-Decision Cap, Navigation Recovery, and Room Awareness Plan (Revision 2 — pending plan review)
+# Jev Acceptance, Applied-Decision Cap, Navigation Recovery, and Room Awareness Plan (Revision 3 — pending plan review)
 
-**Status:** Revision 2 after plan review round 1 (VERDICT: REVISE — 3 High, 3 Medium, 2 Low, all addressed). The room-awareness enrichment section (`## 5`) designed by `architect:architect-room-awareness` is merged.
+**Status:** Revision 3 after plan review round 2 (VERDICT: REVISE — round-1 ledger: 5 FIXED, 3 PARTIAL; round-2 new findings: 2 High — 40-point boundary inversion and bars classification overpromise — and 4 Medium, all addressed here; the room-awareness section (§5) designed by `architect:architect-room-awareness` is merged and integrated into Phase 4).
 
 Design produced by `architect:architect-gate-osc`. Post-campaign follow-up to `doc/agent-jev-presentation-plan.md`; supersedes its D3 scope restrictions per operator approval.
 
@@ -8,7 +8,7 @@ Design produced by `architect:architect-gate-osc`. Post-campaign follow-up to `d
 
 Use the selected option's validated probability—not the service's separate confidence scalar—to accept Jev choices when `p_selected > 1.5 / N`. Count only Jev decisions that survive controller validation/overrides and are completely sent against `reflex_call_cap`. Add a bounded, observation-owned immediate-backtrack preference and explicitly route detected short cycles into safe recovery.
 
-These are three independently testable changes. Do not redesign providers, navigation planning, recording, or DeepSeek history to implement them.
+These are four independently testable changes (probability acceptance, applied cap, navigation recovery, room-awareness enrichment — see Phases 1–4). Phases 1–3 must not redesign providers, navigation planning, recording, or DeepSeek history, and must preserve Jev presentation bytes; Phase 4 intentionally amends the Jev state payload and criteria under the narrow presentation boundary above.
 
 ## Goal
 
@@ -118,7 +118,7 @@ An applied Jev decision is one accepted Jev proposal that passes local protocol 
 - `reflex_paid_available()` retains cap<=0 meaning disabled, but compares applied count rather than reservation count.
 - Keep `reflex_paid_dispatched` and its existing diagnostic semantics for compatibility; do not repurpose or decrement it. It currently measures reservations, notwithstanding its name. Clarify this limitation in documentation.
 - Do not use `reflex_successful` for cap accounting. It is an aggregate provider-success/pre-send counter whose semantics differ by tier: the scripted path increments it on success at `tools/agent/controller.py:2717`, the Jev path increments it only after arbitration acceptance at `:2813`, and the Jev fallback does not increment it. It remains unsuitable for cap accounting because it is pre-send and tier-ambiguous.
-- Add `BudgetLedger.note_reflex_applied(token)` and invoke it only on the complete-send path in `_answer_now`, after `_emit` succeeds. Pass a controller-owned applied-decision token captured at arbitration acceptance and carried through validation/override; comparing action dictionaries alone is insufficient because a fallback may coincidentally equal the original action. `note_reflex_applied` must be idempotent per token.
+- Add `BudgetLedger.note_reflex_applied(token)` and invoke it only on the complete-send path in `_answer_now`, after `_emit` succeeds. Pass a controller-owned applied-decision token captured at arbitration acceptance and carried through validation/override; comparing action dictionaries alone is insufficient because a fallback may coincidentally equal the original action. `note_reflex_applied` must be idempotent per token. **Idempotence storage contract:** the token set is private, episode-owned `BudgetLedger` state — it resets with the episode, stores no provider payload or secret material, is never emitted in artifacts or sidecars, and is naturally bounded by at most `reflex_call_cap` unique entries (repairs reuse an existing token). Idempotence and episode-reset assertions are folded into the cap/repair tests.
 - No count for unsupported needs, singleton/refused builds, parse failure, abstention, stale/unsafe/rejected choices, low concentration, timeout/provider failure, local validation replacement, forced override, or failed/partial send.
 - Count once per newly applied decision. Delivery repair must not charge twice. Retain the controller-owned applied-decision token across `invalid(incomplete)` delivery repair, keyed to the original accepted consultation (not action-dictionary equality, not the sent ordinal). On `invalid(incomplete)`, reissue the page obligation and resend the frozen validated action `without consulting Jev again`. Because `note_reflex_applied(token)` is idempotent, a resend of the same token yields one applied increment with two sent ordinals. If the table/need identity becomes stale before the resend, fail closed to the scripted action rather than treating the resend as the same decision.
 - Retain usage settlement under the original paid reservation even on rejection, timeout, or later failed send. Applied-count changes must not release legitimate paid exposure.
@@ -162,13 +162,13 @@ For each reverse first-step target whose destination is the previous distinct ce
 1. Compute the final candidate score **including the directive contribution** (the +30 directive bonus participates in the score).
 2. Group raw entries by `(candidate family, canonical first-step action signature)` and retain the same deterministic best representative that dedup would retain.
 3. Remove rejected action signatures from consideration; otherwise a rejected alternative can suppress the only usable retreat.
-4. Within each exact family, compare each reversing representative against the best non-reversing representative.
-5. Keep the reversal when no non-reversing alternative exists, or when `reverse_score − best_alt_score > 40` (strict; equality does **not** qualify, so an exact 40-point margin keeps the reversal). Otherwise suppress that reversing representative for this preparation.
+4. Within each `family`, compare each reversing representative against the best non-reversing representative **across action signatures in that family** (an exact `(family, action signature)` group can never contain a non-reversing alternative, since the signature encodes the movement key).
+5. Keep the reversal when no non-reversing alternative exists, or when `reverse_score − best_alt_score > 40` (strict: a margin of exactly 40 does **not** qualify and the reversal is **suppressed**; only margins strictly greater than 40 keep it). Otherwise suppress that reversing representative for this preparation.
 6. Then construct candidates and run normal global dedup/order; preserve existing ordering among remaining candidates.
 
-Different-family priorities, directives, stairs, and door approaches continue to use existing scoring. An unvisited or frontier alternative must not displace a uniquely required higher-priority stair/door route just to avoid reversal. Directives are not cross-family suppression: the 40-point comparison is made within the exact `(family, action signature)` group.
+Different-family priorities, directives, stairs, and door approaches continue to use existing scoring. An unvisited or frontier alternative must not displace a uniquely required higher-priority stair/door route just to avoid reversal. Directives are not cross-family suppression: the 40-point comparison is made within a `family`, across its action-signature representatives.
 
-This bounded preference is deliberately stronger than an exact-score tie-break but weaker than a universal ban. It addresses comparable exploratory alternatives without turning every backtrack into a detour. Include an explanatory additive reason when selecting an anti-backtrack alternative. Added fixtures cover the 40/41 score boundary and the directive-bonus interaction.
+This bounded preference is deliberately stronger than an exact-score tie-break but weaker than a universal ban. It addresses comparable exploratory alternatives without turning every backtrack into a detour. Include an explanatory additive reason when selecting an anti-backtrack alternative. Added fixtures cover the 40/41 score boundary and the directive-bonus interaction: a 40-point margin **suppresses** the reversal, a 41-point margin **keeps** it, and the +30 directive contribution is included in the compared score. Mutation demonstration: flipping `>` to `>=` must fail the equality case.
 
 ### Active cycle recovery
 
@@ -205,7 +205,8 @@ This is presentation enrichment, not room segmentation, path planning, or a chan
 - `tools/agent/presentation.py:319–345,459–481` already separates persistent terrain from current occupancy and computes the actual adjacent destination. Enrichment belongs at that seam, not in policy reason parsing.
 - `tools/agent/presentation.py:803–812` delegates map construction to `state.bounded_map`; `827–861` defines the state object and purity/null-vs-empty contract.
 - `tools/agent/state.py:259–284,287–343` defines the canonical terrain vocabulary and bounded map helper. It currently overlays only creatures, uses remembered terrain/stairs for the underlay, and computes one-cell-margin protocol-clamped bounds.
-- `tools/agent/protocol.py:88–100,118–139` establishes complete `base:null` snapshots. Map triples `[x,y,palette_id]` resolve to display tuples `(glyph,color,style,other)`; an absent cell is blank. These fields are not per-cell object descriptions. Neither palette entries alone nor `other` provide an established item-name binding.
+- `tools/agent/protocol.py:88–100,118–139` establishes complete `base:null` snapshots. Map triples `[x,y,palette_id]` resolve to display tuples `(glyph, foreground color, style, frame color)`; an absent cell is blank. These fields are not per-cell object descriptions; neither style nor frame nor palette entries provide an established item-name binding.
+- **Source availability predicate (exact):** the current snapshot is an available contents/openings source iff `snapshot is not None` and `snapshot.map` is a dict — the empty dict `{}` is *known empty*, not unavailable; a missing or non-dict `map` is *unavailable*. Room helpers must implement this predicate explicitly and must not inherit the existing `getattr(..., "map", None) or {}` collapse, which silently merges absent/malformed with known-empty. Fixture vectors must cover malformed-map versus empty-map versus absent-snapshot.
 - `tools/agent/instances.py:22–42,89–149` owns the terrain classes and color-aware classification. Reuse it; do not create another wall/door/water classifier in presentation.
 - `instances.py:49–64,103–106` treats `]` as a creature-class glyph. Armor’s pinned symbol is `[`, not `]` (`include/defsym.h:468–480`).
 - `include/defsym.h:468–484` also shows important collisions: `*` is gem/rock appearance, `+` is a spellbook symbol as well as a door/wall display, `_` can be a chain, and `.` can be venom. Glyphs alone cannot establish all object identities. `instances.py:116–123,142–145` nevertheless intentionally gives these glyphs terrain interpretations under its existing classification contract.
@@ -245,6 +246,9 @@ Apply the following precedence to each valid nonblank current snapshot cell:
 | `/` | `wand appearance` |
 | `$` | `coin appearance` |
 | `*` | `gem or rock appearance` |
+| `0` | `iron ball appearance` |
+
+Iron balls are included because no earlier classification consumes `0` and the pinned profile provides the exact class (`include/defsym.h:482`); the precedence already distinguishes a current raw iron-ball appearance (foreground overlay → `&`) from a remembered boulder (`T_BOULDER` terrain underlay → `0`).
 
 For creatures, `category` is `creature`; for known feature terrain, use the existing terrain class string; for unclassified content, `category` is `unclassified display`.
 
@@ -324,7 +328,9 @@ Include one record per non-hero position for:
 
 - creature or item appearance;
 - unclassified nonblank display;
-- current classified feature in `{tree,water,lava,trap,bars,boulder,fountain,altar}`.
+- current classified feature in `{tree,water,lava,trap,boulder,fountain,altar}`.
+
+**Bars limitation (exact):** `instances.classify_cell` never produces `T_BARS` from a current display cell (`#` resolves to tree/corridor/unknown by color; the protocol color vocabulary has no metal slot, and native bars use `#` with `HI_METAL`). Screen-derived `bars` records are therefore **not** promised and this is a documented, deliberate omission — a live iron-bar square may classify as corridor, tree, or unclassified. Remembered `T_BARS` from an already-classified memory source still renders via the terrain glyph table and may appear in `openings` with `source="memory"`. Do not extend `classify_cell` in this change: altering it would change navigation walkability and `TerrainMemory.merge` semantics; a pinned display-only bars rule is a separate, explicitly scoped task.
 
 Do not include ordinary floor, wall, corridor, doors, or stairs here; doors/stairs/corridor landmarks belong to `openings`.
 
@@ -399,7 +405,7 @@ Cap criterion enrichment to one fixed-vocabulary clause per movement option. Thi
 
 - **Relative acceptance:** no changes to N, k, probability provenance, safety gates, or comparison rule. Do not promise a concentration increase; measure it.
 - **Applied cap:** no new consultations or accounting paths. Missing room evidence degrades in the same request; it does not trigger retries or consume additional allowance.
-- **Anti-oscillation:** use the actual adjacent destination encoded by the retained action, not a farther target, previous cell, or route-purpose text. Recovery movement gets the same destination appearance clause only when the existing immediate-action template genuinely describes movement. Nonmovement recovery/search must not acquire destination claims. New policy reasons must still pass the existing recognized-purpose mapping; never expose raw diagnostic reasons as instructions.
+- **Anti-oscillation:** use the actual adjacent destination encoded by the retained action, not a farther target, previous cell, or route-purpose text. **Wiring (exact):** implement one pure helper `destination_appearance_clause(candidate, need_kind, context)` in `presentation.py`, consumed by **both** `_walk_text` and the movement branches of `_command_text` (escape, random-move, recovery-step, unblock) — otherwise a change only at the existing `_walk_text` seam would enrich ordinary navigation but silently miss cycle-recovery and emergency moves. The helper returns an empty string for non-command needs, for nonmovement actions (search/wait/inventory/etc.), and when no current appearance exists; direction/key answers remain neutral. Nonmovement recovery/search must not acquire destination claims. New policy reasons must still pass the existing recognized-purpose mapping; never expose raw diagnostic reasons as instructions. Named tests cover a cycle-recovery movement, an emergency escape movement, and search/wait/nonmovement recovery asserting exactly which of them carries the clause.
 - **Wire freeze:** criteria remain a JSON object in retained order; semantic keys, key→index bindings, option count, and canonical actions remain unchanged. This amends the nested state/criterion text contract, not §2’s request-envelope contract.
 - **DeepSeek:** no changes to its renderer/history/cache or `state.render_map` default. Only the Jev bounded-map presentation path is enriched.
 - Update the existing presentation-version traceability identifier according to the repository’s current mechanism; no decision-sidecar schema change is required.
@@ -529,9 +535,13 @@ Add ledger accounting and complete-send charging; audit validation substitution,
 
 Add confirmed movement history/accessors and bounded anti-backtrack filtering. Connect cycles to safe recovery. Test dead ends, corner/door legality, emergency and forced-search ownership, repeated preparation purity, and instance reset. Merge independently once AC.8–11 pass.
 
-### Phase 4 — Review, replay, and controlled live validation
+### Phase 4 — Room-awareness enrichment
 
-Run the full existing auto-agent suite plus added tests. Run offline replay for scripted behavior/artifact compatibility; do not claim offline replay exercises live Jev. Then conduct an operator-approved live comparison, recording per episode and across the campaign: mode/factor, `reflex.applied` and `paid_dispatched` (consulted/reserved) counts, accepted/rejected/fallback counts, N/p acceptance distribution, costs, alternation metrics, coverage, and safety outcomes. Reject success claims based solely on Jev acceptance rate or stationary loop metrics.
+Implement §5: the pure display-appearance helper in `instances.py`; `bounded_map` foreground/current-feature rendering and evidence bounds in `state.py`; the new fixed legend and `room` schema helpers in `presentation.py`; destination-appearance enrichment via the shared pure helper (see §5.7 wiring below); presentation-version bump; regenerated exact snapshots and golden fixtures. Gate: RA.1–RA.10 and their named tests pass; DeepSeek regression snapshots unchanged. Scope note: "Preserve Jev presentation bytes" applies to Phases 1–3 commits only; Phase 4 intentionally amends the Jev state payload and criteria per the narrow presentation boundary.
+
+### Phase 5 — Review, replay, and controlled live validation
+
+Run the full existing auto-agent suite plus added tests. Run offline replay for scripted behavior/artifact compatibility; do not claim offline replay exercises live Jev. Then conduct an operator-approved live comparison, recording per episode and across the campaign: mode/factor, `reflex.applied` and `paid_dispatched` (consulted/reserved) counts, accepted/rejected/fallback counts, N/p acceptance distribution, payload sizes, costs, alternation metrics, coverage, and safety outcomes. Reject success claims based solely on Jev acceptance rate or stationary loop metrics.
 
 ## 8. Acceptance criteria
 
@@ -585,7 +595,7 @@ Add:
 - `test_jev_applied_send_later_native_invalid_is_not_refunded`
 - `test_jev_rejected_usage_settled_once_and_sidecar_retained`
 - `test_jev_cap_zero_and_monetary_admission_remain_fail_closed`
-- `test_old_budget_without_applied_and_new_budget_with_applied_load` — ledger load accepts pre-`reflex_applied` artifacts (field defaults to 0) and preserves an explicitly stored applied count.
+- `test_episode_and_campaign_summary_consumer_compatibility_with_reflex_applied` — consumer-level compatibility (no BudgetLedger deserializer is added): feed `_episode_summary`, `campaign_summary`, and any replay/report reader both an old artifact dictionary lacking `reflex.applied` (defaults to 0) and a new dictionary containing it (count preserved).
 
 ### Navigation — `test/agent/test_auto_navigation.py`
 
@@ -594,7 +604,7 @@ Add:
 - `test_navigation_ignores_rejected_nonbacktracking_alternative`
 - `test_navigation_preserves_only_dead_end_exit`
 - `test_navigation_preserves_uniquely_best_reverse_stair_and_door_routes`
-- `test_antibacktrack_score_exception_at_40_41_and_directive_bonus` — a 40-point margin keeps the reversal, a 41-point margin suppresses it, and the +30 directive bonus participates in the compared scores.
+- `test_antibacktrack_score_exception_at_40_41_and_directive_bonus` — a 40-point margin **suppresses** the reversal, a 41-point margin **keeps** it, and the +30 directive contribution participates in the compared score; the mutation check flips `>` to `>=` and must fail the equality case, and the +30 directive bonus participates in the compared scores.
 - `test_navigation_preparation_does_not_advance_movement_history`
 - `test_cycle_recovery_obeys_door_diagonal_and_corner_legality`
 - `test_emergency_disengagement_may_reverse`
@@ -646,12 +656,12 @@ Each AC and RA below must be covered by the named tests (this mirrors the presen
 | AC.4 | `test_jev_confidence_config_defaults_validation_and_absolute_rollback`; `test_live_and_evaluate_cli_propagate_jev_confidence_policy`; `TestJevConfidence::test_spread_winner_passes_relative_and_fails_legacy_absolute`; `TestJevConfidence::test_confidence_gate_threshold_unchanged_for_spread_distribution` (absolute-mode legacy rollback) |
 | AC.5 | `test_jev_cap_stops_after_exactly_c_complete_applied_sends`; `test_jev_validation_fallback_and_forced_override_do_not_charge_applied`; `test_equal_action_forced_override_uses_provenance_not_dict_equality` |
 | AC.6 | `test_jev_rejections_do_not_exhaust_applied_cap`; `test_jev_skips_abstentions_and_timeouts_leave_applied_allowance`; `test_jev_rejected_usage_settled_once_and_sidecar_retained`; `test_jev_delivery_repair_does_not_double_charge_decision`; `test_jev_failed_or_partial_send_does_not_charge_applied`; `test_jev_applied_send_later_native_invalid_is_not_refunded` |
-| AC.7 | `test_jev_rejected_usage_settled_once_and_sidecar_retained`; `test_old_budget_without_applied_and_new_budget_with_applied_load`; `test_jev_cap_zero_and_monetary_admission_remain_fail_closed` |
+| AC.7 | `test_jev_rejected_usage_settled_once_and_sidecar_retained`; `test_episode_and_campaign_summary_consumer_compatibility_with_reflex_applied`; `test_additive_jev_reasons_preserve_decision_sidecar_loading`; `test_jev_cap_zero_and_monetary_admission_remain_fail_closed` |
 | AC.8 | `test_navigation_prefers_comparable_nonbacktracking_frontier`; `test_navigation_backtrack_filter_applies_before_action_deduplication`; `test_navigation_ignores_rejected_nonbacktracking_alternative`; `test_antibacktrack_score_exception_at_40_41_and_directive_bonus` |
 | AC.9 | `test_ab_cycle_enters_recovery_with_zero_stationary_no_progress`; `test_cycle_recovery_chooses_third_exit_by_four_alternating_moves`; `test_period_three_trailing_movement_preserved`; `CycleDetectorTest::test_abc_cycle` |
 | AC.10 | `test_navigation_preserves_only_dead_end_exit`; `test_navigation_preserves_uniquely_best_reverse_stair_and_door_routes`; `test_cycle_recovery_obeys_door_diagonal_and_corner_legality`; `test_emergency_disengagement_may_reverse`; `test_cycle_without_exit_respects_search_budget_and_nomination`; `test_auto_forced_search.py::test_cycle_recovery_does_not_steal_forced_suffix_ownership` |
 | AC.11 | `test_navigation_preparation_does_not_advance_movement_history`; `test_duplicate_observations_do_not_dilute_movement_cycle`; `test_unknown_or_relocated_hero_invalidates_backtrack_evidence`; `test_instance_reset_clears_previous_cell_and_cycle`; `test_failed_and_partial_act_write_do_not_fold_motion_history` |
-| AC.12 | `test_auto_integration.py::test_history_grows_across_successful_calls`; `test_auto_integration.py::test_history_reflects_only_successful_settlement`; `test_auto_integration.py::test_cancellation_adds_no_history`; `test_auto_integration.py::test_history_inclusive_bound_refuses_while_the_tail_alone_fits`; `test_auto_integration.py::test_a_cache_price_never_lowers_a_reservation`; `test_auto_metrics.py::test_alternating_motion_is_distinct_from_stationary_loop_spans`; `test_auto_metrics.py::test_validation_report_counts_confirmed_alternating_moves`; `test_auto_integration.py::test_deepseek_rendering_snapshot_unchanged` |
+| AC.12 | `test_auto_providers.py::test_history_grows_across_successful_calls`; `test_auto_providers.py::test_history_reflects_only_successful_settlement`; `test_auto_providers.py::test_cancellation_adds_no_history`; `test_auto_providers.py::test_history_inclusive_bound_refuses_while_the_tail_alone_fits`; `test_auto_providers.py::test_a_cache_price_never_lowers_a_reservation`; `test_auto_metrics.py::test_alternating_motion_is_distinct_from_stationary_loop_spans`; `test_auto_metrics.py::test_validation_report_counts_confirmed_alternating_moves`; `test_auto_integration.py::test_deepseek_rendering_snapshot_unchanged` |
 | RA.1 | `TestJevRoomAwareness::test_stale_item_and_creature_absent_from_snapshot_not_overlaid`; `TestJevRoomAwareness::test_current_items_overlay_remembered_floor_and_stairs` |
 | RA.2 | `TestJevRoomAwareness::test_fixed_legend_covers_every_emittable_glyph`; `test_auto_instances.py::test_display_appearance_gem_demon_scroll_mimic_armor_collisions` |
 | RA.3 | `TestJevRoomAwareness::test_current_features_and_unknown_display_expand_map_bounds`; `TestJevRoomAwareness::test_confirmed_hero_wins_and_nonhero_at_is_creature` |
