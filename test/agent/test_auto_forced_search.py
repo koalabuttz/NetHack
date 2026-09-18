@@ -448,8 +448,12 @@ class LiveWiring(WireHarness):
         return result, _act_keys(actions)
 
     def test_prefix_then_bound_suffix_succeeds_once(self):
+        # The prefix is expected to consume no game time (plan 5.4): the
+        # post-prefix observation must carry the *same* displayed time as the
+        # transaction origin, so the following command need is at t=100 and
+        # the suffix's outcome frame advances to t=101.
         recs = [_live_obs(1, 1, t=100), _live_obs(2, 2, t=100),
-                _live_obs(3, 3, t=101), _live_obs(4, None, t=102)]
+                _live_obs(3, 3, t=100), _live_obs(4, None, t=101)]
         result, keys = self._run(recs)
         self.assertIn("m", keys)
         self.assertIn("s", keys)
@@ -503,25 +507,27 @@ class LiveWiring(WireHarness):
         # the cancellation is the native double-m (two m keys, no time)
         self.assertEqual(keys.count("m"), 2)
 
-    def test_intervening_prompt_defers_then_binds(self):
-        # an intervening prompt is answered normally (the prefix flag persists
-        # to the *next command*), and the suffix still binds to that command
+    def test_intervening_prompt_never_lets_a_prefixed_action_through(self):
+        # Plan 5.4: cancel on any intervening prompt.  A ``yn`` prompt cannot
+        # carry the native double-``m``, so the armed prefix cannot be safely
+        # cleared: the transport is terminated and *nothing* is sent through
+        # the prefix -- no prompt answer, no later command, no suffix.
         recs = [_live_obs(1, 1, t=100), _live_obs(2, 2, t=100),
                 _live_obs(3, 3, kind="yn", t=100),
-                _live_obs(4, 4, t=101), _live_obs(5, None, t=102)]
+                _live_obs(4, 4, t=100), _live_obs(5, None, t=100)]
         result, keys = self._run(recs)
         self.assertIn("m", keys)
-        self.assertIn("yn", keys)
-        self.assertIn("s", keys)
-        # nothing prefixed was sent at the prompt, and the suffix follows it
-        self.assertLess(keys.index("yn"), keys.index("s"))
-        self.assertEqual(result.forced_suffixes, 1)
-        self.assertEqual(result.forced_successes, 1)
+        # the prompt is never answered while the prefix is armed
+        self.assertNotIn("yn", keys)
+        self.assertNotIn("s", keys)
+        self.assertEqual(result.forced_suffixes, 0)
+        self.assertGreaterEqual(result.forced_uncleared, 1)
+        self.assertEqual(result.stop_reason, "transport-failure-write")
 
     def test_suffix_without_time_advance_fails_and_does_not_repeat(self):
         recs = [_live_obs(1, 1, t=100), _live_obs(2, 2, t=100),
-                _live_obs(3, 3, t=101), _live_obs(4, 4, t=101),
-                _live_obs(5, 5, t=101)]
+                _live_obs(3, 3, t=100), _live_obs(4, 4, t=100),
+                _live_obs(5, 5, t=100)]
         result, keys = self._run(recs)
         self.assertIn("s", keys)
         self.assertEqual(result.forced_successes, 0)

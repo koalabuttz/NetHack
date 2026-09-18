@@ -21,7 +21,8 @@ for _p in (_ROOT, _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from tools.agent import policy, protocol, recovery, state  # noqa: E402
+from tools.agent import (forced_search, policy, protocol,  # noqa: E402
+                         recovery, state)
 from tools.agent.providers import ProviderConfig, ReflexContext  # noqa: E402
 
 
@@ -194,7 +195,11 @@ class RefusalSuppression(unittest.TestCase):
 
     def test_refused_search_with_no_alternative_quits_gracefully(self):
         # no known floor and unsafe to rest (hungry): command `s` is not an
-        # infinite exhaustion fallback, so the reflex requests a bounded quit
+        # infinite exhaustion fallback, so the reflex requests a bounded quit.
+        # The proposal is observational (plan 3.1): the quit intent is
+        # committed by the controller only after the send and its reconciled
+        # observation, so the direct call asserts the action and the commit is
+        # then exercised explicitly.
         mem = mem_with({(10, 10): FLOOR}, (10, 10),
                        messages=["You already found a monster."])
         mem.no_progress = 3
@@ -202,7 +207,13 @@ class RefusalSuppression(unittest.TestCase):
         self.ref.last_eat_tick = 0     # the eat intent is already on cooldown
         res = self.ref.decide(ctx(mem, tick=0))
         self.assertEqual(res.action, {"key": protocol.KEY_HASH})
+        # a proposal alone mutates no gameplay/recovery/intent state
+        self.assertFalse(self.ref.quitting)
+        # the controller commits the frozen effect at its reconciliation
+        self.ref.commit_effect("quit", "trapped", 0, mem)
         self.assertTrue(self.ref.quitting)
+        self.assertEqual(self.ref.quit_reason,
+                         forced_search.TRAPPED_QUIT_REASON)
 
     def test_fresh_site_still_searches(self):
         # without refusal evidence the ordinary loop breaker still searches
