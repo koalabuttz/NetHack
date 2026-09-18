@@ -1336,10 +1336,14 @@ class TestJevAdapter(unittest.TestCase):
         self.assertTrue(prov.available(prov.config).enabled)
         self.assertEqual(prov.version, "jev-choice/2")
 
+    def test_release_enables_dispatch_by_default(self):
+        # Wave-B release: the shipped default now dispatches
+        self.assertTrue(providers.JevReflex.jev_dispatch_enabled)
+
     def test_dispatch_barrier_blocks_before_any_work(self):
-        # the Wave-A default: decide returns a structured, undispatched
-        # jev-not-enabled result and build_choices skips before reserve
-        prov = providers.JevReflex(self.cfg())     # barrier default False
+        # with the barrier pinned off: decide returns a structured,
+        # undispatched jev-not-enabled result and build_choices skips
+        prov = providers.JevReflex(self.cfg(), jev_dispatch_enabled=False)
         ctx = self.ctx(command_need(1))
         self.assertIsNone(prov.build_choices(ctx))
         res = prov.decide(ctx, time.monotonic() + 2.0)

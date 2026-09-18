@@ -1449,17 +1449,17 @@ class JevReflex(ReflexProvider):
     *raw* choice (index + confidence) and the controller maps and validates it
     against the retained table (6.1) -- no adapter ever invents a live action.
 
-    Wave A ships with :attr:`jev_dispatch_enabled` **False**: the adapter is
-    fully wired and fake-endpoint-tested, but production dispatch is barred
-    until the accounting, evaluator and parser gates pass.  A test may pass
-    ``jev_dispatch_enabled=True`` (keyword-only) to exercise the wire path.
+    :attr:`jev_dispatch_enabled` is the dispatch barrier: Wave A shipped it
+    **False** (no production dispatch) and Wave B released it to **True** once
+    the accounting, evaluator and parser gates passed.  A test may still pin
+    it False with the keyword-only constructor override.
     """
 
     name = "jev"
     version = JEV_ADAPTER_VERSION
-    # Wave-A dispatch barrier.  Wave B flips this default to True once every
-    # accounting/evaluator/parser gate has passed.
-    jev_dispatch_enabled = False
+    # Dispatch barrier.  Wave A shipped False; Wave B released True now that
+    # the accounting, evaluator and parser gates have passed.
+    jev_dispatch_enabled = True
 
     def __init__(self, config: Optional[ProviderConfig] = None,
                  worker_argv: Optional[List[str]] = None,
