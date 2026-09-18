@@ -121,11 +121,20 @@ def _relocate_low(fd):
     stdout can hand an owned render fd the value 1.  That descriptor must
     never be repurposed: it is relocated with ``F_DUPFD`` to >= 3 and the low
     slot is closed again, so fd 1 stays closed exactly as it was.
+
+    Transactional: if ``F_DUPFD`` fails the caller still owns ``fd`` and is
+    expected to close it (the caller's setup guard does), so nothing leaks;
+    if closing the low slot fails the fresh duplicate is closed instead of
+    handed back.
     """
     if fd >= 3:
         return fd
     new = fcntl.fcntl(fd, fcntl.F_DUPFD, 3)
-    os.close(fd)
+    try:
+        os.close(fd)
+    except OSError:
+        _close_fd(new)
+        raise
     return new
 
 
@@ -215,36 +224,58 @@ class RenderDestination(object):
 
 
 def _open_stderr_destination(clock=time.monotonic, **kw):
-    """Own a duplicate of OS fd 2; never touch its status flags."""
+    """Own a duplicate of OS fd 2; never touch its status flags.
+
+    Transactional: the duplicate is retained locally and closed on every
+    ordinary preparation failure (a failed relocation, an alias rejection, a
+    descriptor that cannot be constructed), so no setup path can orphan the
+    owned descriptor.  ``KeyboardInterrupt``/``SystemExit`` are not caught.
+    """
     try:
-        fd = os.dup(2)
+        owned = os.dup(2)
     except OSError as exc:
         raise SpectateError("stderr (fd 2) is not usable: %s" % exc)
-    # Relocate first: if a closed stdout handed this dup the value 1, move it
-    # to >= 3 and leave fd 1 closed before deciding anything else.
-    fd = _relocate_low(fd)
-    if _aliases_stdout(fd):
-        _close_fd(fd)
-        raise SpectateError(
-            "stderr (fd 2) is an alias of stdout (fd 1): spectating there "
-            "would corrupt the wire")
-    # A duplicate shares fd 2's open-file description, so its flags are never
-    # altered; it is normally blocking.
-    return RenderDestination(fd, owned=True, independent=False,
-                             tty=_isatty(fd), label="fd 2", clock=clock, **kw)
+    try:
+        # Relocate first: if a closed stdout handed this dup the value 1, move
+        # it to >= 3 and leave fd 1 closed before deciding anything else.
+        owned = _relocate_low(owned)
+        if _aliases_stdout(owned):
+            raise SpectateError(
+                "stderr (fd 2) is an alias of stdout (fd 1): spectating "
+                "there would corrupt the wire")
+        # A duplicate shares fd 2's open-file description, so its flags are
+        # never altered; it is normally blocking.
+        return RenderDestination(
+            owned, owned=True, independent=False, tty=_isatty(owned),
+            label="fd 2", clock=clock, **kw)
+    except Exception:
+        _close_fd(owned)
+        raise
 
 
 def _open_tty_destination(clock=time.monotonic, **kw):
+    """Open an independent ``/dev/tty`` sink, or fall back to fd 2.
+
+    Transactional like the stderr path: the opened descriptor is closed on
+    every ordinary failure after the open (relocation, nonblocking setup,
+    descriptor construction).  A missing controlling terminal falls back to
+    the fd 2 sink with one note.
+    """
     try:
-        fd = os.open("/dev/tty", os.O_WRONLY)
+        owned = os.open("/dev/tty", os.O_WRONLY)
     except OSError:
         fallback = _open_stderr_destination(clock=clock, **kw)
         fallback.note = ("no controlling terminal: frames fall back to fd 2")
         return fallback
-    fd = _relocate_low(fd)
-    _set_nonblock(fd)                    # own open-file description: safe
-    return RenderDestination(fd, owned=True, independent=True, tty=True,
-                             label="/dev/tty", clock=clock, **kw)
+    try:
+        owned = _relocate_low(owned)
+        _set_nonblock(owned)             # own open-file description: safe
+        return RenderDestination(
+            owned, owned=True, independent=True, tty=True, label="/dev/tty",
+            clock=clock, **kw)
+    except Exception:
+        _close_fd(owned)
+        raise
 
 
 def open_destination(destination, clock=time.monotonic, **kw):

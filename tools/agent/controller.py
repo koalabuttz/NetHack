@@ -691,22 +691,50 @@ class _EpisodeRunner(object):
         episode -- recorded as ``open-failed`` in the meta -- and must not
         propagate: it runs inside ``run_episode``'s OSError/except boundary
         that would otherwise misreport it as a spawn failure.
+
+        The destination is prepared transactionally: ownership is retained
+        locally and it is closed on EVERY ordinary setup failure (stream
+        construction, the fallback-note offer) before the stream is published,
+        so a half-built stream can never orphan its descriptor.  A cleanup
+        error never replaces the fixed ``open-failed`` reason, and
+        ``KeyboardInterrupt``/``SystemExit`` propagate untouched.
         """
         if self.c.spectate == "none":
             return
+        self._spectate_diag_ok = True
+        dest = None
+        stream = None
         try:
-            self._spectate_diag_ok = True
             dest = spectating.open_destination(self.c.spectate)
-            self.spectate = spectating.RenderStream(
+            stream = spectating.RenderStream(
                 dest, self.c.spectate_interval,
                 diagnostic=self._spectate_diagnostic)
+            self.spectate = stream
             if dest.note is not None and not self.c._spectate_noted:
                 self.c._spectate_noted = True
-                self.spectate.offer([dest.note])
-        except Exception:  # noqa: BLE001 - never a spawn failure
+                stream.offer([dest.note])
+            dest = None        # ownership now belongs to the published stream
+        except Exception:        # noqa: BLE001 - never a spawn failure
             self.spectate = None
             self._spectate_diag_ok = False
+            self._close_spectate_setup(stream, dest)
             self.result.spectate_disabled_reason = "open-failed"
+
+    @staticmethod
+    def _close_spectate_setup(stream, dest):
+        """Best-effort teardown of a failed destination preparation.
+
+        Closes a half-built stream (which owns its destination) or, when the
+        stream was never constructed, the destination itself.  A cleanup error
+        is swallowed so it can never replace the fixed disable reason.
+        """
+        try:
+            if stream is not None:
+                stream.close()
+            elif dest is not None:
+                dest.close()
+        except Exception:                    # noqa: BLE001 - teardown
+            pass
 
     def _spectate_diagnostic(self, text):
         """Best-effort note on the side channel, no fresh blocking allowance.
