@@ -230,6 +230,27 @@ class FramePainter(object):
         self.height = len(lines)
         return "".join(out).encode("utf-8", "replace")
 
+    def compose(self, lines, height):
+        """Bytes for drawing ``lines`` given a prior displayed ``height``.
+
+        The transactional sibling of :meth:`frame`: identical byte layout,
+        but the painter's committed height is neither read nor written.  A
+        delivery-aware caller composes with an explicit prior height, writes
+        the result, and only then commits the new height (or resynchronizes)
+        according to the delivery outcome.
+        """
+        if not self.tty:
+            return "".join(line + "\n" for line in lines).encode(
+                "utf-8", "replace")
+        out = []
+        if height:
+            out.append("\x1b[%dA" % height)
+        for line in lines:
+            out.append(line + "\n")
+        if height > len(lines):
+            out.append("\x1b[0J")
+        return "".join(out).encode("utf-8", "replace")
+
     def obs(self, rec):
         return self.frame(obs_frame(rec, self.messages, self.color))
 

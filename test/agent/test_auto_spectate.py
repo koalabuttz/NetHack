@@ -12,9 +12,16 @@ Usage:
 """
 
 import copy
+import fcntl
 import json
 import os
+import select
+import socket
+import stat
+import subprocess
 import sys
+import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -24,7 +31,7 @@ for _p in (HERE, ROOT):
         sys.path.insert(0, _p)
 
 import format_obs  # noqa: E402
-from tools.agent import render  # noqa: E402
+from tools.agent import render, spectating  # noqa: E402
 from tools.agent.directives import (  # noqa: E402
     DirectiveBook, DirectiveSet, PreconditionState)
 from tools.agent.protocol import Snapshot  # noqa: E402
@@ -461,5 +468,496 @@ class DirectiveEligibility(unittest.TestCase):
                             for e in book.events))
 
 
+# ==================================================================
+# Commit 3 -- bounded transport (spectating.py)
+# ==================================================================
+
+class _Clock(object):
+    def __init__(self, t=0.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, dt):
+        self.t += dt
+
+
+class _FakeDest(object):
+    """A destination stub: scripted success/failure, records payloads."""
+
+    def __init__(self, tty=False, results=None, partial=3):
+        self.tty = tty
+        self._results = list(results) if results is not None else None
+        self._partial = partial
+        self.bytes_written = 0
+        self.writes = []
+        self.closed = False
+
+    def write(self, data, *, deadline):
+        data = bytes(data)
+        self.writes.append(data)
+        if self._results is None:
+            self.bytes_written += len(data)
+            return True
+        ok = self._results.pop(0) if self._results else True
+        if ok:
+            self.bytes_written += len(data)
+        else:
+            self.bytes_written += min(self._partial, len(data))
+        return ok
+
+    def close(self):
+        self.closed = True
+
+
+def _stream(interval=0.15, dest=None, clock=None, diagnostic=None):
+    clock = clock or _Clock()
+    dest = dest or _FakeDest()
+    return (spectating.RenderStream(dest, interval, clock=clock,
+                                    diagnostic=diagnostic), dest, clock)
+
+
+class SpectateValidation(unittest.TestCase):
+    def test_destinations(self):
+        for dest in ("tty", "stderr", "none"):
+            self.assertIsNone(spectating.validate_spectate(dest, 0.15))
+        self.assertIsNotNone(spectating.validate_spectate("stdout", 0.15))
+
+    def test_interval_bounds(self):
+        self.assertIsNone(spectating.validate_spectate("stderr", 0))
+        self.assertIsNotNone(spectating.validate_spectate("stderr", -1))
+        self.assertIsNotNone(
+            spectating.validate_spectate("stderr", float("nan")))
+        self.assertIsNotNone(
+            spectating.validate_spectate("stderr", float("inf")))
+        self.assertIsNotNone(
+            spectating.validate_spectate("stderr", float("-inf")))
+
+
+class RenderStreamThrottle(unittest.TestCase):
+    def test_first_attempt_is_immediate(self):
+        st, dest, clk = _stream(interval=0.15)
+        st.offer(["a"])
+        self.assertEqual(st.frames_rendered, 1)
+        self.assertEqual(dest.writes, [b"a\n"])
+        self.assertEqual(st._last_attempt, 0.0)   # completion, not None
+
+    def test_interval_is_measured_from_completion(self):
+        st, dest, clk = _stream(interval=0.15)
+        st.offer(["a"])
+        clk.advance(0.14)
+        st.offer(["b"])
+        self.assertEqual(st.frames_rendered, 1)   # not due yet
+        self.assertAlmostEqual(st.next_due(), 0.15)
+        clk.advance(0.01)
+        st.flush()
+        self.assertEqual(st.frames_rendered, 2)   # due at equality
+        self.assertEqual(dest.writes[-1], b"b\n")
+
+    def test_zero_interval_attempts_each_candidate(self):
+        st, dest, clk = _stream(interval=0)
+        st.offer(["a"])
+        st.offer(["b"])
+        self.assertEqual(st.frames_rendered, 2)
+
+    def test_newest_candidate_coalesces(self):
+        st, dest, clk = _stream(interval=0.15)
+        st.offer(["a"])
+        st.offer(["b"])
+        st.offer(["c"])
+        self.assertEqual(st._coalesced, 1)
+        self.assertAlmostEqual(st.next_due(), 0.15)
+        clk.advance(0.15)
+        st.flush()
+        self.assertEqual(dest.writes[-1], b"c\n")
+
+    def test_next_due_none_without_pending(self):
+        st, dest, clk = _stream(interval=0.15)
+        st.offer(["a"])
+        self.assertIsNone(st.next_due())
+
+    def test_finish_forces_once_and_is_then_idle(self):
+        st, dest, clk = _stream(interval=5.0)
+        st.offer(["a"])
+        st.finish(["final"])                     # forced, interval ignored
+        self.assertEqual(st.frames_rendered, 2)
+        self.assertEqual(dest.writes[-1], b"final\n")
+        st.finish()                              # nothing pending: no-op
+        self.assertEqual(st.frames_rendered, 2)
+
+    def test_per_episode_reset(self):
+        st, dest, clk = _stream(interval=0)
+        st.offer(["a"])
+        fresh, _, _ = _stream(interval=0)
+        self.assertEqual(fresh.frames_rendered, 0)
+        self.assertEqual(fresh.frames_dropped, 0)
+        self.assertIsNone(fresh.disabled_reason)
+
+
+class RenderStreamFailure(unittest.TestCase):
+    def test_three_consecutive_stalls_disable(self):
+        dest = _FakeDest(results=[False, False, False])
+        st, _, clk = _stream(interval=0, dest=dest)
+        for i in range(3):
+            st.offer(["x%d" % i])
+        self.assertEqual(st.frames_rendered, 0)
+        self.assertEqual(st.frames_dropped, 3)
+        self.assertEqual(st.disabled_reason, "write-deadline")
+        self.assertIsNone(st.next_due())
+
+    def test_success_resets_the_stall_streak(self):
+        dest = _FakeDest(results=[False, True, False, False])
+        st, _, clk = _stream(interval=0, dest=dest)
+        for i in range(4):
+            st.offer(["x%d" % i])
+        self.assertEqual(st.frames_rendered, 1)
+        self.assertEqual(st.frames_dropped, 3)
+        self.assertIsNone(st.disabled_reason)    # never 3 *consecutive*
+
+    def test_coalescing_does_not_reset_the_streak(self):
+        dest = _FakeDest(results=[False, False, False])
+        st, _, clk = _stream(interval=0.1, dest=dest)
+        st.offer(["a"])                          # dropped, streak 1
+        clk.advance(0.03)
+        st.offer(["b"])                          # pending
+        st.offer(["c"])                          # coalesced, not delivered
+        clk.advance(0.07)                        # t == 0.10: due
+        st.flush()                               # dropped, streak 2
+        clk.advance(0.1)                         # t == 0.20: due
+        st.offer(["d"])                          # dropped, streak 3
+        self.assertEqual(st.disabled_reason, "write-deadline")
+        self.assertEqual(st.frames_dropped, 3)
+
+    def test_dropped_frame_is_not_counted_rendered_or_resumed(self):
+        dest = _FakeDest(results=[False])
+        st, _, clk = _stream(interval=0, dest=dest)
+        st.offer(["a"])
+        self.assertEqual(st.frames_rendered, 0)
+        self.assertEqual(st.frames_dropped, 1)
+        self.assertIsNone(st.next_due())         # not resumed
+        self.assertEqual(len(dest.writes), 1)
+
+    def test_deadline_cap_drops_without_writing(self):
+        st, dest, clk = _stream(interval=10.0)
+        st.offer(["a"])                          # first attempt
+        clk.advance(0.01)
+        st.offer(["b"])                          # pending (not due)
+        before = len(dest.writes)
+        st.flush(force=True, deadline_cap=clk() - 1.0)
+        self.assertEqual(len(dest.writes), before)   # no fresh allowance
+        self.assertEqual(st.frames_dropped, 1)
+
+    def test_disable_is_idempotent_and_diagnoses_once(self):
+        notes = []
+        dest = _FakeDest(results=[False, False, False])
+        st, _, clk = _stream(interval=0, dest=dest,
+                             diagnostic=notes.append)
+        for i in range(3):
+            st.offer(["x%d" % i])
+        self.assertEqual(st.disabled_reason, "write-deadline")
+        st.disable("write-error", "later")
+        self.assertEqual(st.disabled_reason, "write-deadline")
+        self.assertEqual(len(notes), 1)
+        self.assertIn("write-deadline", notes[0])
+
+
+class RenderStreamTtyTransaction(unittest.TestCase):
+    def test_height_commits_only_on_complete_delivery(self):
+        dest = _FakeDest(tty=True)
+        st, _, clk = _stream(interval=0, dest=dest)
+        st.offer(["a", "b"])
+        self.assertEqual(st._height, 2)
+        st.offer(["c"])
+        self.assertTrue(dest.writes[-1].startswith(b"\x1b[2A"))  # up 2
+        self.assertNotIn(b"\x1b[2J", dest.writes[-1])
+
+    def test_partial_tty_write_forces_absolute_resync(self):
+        dest = _FakeDest(tty=True, results=[False], partial=3)
+        st, _, clk = _stream(interval=0, dest=dest)
+        st.offer(["a"])
+        self.assertTrue(st._pos_unknown)
+        st.offer(["b"])
+        self.assertTrue(dest.writes[-1].startswith(b"\x1b[2J\x1b[H"))
+
+    def test_zero_bytes_leaves_position_known(self):
+        dest = _FakeDest(tty=True, results=[True, False], partial=0)
+        st, _, clk = _stream(interval=0, dest=dest)
+        st.offer(["a", "b"])                     # complete: height 2
+        st.offer(["c"])                          # dropped, zero bytes
+        self.assertFalse(st._pos_unknown)
+        self.assertEqual(st._height, 2)
+        st.offer(["d"])                          # ordinary frame
+        self.assertTrue(dest.writes[-1].startswith(b"\x1b[2A"))
+
+
+class WriteSeams(object):
+    """Deterministic select/write seams for RenderDestination.write."""
+
+    def __init__(self, clock, fdval=7, chunk=4, eintr=0, eagain=0,
+                 zero=False, advance=0.0):
+        self.clock = clock
+        self.fdval = fdval
+        self.chunk = chunk
+        self._eintr = eintr
+        self._eagain = eagain
+        self.zero = zero
+        self.advance = advance
+        self.select_calls = 0
+        self.write_calls = 0
+        self.written = []
+
+    def select(self, r, w, x, timeout):
+        self.select_calls += 1
+        if self._eintr > 0:
+            self._eintr -= 1
+            raise InterruptedError
+        self.clock.t += self.advance
+        return ([], [self.fdval], [])
+
+    def write(self, fd, view):
+        if self._eagain > 0:
+            self._eagain -= 1
+            raise BlockingIOError
+        if self.zero:
+            return 0
+        self.write_calls += 1
+        n = min(self.chunk, len(view))
+        self.written.append(bytes(view[:n]))
+        return n
+
+
+class BoundedWrites(unittest.TestCase):
+    def _dest(self, seams, chunk_limit=4):
+        clk = seams.clock
+        return spectating.RenderDestination(
+            9, owned=True, tty=False, clock=clk, select_fn=seams.select,
+            write_fn=seams.write, chunk_limit=chunk_limit)
+
+    def test_chunks_are_at_most_pipe_buf(self):
+        clk = _Clock()
+        seams = WriteSeams(clk, chunk=4)
+        dest = self._dest(seams)
+        self.assertTrue(dest.write(b"0123456789", deadline=clk() + 100))
+        self.assertEqual(seams.written, [b"0123", b"4567", b"89"])
+        self.assertEqual(dest.bytes_written, 10)
+
+    def test_select_before_every_write(self):
+        clk = _Clock()
+        seams = WriteSeams(clk, chunk=4)
+        dest = self._dest(seams)
+        dest.write(b"0123456789", deadline=clk() + 100)
+        self.assertEqual(seams.select_calls, seams.write_calls)
+
+    def test_deadline_exhaustion_returns_false(self):
+        clk = _Clock()
+        seams = WriteSeams(clk, chunk=4, advance=10.0)
+        dest = self._dest(seams)
+        self.assertFalse(dest.write(b"0123456789", deadline=clk() + 0.25))
+        self.assertEqual(dest.bytes_written, 0)
+
+    def test_eintr_does_not_extend_or_break_the_deadline(self):
+        clk = _Clock()
+        seams = WriteSeams(clk, chunk=4, eintr=1)
+        dest = self._dest(seams)
+        self.assertTrue(dest.write(b"0123456789", deadline=clk() + 100))
+        self.assertEqual(seams.select_calls, seams.write_calls + 1)
+        self.assertEqual(dest.bytes_written, 10)
+
+    def test_eagain_returns_to_select(self):
+        clk = _Clock()
+        seams = WriteSeams(clk, chunk=4, eagain=1)
+        dest = self._dest(seams)
+        self.assertTrue(dest.write(b"0123456789", deadline=clk() + 100))
+        self.assertEqual(dest.bytes_written, 10)
+
+    def test_zero_write_raises(self):
+        clk = _Clock()
+        seams = WriteSeams(clk, zero=True)
+        dest = self._dest(seams)
+        with self.assertRaises(OSError):
+            dest.write(b"abc", deadline=clk() + 100)
+
+
+# ---------------------------------------------- fd lifecycle (subprocesses)
+
+_CHILD_PREAMBLE = r'''
+import os, sys, json, socket, fcntl, stat, time
+RESULT = os.environ["AUTOSPEC_RESULT"]
+sys.path.insert(0, os.environ["AUTOSPEC_ROOT"])
+from tools.agent import spectating as S
+
+def emit(obj):
+    with open(RESULT, "w") as fh:
+        fh.write(json.dumps(obj))
+
+def open_fds():
+    return sorted(int(n) for n in os.listdir("/proc/self/fd"))
+'''
+
+
+class FdLifecycle(unittest.TestCase):
+    def _run(self, body, pass_fds=(), new_session=False):
+        with tempfile.TemporaryDirectory() as td:
+            result = os.path.join(td, "r.json")
+            env = dict(os.environ)
+            env["AUTOSPEC_RESULT"] = result
+            env["AUTOSPEC_ROOT"] = ROOT
+            code = _CHILD_PREAMBLE + body
+            proc = subprocess.run(
+                [sys.executable, "-c", code], env=env,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE, pass_fds=tuple(pass_fds),
+                start_new_session=new_session, timeout=30)
+            try:
+                with open(result) as fh:
+                    return json.load(fh), proc
+            except (OSError, ValueError):
+                return None, proc
+
+    def test_closed_stdout_relocates_and_restores_fd1(self):
+        body = r'''
+os.close(1)
+before = len(open_fds())
+dest = S.open_destination("stderr")
+fd = dest.fd
+fd1_closed = False
+try:
+    os.fstat(1)
+except OSError:
+    fd1_closed = True
+dest.write(b"FRAME", deadline=time.monotonic() + 2)
+dest.close()
+after = len(open_fds())
+emit({"fd": fd, "fd1_closed": fd1_closed, "leak": after - before})
+'''
+        data, proc = self._run(body)
+        self.assertIsNotNone(data, proc.stderr.decode())
+        self.assertGreaterEqual(data["fd"], 3)
+        self.assertTrue(data["fd1_closed"])
+        self.assertEqual(data["leak"], 0)
+
+    def test_socket_alias_is_rejected(self):
+        body = r'''
+a, b = socket.socketpair()
+os.dup2(a.fileno(), 1)
+os.dup2(a.fileno(), 2)
+try:
+    S.open_destination("stderr")
+    emit({"rejected": False})
+except S.SpectateError:
+    emit({"rejected": True})
+'''
+        data, proc = self._run(body)
+        self.assertIsNotNone(data, proc.stderr.decode())
+        self.assertTrue(data["rejected"])
+
+    def test_2_and_1_pipe_alias_is_rejected(self):
+        body = r'''
+r, w = os.pipe()
+os.dup2(w, 1)
+os.dup2(w, 2)
+try:
+    S.open_destination("stderr")
+    emit({"rejected": False})
+except S.SpectateError:
+    emit({"rejected": True})
+'''
+        data, proc = self._run(body)
+        self.assertIsNotNone(data, proc.stderr.decode())
+        self.assertTrue(data["rejected"])
+
+    def test_2_and_1_file_alias_is_rejected(self):
+        body = r'''
+import tempfile
+d = tempfile.mkdtemp()
+f = os.open(os.path.join(d, "alias.bin"),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.dup2(f, 1)
+os.dup2(f, 2)
+try:
+    S.open_destination("stderr")
+    emit({"rejected": False})
+except S.SpectateError:
+    emit({"rejected": True})
+'''
+        data, proc = self._run(body)
+        self.assertIsNotNone(data, proc.stderr.decode())
+        self.assertTrue(data["rejected"])
+
+    def test_tty_fallback_notes_and_rejects_alias(self):
+        # No controlling terminal (new session): a plain tty open falls back
+        # to fd 2 with one note.
+        body = r'''
+try:
+    dest = S.open_destination("tty")
+    emit({"note": bool(dest.note), "label": dest.label})
+except S.SpectateError as exc:
+    emit({"error": str(exc)})
+'''
+        data, proc = self._run(body, new_session=True)
+        self.assertIsNotNone(data, proc.stderr.decode())
+        self.assertTrue(data.get("note"))
+        self.assertEqual(data.get("label"), "fd 2")
+
+    def test_tty_fallback_rejects_2_1_alias_before_note(self):
+        body = r'''
+r, w = os.pipe()
+os.dup2(w, 1)
+os.dup2(w, 2)
+try:
+    S.open_destination("tty")
+    emit({"rejected": False})
+except S.SpectateError:
+    emit({"rejected": True})
+'''
+        data, proc = self._run(body, new_session=True)
+        self.assertIsNotNone(data, proc.stderr.decode())
+        self.assertTrue(data["rejected"])
+
+    def test_stderr_uses_fd2_despite_sys_stderr(self):
+        read_fd, write_fd = os.pipe()
+        body = r'''
+os.dup2(%d, 2)
+import io
+sys.stderr = io.StringIO()
+dest = S.open_destination("stderr")
+dest.write(b"HELLO", deadline=time.monotonic() + 2)
+dest.close()
+emit({"stringio": sys.stderr.getvalue()})
+''' % (write_fd,)
+        data, proc = self._run(body, pass_fds=(write_fd,))
+        os.close(write_fd)
+        self.assertIsNotNone(data, proc.stderr.decode())
+        r, _, _ = select.select([read_fd], [], [], 5)
+        got = os.read(read_fd, 4096) if r else b""
+        os.close(read_fd)
+        self.assertEqual(got, b"HELLO")          # went to fd 2
+        self.assertEqual(data["stringio"], "")   # not to sys.stderr
+
+    def test_none_opens_nothing_and_close_leaves_fd2(self):
+        body = r'''
+before = open_fds()
+dest = S.open_destination("none")
+fd_none = dest.fd
+probe = dest.write(b"ignored", deadline=time.monotonic() + 1)
+dest.close()
+fd2_ok = True
+try:
+    os.fstat(2)
+except OSError:
+    fd2_ok = False
+emit({"fd": fd_none, "probe": probe, "fd2_ok": fd2_ok,
+      "leak": len(open_fds()) - len(before)})
+'''
+        data, proc = self._run(body)
+        self.assertIsNotNone(data, proc.stderr.decode())
+        self.assertIsNone(data["fd"])
+        self.assertTrue(data["probe"])
+        self.assertTrue(data["fd2_ok"])
+        self.assertEqual(data["leak"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
+
