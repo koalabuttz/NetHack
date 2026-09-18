@@ -243,7 +243,10 @@ records the spend.  `estimated_usd` is `0.0` because no tariff was configured
 
 ## 9. Verification summary
 
-* `test_auto*`: 670 green; `test_spectate.py --selftest`: 43 green.
+* `test_auto*`: 670 green at this revision; **706** green after the follow-up
+  wiring session (§14.3) -- the same 681 tests (670 + the later additions) plus
+  25 new `test_auto_integration` cases.
+* `test_spectate.py --selftest`: 43 green.
 * `make -C test/agent check`: green (manifest + header + schema + C fixtures).
 * `make -C test/agent native-prefix`: OK (the fixture above).
 * §8.4 forced-search exhaustive cases: 46, green.
@@ -251,9 +254,11 @@ records the spend.  `estimated_usd` is `0.0` because no tariff was configured
 * 78-column sweep: clean for every changed Python file
   (`forced_search.py`, `controller.py`, `test_auto_forced_search.py`,
   `native_prefix_probe.py`); the `Makefile` has pre-existing long lines only.
-* Evaluator determinism and the live/replay parity fixture (M21): **not
-  exercised** — the evaluator was not migrated (§10).  The existing
-  `test_auto_replay` suite (52) remains green.
+* Evaluator determinism and the live/replay parity fixture (M21): **exercised**
+  in the follow-up session — `evaluate.py` now shares the controller's
+  reconciliation helpers (§14.3), the parity fixture passes and two replays of
+  the same wire are byte-identical.  At this revision the evaluator was
+  unmigrated (§10.3) and `test_auto_replay` (52) was the coverage.
 
 ## 10. Deviations and deferred work (explicit)
 
@@ -266,10 +271,14 @@ records the spend.  `estimated_usd` is `0.0` because no tariff was configured
    real play and the fake-endpoint adapter tests are migrated to the raw
    contract.  Two controller-level cases re-demonstrate M11.
 3. **`evaluate.py` migration (§6.2) and the live/replay parity fixture (M21)
-   are NOT done.**  `evaluate.py` still applies a snapshot and immediately
-   calls `mem.observe`, does not carry a per-need `RejectionSet`, and does not
-   model sent actions from sidecars.  M21 cannot be demonstrated because its
-   subject is unmigrated.  This is the largest remaining piece of the plan.
+   were NOT done at this revision; both are DONE in the follow-up wiring
+   session (§14.3).**  At this revision `evaluate.py` still applied a snapshot
+   and immediately called `mem.observe`, carried no per-need `RejectionSet` and
+   did not model sent actions from sidecars, so M21 could not be demonstrated.
+   The follow-up migrated `_on_obs` to stage -> reconcile -> commit, committed
+   the modeled send's frozen effect at the next reconciled observation, shared
+   `arbitration.arrival_outcome`/`direction_delta`/`classify_outcome` with the
+   controller, and landed the parity fixture.
 4. **M11 is now re-demonstrated at the controller level** (`fe5dd6808`): the
    central `validate_raw_choice` confidence gate and the stale-table-identity
    rejection both fall back to scripted while still billing usage, and a
@@ -278,12 +287,13 @@ records the spend.  `estimated_usd` is `0.0` because no tariff was configured
 5. **M14 is now demonstrated at the controller level** (`d605212cf`): M14-wire-A
    (do not consume the cap) and M14-wire-C (leak the armed prefix as a quit)
    both turn the live-wiring cases red, then were restored green.
-6. **The post-change campaigns were not re-run in this session.**  Every
-   engine fixture (including the plain `episode` driver fixture and the
-   `native-prefix` target) fails at spawn in this environment with
-   `hello=0` / `'closed' record before hello`; the same failure reproduces at
-   HEAD with these changes stashed, so it is an environment condition, not a
-   regression.  §8.2/§8.3 therefore still carry the earlier session's numbers.
+6. **The post-change campaigns were not re-run at this revision** (see §13 for
+   the later, completed zero-key and DeepSeek campaigns).  Every engine fixture
+   (including the plain `episode` driver fixture and the `native-prefix`
+   target) failed at spawn in that environment with `hello=0` / `'closed'
+   record before hello`; the same failure reproduced at HEAD with the changes
+   stashed, so it was an environment condition, not a regression.  §8.2/§8.3
+   therefore still carry the earlier session's numbers.
 
 ## 11. Commits
 
@@ -306,53 +316,79 @@ edited; no engine or profile changes; `make install` was never run;
 
 1. ~~Wire the wave-5 transaction into the controller~~ — **done**
    (`d605212cf`).
-2. ~~Migrate the Jev boundary (§6.1)~~ — **done** (`fe5dd6808`).  **Next**:
-   migrate `evaluate.py` (§6.2) onto the same `arbitration` helpers (stage ->
-   reconcile -> instance/hero resolution -> commit, a per-need
-   `RejectionSet` via `classify_invalid`/`select_retained`), model *sent*
-   actions from sidecars, and land the live/replay parity fixture (M21).
-3. Re-run the post-change campaigns after (2) **in an environment where the
-   agent-only worker bootstraps** (this session's is broken for every engine
-   fixture; see §10.6), then re-populate §8.
+2. ~~Migrate the Jev boundary (§6.1)~~ — **done** (`fe5dd6808`).
+   ~~Migrate `evaluate.py` (§6.2) onto the same shared helpers, model *sent*
+   actions, and land the live/replay parity fixture (M21)~~ — **done** in the
+   follow-up wiring session (§14.3).
+3. ~~Re-run the post-change campaigns~~ — **done** (§13), in an environment
+   where the agent-only worker bootstraps (the earlier session's was broken for
+   every engine fixture; see §10.6).
 
 ## 13. Post-wiring campaign results (step 3 completed)
 
 The previously blocked campaigns were completed after re-staging game data (the
 original blocker was stale staged data, not the binaries; verified by a clean
-mktemp-staged episode run at the same HEAD).
+mktemp-staged episode run at the same HEAD).  Every figure below is read
+mechanically from the final artifacts
+(`/tmp/tmp.vEBxOSjF4F/zero/campaign.json` and
+`/tmp/tmp.vEBxOSjF4F/ds/campaign.json`); no number is a projection.
 
-Zero-key x3 post-wiring (same config as /tmp/nh-reflex-baseline-pre):
-- ep-1: death (closed) at 1892 ticks. The 14,042-tick loop is gone.
-- ep-2: policy-exhausted/trapped at 73 ticks -- the forced-search exception
-  fired LIVE 3 times (3 activations, 3 successful time-advancing searches),
-  then gracefully quit on cap exhaustion. This is the wired transaction
-  working end-to-end: nominate -> gates -> prefix -> suffix -> observed.
-- ep-3: death (closed) at 1875 ticks.
-- All 3: closed, 0 invalids, recordings complete.
+Zero-key x3 post-wiring (same config as /tmp/nh-reflex-baseline-pre),
+`episodes_success` 3/3, 0 failed:
 
-DeepSeek x2 post-wiring (live strategy tier + upgraded reflexes):
-- 2/2 closed (deaths), 6 strategy calls, 2 directives applied, cache 30.1%,
-  unknown_exposure_calls 2 (the known episode-end cancellation), 0 forced
-  activations (the trapped state did not occur -- directives routed
-  differently than the zero-key heuristic).
+| ep | depth_max | ticks | displayed turns | discovered | entered | stairs | loop span | invalids | outcome | stop |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 1 | 1892 | 3047 | 96 | 18 | 0 | 6 | 0 | death | closed |
+| 2 | 1 | 73 | 66 | 80 | 16 | 0 | 8 | 0 | unknown | policy-exhausted |
+| 3 | **2** | 1875 | 2263 | 129 | 38 | 1 | 6 | 0 | death | closed |
+
+* ep-2 was the only episode to reach the trapped state: the forced-search
+  exception fired LIVE 3 times (3 activations, 3 prefixes sent, 3 suffixes
+  sent, 3 time-advancing successes), the fourth activation was denied by the
+  cap (`forced_denials` 1) and the episode ended with the
+  `policy-exhausted/trapped` graceful quit (`forced_trapped` 1).  This is the
+  wired transaction working end-to-end: nominate -> gates -> prefix -> suffix
+  -> observed.
+* ep-3 descended: `depth_max` 2, one stair from a map triple, the largest
+  instance-scoped coverage of the three (129 discovered / 38 entered).
+* All 3: 0 invalids, recordings complete.
+
+DeepSeek x2 post-wiring (live strategy tier + upgraded reflexes),
+`episodes_success` 2/2, 0 failed:
+
+| ep | depth_max | ticks | displayed turns | discovered | entered | stairs | loop span | invalids | outcome | stop |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | **2** | 1205 | 1174 | 140 | 24 | 1 | 6 | 0 | death | closed |
+| 2 | 1 | 1909 | 3109 | 43 | 10 | 0 | 6 | 0 | death | closed |
+
+Session totals for the DeepSeek pair: 6 strategy calls, 2 directives applied,
+cache hit rate 30.1%, `unknown_exposure_calls` 2 (the known episode-end
+cancellation), 0 forced activations (the trapped state did not occur --
+directives routed differently than the zero-key heuristic).
 
 Honest comparison vs baseline:
-- The 14,042/14,101-tick zero-time loops: ELIMINATED (worst span now 6).
-- Tick-cap survival: replaced by genuine deaths and one policy-exhausted
-  quit -- the hero now spends turns playing rather than looping.
-- Depth: still 1 in all episodes. Exploration coverage remains the
-  frontier, as the plan predicted. The forced-search exception proved the
-  trapped-state mechanism but did not by itself unlock deeper dungeons.
+
+* The 14,042/14,101-tick zero-time loops: ELIMINATED.  The worst loop span in
+  this sample is **8** (zero-key ep-2, the 73-tick trapped episode); the other
+  four episodes are 6.
+* Tick-cap survival: replaced by genuine deaths (4 episodes) and one
+  policy-exhausted quit -- the hero now spends turns playing rather than
+  looping.
+* Depth: this **small sample** reached `depth_max` 2 in **one** zero-key
+  episode (ep-3) and **one** DeepSeek episode (ep-1); the other three stayed at
+  depth 1.  This is not a statistical improvement claim: n=3 and n=2 unpaired
+  stochastic episodes are reported per-episode, without significance or a
+  causal claim.  Exploration coverage remains the frontier, as the plan
+  predicted.
 
 ## 14. What was not measured
 
 * live forced-search activation counts, cancellations, cap denials and
-  trapped quits **at campaign scale** — the live wiring is unit-tested through
-  the real runner (§7.6) but no campaign was run (see §10.6), so the
-  per-episode counts are **pending**;
+  trapped quits **at campaign scale** — now measured for the completed zero-key
+  and DeepSeek campaigns (§13): 3 activations / 3 suffixes / 3 successes /
+  1 denial / 1 trapped quit in zero-key ep-2, 0 activations in the DeepSeek
+  pair;
 * door/search/food attempt budgets at campaign scale (unit-tested only);
-* live/replay parity and evaluator determinism under the new semantics
-  (`evaluate.py` is unmigrated);
 * USD cost of the DeepSeek campaign (no tariff configured; `estimated_usd`
   is `0.0` and no cost is asserted).
 
@@ -389,8 +425,26 @@ The returned usage is added to the ledger exactly once on every paid rejection.
   controller case **and** the helper case (`test_auto_candidates`) red, then
   was restored green.
 
-### 14.3 Deferred within wave 6
+### 14.3 Integrated in the follow-up wiring session
 
-* the `evaluate.py` migration and the live/replay parity fixture (M21);
+The isolation review of this revision found the new modules were not fully
+wired into the live controller path.  The follow-up session closed that gap:
+
+* per-instance map/terrain/visits/stairs scoping in the live path (the
+  automaton decides before any terrain/map commit; a fresh arrival gets a new
+  empty scope);
+* the live `HeroResolution` (possible-position sets; `mem.hero` only for a
+  confirmed singleton; ambiguity suppresses movement and forced search);
+* observational preparation/proposal (the frozen effect commits only after a
+  complete send and the reconciled observation);
+* exact forced-search binding (suffix only to a `command` need, and only while
+  the retained origin evidence is unchanged);
+* source-instance-scoped pending directives;
+* the `evaluate.py` migration onto the shared `arbitration` helpers and the
+  live/replay parity fixture (M21).
+
+Still deliberately deferred:
+
 * live Jev enablement (terms/endpoint remain unapproved, as required);
-* re-running the campaigns (environment blocker, §10.6).
+* re-running the campaigns against the *post-fix* build (the §13 figures are
+  from the pre-fix post-wiring build).
