@@ -236,9 +236,47 @@ def classify_outcome(same_position: bool, hero_resolved: bool,
     return ("observed", "unknown")
 
 
+# -- shared detectors (live control and evaluation use one copy) ------------
+
+#: The allowlisted, source-derived arrival outcomes (plan 4.1 ``O``).  Only a
+#: current public arrival outcome counts; quoted/look/history text never
+#: becomes authoritative.
+ARRIVAL_PHRASES = ("you materialize", "you fall", "you are now on level",
+                   "you climb down", "you descend")
+
+
+def arrival_outcome(messages) -> bool:
+    """True for a public arrival outcome among *messages* (4.1 ``O``)."""
+    for entry in messages or ():
+        if isinstance(entry, (tuple, list)) and len(entry) > 1:
+            text = entry[1]
+        else:
+            text = entry
+        low = (text or "").lower()
+        if any(phrase in low for phrase in ARRIVAL_PHRASES):
+            return True
+    return False
+
+
+def direction_delta(action, dir_keys) -> Optional[Tuple[int, int]]:
+    """The grid delta of a plain movement-direction key action, else None.
+
+    *dir_keys* is the ``{(dx, dy): wire_key}`` table (``protocol.DIR_KEYS``);
+    it is a parameter so this module stays a dependency-neutral leaf.
+    """
+    if action is None or getattr(action, "tag", None) != "key":
+        return None
+    code = action.payload[0]
+    for delta, key in dir_keys.items():
+        if key == code:
+            return delta
+    return None
+
+
 __all__ = [
     "REJECTION_CODES", "DEFAULT_CONFIDENCE_THRESHOLD", "RejectionSet",
     "RejectionDecision", "classify_invalid", "select_retained", "RawChoice",
     "ChoiceOutcome", "validate_raw_choice", "Reconciliation",
-    "classify_outcome",
+    "classify_outcome", "arrival_outcome", "direction_delta",
+    "ARRIVAL_PHRASES",
 ]
