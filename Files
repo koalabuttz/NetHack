@@ -587,13 +587,15 @@ test_sel.lua  test_shk.lua  test_src.lua  testmove.lua  testwish.lua
 
 test/agent:
 (files for the engine-free agent port fixtures)
-.gitignore          Makefile            README.md           driver.py
-format_obs.py       gen_profile.py      hostile_matrix.py   reference_state.c
-reference_state.h   schema_check.py     spectate.py         sysconf
-test_auto.py        test_auto_providers.py
-test_auto_replay.py test_auto_spectate.py
-test_menu.c         test_protocol.c     test_spectate.py    test_state.c
-test_view.c
+.gitignore          Makefile            README.md           bench_candidates.py
+driver.py           format_obs.py       gen_profile.py      hostile_matrix.py
+reference_state.c   reference_state.h   schema_check.py     spectate.py
+sysconf
+test_auto.py              test_auto_candidates.py
+test_auto_providers.py    test_auto_replay.py
+test_auto_spectate.py     test_menu.c
+test_protocol.c           test_spectate.py
+test_state.c              test_view.c
 
 test/agent/fixtures/auto:
 (files for the bounded replay evaluation fixtures)
@@ -602,11 +604,11 @@ short.decisions.jsonl   short.wire.jsonl     startup.wire.jsonl
 
 tools/agent:
 (files for the autonomous play harness)
-.gitignore          __init__.py         __main__.py         budget.py
-codec.py            controller.py       directives.py       evaluate.py
-events.py           policy.py           protocol.py         providers.py
-recording.py        render.py           spectating.py       state.py
-worker.py
+.gitignore          __init__.py         __main__.py         arbitration.py
+budget.py           candidates.py       codec.py            controller.py
+directives.py       evaluate.py         events.py           policy.py
+protocol.py         providers.py        recording.py        render.py
+spectating.py       state.py            worker.py
 
 util:
 (files for all versions)
