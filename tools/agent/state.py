@@ -288,7 +288,9 @@ class StagedObservation(object):
     Produced by :meth:`EpisodeMemory.stage` and consumed exactly once by
     :meth:`EpisodeMemory.commit`.  Every field is a plain immutable value, so
     the controller can reconcile an in-flight attempt against it before any of
-    it reaches durable memory.
+    it reaches durable memory.  ``hero_cells`` is *every* ``@`` cell of the
+    frame, not just the first: hero identity is a possible-position set
+    (plan 4.2), so the several-``@`` case must reach the resolver intact.
     """
 
     cells: Dict[Tuple[int, int], tuple]
@@ -297,31 +299,132 @@ class StagedObservation(object):
     hero: Optional[Tuple[int, int]]
     status: "Status"
     messages: tuple
+    hero_cells: tuple = ()
+
+
+#: Sentinel for :meth:`EpisodeMemory.commit`: derive the hero square from the
+#: staged observation (the compatibility behaviour for direct callers).  The
+#: controller passes its reconciled :class:`instances.HeroResolution` instead,
+#: so an unresolved/ambiguous frame clears ``mem.hero`` rather than adopting a
+#: first ``@`` (plan 4.2).
+DERIVED_HERO = object()
+
+
+class _InstanceScope(object):
+    """One level instance's *map-local* memory (plan 4.1 rule 6).
+
+    A fresh allocation gets a brand-new empty scope: terrain, visits, stairs
+    and the progress/recovery counters are all local, so no old-instance
+    coordinate, visit or budget can leak across an arrival.
+    """
+
+    def __init__(self) -> None:
+        self.grid: Dict[Tuple[int, int], tuple] = {}
+        self.visits: Dict[Tuple[int, int], int] = {}
+        self.stairs_down: Set[Tuple[int, int]] = set()
+        self.stairs_up: Set[Tuple[int, int]] = set()
+        self.hero: Optional[Tuple[int, int]] = None
+        self.last_hero: Optional[Tuple[int, int]] = None
+        self.no_progress = 0
+        self.searches_since_progress = 0
 
 
 class EpisodeMemory(object):
-    """All mutable per-episode public memory.  Reset wholesale per episode."""
+    """All mutable per-episode public memory.  Reset wholesale per episode.
+
+    The map-local fields (terrain, visits, stairs, hero, progress counters)
+    are
+    *per level instance*: :meth:`begin_instance` swaps in a fresh empty scope
+    (plan 4.1 rule 6).  The episode-scoped evidence that legitimately survives
+    an arrival -- the inventory cache and message history -- stays on the
+    object itself, because the engine's own inventory is unchanged by moving
+    levels (plan 5.2).
+    """
 
     def __init__(self) -> None:
         self.reset()
         self.tick = 0
 
     def reset(self) -> None:
-        self.grid: Dict[Tuple[int, int], tuple] = {}
-        self.visits: Dict[Tuple[int, int], int] = {}
-        self.hero: Optional[Tuple[int, int]] = None
-        self.stairs_down: Set[Tuple[int, int]] = set()
-        self.stairs_up: Set[Tuple[int, int]] = set()
+        self.instance: Optional[int] = None
+        self._scope = _InstanceScope()
         self.inventory = Inventory()
         self.status = Status()
         self.seen_msgs: Set[int] = set()
         self.boundary = BoundaryDetector()
         self.rejected_food = 0
         self.failed_moves = 0
-        self.searches_since_progress = 0
-        self.last_hero: Optional[Tuple[int, int]] = None
-        self.no_progress = 0
         self.messages: List[str] = []
+
+    def begin_instance(self, instance: Optional[int]) -> None:
+        """Start a fresh level-instance scope with empty map-local memory."""
+        self.instance = instance
+        self._scope = _InstanceScope()
+
+    # -- per-instance map-local memory (transparent to callers) ----------
+    @property
+    def grid(self) -> Dict[Tuple[int, int], tuple]:
+        return self._scope.grid
+
+    @grid.setter
+    def grid(self, value: Dict[Tuple[int, int], tuple]) -> None:
+        self._scope.grid = value
+
+    @property
+    def visits(self) -> Dict[Tuple[int, int], int]:
+        return self._scope.visits
+
+    @visits.setter
+    def visits(self, value: Dict[Tuple[int, int], int]) -> None:
+        self._scope.visits = value
+
+    @property
+    def stairs_down(self) -> Set[Tuple[int, int]]:
+        return self._scope.stairs_down
+
+    @stairs_down.setter
+    def stairs_down(self, value: Set[Tuple[int, int]]) -> None:
+        self._scope.stairs_down = value
+
+    @property
+    def stairs_up(self) -> Set[Tuple[int, int]]:
+        return self._scope.stairs_up
+
+    @stairs_up.setter
+    def stairs_up(self, value: Set[Tuple[int, int]]) -> None:
+        self._scope.stairs_up = value
+
+    @property
+    def hero(self) -> Optional[Tuple[int, int]]:
+        return self._scope.hero
+
+    @hero.setter
+    def hero(self, value: Optional[Tuple[int, int]]) -> None:
+        self._scope.hero = value
+
+    @property
+    def last_hero(self) -> Optional[Tuple[int, int]]:
+        return self._scope.last_hero
+
+    @last_hero.setter
+    def last_hero(self, value: Optional[Tuple[int, int]]) -> None:
+        self._scope.last_hero = value
+
+    @property
+    def no_progress(self) -> int:
+        return self._scope.no_progress
+
+    @no_progress.setter
+    def no_progress(self, value: int) -> None:
+        self._scope.no_progress = value
+
+    @property
+    def searches_since_progress(self) -> int:
+        return self._scope.searches_since_progress
+
+    @searches_since_progress.setter
+    def searches_since_progress(self, value: int) -> None:
+        self._scope.searches_since_progress = value
 
     def observe(self, snap: protocol.Snapshot) -> None:
         """Fold one applied snapshot into durable memory.
@@ -344,12 +447,15 @@ class EpisodeMemory(object):
         cells: Dict[Tuple[int, int], tuple] = {}
         stairs_down: Set[Tuple[int, int]] = set()
         stairs_up: Set[Tuple[int, int]] = set()
+        hero_cells: List[Tuple[int, int]] = []
         for pos, cell in snap.map.items():
             cells[pos] = cell
             if cell and cell[0] == STAIRS_DOWN:
                 stairs_down.add(pos)
             elif cell and cell[0] == STAIRS_UP:
                 stairs_up.add(pos)
+            if cell and cell[0] == "@":
+                hero_cells.append(pos)
         messages = []
         for m in snap.msg or []:
             e = m.get("e")
@@ -358,15 +464,27 @@ class EpisodeMemory(object):
         return StagedObservation(
             cells=cells, stairs_down=frozenset(stairs_down),
             stairs_up=frozenset(stairs_up), hero=hero_position(snap),
-            status=parse_status(snap), messages=tuple(messages))
+            status=parse_status(snap), messages=tuple(messages),
+            hero_cells=tuple(sorted(hero_cells)))
 
-    def commit(self, staged: "StagedObservation") -> None:
-        """Fold a staged observation into durable memory (the one commit)."""
+    def commit(self, staged: "StagedObservation",
+               hero=DERIVED_HERO) -> None:
+        """Fold a staged observation into durable memory (the one commit).
+
+        *hero* is the reconciled confirmed singleton the controller resolved
+        from the prior position set and the matched attempt (plan 4.2); the
+        sentinel :data:`DERIVED_HERO` keeps the direct-caller compatibility of
+        deriving it from the staged frame.  An explicit ``None`` -- an
+        unresolved or ambiguous frame -- *clears* ``mem.hero`` so movement,
+        stair/door actions and forced search stay suppressed until identity is
+        positively confirmed, and an unknown hero earns no visit credit.
+        """
         for pos, cell in staged.cells.items():
             self.grid[pos] = cell
         self.stairs_down |= set(staged.stairs_down)
         self.stairs_up |= set(staged.stairs_up)
-        hero = staged.hero
+        hero = staged.hero if hero is DERIVED_HERO else hero
+        self.hero = hero
         if hero is not None:
             if hero == self.last_hero:
                 self.no_progress += 1
@@ -374,7 +492,6 @@ class EpisodeMemory(object):
                 self.no_progress = 0
                 self.searches_since_progress = 0
             self.last_hero = hero
-            self.hero = hero
             self.visits[hero] = self.visits.get(hero, 0) + 1
         self.status = staged.status
         for e, text in staged.messages:

@@ -344,7 +344,12 @@ def reconcile_hero(prior: HeroResolution, ev: MovementEvidence,
     if ev.expected is not None and frozenset((ev.expected,)) == cells:
         return HeroResolution(H_STATUS_CONFIRMED, ev.expected, cells, False,
                               "expected destination confirmed", generation)
-    if len(cells) == 1 and prior.resolved:
+    if len(cells) == 1:
+        # A unique @ in a coherent frame is positive support for the hero
+        # (plan 4.2: a unique @ at a coherent boundary bootstraps).  This also
+        # re-confirms after a transient unresolved frame, but never picks a
+        # first/nearest @ out of several -- the multiple-@ case above stays a
+        # possibility set.
         only = next(iter(cells))
         return HeroResolution(H_STATUS_CONFIRMED, only, cells, False,
                               "single consistent @", generation)
