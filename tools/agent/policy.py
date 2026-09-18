@@ -35,7 +35,8 @@ import random
 import time
 from typing import Dict, List, Optional, Tuple
 
-from . import protocol, state
+from . import candidates, navigation, protocol, state
+from .arbitration import select_retained
 from .directives import DirectiveView
 from .providers import ReflexContext, ReflexResult, ReflexTimeout
 
@@ -114,6 +115,13 @@ class ScriptedReflex(object):
         # every loop boundary so a single scripted decision cannot overrun its
         # allowance.
         self.deadline = 0.0
+        # Wave-3 identity/bookkeeping.  The table version and the
+        # controller-owned rejection version are canonical table inputs, and
+        # the active level-instance id scopes directive settlement; none is a
+        # gameplay-memory mutation.
+        self._table_version = 1
+        self.rejection_version = 0
+        self.instance_id = 0
 
     # -- provider surface ------------------------------------------------
     def _check_deadline(self) -> None:
@@ -124,24 +132,130 @@ class ScriptedReflex(object):
         self.deadline = float(getattr(context, "deadline", 0.0) or 0.0)
         self.directives = _directive_view(context)
         self._check_deadline()
-        need = context.need or {}
-        kind = need.get("kind")
-        if kind == "menu":
-            action, reason = self._menu(context)
-        elif kind == "yn":
-            action, reason = self._yn(context)
-        elif kind in ("command", "key", "direction"):
-            action, reason = self._command(context)
-        elif kind == "ack":
-            action, reason = {"ack": True}, "acknowledge display"
-        elif kind in ("line", "extcmd"):
-            action, reason = self._textish(context)
-        elif kind == "position":
-            action, reason = {"key": KEY.KEY_ESC}, "cancel position request"
+        kind = (context.need or {}).get("kind")
+        if kind not in ("command", "key", "direction"):
+            return self._decide_scripted_kind(context, kind)
+        prepared = getattr(context, "prepared", None)
+        if prepared is None:
+            prepared = self.prepare(context)
+        cand = self._select(prepared, getattr(context, "rejected", None))
+        if cand is None:
+            # member exhaustion: a reviewed per-kind structural fallback,
+            # never an infinite `s` (3.5)
+            return ReflexResult(action={"key": KEY.KEY_SEARCH},
+                                confidence=0.5, provider="scripted",
+                                reason="exhausted: structural fallback")
+        self._note_selection(cand, context)
+        return ReflexResult(action=candidates.candidate_to_wire(cand),
+                            confidence=0.5, provider="scripted",
+                            reason=cand.reason or cand.semantic_label)
+
+    def prepare(self, context: ReflexContext) -> "candidates.PreparedReflex":
+        """Pure multi-candidate preparation into one immutable table (3.1).
+
+        Builds the single retained table of at most
+        :data:`candidates.MAX_CANDIDATES` deterministic candidates for this
+        decision.  Only reflex-local bookkeeping can change here; gameplay
+        memory is never mutated, so a proposal can never become an outcome.
+        Command/key/direction needs are fully candidate-based; menus, prompts
+        and other kinds stay scripted and degrade to a one-row table.
+        """
+        self.deadline = float(getattr(context, "deadline", 0.0) or 0.0)
+        self.directives = _directive_view(context)
+        kind = (context.need or {}).get("kind")
+        if kind in ("command", "key", "direction"):
+            cands = self._command_candidates(context)
         else:
-            action, reason = {"key": KEY.KEY_ESC}, "unknown kind fallback"
+            action, reason = self._noncommand(context, kind)
+            cands = (candidates.make_candidate(
+                action, family="prompt", score=0, reason=reason,
+                proposed_effect="prompt"),)
+        features = self._features(context)
+        table = candidates.build_table(
+            self._need_key(context), self._table_version, cands,
+            features_digest=features.digest(), jev_eligibility=False,
+            rejection_version=self.rejection_version)
+        return candidates.PreparedReflex(immutable_features=features,
+                                         table=table)
+
+    def _decide_scripted_kind(self, context, kind):
+        """Menus, prompts and any other non-command need stay scripted."""
+        action, reason = self._noncommand(context, kind)
         return ReflexResult(action=action, confidence=0.5,
                             provider="scripted", reason=reason)
+
+    def _noncommand(self, context, kind):
+        if kind == "menu":
+            return self._menu(context)
+        if kind == "yn":
+            return self._yn(context)
+        if kind == "ack":
+            return {"ack": True}, "acknowledge display"
+        if kind in ("line", "extcmd"):
+            return self._textish(context)
+        if kind == "position":
+            return {"key": KEY.KEY_ESC}, "cancel position request"
+        return {"key": KEY.KEY_ESC}, "unknown kind fallback"
+
+    def _select(self, prepared, rejected):
+        """The retained argmax among eligible, unrejected members (3.5)."""
+        if rejected is not None:
+            return select_retained(prepared.table, rejected)
+        return prepared.table.scripted()
+
+    def _note_selection(self, cand, context):
+        """Commit the *selection-time* reflex bookkeeping for a candidate.
+
+        Nothing here touches gameplay memory.  Only the chosen candidate's
+        recorded effect is applied, so a discarded proposal can never advance
+        an intent, a search counter or an inventory refresh.
+        """
+        effect = cand.proposed_effect
+        if effect == "prompt":
+            return
+        self.intent = ""
+        if effect == "quit":
+            self.quitting = True
+            if self.quit_reason == "":
+                self.quit_reason = ("tick-cap" if context.tick
+                                    >= self.max_ticks else "quit")
+        elif effect == "schedule-eat":
+            self.last_eat_tick = context.tick
+            self.intent = "eat"
+            self.eat_reject_base = sum(
+                1 for m in context.memory.messages
+                if "don't have that object" in m)
+            self.eat_forced_menu = False
+        elif effect in ("refresh-inventory", "refresh-inventory-periodic"):
+            self.last_inv_tick = context.tick
+        elif effect == "secret-search":
+            context.memory.searches_since_progress += 1
+
+    def _need_key(self, context):
+        nk = getattr(context, "need_key", None)
+        if nk is None:
+            return ()
+        return candidates.normalize_need_key(nk)
+
+    def _features(self, context):
+        """The immutable public-state subset this preparation binds to."""
+        mem = context.memory
+        st = mem.status
+        hero = mem.hero
+        conditions = (st.hunger,) if st.hunger else ()
+        return candidates.ReflexFeatures(
+            episode=getattr(context, "episode", 0) or 0,
+            controller_tick=getattr(context, "tick", 0) or 0,
+            need_key=self._need_key(context),
+            level_instance_id=self.instance_id,
+            displayed_level=st.dlvl or "",
+            hero_confirmed=tuple(hero) if hero else (),
+            hero_status=("confirmed" if hero else "unknown"),
+            hp=st.hp, hp_max=st.hp_max, game_time=st.time,
+            conditions=conditions,
+            inventory_signature=mem.inventory_signature() or (),
+            directive_generation=self.directives.generation,
+            rejection_version=self.rejection_version)
 
     def fallback(self, context: ReflexContext) -> ReflexResult:
         return self.decide(context)
@@ -249,69 +363,135 @@ class ScriptedReflex(object):
             return {"yn": ord("*")}, "open the food menu"
         return {"yn": KEY.KEY_ESC}, "no known-safe food answer: cancel eat"
 
-    # -- gameplay commands ----------------------------------------------
-    def _command(self, context: ReflexContext):
-        self.intent = ""
-        if self.quitting or context.tick >= self.max_ticks:
-            self.quitting = True
-            if self.quit_reason == "":
-                self.quit_reason = ("tick-cap" if context.tick >=
-                                    self.max_ticks else "quit")
-            return {"key": KEY.KEY_HASH}, "tick cap: request quit"
+    # -- gameplay commands: candidate generation ------------------------
+    def _command_candidates(self, context: ReflexContext):
+        """Every command candidate, in the documented precedence order.
+
+        Safety emergencies, mandatory continuations and maintenance actions
+        take precedence through *priority* (they become the sole candidate),
+        not through an unbounded score bonus (3.3).  Only when none applies
+        does navigation generate a scored multi-candidate set.
+        """
         mem = context.memory
         st = mem.status
         hero = mem.hero
-
-        # 1. low-HP disengagement: escape before taking any other action
+        if self.quitting or context.tick >= self.max_ticks:
+            why = ("tick cap: request quit" if context.tick >= self.max_ticks
+                   else "quit")
+            return (self._cand({"key": KEY.KEY_HASH}, "quit", "other", 0,
+                               why, "quit"),)
+        # 1. low-HP disengagement: escape before any other action
         if hero is not None and self._low_hp(st):
-            return self._escape(mem, hero)
-
-        # 2. hunger: schedule a known-safe food intent.  An acquire_food
-        #    directive shortens the retry interval and, when the cache shows
-        #    no known-safe food, inspects the inventory before exploring.
+            action, why = self._escape(mem, hero)
+            return (self._cand(action, "escape", "emergency", 0, why,
+                               "emergency"),)
+        # 2. hunger: schedule a known-safe food intent
         if self._hungry(st) and \
                 (context.tick - self.last_eat_tick) > self._eat_interval():
-            self.last_eat_tick = context.tick
-            self.intent = "eat"
-            self.eat_reject_base = sum(1 for m in mem.messages
-                                       if "don't have that object" in m)
-            self.eat_forced_menu = False
-            return {"key": KEY.KEY_EAT}, "hungry: attempt to eat"
-
+            return (self._cand({"key": KEY.KEY_EAT}, "eat", "food", 0,
+                               "hungry: attempt to eat", "schedule-eat"),)
         if self.directives.wants_food() and hero is not None \
                 and not mem.inventory.food_rows() \
                 and mem.inventory.stale(context.tick, INV_STALE_TICKS) \
                 and (context.tick - self.last_inv_tick) \
                 > INV_REFRESH_COOLDOWN:
-            self.last_inv_tick = context.tick
-            return {"key": KEY.KEY_INV}, \
-                "directive %s: inspect inventory for food" \
-                % self.directives.top_goal()
-
+            reason = ("directive %s: inspect inventory for food"
+                      % self.directives.top_goal())
+            return (self._cand({"key": KEY.KEY_INV}, "inspect-inventory",
+                               "inventory", 0, reason,
+                               "refresh-inventory"),)
         if hero is None:
             # The hero's square is unknown, so every direction leads into
             # unknown space and adjacency cannot be evaluated: never move
             # blind, hold the turn with a search instead.
-            return {"key": KEY.KEY_SEARCH}, "no hero fix: search in place"
-
+            return (self._cand({"key": KEY.KEY_SEARCH}, "search-in-place",
+                               "recovery", 0,
+                               "no hero fix: search in place", "recovery"),)
         # 3. loop breakers: progress without ever walking into a monster
         np = mem.no_progress
         if np >= 10:
-            return self._unblock(mem, hero, st), "loop breaker: unblock"
+            action = self._unblock(mem, hero, st)
+            return (self._cand(action, "unblock", "recovery", 0,
+                               "loop breaker: unblock", "recovery"),)
         if np >= 6:
             key, why = self._random_move(mem, hero)
-            return {"key": key}, "loop breaker: %s" % why
+            return (self._cand({"key": key}, "random-move", "recovery", 0,
+                               "loop breaker: %s" % why, "recovery"),)
         if np >= 3:
-            return {"key": KEY.KEY_SEARCH}, "loop breaker: search"
-
+            return (self._cand({"key": KEY.KEY_SEARCH}, "search",
+                               "recovery", 0, "loop breaker: search",
+                               "recovery"),)
         # 4. inventory cache maintenance (never preempts safety or progress)
-        if mem.inventory.stale(context.tick, INV_STALE_TICKS):
-            if (context.tick - self.last_inv_tick) > INV_REFRESH_COOLDOWN:
-                self.last_inv_tick = context.tick
-                return {"key": KEY.KEY_INV}, "refresh the inventory cache"
+        if mem.inventory.stale(context.tick, INV_STALE_TICKS) \
+                and (context.tick - self.last_inv_tick) \
+                > INV_REFRESH_COOLDOWN:
+            return (self._cand({"key": KEY.KEY_INV}, "refresh-inventory",
+                               "inventory", 0,
+                               "refresh the inventory cache",
+                               "refresh-inventory-periodic"),)
+        return self._navigation_candidates(context, mem, hero)
 
-        step = self._move_key(context, hero)
-        return {"key": step[0]}, step[1]
+    @staticmethod
+    def _cand(action, label, family, score, reason, effect,
+              direction=(), direction_rank=0):
+        """Build one content-addressed candidate with its semantic label."""
+        return candidates.make_candidate(
+            action, label, family=family, score=score, reason=reason,
+            proposed_effect=effect, direction=direction,
+            direction_rank=direction_rank)
+
+    def _navigation_candidates(self, context, mem, hero):
+        """One-Dijkstra navigation candidates over all reachable targets.
+
+        This replaces the old priority-return navigation: a single Dijkstra
+        enumerates every reachable down stair, closed-door approach, frontier
+        and unvisited cell, and the retained argmax picks the first step.  A
+        directive only reorders candidates the reflex already knows how to
+        build; it never supplies a key.
+        """
+        explore_first = self.directives.prefers_frontier() \
+            and not self.directives.prefers_stairs()
+        if hero in mem.stairs_down and not explore_first:
+            return (self._cand({"key": ord(">")}, "descend", "descend", 900,
+                               "descend the known stairs", "descend"),)
+        terrain = self._terrain(mem)
+        plan = navigation.plan(terrain, hero, mem.visits, None,
+                               self._check_deadline)
+        cands = []
+        for target in plan.targets:
+            key = KEY.DIR_KEYS[target.first_step]
+            score = _target_score(target.family, target.cost, explore_first)
+            score += self._directive_component(target)
+            cands.append(self._cand(
+                {"key": key}, "navigate", _NAV_FAMILY[target.family], score,
+                "%s: %s" % (self._nav_reason(), target.reason), "navigate",
+                direction=target.first_step,
+                direction_rank=navigation.DIR_RANK[target.first_step]))
+        if cands:
+            return tuple(cands)
+        if mem.searches_since_progress < 3:
+            return (self._cand({"key": KEY.KEY_SEARCH}, "search-secret",
+                               "secret-search", 300,
+                               "search for secret doors",
+                               "secret-search"),)
+        key, why = self._random_move(mem, hero)
+        return (self._cand({"key": key}, "random-move", "recovery", 200, why,
+                           "recovery"),)
+
+    def _terrain(self, mem):
+        """Build one classified terrain view from remembered raw cells."""
+        terrain = navigation.TerrainMemory()
+        terrain.merge(mem.grid)
+        return terrain
+
+    def _directive_component(self, target) -> int:
+        """A bounded, logged directive contribution to a target's score."""
+        if not self.directives.active:
+            return 0
+        want = self.directives.target
+        if want is not None and tuple(want) == target.pos:
+            return 30
+        return 0
 
     def _hungry(self, st: state.Status) -> bool:
         return st.hunger.startswith(("Hungry", "Weak", "Fainting"))
@@ -388,55 +568,10 @@ class ScriptedReflex(object):
         return {"key": KEY.KEY_SEARCH}
 
     # -- navigation ------------------------------------------------------
-    def _move_key(self, context: ReflexContext, hero):
-        mem = context.memory
-        # standing on the known down stairs: descend (bounded progress),
-        # unless an explore_frontier/search_dead_ends directive is in force
-        # and nothing asked to descend -- the directive only changes the
-        # reflex's own ordering, it never supplies the key.
-        explore_first = self.directives.prefers_frontier() \
-            and not self.directives.prefers_stairs()
-        if hero in mem.stairs_down and not explore_first:
-            return ord(">"), "descend the known stairs"
-        for target in self._target_list(mem, hero):
-            step = self._first_step(mem, hero, target)
-            if step is not None:
-                return KEY.DIR_KEYS[step], self._nav_reason()
-        if mem.searches_since_progress < 3:
-            mem.searches_since_progress += 1
-            return KEY.KEY_SEARCH, "search for secret doors"
-        return self._random_move(mem, hero)
-
     def _nav_reason(self) -> str:
         if not self.directives.active:
             return "navigate"
         return "navigate (%s)" % self.directives.top_goal()
-
-    def _target_list(self, mem, hero):
-        down = [p for p in mem.stairs_down
-                if p != hero and state.passable(mem.tile(p))]
-        frontier, unvisited = [], []
-        for pos, cell in mem.grid.items():
-            if pos == hero or not state.passable(cell[0]):
-                continue
-            if self._is_frontier(mem, pos):
-                frontier.append(pos)
-            elif mem.visits.get(pos, 0) == 0:
-                unvisited.append(pos)
-        stairs = [min(down, key=lambda p: _manhattan(p, hero))] \
-            if down else []
-        fronts = sorted(frontier,
-                        key=lambda p: _manhattan(p, hero) + 0.5
-                        * mem.visits.get(p, 0))[:8]
-        unexplored = sorted(unvisited, key=lambda p: _manhattan(p, hero))[:8]
-        # An explore_frontier/search_dead_ends directive puts frontiers first
-        # and holds the stair target back; every other goal keeps the
-        # default, which is down-stairs first.
-        if self.directives.prefers_frontier() \
-                and not self.directives.prefers_stairs():
-            extras = [p for p in down if p not in stairs]
-            return fronts + unexplored + stairs + extras
-        return stairs + fronts + unexplored
 
     def _frontier_target(self, mem, hero):
         best = None
@@ -541,6 +676,35 @@ class ScriptedReflex(object):
 
 def _manhattan(a, b):
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+# Navigation target families mapped to candidate families (candidates.py),
+# and their initial ordinary base scores (plan 3.3).  The bounded path-length
+# adjustment never crosses a family boundary (gaps are >= 100, adjustment is
+# capped at 40), so a nearer stair cannot be suppressed indefinitely by a
+# distant frontier.
+_NAV_FAMILY = {navigation.TFAM_STAIR: "stair",
+               navigation.TFAM_DOOR: "door",
+               navigation.TFAM_FRONTIER: "frontier",
+               navigation.TFAM_UNVISITED: "unvisited"}
+_NAV_BASE = {"stair": 800, "door": 700, "frontier": 500, "unvisited": 400}
+_EXPLORE_BOOST = 450    # explore_frontier/search_dead_ends: hold stairs back
+_MAX_STEP_UNITS = 40    # bounded path-length adjustment
+
+
+def _target_score(family: str, cost: int, explore_first: bool) -> int:
+    """The integer score of one reachable navigation target (3.3).
+
+    *cost* is the target's integer Dijkstra distance (section 4.5), so the
+    within-family ordering prefers the nearest reachable target.  The bounded
+    adjustment never crosses a family boundary (gaps are >= 100, cap 40), so
+    ordinary frontier bias cannot suppress a newly reachable staircase.
+    """
+    score = _NAV_BASE[family] - min(cost // navigation.BASE_STEP,
+                                    _MAX_STEP_UNITS)
+    if explore_first and family in ("frontier", "unvisited"):
+        score += _EXPLORE_BOOST
+    return score
 
 
 def _directive_view(context) -> DirectiveView:

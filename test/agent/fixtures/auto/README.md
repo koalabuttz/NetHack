@@ -33,11 +33,11 @@ recordings are not in the repository):
 - `startup.wire.jsonl`
   `60a7572334ca58ea06c09c39d2c7c998b1b7ff18993123e7ff141174de93e6ca`
 - `short.wire.jsonl`
-  `02d779f44dbda793d9c7945da00d6b56b7fe66ea5cf422def4583fa3e78114b2`
+  `30e322b2b82eab83c84968c3fbe8c885e730543a06839f4c74f66da7b254d727`
 - `short.actions.jsonl`
-  `9d5011acb959664803138571f65adb7a331206038eb84bbc91cc6fde89021384`
+  `b7a985c96a902033c1539a7aca1ec3fdb7b8740b3132ce0f85d483bbd2f2635d`
 - `short.decisions.jsonl`
-  `4e0b33f38cc05f2fc13552bd0cb25bd7a560c191228e8d417c58001133730a7e`
+  `64541dec1de0e431abb3682c453220bc2a2f081faedb236139c5091a8f1c0ef5`
 - `legacy-ep3.wire.jsonl`
   `f59639a98d043c95c315cf4ab2bd93aa1fb656e7bb150e30a5dbf3294f4d00e7`
 
@@ -95,9 +95,9 @@ controller's outbound-action sidecar (ordinal, preceding input offset,
 reason, boundaries, usage).  The episode ran until the tick-cap graceful quit,
 so it ends in a clean `closed`.
 
-It carries 48 needs — character selection (`yn`, two `menu`s, an `ack`),
-31 `command` moves, one `extcmd` (the tick-cap quit) and mid-run prompts — and
-is the fixture with real ground-truth actions for agreement assertions.
+It carries 47 needs — character selection (`yn`, `menu`s, an `ack`), 31
+`command` moves, one `extcmd` (the tick-cap quit) and mid-run prompts — and is
+the fixture with real ground-truth actions for agreement assertions.
 
 **Reproduce the ground-truth agreement:**
 
@@ -111,7 +111,10 @@ python3 -m tools.agent.evaluate test/agent/fixtures/auto/short.wire.jsonl \
 
 Because the recording was produced by the scripted reflex itself, replaying it
 with the *same* configuration reproduces every original action
-(agreement 48/48).  **The `--max-ticks` value must match the recording's** —
+(agreement 47/47).  The `short.*` sidecars were re-captured for the wave-3
+one-Dijkstra navigation rewrite (a legitimate policy change invalidates the
+old trajectory, exactly as this README warns).  **The `--max-ticks` value must
+match the recording's** —
 the replay's reflex quits at the same tick cap, and a different cap changes
 the `extcmd` answer and the tick at which the quit is requested.  A mismatch
 is a configuration error in the evaluation, not policy drift.

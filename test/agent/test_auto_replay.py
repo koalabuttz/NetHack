@@ -380,11 +380,11 @@ class FixtureIntegrityTest(unittest.TestCase):
         "startup.wire.jsonl": (
           "60a7572334ca58ea06c09c39d2c7c998b1b7ff18993123e7ff141174de93e6ca"),
         "short.wire.jsonl": (
-          "02d779f44dbda793d9c7945da00d6b56b7fe66ea5cf422def4583fa3e78114b2"),
+          "30e322b2b82eab83c84968c3fbe8c885e730543a06839f4c74f66da7b254d727"),
         "short.actions.jsonl": (
-          "9d5011acb959664803138571f65adb7a331206038eb84bbc91cc6fde89021384"),
+          "b7a985c96a902033c1539a7aca1ec3fdb7b8740b3132ce0f85d483bbd2f2635d"),
         "short.decisions.jsonl": (
-          "4e0b33f38cc05f2fc13552bd0cb25bd7a560c191228e8d417c58001133730a7e"),
+          "64541dec1de0e431abb3682c453220bc2a2f081faedb236139c5091a8f1c0ef5"),
         "legacy-ep3.wire.jsonl": (
           "f59639a98d043c95c315cf4ab2bd93aa1fb656e7bb150e30a5dbf3294f4d00e7"),
     }
