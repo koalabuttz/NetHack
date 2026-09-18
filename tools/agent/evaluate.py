@@ -770,9 +770,10 @@ class ReplayPass(object):
         """Commit the frozen effect of the modeled send (plan 3.1/6.2)."""
         if self._pending_effect is None:
             return
-        effect, label = self._pending_effect
+        effect, label, payload = self._pending_effect
         self.reflex.commit_effect(effect, label, self.tick, self.mem,
-                                  observed_kind=self._last_observed_kind)
+                                  observed_kind=self._last_observed_kind,
+                                  payload=payload)
         self._pending_effect = None
 
     def _on_invalid(self, rec) -> None:
@@ -1036,14 +1037,21 @@ class ReplayPass(object):
             "directives": [view.dset.to_dict()] if view.active else [],
         })
         self.answered += 1
-        # Model the send (plan 6.2): the selected gameplay action is treated
-        # as sent, so its frozen effect is committed at the NEXT reconciled
-        # observation -- never here.  A non-command need models no send.
+        # Model the send (plan 6.2): the selected action is treated as sent,
+        # so its frozen effect is committed at the NEXT reconciled
+        # observation -- never here.  A gameplay command additionally models
+        # the SentAttempt (motion/tick); a non-command need freezes only its
+        # effect (and payload), exactly as the live controller arms no attempt
+        # for menu/prompt/ack/line/extcmd/position.
         self._pending_effect = None
         self._sent_action = None
         self._sent_stair = False
         self._sent_before = None
-        if need.need.get("kind") in ("command", "key", "direction"):
+        kind = need.need.get("kind")
+        cand = getattr(self.reflex, "last_candidate", None)
+        matched = (cand is not None
+                   and candidates.candidate_to_wire(cand) == selected)
+        if kind in ("command", "key", "direction"):
             self._sent_action = candidates.wire_to_action(selected)
             self._sent_stair = (self._sent_action.tag == "key"
                                 and self._sent_action.payload[0]
@@ -1051,12 +1059,15 @@ class ReplayPass(object):
             self._sent_before = {"hero": self.mem.hero,
                                  "time": self.mem.status.time,
                                  "dlvl": self.mem.status.dlvl}
-            cand = getattr(self.reflex, "last_candidate", None)
-            if cand is not None and \
-                    candidates.candidate_to_wire(cand) == selected:
-                self._pending_effect = (cand.proposed_effect,
-                                        cand.semantic_label)
-        if need.need.get("kind") in ("command", "key", "direction"):
+            if matched:
+                self._pending_effect = (
+                    cand.proposed_effect, cand.semantic_label,
+                    tuple(getattr(cand, "effect_payload", ())))
+        elif matched and getattr(cand, "proposed_effect", ""):
+            self._pending_effect = (
+                cand.proposed_effect, cand.semantic_label,
+                tuple(getattr(cand, "effect_payload", ())))
+        if kind in ("command", "key", "direction"):
             self.tick += 1
         self._pending = None
 
