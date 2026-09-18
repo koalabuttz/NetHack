@@ -663,8 +663,11 @@ The output JSONL has three record kinds:
     `proposal`, the `selected` action, the provider label, `legal` (the
     selected action passes the wire shape gate), `fallback`, `low_confidence`,
     the `actual_action` and its `actual_action_source` (`sidecar` or
-    `unknown`), the `agreement` against the original, the boundary `eids`
-    detected at that need, and any active directive set;
+    `unknown`), the `agreement` against the original, the `sent_ordinal` of
+    the modeled send (every answer is one act, exactly as live), the
+    boundary `eids` detected at that need, and any active directive set;
+    a rejected attempt's row additionally carries `rejected_action`, the
+    `retry_action` that replaces it and that retry's `sent_ordinal`;
   * `record: "boundary"` / `record: "directive"` — the deterministic
     event-lifecycle ledger, with the wall-timing map **dropped**;
   * `record: "summary"` — the rollup: per-need coverage, per-provider
@@ -689,7 +692,13 @@ The output JSONL has three record kinds:
     lists it under `rejected_attempts`) and the *accepted* candidate — the
     attempt the wire did not reject — is what `actual_action` and the
     agreement/coverage figures use.  A first, rejected action is never
-    reported as the original.
+    reported as the original.  The rejected attempt is also **discarded**,
+    exactly as the live controller discards its in-flight attempt: its
+    frozen effect is never committed at the next observation and its action
+    drives no recorded-state reconciliation.  The accepted retry — the
+    attempt recorded after the rejected ones, or unknown when the sidecar is
+    exhausted — is the modeled send instead, so a same-ID retry does not
+    resend (or commit) the rejected winner.
   * **legality** is structural validity (the `validate_action` gate); it is
     not safety.  Confidence agreement with a recorded action is **not**
     evidence of calibration, and is never reported as such.
