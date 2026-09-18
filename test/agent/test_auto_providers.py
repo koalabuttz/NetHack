@@ -10,6 +10,7 @@ redirect guards, deadline, kill, reap -- is exercised without touching a
 real provider.  The default configuration is asserted to be network-free.
 """
 
+import hashlib
 import http.server
 import json
 import os
@@ -1608,6 +1609,8 @@ def wire_ctx(need=None, tick=3):
     terrain = instances.TerrainMemory()
     terrain.terrain[(5, 5)] = instances.T_FLOOR
     terrain.terrain[(6, 5)] = instances.T_FLOOR
+    # production commits the parsed status with the snapshot
+    mem.status = state.parse_status(snap)
     ctx = ReflexContext(
         episode=1, tick=tick, need=need,
         need_key=protocol.NeedKey(1, 1, need.get("id")), snapshot=snap,
@@ -1632,6 +1635,11 @@ def wire_ctx(need=None, tick=3):
 
 
 WIRE_KEYS = ("navigate-north", "navigate-east", "search-in-place")
+
+
+def _read_fixture(name):
+    with open(os.path.join(_HERE, "fixtures", name)) as handle:
+        return handle.read()
 
 
 def jev_answer(choice, probs, usage=None, action_type="choice", nest=True):
@@ -1705,6 +1713,17 @@ class TestJevWireContract(unittest.TestCase):
         self.assertEqual(list(json.loads(json.dumps(criteria)).keys()),
                          list(WIRE_KEYS))
 
+        # the committed golden request fixture pins the exact raw bytes
+        golden = json.loads(_read_fixture("jev_golden_request.json"))
+        self.assertEqual(hashlib.sha256(raw).hexdigest(),
+                         golden["request_body_sha256"])
+        self.assertEqual(sent, golden["request_body"])
+        self.assertEqual(list(criteria), golden["option_keys"])
+        self.assertEqual(question["instructions"], golden["instructions"])
+        self.assertEqual(sent["state"]["legend"], golden["legend"])
+        self.assertEqual(golden["capture"]["presentation_version"],
+                         providers.JEV_PRESENTATION_VERSION)
+
     def test_instructions_exact_text(self):
         expected = (
             "You are choosing the next action in NetHack. Prioritize "
@@ -1759,6 +1778,31 @@ class TestJevParser(unittest.TestCase):
         self._respond(jev_answer(WIRE_KEYS[1], self.probs, nest=False))
         res = self.prov.decide(wire_ctx(), time.monotonic() + 2.0)
         self.assertEqual((res.index, res.parse_error), (1, ""))
+        # a mixed placement: the key at the answer level, the distribution on
+        # the named action object
+        mixed = {"model": "jev-latest",
+                 "answers": {"action": {"type": "choice",
+                                        "probabilities": self.probs},
+                             "choice": WIRE_KEYS[1]}}
+        self._respond(mixed)
+        res = self.prov.decide(wire_ctx(), time.monotonic() + 2.0)
+        self.assertEqual((res.index, res.parse_error), (1, ""))
+        self.prov.cancel()
+
+    def test_captured_authoritative_response_parses(self):
+        # the committed fixture is an authoritative-shaped body using the new
+        # semantic keys; it must parse to the recorded identity
+        golden = json.loads(_read_fixture("jev_golden_request.json"))
+        self._respond(golden["response"])
+        res = self.prov.decide(wire_ctx(), time.monotonic() + 2.0)
+        expected = golden["expected"]
+        self.assertEqual(res.parse_error, "")
+        self.assertEqual(res.index, expected["selected_retained_index"])
+        self.assertEqual(res.confidence, expected["confidence"])
+        self.assertEqual(res.usage, expected["usage"])
+        # the response's keys are exactly the committed option keys
+        probs = golden["response"]["answers"]["action"]["probabilities"]
+        self.assertEqual(set(probs), set(golden["option_keys"]))
         self.prov.cancel()
 
     def test_omitted_type_rejected(self):
