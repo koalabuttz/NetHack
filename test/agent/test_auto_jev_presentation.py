@@ -700,9 +700,11 @@ class TestJevVersion(WireHarness):
 # ----------------------------------------------------------------- AC.11
 
 class TestJevConfidence(unittest.TestCase):
-    """The confidence gate is untouched; its measurement plan is documented."""
+    """Peakedness-relative acceptance plus the legacy absolute rollback."""
 
     def test_confidence_gate_threshold_unchanged_for_spread_distribution(self):
+        # Legacy rollback coverage: the flat scalar threshold is preserved for
+        # callers that explicitly request absolute mode.
         from tools.agent import arbitration
 
         cands = [cand(KEY.KEY_H, "navigate", family="frontier"),
@@ -717,7 +719,8 @@ class TestJevConfidence(unittest.TestCase):
                 confidence=confidence, dispatched=True)
             return arbitration.validate_raw_choice(
                 table, raw, arbitration.RejectionSet(),
-                threshold=threshold, eligible=lambda c: True)
+                threshold=threshold, eligible=lambda c: True,
+                mode=arbitration.CONFIDENCE_ABSOLUTE)
 
         # a spread distribution over several acceptable navigation
         # alternatives is legitimately low-concentration: the gate reads the
@@ -734,6 +737,171 @@ class TestJevConfidence(unittest.TestCase):
         self.assertFalse(outcome(0.799, 0.8).accepted)
         # a concentrated distribution is unaffected
         self.assertTrue(outcome(0.96, 0.8).accepted)
+
+    # -- relative (peakedness) acceptance ---------------------------------
+
+    @staticmethod
+    def _raw(table, index, prob, confidence=0.0, **kw):
+        from tools.agent import arbitration
+        fields = dict(table_id=table.table_id, need_key=tuple(table.need_key),
+                      table_version=table.table_version, index=index,
+                      confidence=confidence, selected_probability=prob)
+        fields.update(kw)
+        return arbitration.RawChoice(**fields)
+
+    @staticmethod
+    def _table_n(n, need_key=(1, 1, 1)):
+        codes = [KEY.KEY_H, KEY.KEY_L, KEY.KEY_J, KEY.KEY_K, KEY.KEY_Y,
+                 KEY.KEY_U][:n]
+        labels = ["navigate", "search", "eat", "wait", "inventory",
+                  "pick-up"][:n]
+        return table_of([cand(c, l) for c, l in zip(codes, labels)],
+                        need_key=need_key)
+
+    def test_relative_gate_uses_selected_probability_not_reported_confidence(
+            self):
+        from tools.agent import arbitration
+        table = self._table_n(2)
+        # a high service confidence with a *low* selected probability fails
+        out = arbitration.validate_raw_choice(
+            table, self._raw(table, 0, 0.30, confidence=0.99),
+            arbitration.RejectionSet())
+        self.assertFalse(out.accepted)
+        self.assertEqual(out.code, "confidence")
+        # a low confidence with a *sufficient* selected probability passes
+        out = arbitration.validate_raw_choice(
+            table, self._raw(table, 0, 0.90, confidence=0.0),
+            arbitration.RejectionSet())
+        self.assertTrue(out.accepted)
+
+    def test_relative_gate_thresholds_for_two_through_six_options(self):
+        from tools.agent import arbitration
+        expected = {2: 1.5 / 2, 3: 1.5 / 3, 4: 1.5 / 4, 5: 1.5 / 5,
+                    6: 1.5 / 6}
+        for n, need in expected.items():
+            table = self._table_n(n)
+            # just above the boundary passes
+            out = arbitration.validate_raw_choice(
+                table, self._raw(table, 0, need + 1e-9),
+                arbitration.RejectionSet())
+            self.assertTrue(out.accepted, n)
+            # just below the boundary fails
+            out = arbitration.validate_raw_choice(
+                table, self._raw(table, 0, need - 1e-9),
+                arbitration.RejectionSet())
+            self.assertFalse(out.accepted, n)
+
+    def test_relative_gate_strict_boundary_and_uniform_rejection(self):
+        from tools.agent import arbitration
+        for n in (2, 3, 4, 5, 6):
+            table = self._table_n(n)
+            uniform = 1.0 / n
+            # exactly at k/N fails: the rule is "exceeds"
+            out = arbitration.validate_raw_choice(
+                table, self._raw(table, 0, uniform),
+                arbitration.RejectionSet())
+            self.assertFalse(out.accepted, n)
+            # 2/N always passes (binary reachability for every n)
+            out = arbitration.validate_raw_choice(
+                table, self._raw(table, 0, 2.0 / n),
+                arbitration.RejectionSet())
+            self.assertTrue(out.accepted, n)
+
+    def test_relative_gate_monotone_in_probability_and_option_count(self):
+        from tools.agent import arbitration
+        # for fixed N, acceptance is monotone in p
+        table = self._table_n(5)
+        seen_accept = False
+        for p in [0.05 * i for i in range(21)]:
+            out = arbitration.validate_raw_choice(
+                table, self._raw(table, 0, p), arbitration.RejectionSet())
+            if out.accepted:
+                seen_accept = True
+            elif seen_accept:
+                self.fail("acceptance must be monotone in p")
+        # for fixed p, a larger N is never harder: 0.34 fails at N=3 but
+        # passes at N=5
+        out3 = arbitration.validate_raw_choice(
+            self._table_n(3), self._raw(self._table_n(3), 0, 0.34),
+            arbitration.RejectionSet())
+        out5 = arbitration.validate_raw_choice(
+            self._table_n(5), self._raw(self._table_n(5), 0, 0.34),
+            arbitration.RejectionSet())
+        self.assertFalse(out3.accepted)
+        self.assertTrue(out5.accepted)
+
+    def test_relative_gate_rejects_missing_bool_nonfinite_probability(self):
+        from tools.agent import arbitration
+        table = self._table_n(3)
+        raw = arbitration.RawChoice(
+            table_id=table.table_id, need_key=tuple(table.need_key),
+            table_version=table.table_version, index=0, confidence=0.99)
+        # no selected probability at all: fail closed, never fall back to the
+        # unrelated confidence scalar
+        out = arbitration.validate_raw_choice(table, raw,
+                                              arbitration.RejectionSet())
+        self.assertFalse(out.accepted)
+        self.assertEqual(out.code, "confidence")
+        for bad in (True, "hi", float("nan"), float("inf"), -0.1, 1.1, None):
+            out = arbitration.validate_raw_choice(
+                table, self._raw(table, 0, bad), arbitration.RejectionSet())
+            self.assertFalse(out.accepted, bad)
+            self.assertEqual(out.code, "confidence", bad)
+
+    def test_relative_gate_preserves_identity_rejection_and_safety_checks(
+            self):
+        from tools.agent import arbitration
+        table = self._table_n(2)
+        # a maximally concentrated probability never bypasses identity
+        out = arbitration.validate_raw_choice(
+            table, self._raw(table, 0, 1.0, table_id="stale"),
+            arbitration.RejectionSet())
+        self.assertEqual(out.code, "stale")
+        out = arbitration.validate_raw_choice(
+            table, self._raw(table, 5, 1.0), arbitration.RejectionSet())
+        self.assertEqual(out.code, "index-range")
+        # a rejected member is rejected at arbitrarily high p
+        rejected = arbitration.RejectionSet()
+        rejected.exclude(table.ordered_candidates[0])
+        out = arbitration.validate_raw_choice(
+            table, self._raw(table, 0, 1.0), rejected)
+        self.assertEqual(out.code, "rejected-member")
+        # the eligibility (safety) gate is independent of concentration
+        out = arbitration.validate_raw_choice(
+            table, self._raw(table, 0, 1.0), arbitration.RejectionSet(),
+            eligible=lambda c: False)
+        self.assertEqual(out.code, "unsafe")
+
+    def test_relative_gate_counts_retained_offered_actions_not_targets(self):
+        from tools.agent import arbitration
+        # Two identical wire actions dedup to one retained member, so the
+        # offered count N is the *retained* table size (2), not the raw target
+        # count (3): the same p that would pass 1.5/3 is rejected at 1.5/2.
+        dup = [cand(KEY.KEY_H, "navigate"), cand(KEY.KEY_H, "navigate"),
+               cand(KEY.KEY_L, "search")]
+        table = table_of(dup)
+        self.assertEqual(len(table.ordered_candidates), 2)
+        out = arbitration.validate_raw_choice(
+            table, self._raw(table, 0, 0.6), arbitration.RejectionSet())
+        self.assertFalse(out.accepted)
+        self.assertIn("N=2", out.reason)
+
+    def test_spread_winner_passes_relative_and_fails_legacy_absolute(self):
+        from tools.agent import arbitration
+        table = self._table_n(3)
+        spread = 0.55        # a genuine but soft winner over three options
+        # relative accepts the concentrated-enough winner ...
+        out = arbitration.validate_raw_choice(
+            table, self._raw(table, 0, spread, confidence=spread),
+            arbitration.RejectionSet())
+        self.assertTrue(out.accepted)
+        # ... while the legacy absolute gate rejects the same answer
+        out = arbitration.validate_raw_choice(
+            table, self._raw(table, 0, spread, confidence=spread),
+            arbitration.RejectionSet(), threshold=0.8,
+            mode=arbitration.CONFIDENCE_ABSOLUTE)
+        self.assertFalse(out.accepted)
+        self.assertEqual(out.code, "confidence")
 
     def test_agent_docs_describe_jev_confidence_and_live_distribution_measurement(
             self):

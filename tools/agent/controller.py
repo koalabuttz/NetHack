@@ -2798,21 +2798,27 @@ class _EpisodeRunner(object):
         raw = arbitration.RawChoice(
             table_id=res.table_id, need_key=tuple(res.need_key),
             table_version=res.table_version, index=res.index,
-            confidence=res.confidence, abstain=res.abstain,
+            confidence=res.confidence,
+            selected_probability=getattr(res, "selected_probability", None),
+            abstain=res.abstain,
             parse_error=res.parse_error, latency=res.latency,
             dispatched=res.dispatched)
         outcome = arbitration.validate_raw_choice(
             prepared.table, raw, self._rejection_for(self.pending_key),
             threshold=self.c.config.confidence_threshold,
-            eligible=lambda cand: cand.family != "emergency")
+            eligible=lambda cand: cand.family != "emergency",
+            mode=getattr(self.c.config, "jev_confidence_mode", "relative"),
+            factor=getattr(self.c.config, "jev_relative_factor", 1.5))
         if not outcome.accepted:
             self.ledger.reflex_fallback += 1
             return (fallback_action, "scripted",
                     "jev rejected: %s" % (outcome.reason or outcome.code),
                     latency, usage, True)
         self.ledger.reflex_successful += 1
+        accepted_reason = ("jev choice: %s" % outcome.reason
+                           if outcome.reason else "jev choice")
         return (candidates.candidate_to_wire(outcome.candidate), "jev",
-                "jev choice", latency, usage, False)
+                accepted_reason, latency, usage, False)
 
     def _safe_fallback(self, need) -> dict:
         """A structurally valid, non-blocking answer for any need kind.
@@ -2849,6 +2855,9 @@ def _safe_config(config: ProviderConfig) -> dict:
         "role": config.role,
         "max_ticks": config.max_ticks,
         "confidence_threshold": config.confidence_threshold,
+        "jev_confidence_mode": getattr(config, "jev_confidence_mode",
+                                       "relative"),
+        "jev_relative_factor": getattr(config, "jev_relative_factor", 1.5),
         "strategy_call_cap": config.strategy_call_cap,
         "deepseek_model": config.deepseek_model,
         "deepseek_base_url": config.deepseek_base_url,

@@ -34,6 +34,16 @@ REJECTION_CODES = (
 
 DEFAULT_CONFIDENCE_THRESHOLD = 0.8
 
+#: The relative-acceptance rule: a Jev choice is accepted on concentration
+#: alone when the *selected option's own validated probability* strictly
+#: exceeds ``factor / N`` for the retained offered count ``N``.  The factor
+#: must be greater than 1 so acceptance is above a uniform distribution, and
+#: below 2 so a two-option choice remains attainable.
+CONFIDENCE_RELATIVE = "relative"
+CONFIDENCE_ABSOLUTE = "absolute"
+CONFIDENCE_MODES = (CONFIDENCE_RELATIVE, CONFIDENCE_ABSOLUTE)
+DEFAULT_RELATIVE_FACTOR = 1.5
+
 
 class RejectionSet(object):
     """Controller-owned, versioned rejection set for one NeedKey.
@@ -118,6 +128,11 @@ class RawChoice(object):
     table_version: int = -1
     index: Optional[int] = None
     confidence: Optional[float] = None
+    #: The selected option's own validated probability (the concentration the
+    #: relative gate reads).  Populated by the parser only after the full
+    #: response vector and its maximum have been validated; ``None`` means no
+    #: trustworthy selected probability was supplied.
+    selected_probability: Optional[float] = None
     abstain: bool = False
     parse_error: str = ""
     usage: tuple = ()
@@ -144,15 +159,33 @@ class ChoiceOutcome(object):
 def validate_raw_choice(table: CandidateTable, raw: RawChoice,
                         rejected: RejectionSet,
                         threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
-                        eligible=None) -> ChoiceOutcome:
+                        eligible=None,
+                        mode: str = CONFIDENCE_RELATIVE,
+                        factor: float = DEFAULT_RELATIVE_FACTOR
+                        ) -> ChoiceOutcome:
     """Validate one raw choice against the retained table (3.4/6.1).
 
     Checks, in order: exact request/table identity, parse, deliberate
-    abstention, non-bool integer index in bounds, finite confidence in
-    ``[0, 1]`` meeting *threshold*, and unrejected membership.  *eligible* is
-    an optional predicate ``candidate -> bool`` for the current safety
-    contract; a member that fails it is rejected as ``unsafe``.  Nothing is
-    mutated here.
+    abstention, non-bool integer index in bounds, the confidence/concentration
+    gate, and unrejected membership.  *eligible* is an optional predicate
+    ``candidate -> bool`` for the current safety contract; a member that fails
+    it is rejected as ``unsafe``.  Nothing is mutated here.
+
+    Confidence gate (plan section 2):
+
+    * ``mode="relative"`` (the default) accepts on *concentration* only --
+      the selected option's own validated ``selected_probability`` must be a
+      finite probability in ``[0, 1]`` that strictly exceeds ``factor / N``
+      for the retained offered count ``N``.  Missing/malformed selected
+      probability fails closed; the unrelated service ``confidence`` scalar is
+      never consulted.  A singleton table (``N < 2``) bypasses the comparison,
+      but still requires a valid selected probability.
+    * ``mode="absolute"`` is the explicit rollback: the legacy scalar
+      ``confidence`` in ``[0, 1]`` must be at least *threshold* (inclusive).
+
+    The rejection code is ``confidence`` in both modes.  A passing
+    concentration test never bypasses the identity, membership, rejection or
+    eligibility gates: safety stays independent of the acceptance rule.
     """
     if raw.parse_error:
         return ChoiceOutcome(False, reason="parse: %s" % raw.parse_error,
@@ -173,14 +206,32 @@ def validate_raw_choice(table: CandidateTable, raw: RawChoice,
     if not (0 <= index < len(table.ordered_candidates)):
         return ChoiceOutcome(False, reason="index %r out of range" % (index,),
                              code="index-range")
-    conf = raw.confidence
-    if (isinstance(conf, bool) or not isinstance(conf, (int, float))
-            or not math.isfinite(conf) or not (0.0 <= conf <= 1.0)):
-        return ChoiceOutcome(False, reason="confidence is not a finite "
-                             "probability", code="confidence")
-    if conf < threshold:
-        return ChoiceOutcome(False, reason="confidence %.3f below %.3f"
-                             % (conf, threshold), code="confidence")
+    if mode == CONFIDENCE_ABSOLUTE:
+        conf = raw.confidence
+        if (isinstance(conf, bool) or not isinstance(conf, (int, float))
+                or not math.isfinite(conf) or not (0.0 <= conf <= 1.0)):
+            return ChoiceOutcome(False, reason="confidence is not a finite "
+                                 "probability", code="confidence")
+        if conf < threshold:
+            return ChoiceOutcome(False, reason="confidence %.3f below %.3f"
+                                 % (conf, threshold), code="confidence")
+        ratio_note = ""
+    else:
+        prob = raw.selected_probability
+        if (isinstance(prob, bool) or not isinstance(prob, (int, float))
+                or not math.isfinite(prob) or not (0.0 <= prob <= 1.0)):
+            return ChoiceOutcome(
+                False, reason="confidence: selected probability is missing "
+                "or not a finite probability", code="confidence")
+        prob = float(prob)
+        count = len(table.ordered_candidates)
+        required = (float(factor) / count) if count else float("inf")
+        ratio_note = ("relative concentration p=%.3f N=%d k=%.3f"
+                      % (prob, count, factor))
+        if count >= 2 and not prob > required:
+            return ChoiceOutcome(
+                False, reason="%s requires >%.3f" % (ratio_note, required),
+                code="confidence")
     cand = table.ordered_candidates[index]
     if rejected.excludes(cand):
         return ChoiceOutcome(False, reason="member already rejected",
@@ -188,7 +239,7 @@ def validate_raw_choice(table: CandidateTable, raw: RawChoice,
     if eligible is not None and not eligible(cand):
         return ChoiceOutcome(False, reason="member is not currently safe",
                              code="unsafe")
-    return ChoiceOutcome(True, candidate=cand)
+    return ChoiceOutcome(True, candidate=cand, reason=ratio_note)
 
 
 # -- reconciliation -------------------------------------------------------
@@ -275,6 +326,8 @@ def direction_delta(action, dir_keys) -> Optional[Tuple[int, int]]:
 
 __all__ = [
     "REJECTION_CODES", "DEFAULT_CONFIDENCE_THRESHOLD", "RejectionSet",
+    "CONFIDENCE_RELATIVE", "CONFIDENCE_ABSOLUTE", "CONFIDENCE_MODES",
+    "DEFAULT_RELATIVE_FACTOR",
     "RejectionDecision", "classify_invalid", "select_retained", "RawChoice",
     "ChoiceOutcome", "validate_raw_choice", "Reconciliation",
     "classify_outcome", "arrival_outcome", "direction_delta",

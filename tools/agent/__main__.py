@@ -61,7 +61,16 @@ def build_parser():
     auto.add_argument("--confidence-threshold", type=float, default=0.8,
                       help="minimum confidence for a *paid* reflex answer "
                            "(0..1); the scripted heuristic is never compared "
-                           "to it")
+                           "to it.  Applies to absolute mode only")
+    auto.add_argument("--jev-confidence-mode", choices=["relative", "absolute"],
+                      default="relative",
+                      help="Jev acceptance policy: relative (default) accepts "
+                           "on the selected probability exceeding "
+                           "jev-relative-factor/N; absolute is the legacy "
+                           "flat confidence-threshold rollback")
+    auto.add_argument("--jev-relative-factor", type=float, default=1.5,
+                      help="relative multiplier k, strictly between 1 and 2 "
+                           "(default 1.5)")
     # -- deadlines --------------------------------------------------------
     auto.add_argument("--reflex-deadline", type=float, default=0.75,
                       help="reflex decision allowance in seconds")
@@ -131,6 +140,8 @@ def _config_from_args(a) -> ProviderConfig:
         reflex=a.reflex, strategy=a.strategy, role=a.role,
         max_ticks=a.max_ticks,
         confidence_threshold=a.confidence_threshold,
+        jev_confidence_mode=a.jev_confidence_mode,
+        jev_relative_factor=a.jev_relative_factor,
         strategy_call_cap=a.strategy_call_cap,
         postmortem_reserve=a.postmortem_reserve,
         reflex_deadline=a.reflex_deadline,

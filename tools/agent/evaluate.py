@@ -1277,6 +1277,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--strategy-call-cap", type=int, default=8)
     p.add_argument("--postmortem-reserve", type=int, default=0)
     p.add_argument("--confidence-threshold", type=float, default=0.8)
+    p.add_argument("--jev-confidence-mode", choices=["relative", "absolute"],
+                   default="relative")
+    p.add_argument("--jev-relative-factor", type=float, default=1.5)
     p.add_argument("--deepseek-model", default="deepseek-v4-flash")
     p.add_argument("--deepseek-key-file", default=None)
     p.add_argument("--deepseek-base-url",
@@ -1301,6 +1304,8 @@ def _config_from_args(a) -> ProviderConfig:
     return ProviderConfig(
         reflex=a.reflex, strategy=a.strategy, role=a.role,
         max_ticks=a.max_ticks, confidence_threshold=a.confidence_threshold,
+        jev_confidence_mode=a.jev_confidence_mode,
+        jev_relative_factor=a.jev_relative_factor,
         strategy_call_cap=a.strategy_call_cap,
         postmortem_reserve=a.postmortem_reserve,
         deepseek_model=a.deepseek_model,

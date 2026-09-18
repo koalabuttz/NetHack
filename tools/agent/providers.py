@@ -75,6 +75,16 @@ class ProviderConfig(object):
     role: str = "Valkyrie"
     max_ticks: int = 2000
     confidence_threshold: float = 0.8
+    #: Jev acceptance policy.  ``relative`` (default) accepts on concentration
+    #: (``selected_probability > jev_relative_factor / N``) and ignores the
+    #: service's separate confidence scalar entirely; ``absolute`` is the
+    #: explicit rollback that restores the legacy flat ``confidence_threshold``
+    #: comparison.  The two are never combined.
+    jev_confidence_mode: str = "relative"
+    #: The relative multiplier ``k``: strictly greater than 1 (above a uniform
+    #: distribution) and strictly less than 2 (so a two-option choice remains
+    #: attainable).  Default 1.5.
+    jev_relative_factor: float = 1.5
     strategy_call_cap: int = 8
     postmortem_reserve: int = 1
     # Confirmed against api-docs.deepseek.com/api/list-models: the documented
@@ -157,6 +167,15 @@ class ProviderConfig(object):
         if self.strategy not in ("off", "deepseek"):
             return ("--strategy must be off or deepseek (got %r)"
                     % (self.strategy,))
+        if self.jev_confidence_mode not in ("relative", "absolute"):
+            return ("--jev-confidence-mode must be relative or absolute "
+                    "(got %r)" % (self.jev_confidence_mode,))
+        if not _finite(self.jev_relative_factor):
+            return "--jev-relative-factor must be a finite number"
+        if not (1.0 < float(self.jev_relative_factor) < 2.0):
+            return ("--jev-relative-factor must be strictly between 1 and 2 "
+                    "(got %r): above a uniform distribution and still able to "
+                    "accept a two-option choice" % (self.jev_relative_factor,))
         ints = (("max-ticks", self.max_ticks, 0, 10 ** 9),
                 ("strategy-call-cap", self.strategy_call_cap, 0, 10 ** 9),
                 ("postmortem-reserve", self.postmortem_reserve, 0, 10 ** 9),
@@ -281,6 +300,11 @@ class ReflexChoiceResult(object):
     table_version: int = -1
     index: Optional[int] = None
     confidence: Any = None
+    #: The selected option's own validated probability from the response
+    #: vector, or ``None``.  Populated only after the full vector and its
+    #: maximum have been validated, so it is a trustworthy concentration for
+    #: the relative acceptance gate.
+    selected_probability: Optional[float] = None
     abstain: bool = False
     parse_error: str = ""
     reason: str = ""
@@ -1778,6 +1802,7 @@ class JevReflex(ReflexProvider):
                                    reason="not-max")
         return _choice_replace(base, index=built.key_index[choice],
                                confidence=_jev_confidence(action, selected),
+                               selected_probability=selected,
                                usage=usage, reason="choice")
 
 

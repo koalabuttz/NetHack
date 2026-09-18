@@ -1839,6 +1839,42 @@ class TestJevParser(unittest.TestCase):
                 self.assertEqual(res.usage, usage)
         self.prov.cancel()
 
+    def test_jev_parser_preserves_selected_probability_and_legacy_confidence(
+            self):
+        # the parser records the selected key's own validated probability in
+        # ``selected_probability`` while preserving the service confidence
+        # scalar for absolute-mode diagnostics
+        probs = {WIRE_KEYS[0]: 0.1, WIRE_KEYS[1]: 0.7, WIRE_KEYS[2]: 0.2}
+        body = jev_answer(WIRE_KEYS[1], probs)
+        body["answers"]["action"]["confidence"] = 0.42
+        self._respond(body)
+        res = self.prov.decide(wire_ctx(), time.monotonic() + 2.0)
+        self.assertEqual(res.parse_error, "")
+        self.assertAlmostEqual(res.selected_probability,
+                               probs[WIRE_KEYS[1]])
+        self.assertAlmostEqual(res.confidence, 0.42)
+        # an omitted service confidence falls back to the selected probability
+        self._respond(jev_answer(WIRE_KEYS[1], probs))
+        res = self.prov.decide(wire_ctx(), time.monotonic() + 2.0)
+        self.assertAlmostEqual(res.confidence, probs[WIRE_KEYS[1]])
+        self.assertAlmostEqual(res.selected_probability, probs[WIRE_KEYS[1]])
+        self.prov.cancel()
+
+    def test_jev_parser_rejects_bad_vectors_and_nonmax_selection(self):
+        # no selected probability is produced when the vector or the selection
+        # is invalid: the relative gate must then fail closed
+        for probs, choice in (
+                ({WIRE_KEYS[0]: 1.0}, WIRE_KEYS[0]),           # short vector
+                ({WIRE_KEYS[0]: 0.4, WIRE_KEYS[1]: 0.4,
+                  WIRE_KEYS[2]: 0.4}, WIRE_KEYS[1]),           # unnormalised
+                (self.probs, WIRE_KEYS[0])):                   # not a maximum
+            with self.subTest(choice=choice):
+                self._respond(jev_answer(choice, probs))
+                res = self.prov.decide(wire_ctx(), time.monotonic() + 2.0)
+                self.assertNotEqual(res.parse_error, "")
+                self.assertIsNone(res.selected_probability)
+        self.prov.cancel()
+
     def test_semantic_probability_keys(self):
         # the probability-key set must equal the semantic criteria-key set
         self._respond(jev_answer(WIRE_KEYS[1],
@@ -2762,11 +2798,17 @@ class _FakeJev(object):
     version = "fake/1"
     last_error = ""
 
-    def __init__(self, confidence=0.9, usage=None, index=0, abstain=False):
+    def __init__(self, confidence=0.9, usage=None, index=0, abstain=False,
+                 selected_probability=None):
         # ``index`` selects the retained-table member the controller maps
         # centrally; ``abstain`` models a paid abstention.
         self.index = index
         self.confidence = confidence
+        # The relative acceptance gate reads the selected option's own
+        # probability; the double mirrors the parser by defaulting it to the
+        # confidence scalar unless a test overrides it explicitly.
+        self.selected_probability = (confidence if selected_probability is None
+                                     else selected_probability)
         self.abstain = abstain
         self.usage = usage or {}
         self.cancelled = 0
@@ -2791,7 +2833,9 @@ class _FakeJev(object):
             need_key=(tuple(table.need_key) if table is not None else ()),
             table_version=(table.table_version if table is not None else -1),
             index=None if self.abstain else self.index,
-            confidence=self.confidence, abstain=self.abstain,
+            confidence=self.confidence,
+            selected_probability=self.selected_probability,
+            abstain=self.abstain,
             usage=self.usage, dispatched=True, reason="fake")
 
     def fallback(self, ctx):
@@ -3679,6 +3723,47 @@ class TestProviderConfigValidation(unittest.TestCase):
     def test_default_config_is_valid(self):
         self.assertIsNone(ProviderConfig().validate())
 
+    def test_jev_confidence_config_defaults_validation_and_absolute_rollback(
+            self):
+        # new defaults: relative mode, factor 1.5
+        cfg = ProviderConfig()
+        self.assertEqual(cfg.jev_confidence_mode, "relative")
+        self.assertEqual(cfg.jev_relative_factor, 1.5)
+        self.assertIsNone(cfg.validate())
+        # the mode is a closed vocabulary
+        self.assertIn("jev-confidence-mode",
+                      ProviderConfig(jev_confidence_mode="guess").validate())
+        self.assertIsNone(
+            ProviderConfig(jev_confidence_mode="absolute").validate())
+        # the factor must be strictly inside (1, 2)
+        for bad in (1.0, 0.5, 2.0, 3.0, float("nan"), float("inf"), True):
+            self.assertIn("jev-relative-factor",
+                          ProviderConfig(jev_relative_factor=bad).validate(),
+                          bad)
+        self.assertIsNone(ProviderConfig(jev_relative_factor=1.99).validate())
+        self.assertIsNone(ProviderConfig(jev_relative_factor=1.01).validate())
+        # the legacy threshold and its spelling stay valid and unchanged
+        self.assertEqual(ProviderConfig().confidence_threshold, 0.8)
+        self.assertIsNone(ProviderConfig(confidence_threshold=0.5).validate())
+
+    def test_live_and_evaluate_cli_propagate_jev_confidence_policy(self):
+        from tools.agent import __main__ as cli
+        from tools.agent import evaluate
+        live = cli.build_parser()
+        args = live.parse_args(
+            ["auto", "--output-dir", "/tmp/x",
+             "--jev-confidence-mode", "absolute",
+             "--jev-relative-factor", "1.8"])
+        cfg = cli._config_from_args(args)
+        self.assertEqual(cfg.jev_confidence_mode, "absolute")
+        self.assertEqual(cfg.jev_relative_factor, 1.8)
+        # the evaluation CLI carries the same policy and default
+        ev = evaluate.build_parser()
+        eargs = ev.parse_args(["w", "--output", "o"])
+        ecfg = evaluate._config_from_args(eargs)
+        self.assertEqual(ecfg.jev_confidence_mode, "relative")
+        self.assertEqual(ecfg.jev_relative_factor, 1.5)
+
     def test_usd_cap_requires_a_complete_tariff(self):
         self.assertIn("complete tariff",
                       ProviderConfig(usd_cap=1.0).validate())
@@ -3965,10 +4050,12 @@ class TestPartialTariffAccounting(unittest.TestCase):
 class TestJevFallbackUsage(WireHarness):
     """Medium 3: a paid Jev answer is billed whether or not it is used."""
 
-    def _runner(self, fake):
+    def _runner(self, fake, absolute=False):
         cfg = ProviderConfig(max_ticks=200, reflex="jev", reflex_call_cap=5,
                              postmortem_reserve=0, deepseek_price_in=1.0,
-                             deepseek_price_out=1.0)
+                             deepseek_price_out=1.0,
+                             jev_confidence_mode=("absolute" if absolute
+                                                  else "relative"))
         ctl = controller.Controller(
             cfg, controller.ControllerPaths("w", "r", "d", "s"), self.dir,
             episode_timeout=5.0)
@@ -4015,11 +4102,12 @@ class TestJevFallbackUsage(WireHarness):
 
     def test_low_confidence_choice_is_rejected_but_billed(self):
         # M11 at the controller: the central confidence gate rejects the raw
-        # choice, yet the paid usage is still billed exactly once (6.1)
+        # choice, yet the paid usage is still billed exactly once (6.1).  This
+        # is the legacy absolute-mode scalar gate (kept as rollback coverage).
         usage = {"prompt_tokens": 1000000, "completion_tokens": 0,
                  "reported": True}
         fake = _FakeJev(confidence=0.2, usage=usage)
-        runner, rec = self._runner(fake)
+        runner, rec = self._runner(fake, absolute=True)
         proposal, provider, reason, latency, u, low = runner._decide(
             runner.pending_need)
         rec.finalize({})

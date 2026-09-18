@@ -404,9 +404,15 @@ class RawChoiceValidation(unittest.TestCase):
         base.update(kw)
         return arbitration.RawChoice(**base)
 
+    @staticmethod
+    def _abs(table, raw, rejected, **kw):
+        """Validate in the explicit legacy absolute mode (rollback coverage)."""
+        return arbitration.validate_raw_choice(
+            table, raw, rejected, mode=arbitration.CONFIDENCE_ABSOLUTE, **kw)
+
     def test_accepts_a_valid_choice(self):
         t = self._table()
-        out = arbitration.validate_raw_choice(
+        out = self._abs(
             t, self._raw(t, index=1), arbitration.RejectionSet())
         self.assertTrue(out.accepted)
         self.assertEqual(out.candidate.semantic_label, "west")
@@ -414,21 +420,21 @@ class RawChoiceValidation(unittest.TestCase):
     # -- M11: each gate must independently fail closed -------------------
     def test_m11_identity_gate(self):
         t = self._table()
-        out = arbitration.validate_raw_choice(
+        out = self._abs(
             t, self._raw(t, table_id="deadbeef"), arbitration.RejectionSet())
         self.assertFalse(out.accepted)
         self.assertEqual(out.code, "stale")
-        out = arbitration.validate_raw_choice(
+        out = self._abs(
             t, self._raw(t, table_version=99), arbitration.RejectionSet())
         self.assertEqual(out.code, "stale")
-        out = arbitration.validate_raw_choice(
+        out = self._abs(
             t, self._raw(t, need_key=(9, 9, 9)), arbitration.RejectionSet())
         self.assertEqual(out.code, "stale")
 
     def test_m11_index_type_gate(self):
         t = self._table()
         for bad in (True, "0", 1.0, None):
-            out = arbitration.validate_raw_choice(
+            out = self._abs(
                 t, self._raw(t, index=bad), arbitration.RejectionSet())
             self.assertFalse(out.accepted, bad)
             self.assertEqual(out.code, "index-type", bad)
@@ -436,7 +442,7 @@ class RawChoiceValidation(unittest.TestCase):
     def test_m11_index_range_gate(self):
         t = self._table()
         for bad in (-1, 2, 999):
-            out = arbitration.validate_raw_choice(
+            out = self._abs(
                 t, self._raw(t, index=bad), arbitration.RejectionSet())
             self.assertFalse(out.accepted, bad)
             self.assertEqual(out.code, "index-range", bad)
@@ -444,12 +450,12 @@ class RawChoiceValidation(unittest.TestCase):
     def test_m11_confidence_gate(self):
         t = self._table()
         for bad in (0.5, 0.7999, float("nan"), float("inf"), True, "hi"):
-            out = arbitration.validate_raw_choice(
+            out = self._abs(
                 t, self._raw(t, confidence=bad), arbitration.RejectionSet())
             self.assertFalse(out.accepted, bad)
             self.assertEqual(out.code, "confidence", bad)
         # exactly the threshold is accepted (>=), one ulp below is not
-        self.assertTrue(arbitration.validate_raw_choice(
+        self.assertTrue(self._abs(
             t, self._raw(t, confidence=0.8),
             arbitration.RejectionSet()).accepted)
 
@@ -457,14 +463,14 @@ class RawChoiceValidation(unittest.TestCase):
         t = self._table()
         rejected = arbitration.RejectionSet()
         rejected.exclude(t.ordered_candidates[0])
-        out = arbitration.validate_raw_choice(t, self._raw(t, index=0),
+        out = self._abs(t, self._raw(t, index=0),
                                               rejected)
         self.assertFalse(out.accepted)
         self.assertEqual(out.code, "rejected-member")
 
     def test_m11_safety_gate(self):
         t = self._table()
-        out = arbitration.validate_raw_choice(
+        out = self._abs(
             t, self._raw(t, index=0), arbitration.RejectionSet(),
             eligible=lambda c: c.semantic_label != "north")
         self.assertFalse(out.accepted)
@@ -472,11 +478,11 @@ class RawChoiceValidation(unittest.TestCase):
 
     def test_parse_error_and_abstain_short_circuit(self):
         t = self._table()
-        out = arbitration.validate_raw_choice(
+        out = self._abs(
             t, self._raw(t, parse_error="bad json"),
             arbitration.RejectionSet())
         self.assertEqual(out.code, "parse")
-        out = arbitration.validate_raw_choice(
+        out = self._abs(
             t, self._raw(t, abstain=True), arbitration.RejectionSet())
         self.assertEqual(out.code, "abstain")
 
@@ -486,7 +492,7 @@ class RawChoiceValidation(unittest.TestCase):
         t = self._table()
         raw = self._raw(t, index=999,
                         usage=(("prompt", 10), ("completion", 2)))
-        out = arbitration.validate_raw_choice(t, raw,
+        out = self._abs(t, raw,
                                               arbitration.RejectionSet())
         self.assertFalse(out.accepted)
         self.assertEqual(dict(raw.usage)["prompt"], 10)

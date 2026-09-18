@@ -90,32 +90,53 @@ def _walk(cells, hero, steps):
 
 
 class PinConfidenceGate(unittest.TestCase):
-    """The old flat absolute gate (Phase 1 changes this)."""
+    """The old flat absolute gate, and the relative rule that replaces it.
+
+    Phase 1 flipped these pins: the flat threshold survives only in the
+    explicit ``absolute`` rollback, while the default relative rule accepts a
+    genuine spread winner on concentration.
+    """
+
+    def _table(self):
+        return _table([_cand(protocol.KEY_H, "navigate", family="frontier"),
+                       _cand(protocol.KEY_L, "navigate", family="frontier"),
+                       _cand(protocol.KEY_J, "navigate", family="frontier")])
 
     def test_pin_absolute_gate_rejects_spread_winner(self):
         # A valid three-way spread distribution whose winning probability is
-        # 1/3 is rejected by the shipped 0.8 threshold -- the campaign defect.
-        cands = [_cand(protocol.KEY_H, "navigate", family="frontier"),
-                 _cand(protocol.KEY_L, "navigate", family="frontier"),
-                 _cand(protocol.KEY_J, "navigate", family="frontier")]
-        table = _table(cands)
+        # 1/3 is rejected by the shipped 0.8 threshold -- the campaign defect,
+        # now reachable only through the explicit absolute rollback.
+        table = self._table()
         raw = arbitration.RawChoice(
             table_id=table.table_id, need_key=tuple(table.need_key),
             table_version=table.table_version, index=0,
             confidence=1.0 / 3.0, dispatched=True)
         outcome = arbitration.validate_raw_choice(
             table, raw, arbitration.RejectionSet(), threshold=0.8,
-            eligible=lambda c: True)
+            eligible=lambda c: True, mode=arbitration.CONFIDENCE_ABSOLUTE)
         self.assertFalse(outcome.accepted)
         self.assertEqual(outcome.code, "confidence")
 
-    def test_pin_no_selected_probability_field(self):
-        # The pre-change neutral records carry only a scalar confidence.
-        self.assertFalse(hasattr(arbitration.RawChoice(), "selected_probability"))
-        self.assertFalse(hasattr(arbitration.validate_raw_choice(
-            _table([_cand(protocol.KEY_H, "navigate")]),
-            arbitration.RawChoice(), arbitration.RejectionSet()),
-            "selected_probability"))
+    def test_relative_gate_accepts_a_soft_spread_winner(self):
+        # The default relative rule reads the selected option's own validated
+        # probability: a genuine but soft three-way winner (0.55 > 1.5/3)
+        # passes on concentration even though the legacy 0.8 gate rejects it.
+        table = self._table()
+        raw = arbitration.RawChoice(
+            table_id=table.table_id, need_key=tuple(table.need_key),
+            table_version=table.table_version, index=0,
+            confidence=0.0, selected_probability=0.55, dispatched=True)
+        outcome = arbitration.validate_raw_choice(
+            table, raw, arbitration.RejectionSet(), eligible=lambda c: True)
+        self.assertTrue(outcome.accepted)
+        self.assertIn("N=3", outcome.reason)
+
+    def test_pin_selected_probability_field_is_present(self):
+        # The neutral records now carry the selected probability the relative
+        # gate reads; it defaults to None so old constructors stay valid.
+        self.assertIsNone(arbitration.RawChoice().selected_probability)
+        self.assertIn("selected_probability",
+                      {f for f in arbitration.RawChoice.__dataclass_fields__})
 
 
 class PinAppliedCap(unittest.TestCase):
