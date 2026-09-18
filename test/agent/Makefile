@@ -168,6 +168,21 @@ play:
 	    --data "$(DATA)" $(if $(SYSCONF),--sysconf "$(SYSCONF)") \
 	    --private-root "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-play)"
 
+# The mandatory wave-5 native fixture: through the real adapter it proves the
+# ``m`` reqmenu prefix consumes no game time, the exact following command need
+# carries the suffix, native double-``m`` cancels, and no prefix leaks into a
+# later command.  Needs a built agent worker and launcher, so it is opt-in.
+native-prefix:
+	@test -n "$(WORKER)" -a -n "$(RUNNER)" -a -n "$(DATA)" || \
+	    { echo "set WORKER, RUNNER, DATA (and optionally SYSCONF,"; \
+	      echo "PRIVATE_ROOT) for the native prefix probe"; exit 2; }
+	rm -rf "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-native-prefix)"
+	mkdir -p "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-native-prefix)"
+	python3 native_prefix_probe.py --runner "$(RUNNER)" --worker "$(WORKER)" \
+	    --data "$(DATA)" $(if $(SYSCONF),--sysconf "$(SYSCONF)") \
+	    --private-root \
+	    "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-native-prefix)"
+
 # Interaction breadth on real engine menus (inventory, farlook, help with text
 # paging, annotation, native quit confirmations).  Needs a built agent worker
 # and launcher, so it is opt-in like `play`.
@@ -323,5 +338,6 @@ clean:
 	rm -f $(TESTS) $(AGENT_OBJS) $(REF_OBJS) .dep.*.d .profile.tmp .profile.h.tmp
 
 .PHONY: all check manifest-check header-check schema-check matrix \
-	episode play breadth matrix-full sanitize asan-lifecycle depcheck clean \
+	episode play native-prefix breadth matrix-full sanitize \
+	asan-lifecycle depcheck clean \
 	sentinel drain
