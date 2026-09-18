@@ -505,6 +505,12 @@ class ReplayPass(object):
         self._sent_stair = False
         self._pending_effect = None
         self._last_observed_kind = ""
+        # The modeled sent ordinal (plan 6.2/3.5).  Every need's answer is
+        # one act, and an invalid retry is a second act, so this counts
+        # exactly what the live controller's ``action_ordinal`` counts: the
+        # ordinals stay aligned with the recording instead of collapsing a
+        # rejected attempt into its predecessor.
+        self._sent_ordinal = 0
 
     # -- provider construction ------------------------------------------
     def _build_reflex(self, name):
@@ -780,15 +786,35 @@ class ReplayPass(object):
         self.invalids += 1
         self.ledger.reflex_invalid += 1
         # `invalid` leaves the same request outstanding: a rejected *attempt*,
-        # not a completed decision.  It is recorded as its own decision row,
-        # and -- when the attempt it rejected is known -- that rejected action
-        # is labelled here, distinct from the accepted ground truth.
+        # not a completed decision.  The modeled send it rejected is discarded
+        # exactly as the live controller discards its in-flight attempt (3.1):
+        # no frozen effect may be committed at the next observation and no
+        # reconciliation evidence comes from the rejected action.
+        self._pending_effect = None
+        self._sent_action = None
+        self._sent_stair = False
+        self._sent_before = None
+        # It is recorded as its own decision row, and -- when the attempt it
+        # rejected is known -- that rejected action is labelled here, distinct
+        # from the accepted ground truth.  The invalid count for this NeedKey
+        # advances, so the accepted retry is the recorded attempt that follows
+        # the rejected ones, and it becomes the modeled send the next
+        # observation reconciles against (3.5).  An exhausted sidecar leaves
+        # the retry unknown rather than re-using the rejected winner.
         key = self._last_key
         rejected_action = None
+        retry_action = None
+        retry_ordinal = None
         if key is not None:
             n = self._invalid_seen.get(key, 0)
             self._invalid_seen[key] = n + 1
             rejected_action = self.actions_index.accepted(key, n)
+            retry_action = self.actions_index.accepted(key, n + 1)
+            if retry_action is not None and retry_action != rejected_action:
+                gameplay = self._last_need_kind in ("command", "key",
+                                                    "direction")
+                retry_ordinal = self._model_send(retry_action,
+                                                 gameplay=gameplay)
         self.decisions.append({
             "schema": EVAL_SCHEMA, "record": "need", "index": self.needs,
             "need": {"seq": (key[0] if key is not None else self.last_seq),
@@ -800,6 +826,8 @@ class ReplayPass(object):
             "agreement": None, "actual_action": None,
             "actual_action_source": "unknown",
             "rejected_action": rejected_action,
+            "retry_action": retry_action,
+            "sent_ordinal": retry_ordinal,
             "boundaries": [], "directives": [],
         })
 
@@ -807,6 +835,15 @@ class ReplayPass(object):
         self.closed = True
         self.eof = False
         self.provider.on_closed()
+        # A closed episode stops further gameplay commits: the in-flight
+        # modeled attempt is discarded without crediting an outcome, and the
+        # instance automaton stops -- exactly the live controller's close path
+        # (3.4), so the terminal lifecycle matches live.
+        self.instance.stop()
+        self._pending_effect = None
+        self._sent_action = None
+        self._sent_stair = False
+        self._sent_before = None
         detected = self.mem.boundary.check(self.mem.status, closed=True)
         self.ledger.note_boundary("detected", len(detected))
         self._note_detected(detected)
@@ -1021,22 +1058,6 @@ class ReplayPass(object):
             actual_source = "sidecar"
 
         self._note_low_conf(low)
-        self.decisions.append({
-            "schema": EVAL_SCHEMA, "record": "need", "index": need.index,
-            "need": {"seq": need.seq, "id": need.nid,
-                     "kind": need.need.get("kind")},
-            "provider": provider_label,
-            "proposal": proposal, "selected": selected,
-            "reason": reason, "legal": legal, "fallback": fallback,
-            "low_confidence": low,
-            "actual_action": actual, "actual_action_source": actual_source,
-            "rejected_attempts": rejected_actions,
-            "rejected_count": len(rejected_actions),
-            "agreement": agreement,
-            "boundaries": list(need.boundaries),
-            "directives": [view.dset.to_dict()] if view.active else [],
-        })
-        self.answered += 1
         # Model the send (plan 6.2): the selected action is treated as sent,
         # so its frozen effect is committed at the NEXT reconciled
         # observation -- never here.  A gameplay command additionally models
@@ -1051,14 +1072,12 @@ class ReplayPass(object):
         cand = getattr(self.reflex, "last_candidate", None)
         matched = (cand is not None
                    and candidates.candidate_to_wire(cand) == selected)
+        # Every need's answer is one act, so it takes the next sent ordinal --
+        # whichever kind it is -- exactly as the live controller's single send
+        # advances ``action_ordinal``.
+        ordinal = self._model_send(
+            selected, gameplay=kind in ("command", "key", "direction"))
         if kind in ("command", "key", "direction"):
-            self._sent_action = candidates.wire_to_action(selected)
-            self._sent_stair = (self._sent_action.tag == "key"
-                                and self._sent_action.payload[0]
-                                in (ord(">"), ord("<")))
-            self._sent_before = {"hero": self.mem.hero,
-                                 "time": self.mem.status.time,
-                                 "dlvl": self.mem.status.dlvl}
             if matched:
                 self._pending_effect = (
                     cand.proposed_effect, cand.semantic_label,
@@ -1067,9 +1086,47 @@ class ReplayPass(object):
             self._pending_effect = (
                 cand.proposed_effect, cand.semantic_label,
                 tuple(getattr(cand, "effect_payload", ())))
+        self.decisions.append({
+            "schema": EVAL_SCHEMA, "record": "need", "index": need.index,
+            "need": {"seq": need.seq, "id": need.nid,
+                     "kind": need.need.get("kind")},
+            "provider": provider_label,
+            "proposal": proposal, "selected": selected,
+            "reason": reason, "legal": legal, "fallback": fallback,
+            "low_confidence": low,
+            "actual_action": actual, "actual_action_source": actual_source,
+            "rejected_attempts": rejected_actions,
+            "rejected_count": len(rejected_actions),
+            "agreement": agreement, "sent_ordinal": ordinal,
+            "boundaries": list(need.boundaries),
+            "directives": [view.dset.to_dict()] if view.active else [],
+        })
+        self.answered += 1
         if kind in ("command", "key", "direction"):
             self.tick += 1
         self._pending = None
+
+    def _model_send(self, action, gameplay: bool = True) -> int:
+        """Model one *sent* act and bind its reconciliation evidence (6.2).
+
+        The ordinal advances for every answer -- a gameplay command and a
+        non-command prompt alike -- and is advanced again by
+        :meth:`_on_invalid` for the correlated retry, so the modeled
+        ordinals match the live controller's ``action_ordinal`` rather than
+        collapsing a rejected attempt.  Only a gameplay send models the
+        SentAttempt's motion baseline; a non-command send freezes no movement
+        evidence, exactly as the live controller arms no attempt for it.
+        """
+        self._sent_ordinal += 1
+        if gameplay:
+            self._sent_action = candidates.wire_to_action(action)
+            self._sent_stair = (self._sent_action.tag == "key"
+                                and self._sent_action.payload[0]
+                                in (ord(">"), ord("<")))
+            self._sent_before = {"hero": self.mem.hero,
+                                 "time": self.mem.status.time,
+                                 "dlvl": self.mem.status.dlvl}
+        return self._sent_ordinal
 
     def _propose(self, ctx) -> Tuple[Optional[dict], str, str, bool]:
         """Run the candidate provider; return (action, label, reason, fb).
