@@ -1384,11 +1384,56 @@ class TestJevAdapter(unittest.TestCase):
         self.assertIn("action=", built.criteria["opt-0"])
         self.assertIn("reason=", built.criteria["opt-0"])
         self.assertEqual(built.payload["model"], "jev-latest")
-        self.assertEqual(built.payload["options"], built.criteria)
+        # the documented /systemone body: state, model and one action question
+        self.assertIn("state", built.payload)
+        question = built.payload["questions"]["action"]
+        self.assertEqual(question["type"], "choice")
+        self.assertEqual(question["criteria"], built.criteria)
+        self.assertIn("untrusted", question["instructions"])
+
+    def _respond_nested(self, choice="opt-1", probs=None,
+                        action_type="choice", usage=None, confidence=None):
+        """The documented nesting: choice/probs live in ``answers.action``."""
+        if probs is None:
+            probs = {"opt-0": 0.1, "opt-1": 0.9}
+        action = {"type": action_type, "choice": choice,
+                  "probabilities": probs}
+        if confidence is not None:
+            action["confidence"] = confidence
+        body = {"model": "jev-latest", "answers": {"action": action}}
+        if usage is not None:
+            body["usage"] = usage
+        self.ep.responder = lambda path, b: (200, json.dumps(body).encode())
+
+    def test_documented_nested_response_is_parsed(self):
+        # the real schema: answers.action.{choice,probabilities,confidence}
+        self._respond_nested(probs={"opt-0": 0.04, "opt-1": 0.96},
+                             confidence=0.82,
+                             usage={"input_tokens": 312,
+                                    "output_tokens": 48})
+        prov = self.prov()
+        res = prov.decide(self.ctx(command_need(1)),
+                          time.monotonic() + 2.0)
+        self.assertIsNotNone(res)
+        self.assertEqual(res.index, 1)
+        self.assertEqual(res.confidence, 0.82)
+        self.assertEqual(res.parse_error, "")
+        self.assertEqual(res.usage.get("input_tokens"), 312)
+        prov.cancel()
+
+    def test_nested_confidence_falls_back_to_selected_probability(self):
+        # a nested body with no confidence still yields probabilities[choice]
+        self._respond_nested(probs={"opt-0": 0.1, "opt-1": 0.9})
+        prov = self.prov()
+        res = prov.decide(self.ctx(command_need(1)),
+                          time.monotonic() + 2.0)
+        self.assertEqual(res.index, 1)
+        self.assertEqual(res.confidence, 0.9)
+        prov.cancel()
 
     def test_confidence_is_the_selected_probability(self):
-        # the confidence is probabilities[choice]; the API's separate,
-        # unverified confidence field is ignored entirely
+        # an answer-level confidence is never read; with none on the action
+        # object the confidence falls back to probabilities[choice]
         self._respond(probs={"opt-0": 0.2, "opt-1": 0.8}, confidence=0.99)
         prov = self.prov()
         res = prov.decide(self.ctx(command_need(1)),

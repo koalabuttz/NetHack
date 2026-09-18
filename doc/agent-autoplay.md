@@ -10,7 +10,7 @@ Two tiers, from the handoff (`doc/agent-autoplay-plan.md`):
 
   * **reflex** -- answers every request, in the action path.  ScriptedReflex
     always ships and is always available; an optional Jev tier can replace it
-    with a typed-choice decision.  Paid reflex work ships **disabled**.
+    with a typed-choice decision.  Paid reflex work is opt-in.
   * **strategy** -- deliberates at *strategy boundaries* and returns
     constrained **goals**, never wire actions.  Optional DeepSeek, run in a
     killable worker process so a hung provider cannot hold the wire.
@@ -56,9 +56,9 @@ evaluation" below.
 
 `--reflex scripted|jev` (default scripted)
     the reflex tier.  `scripted` is always available; `jev` requires
-    `JEV_API_KEY`, `--i-accept-jev-terms` and `--jev-base-url`, and even then
-    only routes to the fake-endpoint-testable adapter (see "Providers").  Any
-    other value is rejected.
+    `JEV_API_KEY` and `--i-accept-jev-terms`, and posts to the official
+    `api.typesafe.ai` endpoint unless `--jev-base-url` overrides it (see
+    "Providers").  Any other value is rejected.
 
 `--strategy off|deepseek` (default off)
     the strategy tier.  `off` is completely network-free.  Any other value is
@@ -196,7 +196,9 @@ evaluation" below.
     worker.
 
 `--jev-key-file`, `--jev-base-url`, `--i-accept-jev-terms`
-    the Jev trio; all three are needed before `--reflex jev` will start.
+    the Jev controls; a key and the terms acknowledgement are needed before
+    `--reflex jev` will start, and `--jev-base-url` overrides the official
+    endpoint.
 
 `--output-dir DIR`
     where the `ep-N.*` recordings are written.
@@ -420,12 +422,18 @@ discards the plan; the controller's scripted directives continue.
 
 **JevReflex** implements the typed-choice adapter contract -- a bounded
 choice table, a finite `[0,1]` confidence check, and fallback on any
-malformed or unknown value -- but **ships DISABLED**: `--reflex jev` fails
-with a clear message unless `JEV_API_KEY`, `--i-accept-jev-terms` and
-`--jev-base-url` are all present, and even then only the fake-endpoint
-adapter is reachable (no official contract has been supplied).  Keys 1..255
-fit one <= 255-way choice; menus are limited to 128 selectable rows;
-position, `line` and `extcmd` are never sent to Jev.
+malformed or unknown value.  It posts the documented typesafe.ai body to
+`(--jev-base-url or the official https://api.typesafe.ai/v1) + /systemone`:
+a top-level `state` (the structured game context), `model` (`"jev-latest"`),
+and a `questions.action` object carrying the fixed `instructions`, `type`
+(`"choice"`) and a `criteria` map from each `opt-N` key to its deterministic
+candidate line (label | direction | canonical action | reason).  The answer
+is read from `answers.action`: `choice` names one offered `opt-N` key,
+`probabilities` is the full distribution over exactly those keys, and
+`confidence` is the score -- the selected key's probability stands in when
+the body carries none.  Keys 1..255 fit one <= 255-way choice; menus are
+limited to 128 selectable rows; position, `line` and `extcmd` are never sent
+to Jev.
 
 Secrets come only from `DEEPSEEK_API_KEY` / `JEV_API_KEY` or a **0600 key
 file**.  The key never appears in a log line, a recording, a structured
