@@ -750,6 +750,16 @@ class _EpisodeRunner(object):
         self.deadline = 0.0
         self.need_deadline = None
         self.action_ordinal = 0
+        # Applied-decision accounting: the controller-owned token of the most
+        # recent *accepted* Jev proposal (set by ``_decide_jev``), the
+        # per-episode sequence that keeps two tokens distinct even for the same
+        # action, the last completely-sent Jev decision (kept only so an
+        # ``invalid(incomplete)`` delivery repair can resend it without
+        # consulting Jev again), and the pending repair record itself.
+        self._applied_token = None
+        self._applied_seq = 0
+        self._last_jev_send = None
+        self._repair_send = None
         self.reflex_timeouts = 0
         self.rec_healthy = True
         # -- render-only state (never feeds policy, health or the wire) ----
@@ -1378,6 +1388,9 @@ class _EpisodeRunner(object):
         self.need_deadline = time.monotonic() + self.c.content_deadline
         self.force_fallback = False
         self.retries = 0
+        # A new need cannot be the repair of a previous decision's delivery.
+        self._last_jev_send = None
+        self._repair_send = None
         if need is not None:
             self._needs += 1
             self.pending_key = NeedKey(self.result.index, seq, need.get("id"))
@@ -1706,6 +1719,11 @@ class _EpisodeRunner(object):
             # request bookkeeping so the page obligation is re-issued, and do
             # NOT exclude the candidate from gameplay
             self.req.reset_delivery()
+            # A repaired delivery resends the frozen validated action rather
+            # than consulting Jev again; the applied-decision token rides
+            # along so the resend cannot double-charge (idempotent).
+            if getattr(self, "_last_jev_send", None) is not None:
+                self._repair_send = self._last_jev_send
         else:
             # an ordinary/engine invalid terminally excludes the exact
             # in-flight attempt's canonical action for this NeedKey, so the
@@ -2541,53 +2559,56 @@ class _EpisodeRunner(object):
             self.reflex.quit_reason = forced_search.TRAPPED_QUIT_REASON
         return {"key": protocol.KEY_HASH}
 
+    def _resend_repair(self, need, repair):
+        """The frozen validated action for an ``invalid(incomplete)`` repair.
+
+        Returns ``(selected, provider, reason, latency, usage, low,
+        applied_token)``.  A repair resends the *same* decision without
+        consulting Jev again, so it carries the original applied-decision
+        token (whose charge is idempotent).  When the need/table identity has
+        gone stale the resend fails closed to the scripted action and charges
+        nothing, rather than treating the stale resend as the same decision.
+        """
+        if (need is not None and need.get("id") == repair.get("need_id")
+                and self.pending_key == repair.get("need_key")):
+            return (repair["action"], "jev", "jev delivery repair resend",
+                    repair.get("latency", 0.0), repair.get("usage", {}), False,
+                    repair.get("token"))
+        return (self._safe_fallback(need), "scripted",
+                "jev delivery repair stale: safe fallback", 0.0, {}, True, None)
+
     def _answer_now(self, deadline) -> bool:
         need = self.pending_need
-        proposal, provider, reason, latency, usage, decided_low = \
-            self._decide(need, deadline)
+        repair = getattr(self, "_repair_send", None)
+        self._repair_send = None
+        applied_token = None
+        if repair is not None:
+            # A delivery repair resends the frozen validated action: no fresh
+            # paid consultation, no forced override, and an idempotent applied
+            # charge against the original decision's token.
+            (selected, provider, sel_reason, latency, usage, low,
+             applied_token) = self._resend_repair(need, repair)
+            proposal = selected if provider == "jev" else None
+        else:
+            proposal, provider, reason, latency, usage, decided_low = \
+                self._decide(need, deadline)
+            sel_reason = ""
+            # Escalation is based on the FINAL selection outcome, not on an
+            # intermediate provider result: a scripted proposal that then
+            # fails local validation is a fallback, so the streak must not
+            # have been reset by the (discarded) scripted score.
+            low = decided_low
         now = time.monotonic()
         write_dl = now + self.c.answer_deadline
         if deadline is not None:
             # the answer must still go out even when the content deadline has
             # just passed, so the bounded write keeps a small floor
             write_dl = min(write_dl, max(deadline, now + 0.25))
-        # Escalation is based on the FINAL selection outcome, not on an
-        # intermediate provider result: a scripted proposal that then fails
-        # local validation is a fallback, so the streak must not have been
-        # reset by the (discarded) scripted score.
-        low = decided_low
-        if proposal is None:
-            selected = self._safe_fallback(need)
-            sel_reason = ("no proposal (%s): safe fallback"
-                          % (reason or "none"))
-            low = True
+        if repair is None:
+            selected, sel_reason, role, provider, low, applied_token = \
+                self._resolve_selection(need, proposal, provider, reason, low)
         else:
-            err = protocol.validate_action(need, proposal)
-            if err:
-                selected = self._safe_fallback(need)
-                sel_reason = "validation fallback: %s" % err
-                low = True
-            else:
-                selected = proposal
-                sel_reason = reason
-        # Wave 5: the controller-owned two-send transaction overrides the
-        # ordinary selection *after* the final fallback decision, so an armed
-        # prefix is resolved here and never handed to a later command (5.4).
-        role = ""
-        override = self._forced_override(need, selected)
-        if override is not None:
-            if override[2] == "terminate":
-                # The armed dangerous prefix cannot be cleared in this need
-                # (a prompt/menu cannot carry the native double-m).  End the
-                # transport rather than let the prefix modify a later action
-                # (plan 5.4); nothing prefixed is ever sent.
-                self._forced_abort("armed prefix cannot be cleared")
-                self.result.forced_uncleared += 1
-                raise _TransportFailure(
-                    "forced search: armed prefix cannot be cleared")
-            selected, sel_reason, role = override
-            provider = "scripted"
-            low = (role == "trap")
+            role = ""
         self._note_low_conf(low)
         self._activate_pending_directives(need)
         view = self.book.view(self.tick, self.mem.status.dlvl,
@@ -2620,11 +2641,73 @@ class _EpisodeRunner(object):
             # because motion/tick semantics belong to gameplay commands only
             # (plan 3.1).
             self._freeze_noncommand_effect(selected)
+        if applied_token is not None:
+            # The applied-decision cap is charged exactly here: after the
+            # complete send of the unoverridden, locally valid Jev proposal.
+            # ``note_reflex_applied`` is idempotent, so a delivery repair that
+            # resends the same token still counts once.  The sent decision is
+            # remembered so an ``invalid(incomplete)`` repair can resend it
+            # without consulting Jev again.
+            self.ledger.note_reflex_applied(applied_token)
+            self._last_jev_send = {
+                "action": selected, "token": applied_token,
+                "need_id": need.get("id"), "need_key": self.pending_key,
+                "latency": latency, "usage": usage}
         if role:
             self._forced_after_send(role, ordinal)
         self.pending = False
         self.force_fallback = False
         return True
+
+    def _resolve_selection(self, need, proposal, provider, reason, low):
+        """The final sent action, its provenance and its applied token.
+
+        Rewrites the raw proposal into the answer actually sent: a structural
+        fallback when there is no proposal, a scripted fallback when it fails
+        local validation, and the controller-owned forced-search override when
+        one is armed (Wave 5).  The returned applied-decision token is set
+        **only** when the result is the unoverridden, locally valid Jev
+        proposal, so fallback, validation substitution and forced override all
+        charge nothing.
+        """
+        applied_token = None
+        if proposal is None:
+            selected = self._safe_fallback(need)
+            sel_reason = ("no proposal (%s): safe fallback"
+                          % (reason or "none"))
+            low = True
+        else:
+            err = protocol.validate_action(need, proposal)
+            if err:
+                selected = self._safe_fallback(need)
+                sel_reason = "validation fallback: %s" % err
+                low = True
+            else:
+                selected = proposal
+                sel_reason = reason
+                if provider == "jev":
+                    applied_token = self._applied_token
+        # Wave 5: the controller-owned two-send transaction overrides the
+        # ordinary selection *after* the final fallback decision, so an armed
+        # prefix is resolved here and never handed to a later command (5.4).
+        role = ""
+        override = self._forced_override(need, selected)
+        if override is not None:
+            if override[2] == "terminate":
+                # The armed dangerous prefix cannot be cleared in this need
+                # (a prompt/menu cannot carry the native double-m).  End the
+                # transport rather than let the prefix modify a later action
+                # (plan 5.4); nothing prefixed is ever sent.
+                self._forced_abort("armed prefix cannot be cleared")
+                self.result.forced_uncleared += 1
+                raise _TransportFailure(
+                    "forced search: armed prefix cannot be cleared")
+            selected, sel_reason, role = override
+            provider = "scripted"
+            low = (role == "trap")
+            # a forced override is controller-owned, not an applied Jev choice
+            applied_token = None
+        return selected, sel_reason, role, provider, low, applied_token
 
     def _decide(self, need, need_deadline=None):
         """Answer one need within an *absolute* reflex deadline.
@@ -2637,7 +2720,12 @@ class _EpisodeRunner(object):
         Returns ``(proposal, provider, reason, latency, usage, low_conf)``;
         ``low_conf`` is the *provider-side* contribution to escalation, which
         :meth:`_answer_now` combines with the final validation outcome.
+
+        Side effect: the applied-decision token of any previously accepted Jev
+        proposal is cleared here, so it can only ever describe *this*
+        decision's acceptance.
         """
+        self._applied_token = None
         if self.force_fallback:
             self.ledger.reflex_fallback += 1
             return (self._safe_fallback(need), "controller",
@@ -2815,6 +2903,12 @@ class _EpisodeRunner(object):
                     "jev rejected: %s" % (outcome.reason or outcome.code),
                     latency, usage, True)
         self.ledger.reflex_successful += 1
+        # Capture the controller-owned applied-decision token of this accepted
+        # consultation.  It is charged only once the final selected action
+        # completes its send in ``_answer_now``, and it is reused verbatim by a
+        # delivery-repair resend so the decision is counted exactly once.
+        self._applied_seq += 1
+        self._applied_token = (self.result.index, self._applied_seq)
         accepted_reason = ("jev choice: %s" % outcome.reason
                            if outcome.reason else "jev choice")
         return (candidates.candidate_to_wire(outcome.candidate), "jev",
@@ -2914,6 +3008,7 @@ def episode_ok(r: EpisodeResult) -> bool:
 
 def _episode_summary(r: EpisodeResult) -> dict:
     usage = (r.budget or {}).get("usage", {}) if r.budget else {}
+    reflex = (r.budget or {}).get("reflex", {}) if r.budget else {}
     return {
         "index": r.index,
         "ok": episode_ok(r),
@@ -2929,6 +3024,21 @@ def _episode_summary(r: EpisodeResult) -> dict:
         "invalids": r.invalids,
         "boundaries": r.boundaries, "strategy_calls": r.strategy_calls,
         "directives_applied": r.directives_applied,
+        # Jev consultation/applied accounting.  ``paid_dispatched`` counts
+        # paid consultations *reserved* (the historical diagnostic, which may
+        # exceed the applied cap); ``applied`` counts complete sends of
+        # unoverridden, locally valid Jev proposals, which the applied cap
+        # bounds.  Absent legacy fields default to 0.
+        "reflex": {
+            "applied": reflex.get("applied", 0),
+            "paid_dispatched": reflex.get("paid_dispatched", 0),
+            "accepted": reflex.get("successful", 0),
+            "rejected": reflex.get("fallback", 0),
+            "fallback": reflex.get("fallback", 0),
+            "timeout": reflex.get("timeout", 0),
+            "invalid": reflex.get("invalid", 0),
+            "low_confidence": reflex.get("low_confidence", 0),
+        },
         # Wave-5 dangerous forced search: activations (prefixes sent), sent
         # suffixes, time-advanced successes, cancels, gate denials, trapped
         # quits and un-cleared prefixes are reported separately and never
@@ -2985,7 +3095,10 @@ def campaign_summary(results, config, episode_timeout: float) -> dict:
               "unknown_exposure_usd": 0.0,
               "cache_hit_tokens": 0, "cache_miss_tokens": 0,
               "cache_unclassified_tokens": 0, "reasoning_tokens": 0,
-              "cache_hit_rate": None}
+              "cache_hit_rate": None,
+              "reflex": {"applied": 0, "paid_dispatched": 0, "accepted": 0,
+                         "rejected": 0, "fallback": 0, "timeout": 0,
+                         "invalid": 0, "low_confidence": 0}}
     for e in episodes:
         for key in ("ticks", "needs", "actions", "invalids", "boundaries",
                     "strategy_calls", "directives_applied"):
@@ -3008,6 +3121,9 @@ def campaign_summary(results, config, episode_timeout: float) -> dict:
         totals["cache_miss_tokens"] += u["cache_miss_tokens"]
         totals["cache_unclassified_tokens"] += u["cache_unclassified_tokens"]
         totals["reasoning_tokens"] += u["reasoning_tokens"]
+        rf = e["reflex"]
+        for key in totals["reflex"]:
+            totals["reflex"][key] += rf.get(key, 0)
     # The campaign rate is computed from the *summed* H and M, never as an
     # average of per-episode percentages: a short episode must not weigh as
     # much as a long one.

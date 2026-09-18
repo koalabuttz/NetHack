@@ -24,7 +24,7 @@ no USD figure is asserted and the unknown-price exposure is counted instead.
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 @dataclass
@@ -191,7 +191,18 @@ class BudgetLedger(object):
         self.reflex_invalid = 0
         self.reflex_low_confidence = 0
         self.reflex_fallback = 0
+        # Reservations made (the historical ``paid_dispatched`` diagnostic: it
+        # counts paid consultations *reserved*, not decisions applied).
         self.reflex_paid_dispatched = 0
+        # Applied Jev decisions: accepted proposals that passed local
+        # validation, were not overridden, and completed their action-wire
+        # send.  This -- not the reservation count -- is what the applied cap
+        # bounds.  ``_applied_tokens`` is the private, episode-owned
+        # idempotence set (one token per applied decision; a delivery repair
+        # reuses its token), so a resend cannot charge twice.  It stores no
+        # provider payload or secret and is never emitted.
+        self.reflex_applied = 0
+        self._applied_tokens: Set[str] = set()
         # -- boundary counters ------------------------------------------
         self.boundaries_detected = 0
         self.boundaries_queued = 0
@@ -632,9 +643,33 @@ class BudgetLedger(object):
 
     # -- reflex paid bound (Jev) ----------------------------------------
     def reflex_paid_available(self) -> bool:
+        """Admission for a paid consultation, against the *applied* count.
+
+        A cap <= 0 disables the paid tier.  Otherwise the cap bounds applied
+        Jev decisions (complete sends), so rejected/skipped/abstained
+        consultations no longer exhaust the allowance -- they still cost
+        money, but they do not spend the applied decision budget.
+        """
         if self.reflex_cap <= 0:
             return False
-        return self.reflex_paid_dispatched < self.reflex_cap
+        return self.reflex_applied < self.reflex_cap
+
+    def note_reflex_applied(self, token) -> bool:
+        """Idempotently record one applied Jev decision; return what happened.
+
+        Called only on the complete-send path of an unoverridden, locally
+        valid Jev proposal.  ``token`` is the controller-owned
+        applied-decision token for that decision; the same token delivered
+        twice (a delivery-repair resend) counts exactly once.  Returns True
+        when the count advanced, False for an already-counted token.
+        """
+        if token is None:
+            return False
+        if token in self._applied_tokens:
+            return False
+        self._applied_tokens.add(token)
+        self.reflex_applied += 1
+        return True
 
     def reserve_reflex_paid(self, prompt_bound: int = 0,
                             completion_bound: int = 0) -> Optional[str]:
@@ -669,6 +704,7 @@ class BudgetLedger(object):
                 "low_confidence": self.reflex_low_confidence,
                 "fallback": self.reflex_fallback,
                 "paid_dispatched": self.reflex_paid_dispatched,
+                "applied": self.reflex_applied,
             },
             "boundaries": {
                 "detected": self.boundaries_detected,

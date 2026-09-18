@@ -31,12 +31,13 @@ for _p in (_ROOT, _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from tools.agent import (arbitration, candidates, controller,  # noqa: E402
+from tools.agent import (arbitration, budget, candidates, controller,  # noqa: E402
                          directives, forced_search, instances, policy,
-                         protocol, state)
+                         protocol, providers, recording, state)
 from tools.agent.providers import ProviderConfig, ReflexContext  # noqa: E402
-from test_auto import (CLOSED, HELLO, WireHarness, _line, _parse_actions,
-                       obs)  # noqa: E402
+from test_auto import (CLOSED, HELLO, WireHarness, _line,  # noqa: E402
+                       _parse_actions, hello, obs)
+from test_auto_providers import paced  # noqa: E402
 
 PAL = [[0, " ", "none", 0, "none"],
        [1, ".", "gray", 0, "none"],
@@ -789,6 +790,298 @@ class JevPresentationIsolation(WireHarness):
         # rendering the same context twice is byte-identical (render-once)
         self.assertEqual(providers._render_strategy_prompt(self._ctx()),
                          rendered)
+
+
+# -------------------------------------------- applied-decision cap (phase 2)
+
+class _ChoiceJev(object):
+    """A typed-choice Jev double that never opens a socket (no real provider)."""
+
+    name = "jev"
+    version = "fake/1"
+    last_error = ""
+
+    def __init__(self, index=0, selected_probability=0.9, confidence=0.9,
+                 abstain=False, usage=None, parse_error="", returns_none=False):
+        self.index = index
+        self.selected_probability = selected_probability
+        self.confidence = confidence
+        self.abstain = abstain
+        self.usage = usage or {}
+        self.parse_error = parse_error
+        self.returns_none = returns_none
+        self.decides = 0
+
+    def available(self, config):
+        return providers.Availability(True, "fake jev")
+
+    def build_request(self, ctx):
+        return providers.JevBuild({"table_id": "fake", "candidates": []}, "")
+
+    def decide(self, ctx, deadline=0.0):
+        self.decides += 1
+        if self.returns_none:
+            self.last_error = "timeout"
+            return None
+        table = getattr(getattr(ctx, "prepared", None), "table", None)
+        return providers.ReflexChoiceResult(
+            table_id=(table.table_id if table is not None else ""),
+            need_key=(tuple(table.need_key) if table is not None else ()),
+            table_version=(table.table_version if table is not None else -1),
+            index=None if self.abstain else self.index,
+            confidence=self.confidence,
+            selected_probability=self.selected_probability,
+            abstain=self.abstain, parse_error=self.parse_error,
+            usage=self.usage, dispatched=True, reason="fake")
+
+    def cancel(self):
+        pass
+
+    def on_closed(self):
+        pass
+
+
+class JevAppliedCap(WireHarness):
+    """AC.5/AC.6: the cap bounds *applied* decisions, charged on complete send."""
+
+    def _runner(self, fake, cap=2, config=None):
+        cfg = config or ProviderConfig(
+            max_ticks=200, reflex="jev", postmortem_reserve=0,
+            reflex_call_cap=cap)
+        ctl = controller.Controller(
+            cfg, controller.ControllerPaths("w", "r", "d", "s"), self.dir,
+            episode_timeout=5.0)
+        ctl._new_reflex_provider = lambda reflex: fake
+        result = controller.EpisodeResult(index=1)
+        rec = recording.EpisodeRecorder(self.dir, 1)
+        proc = paced([hello()], [0.0])
+        self.addCleanup(proc.close)
+        r = controller._EpisodeRunner(ctl, proc, rec, result)
+        r.pending_key = protocol.NeedKey(1, 1, 1)
+        r.pending_seq = 1
+        r.pending_need = {"id": 1, "kind": "command", "prompt": ""}
+        # a plus-shaped floor with a confirmed hero yields >1 distinct
+        # movement candidate, so the relative gate has a real N >= 2 table
+        for pos in [(5, 5), (4, 5), (6, 5), (5, 4), (5, 6)]:
+            r.mem.grid[pos] = "."
+        r.mem.hero = (5, 5)
+        r.mem.status.hp = 10
+        r.mem.status.hp_max = 10
+        r.mem.inventory.refresh([], 0, 0)
+        r.req.begin({"id": 1, "kind": "command", "prompt": ""}, 1)
+        return r, rec, proc
+
+    def _answer(self, r):
+        r.pending = True
+        r.pending_need = {"id": 1, "kind": "command", "prompt": ""}
+        return r._answer_now(None)
+
+    def test_jev_rejections_do_not_exhaust_applied_cap(self):
+        # a rejected consultation is reserved and billed, but spends no
+        # applied allowance: cap=1 still admits many consultations
+        fake = _ChoiceJev(index=99, usage={"prompt_tokens": 100})
+        r, rec, _ = self._runner(fake, cap=1)
+        for _ in range(4):
+            self._answer(r)
+        rec.finalize({})
+        self.assertEqual(r.ledger.reflex_applied, 0)
+        self.assertEqual(r.ledger.reflex_paid_dispatched, 4)
+        self.assertTrue(r.ledger.reflex_paid_available())
+        self.assertEqual(fake.decides, 4)
+
+    def test_jev_skips_abstentions_and_timeouts_leave_applied_allowance(self):
+        abstain = _ChoiceJev(abstain=True, usage={"prompt_tokens": 5})
+        r, rec, _ = self._runner(abstain, cap=1)
+        self._answer(r)
+        rec.finalize({})
+        self.assertEqual(r.ledger.reflex_applied, 0)
+        self.assertEqual(r.ledger.reflex_paid_dispatched, 1)
+        self.assertTrue(r.ledger.reflex_paid_available())
+
+        timeout = _ChoiceJev(returns_none=True)
+        r2, rec2, _ = self._runner(timeout, cap=1)
+        self._answer(r2)
+        rec2.finalize({})
+        self.assertEqual(r2.ledger.reflex_applied, 0)
+        self.assertTrue(r2.ledger.reflex_paid_available())
+
+    def test_jev_cap_stops_after_exactly_c_complete_applied_sends(self):
+        fake = _ChoiceJev()
+        r, rec, _ = self._runner(fake, cap=2)
+        for _ in range(4):
+            self._answer(r)
+        rec.finalize({})
+        # exactly two complete applied sends, then the paid tier is suppressed
+        self.assertEqual(r.ledger.reflex_applied, 2)
+        self.assertEqual(fake.decides, 2)
+        self.assertFalse(r.ledger.reflex_paid_available())
+
+    def test_jev_validation_fallback_and_forced_override_do_not_charge_applied(
+            self):
+        from unittest import mock
+        # (a) a locally invalid Jev proposal is replaced by the fallback
+        fake = _ChoiceJev()
+        r, rec, _ = self._runner(fake)
+        with mock.patch.object(controller.protocol, "validate_action",
+                               return_value="bad action"):
+            self._answer(r)
+        self.assertEqual(r.ledger.reflex_applied, 0)
+        self.assertTrue(r.ledger.reflex_paid_available())
+        # (b) a controller-owned forced-search override charges nothing either
+        fake2 = _ChoiceJev()
+        r2, rec2, _ = self._runner(fake2)
+        r2._forced_override = lambda need, selected: (
+            {"key": protocol.KEY_SEARCH}, "forced search", "prefix")
+        self._answer(r2)
+        rec.finalize({})
+        rec2.finalize({})
+        self.assertEqual(r2.ledger.reflex_applied, 0)
+        self.assertTrue(r2.ledger.reflex_paid_available())
+
+    def test_equal_action_forced_override_uses_provenance_not_dict_equality(
+            self):
+        # The override's action dict is *identical* to the Jev proposal; the
+        # decision is still a controller override, so provenance -- not dict
+        # equality -- decides, and nothing is charged.
+        fake = _ChoiceJev()
+        r, rec, _ = self._runner(fake)
+        seen = {}
+        real_record = r.rec.record_decision
+        r.rec.record_decision = lambda **kw: (seen.update(kw),
+                                              real_record(**kw))[1]
+
+        def override(need, selected):
+            seen["overridden_action"] = dict(selected)
+            return (dict(selected), "forced search", "prefix")
+
+        r._forced_override = override
+        self._answer(r)
+        rec.finalize({})
+        # the override action really did coincide with the Jev proposal ...
+        self.assertEqual(seen["provider"], "scripted")
+        self.assertEqual(seen["overridden_action"], seen["selected"])
+        # ... yet the decision is a controller override: nothing applied
+        self.assertEqual(r.ledger.reflex_applied, 0)
+        self.assertIsNone(r._last_jev_send)
+        self.assertTrue(r.ledger.reflex_paid_available())
+
+    def test_jev_failed_or_partial_send_does_not_charge_applied(self):
+        fake = _ChoiceJev()
+        r, rec, _ = self._runner(fake)
+
+        def boom(*a, **k):
+            raise controller._TransportFailure("partial write")
+
+        r._emit = boom
+        with self.assertRaises(controller._TransportFailure):
+            self._answer(r)
+        rec.finalize({})
+        self.assertEqual(r.ledger.reflex_applied, 0)
+        self.assertTrue(r.ledger.reflex_paid_available())
+
+    def test_jev_delivery_repair_does_not_double_charge_decision(self):
+        fake = _ChoiceJev(usage={"prompt_tokens": 1000})
+        r, rec, _ = self._runner(fake, cap=1)
+        self._answer(r)
+        self.assertEqual(r.ledger.reflex_applied, 1)
+        self.assertEqual(r.action_ordinal, 1)
+        # the engine rejects the delivery as incomplete: page repair + resend
+        r._on_invalid({"code": "incomplete"})
+        self.assertIsNotNone(r._repair_send)
+        self._answer(r)
+        rec.finalize({})
+        # one provider call, one applied increment, two sent ordinals
+        self.assertEqual(fake.decides, 1)
+        self.assertEqual(r.ledger.reflex_applied, 1)
+        self.assertEqual(r.action_ordinal, 2)
+        # paid settlement is unchanged: the single consultation billed once
+        self.assertEqual(r.ledger.reflex_paid_dispatched, 1)
+        self.assertEqual(r.ledger.prompt_tokens, 1000)
+
+    def test_jev_applied_send_later_native_invalid_is_not_refunded(self):
+        fake = _ChoiceJev()
+        r, rec, _ = self._runner(fake, cap=1)
+        self._answer(r)
+        self.assertEqual(r.ledger.reflex_applied, 1)
+        # a later ordinary engine invalid does not refund the applied count
+        r._on_invalid({"code": "kind"})
+        rec.finalize({})
+        self.assertEqual(r.ledger.reflex_applied, 1)
+
+    def test_jev_rejected_usage_settled_once_and_sidecar_retained(self):
+        records = []
+        fake = _ChoiceJev(index=99, usage={"prompt_tokens": 1000})
+        r, rec, _ = self._runner(fake, cap=1)
+        real_record = r.rec.record_decision
+
+        def capture(**kw):
+            records.append(kw)
+            return real_record(**kw)
+
+        r.rec.record_decision = capture
+        self._answer(r)
+        rec.finalize({})
+        # the paid usage is settled exactly once even though it was rejected
+        self.assertEqual(r.ledger.prompt_tokens, 1000)
+        self.assertEqual(r.ledger.reflex_paid_dispatched, 1)
+        self.assertEqual(r.ledger.reflex_applied, 0)
+        # a normal fallback decision record is retained with its reason
+        self.assertTrue(records)
+        self.assertEqual(records[-1]["provider"], "scripted")
+        self.assertIn("jev rejected", records[-1]["reason"])
+
+    def test_jev_cap_zero_and_monetary_admission_remain_fail_closed(self):
+        fake = _ChoiceJev()
+        r, rec, _ = self._runner(fake, cap=0)
+        self._answer(r)
+        rec.finalize({})
+        self.assertEqual(fake.decides, 0)          # cap 0 disables the tier
+        cfg = ProviderConfig(max_ticks=200, reflex="jev", reflex_call_cap=5,
+                             postmortem_reserve=0, usd_cap=1.0,
+                             deepseek_price_in=1.0, deepseek_price_out=1.0)
+        fake2 = _ChoiceJev()
+        r2, rec2, _ = self._runner(fake2, config=cfg)
+        self._answer(r2)
+        rec2.finalize({})
+        self.assertEqual(fake2.decides, 0)         # a USD cap refuses Jev
+        self.assertIsNone(r2.ledger.reserve_reflex_paid())
+
+
+class SummaryCompatibility(unittest.TestCase):
+    """AC.7: additive ``reflex.applied`` reporting keeps old consumers working."""
+
+    def _result(self, index, budget):
+        r = controller.EpisodeResult(index=index)
+        r.spawn_ok = True
+        r.closed = True
+        r.returncode = 0
+        r.recording_complete = True
+        r.budget = budget
+        return r
+
+    def test_episode_and_campaign_summary_consumer_compatibility_with_reflex_applied(
+            self):
+        # an OLD artifact dictionary lacks reflex.* entirely: defaults to 0
+        old = self._result(1, {"usage": {"prompt_tokens": 5}})
+        ep = controller._episode_summary(old)
+        self.assertEqual(ep["reflex"]["applied"], 0)
+        self.assertEqual(ep["reflex"]["paid_dispatched"], 0)
+        summary = controller.campaign_summary([old], ProviderConfig(), 1.0)
+        self.assertEqual(summary["totals"]["reflex"]["applied"], 0)
+        # a NEW artifact carries applied/paid_dispatched and they are preserved
+        new = self._result(2, {
+            "usage": {"prompt_tokens": 5},
+            "reflex": {"applied": 3, "paid_dispatched": 7, "successful": 3,
+                       "fallback": 4, "timeout": 1, "invalid": 0,
+                       "low_confidence": 0}})
+        ep2 = controller._episode_summary(new)
+        self.assertEqual(ep2["reflex"]["applied"], 3)
+        self.assertEqual(ep2["reflex"]["paid_dispatched"], 7)
+        summary2 = controller.campaign_summary([old, new], ProviderConfig(), 1.0)
+        self.assertEqual(summary2["totals"]["reflex"]["applied"], 3)
+        self.assertEqual(summary2["totals"]["reflex"]["paid_dispatched"], 7)
+        # a JSON round trip stays parseable by an older consumer
+        json.dumps(summary2)
 
 
 if __name__ == "__main__":

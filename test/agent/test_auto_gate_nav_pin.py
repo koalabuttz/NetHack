@@ -140,19 +140,27 @@ class PinConfidenceGate(unittest.TestCase):
 
 
 class PinAppliedCap(unittest.TestCase):
-    """Reservation-based admission (Phase 2 changes this)."""
+    """Reservation-based admission, replaced by applied-decision admission.
 
-    def test_pin_reservation_cap_exhausted_by_unapplied_consultations(self):
+    Phase 2 flipped these pins: the cap now bounds *applied* Jev decisions, so
+    unapplied consultations no longer exhaust the allowance.
+    """
+
+    def test_pin_reservation_cap_no_longer_bounds_unapplied_consultations(
+            self):
         ledger = budget.BudgetLedger(reflex_cap=2)
         # two paid consultations are reserved and then both rejected at
         # arbitration: nothing was ever applied to the wire ...
         self.assertIsNotNone(ledger.reserve_reflex_paid())
         self.assertIsNotNone(ledger.reserve_reflex_paid())
-        # ... yet the cap is now spent, so no further consultation is admitted.
-        self.assertFalse(ledger.reflex_paid_available())
-        self.assertIsNone(ledger.reserve_reflex_paid())
-        # and the ledger reports no applied counter at all.
-        self.assertNotIn("applied", ledger.as_dict()["reflex"])
+        # ... so the applied cap is untouched and further consultation stays
+        # admissible (the reservation diagnostic still records both).
+        self.assertEqual(ledger.reflex_paid_dispatched, 2)
+        self.assertEqual(ledger.reflex_applied, 0)
+        self.assertTrue(ledger.reflex_paid_available())
+        self.assertIsNotNone(ledger.reserve_reflex_paid())
+        # and the ledger now reports an applied counter
+        self.assertIn("applied", ledger.as_dict()["reflex"])
 
 
 class PinNavigation(unittest.TestCase):

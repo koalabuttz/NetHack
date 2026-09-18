@@ -674,11 +674,18 @@ class TestBudgetLedger(unittest.TestCase):
         self.assertFalse(led.strategy_available())
 
     def test_reflex_paid_bound_is_separate(self):
+        # Admission is against *applied* decisions, not reservations: many
+        # consultations may be reserved, but only the applied cap suppresses
+        # the paid tier.
         led = budget.BudgetLedger(reflex_cap=2)
         self.assertTrue(led.reserve_reflex_paid())
         self.assertTrue(led.reflex_paid_available())
         led.reserve_reflex_paid()
-        self.assertFalse(led.reserve_reflex_paid())
+        self.assertTrue(led.reserve_reflex_paid())     # reservations don't cap
+        led.note_reflex_applied("a")
+        led.note_reflex_applied("b")
+        self.assertFalse(led.reflex_paid_available())
+        self.assertIsNone(led.reserve_reflex_paid())
 
     def test_report_shape(self):
         led = budget.BudgetLedger()
@@ -1256,11 +1263,17 @@ class TestMixedProviderReservations(unittest.TestCase):
         self.assertEqual(led.prompt_tokens, 5)
 
     def test_reflex_cap_is_separate_and_counts_handles(self):
+        # The cap bounds applied decisions; the reservation diagnostic still
+        # counts every handle handed out.
         led = self.led(reflex_cap=2)
         self.assertIsNotNone(led.reserve_reflex_paid())
         self.assertIsNotNone(led.reserve_reflex_paid())
+        self.assertIsNotNone(led.reserve_reflex_paid())
+        self.assertEqual(led.reflex_paid_dispatched, 3)
+        led.note_reflex_applied("a")
+        led.note_reflex_applied("b")
         self.assertIsNone(led.reserve_reflex_paid())
-        self.assertEqual(led.reflex_paid_dispatched, 2)
+        self.assertEqual(led.reflex_applied, 2)
 
 
 # ============================================================ Jev
