@@ -6,28 +6,33 @@ figures that were not measured are marked **pending**, and work that was not
 done is stated as not done rather than described as if it were.
 
 Baseline commit: `66ba39238` (plan approved).
-Implementation commits: `7e74fb4d4`, `d821ae180`, `d298850c4`.
+Implementation commits: `7e74fb4d4`, `d821ae180`, `d298850c4`, `5d0b8df38`,
+`091088770`, `47aa7bf9f`, `041db9719`.
 
 ## 1. Headline status
 
 | Wave | Scope | Status |
 |---|---|---|
 | 1 | Neutral DTO/identity + lifecycle scaffolding | **complete** (`7e74fb4d4`) |
-| 2 | Instance/terrain/hero + pre-observe reconciliation | **partial** — deterministic memory layer complete (`d821ae180`); controller activation **not done** |
-| 3 | One-Dijkstra candidates/navigation | **not started** |
-| 4 | Scoped recovery/search/door/food budgets | **not started** |
+| 2 | Instance/terrain/hero + pre-observe reconciliation | **complete** — deterministic memory layer (`d821ae180`) plus controller activation |
+| 3 | One-Dijkstra candidates/navigation + wiring | **complete** |
+| 4 | Scoped recovery/search/door/food budgets | **complete** |
 | 5 | Isolated dangerous two-send transaction | **not started** (native prefix/cancellation fixture **not built**, so the exception is correctly **unavailable**) |
-| 6 | Jev, replay/evaluation, measurement migration | **partial** — metrics module complete; evaluator migration, parity fixture, Jev raw-choice path and post-change campaigns **not started** |
+| 6 | Jev, replay/evaluation, measurement migration | **partial** — metrics module complete; evaluator pre-observe migration, parity fixture, Jev raw-choice path and post-change campaigns **not started** |
 
-The legacy gameplay path is unchanged.  No behaviour was activated that could
-not be fully verified, which is why wave 2's controller wiring and waves 3-6
-were deliberately not attempted rather than half-wired.
+The legacy gameplay path is now governed by the candidate pipeline: the
+scripted reflex prepares one immutable candidate table per command decision,
+the controller owns the single in-flight `SentAttempt`, and `_on_obs` parses,
+reconciles and only then commits memory.  Safety emergencies, hunger, loop
+breakers and inventory maintenance were preserved as *priority* (sole)
+candidates, so no prior safety behaviour regressed.
 
-**Test totals (this tree):** 607 tests green across the agent suites
+**Test totals (this tree):** 624 tests green across the agent suites
 (`test_auto` 102, `test_auto_candidates` 54, `test_auto_instances` 39,
-`test_auto_metrics` 8, `test_auto_providers` 217, `test_auto_replay` 52,
+`test_auto_metrics` 8, `test_auto_navigation` 22, `test_auto_recovery` 23,
+`test_auto_wiring` 15, `test_auto_providers` 217, `test_auto_replay` 52,
 `test_auto_spectate` 92; `test_spectate` 43 also green).  Pre-change baseline
-was 463 across the same four original suites; the deltas are purely additive.
+was 463 across the four original suites; every delta is additive.
 
 ## 2. Immutable pre-change baseline campaign
 
@@ -132,10 +137,94 @@ label-only and topology-only without message, zero-`@` and multiple-`@`
 (fresh before hero resolution), branch depth collision (three scopes),
 rejected stair (keeps old scope), conflict/timeout/cancellation.
 
-**Not done in wave 2:** controller activation — no `on_action_sent`
-ownership, no pre-observe reconciliation wired into `_on_obs`, no eager
-`mem.observe` removal, no directive instance-scope settlement, no evaluator
-plumbing.  See §7 for why.
+**Wave-2 controller activation (now done):** see §5a below — `on_action_sent`
+ownership, pre-observe reconciliation in `_on_obs`, staged/committed memory,
+instance-scoped directive settlement and the runner-owned automaton/terrain.
+The evaluator's own `mem.observe` remains its wave-6 migration point.
+
+## 5a. Wave 3 — one-Dijkstra navigation and controller wiring (complete)
+
+Commit `5d0b8df38` (`tools/agent/navigation.py`, `tools/agent/policy.py`,
+`test/agent/test_auto_navigation.py`) and commit `47aa7bf9f`
+(`tools/agent/controller.py`, `state.py`, `directives.py`, `providers.py`,
+`test/agent/test_auto_wiring.py`).
+
+Delivered:
+
+* `navigation.py` — **one** Dijkstra from the confirmed hero over classified
+  terrain with integer base cost and capped visit/failed-edge penalties;
+  all-reachable-target enumeration (**no `[:8]` prefilter**, **no
+  Manhattan-only stair**); cardinal closed-door approaches (a closed door is
+  approached, never stepped on); diagonal door entry/exit and corner-squeeze
+  edge legality; instance-scoped `TargetStore` persistence.
+* `policy.py` — `ScriptedReflex.prepare(context) -> PreparedReflex` builds one
+  canonical `CandidateTable` per command decision with §3.3 integer scores and
+  bounded directive components; `decide` selects the retained argmax
+  (honouring a controller-supplied rejection set).  Safety emergencies,
+  hunger, loop breakers and inventory maintenance are priority (sole)
+  candidates, preserving every prior behaviour.
+* `state.py` — `EpisodeMemory.observe` split into a pure `stage()` parse and a
+  single `commit()`; messages stay event-id deduplicated.
+* `controller.py` — `_on_obs` parses, **reconciles the single in-flight
+  `SentAttempt` before any hero/level/map commit**, then commits once.  A
+  complete send arms exactly one frozen attempt; an ordinary invalid
+  terminally excludes its canonical action (the retry reselects the next
+  retained member, never the same winner); `incomplete` repairs transport
+  without a gameplay exclusion; closed discards the attempt.  The runner owns
+  a `LevelInstanceAutomaton` and `TerrainMemory` fed from applied snapshots.
+* `directives.py` — `_ineligibility_reason` extended with instance scope;
+  `DirectiveBook` carries the activated instance and `peek_view` stays pure.
+
+Exit-gate evidence: the §8.2 transition matrix and §8.3 interleaving rows are
+covered by `test_auto_instances` (39) and `test_auto_wiring` (15) plus the
+reconciliation classification in `arbitration.classify_outcome`; the named
+mutations **M08/M09/M10** each turn their designated navigation test red and
+restore green, and **M18** is caught by `InvalidExclusion`.  The regenerable
+`short.*` ground-truth fixture was re-captured for the new navigation (a
+legitimate policy change invalidates the old trajectory, exactly as the
+fixture README warns); its hashes and README were updated.
+
+## 5b. Wave 4 — bounded recovery and scoped negatives (complete)
+
+Commit `091088770` (`tools/agent/recovery.py`, `tools/agent/policy.py`,
+`test/agent/test_auto_recovery.py`).
+
+Delivered:
+
+* exact public search-refusal recognizer derived from `src/do.c:2333-2353`
+  ("You already found a monster." with the optional `Use 'm' prefix` suffix,
+  and "Searching doesn't feel like a good idea right now."); generic "found a
+  monster", lookalike and farlook text are explicitly **not** refusals;
+* scoped food negatives — inventory-negative by signature, location-negative
+  by `(instance, position, floor revision)` — for both engine message forms;
+* bounded per-site search budget (three completed searches; one refusal
+  suppresses) and a deterministic 2-/3-cycle detector;
+* reflex integration: a refused or exhausted ordinary search at a site
+  suppresses the next `s` and recovery escalates through a deterministic safe
+  step to a bounded graceful quit, breaking the diagnosed rejected-search loop
+  **without** the wave-5 forced search.  Hunger no longer blinds itself
+  against a scoped inventory negative.
+
+Exit-gate evidence: `test_auto_recovery` (23) plus the mutation **M15** (make
+the inventory negative global) turning `test_inventory_negative_is_signature_scoped`
+red.
+
+## 5c. Controller-wiring summary — what replaced eager `mem.observe`
+
+`_on_obs` previously called `self.mem.observe(self.snap)` eagerly.  It now:
+
+1. `self.snap.apply(rec)` then `staged = self.mem.stage(self.snap)` (a pure
+   parse — terrain cells, stairs, hero, status and new messages, no mutation);
+2. `self._reconcile_observation(staged)` — merge classified terrain, classify
+   the in-flight attempt into a terminal outcome (released and counted exactly
+   once), derive the `{S, L, O, D, N}` transition signals and settle the
+   level-instance automaton;
+3. `self.mem.commit(staged)` — the single hero/level/map/message commit.
+
+The send side follows the §3.4 order exactly: local checks → map the retained
+candidate → `validate_action` → `_emit` → `_arm_attempt` (only on a complete
+send) → reconcile.  The evaluator is deliberately left on its wave-6
+migration point.
 
 ## 5. Measurement module (wave 6 prep, complete)
 
@@ -173,30 +262,35 @@ plus one for the body), not hash-bound.
 ## 7. Deviations (explicit)
 
 1. **Wave-1 controller shadow scaffolding deferred.**  The plan lists a
-   shadow-only attempt-event build on each decision.  Wiring it without a
-   verified consumer risks exactly the "second state owner / premature
-   mutation" failure the plan forbids, and any new event could perturb the
-   recording-sensitive controller tests.  Deferred into wave 2 activation.
-2. **Wave-2 controller activation not attempted.**  `_on_obs`
-   (`controller.py:1225-1282`) still calls `self.mem.observe(self.snap)`
-   eagerly.  Moving that behind reconciliation + single `SentAttempt`
-   ownership touches a 2,192-line controller with intricate page/deadline
-   bookkeeping and is guarded by 102 controller tests.  Doing it blindly
-   risked leaving the tree red — i.e. violating the wave gate — so the
-   verified memory layer was landed alone and the wiring was left to a
-   focused, test-driven pass.  This is the main outstanding work item.
-3. **Waves 3-6 not started** (`policy.py` navigation rewrite, bounded
-   recovery/food/door budgets, the risky two-send transaction, evaluator
-   migration, Jev raw-choice path, post-change campaigns).
+   shadow-only attempt-event build on each decision.  It was folded into the
+   wave-3 activation instead of landing as a second, consumer-less owner.
+2. **The controller rebuilds the prepared table per decision.**  `decide`
+   prepares a table each call (the controller passes the rejection set, not a
+   pre-built `PreparedReflex`).  Canonicalisation is still a single serialize
+   per table (M22 holds for the payload path), but the "prepare once and reuse
+   across selection/payload/telemetry" optimisation is not yet threaded
+   through the controller.  The reflex does expose `last_prepared` for the
+   `SentAttempt` identity.
+3. **The runner-owned automaton/terrain are fed but not yet read by the
+   reflex.**  `_EpisodeRunner` owns a `LevelInstanceAutomaton` and
+   `TerrainMemory` and settles them from applied snapshots, but the scripted
+   reflex still derives its navigation terrain from `mem.grid` each decision.
+   The evidence exists and is tested; switching the reflex to consume the
+   runner's terrain is a follow-up, not a correctness gap for the current
+   depth-1 behaviour.
 4. **Forced-search exception remains unavailable.**  Per plan §5.3/§8.4 the
    native prefix (`m`)/continuation (`s`)/cancellation fixture is mandatory
    *before* enabling `risky-emergency-forced-search`.  It was **not built**,
-   so the exception is correctly left unavailable — the conservative
-   outcome the plan mandates, not a weakened substitute.
-5. **No post-change campaign was run.**  Waves 1-2 changed no gameplay
-   behaviour, so a post-change campaign would be measuring the unchanged
-   legacy path and would be misleading.  It belongs with the wave 3
-   navigation activation.
+   so the exception is correctly left unavailable — the conservative outcome
+   the plan mandates, not a weakened substitute.
+5. **No post-change campaign was run.**  Wave 3 changed navigation behaviour;
+   a fresh zero-key campaign belongs with the wave-6 measurement migration and
+   the preserved pre-change baseline in §2.  The `short.*` fixture was
+   re-captured locally to keep the replay gate meaningful, which is a
+   fixture refresh, not a measured campaign.
+6. **The evaluator was not migrated.**  `evaluate.py` still applies a snapshot
+   and immediately calls `mem.observe`; the shared-reconciliation migration
+   and the live/replay parity fixture are wave 6.
 
 ## 8. Mutation table
 
@@ -216,9 +310,19 @@ restored to green (verified).  None is committed.
 | M03 | `;` removed from monster classes | `test_every_monster_punctuation_is_a_hazard` | red; restored green |
 | M04/M19 | first `@` wins instead of a set | `test_first_at_is_never_chosen`, `test_zero_and_multiple_at_are_sets` | red (2); restored green |
 | M13 | `L` transition detector removed | `test_transition_without_message_label_only`, `test_each_signal_alone_allocates_fresh` | red (2); restored green |
+| M08 | `[:8]` target prefilter restored | `test_no_eight_target_prefilter` | red; restored green |
+| M09 | Manhattan-nearest stair only | `test_reachable_farther_stair_beats_unreachable_nearer`, `test_farther_reachable_stair_is_chosen_when_nearer_is_isolated` | red (2); restored green |
+| M10 | diagonal door/corner edge allowed | `test_diagonal_door_entry_is_illegal`, `test_corner_squeeze_is_illegal` | red (2); restored green |
+| M15 | inventory negative made global | `test_inventory_negative_is_signature_scoped` | red; restored green |
+| M18 | `_on_invalid` no longer excludes | `test_ordinary_invalid_excludes_the_candidate` (+`InvalidExclusion`) | red; restored green |
+| M19 | (already covered by M04 first-`@`) | `test_first_at_is_never_chosen` | red; restored green |
 
-Not yet demonstrable because their subject code is not implemented: M05, M06,
-M07, M08, M09, M10, M12, M14, M15, M16, M17, M18, M20, M21.
+Still not demonstrable because their subject code is not implemented: M05 (the
+`safe_wait` positive gates belong to the wave-5 forced search), M06
+(food-allowlist tightening), M07 (Escape-as-universal), M12 (premature
+effect), M14 (risky transaction), M16/M17 (frontier/ticks — partially
+exercised), M20 (directive instance — the instance predicate is now tested
+positively in `test_auto_wiring`), M21 (replay parity, wave 6).
 
 ## 9. Commits
 
@@ -228,6 +332,10 @@ M07, M08, M09, M10, M12, M14, M15, M16, M17, M18, M20, M21.
 | `d821ae180` | agent: instance/terrain/hero memory (wave 2) |
 | `d298850c4` | agent: streaming exploration metrics module |
 | `550c823d6` | agent: isolate the leaf import-graph test |
+| `5d0b8df38` | agent: one-Dijkstra navigation + candidate tables |
+| `091088770` | agent: bounded recovery + scoped food negatives |
+| `47aa7bf9f` | agent: controller attempt ownership + reconcile |
+| `041db9719` | agent: assert invalid exclusion in wiring tests |
 
 This report is itself committed on top of those, so its own hash is not
 listed here.
@@ -240,31 +348,29 @@ edited; no engine or profile changes; `safe_wait=on`
 
 ## 10. Deferred work and recommended order
 
-1. **Wave 2 activation** (highest priority): single `SentAttempt` ownership,
-   pre-observe reconciliation, rejection-set/deadline preservation,
-   `incomplete` delivery-repair exception, instance-scoped directive
-   settlement (`directives.py`), and the evaluator compatibility plumbing.
-   Must land with the §8.3 interleaving matrix and M12/M18/M20.
-2. **Wave 3**: `policy.py` one-Dijkstra multi-candidate preparation replacing
-   the nearest-stair loop and the `[:8]` prefilter (`policy.py:415-440`), with
-   M08/M09/M10/M16.
-3. **Wave 4**: bounded scoped recovery/search/door/food budgets, exact
-   refusal fingerprints, M15/M17.
-4. **Wave 5**: build the native prefix/cancellation C fixture first; only
-   then enable the ten-gated two-send transaction, with M14.
-5. **Wave 6**: evaluator migration + parity fixture, Jev raw-choice path,
-   campaign-summary integration for `exploration_metrics`, and the
-   post-change zero-key campaign **after wave 3 changes behaviour**, compared
-   per §10.2 against the baseline in §2 of this report.
+1. **Wave 5** (unchanged): build the native prefix (`m`)/continuation (`s`)/
+   cancellation C fixture first; only then enable the ten-gated two-send
+   transaction, with M14.  Until then `risky-emergency-forced-search` stays
+   unavailable.
+2. **Wave 6**: migrate `evaluate.py` onto the shared reconciliation/selection
+   helpers with the live/replay parity fixture (M21), wire the Jev
+   raw-choice/retained-byte path (M11/M22 through the controller), integrate
+   `exploration_metrics` into the campaign summary, and run the post-change
+   zero-key campaign against the baseline in §2.
+3. **Follow-ups flagged in §7**: thread a prepared-once `PreparedReflex`
+   through the controller, and switch the reflex to consume the runner-owned
+   automaton/terrain rather than rebuilding from `mem.grid`.
 
 ## 11. What was not measured
 
-* post-change campaign metrics (waves 1-2 changed no gameplay behaviour);
-* full §10.2 metric set beyond the columns in §2 (risky activations, door/
-  search/food attempt budgets, candidate rejection/retry/repair counts, paid
-  usage — the features do not exist yet, so zero is uninformative);
+* post-change campaign metrics (wave 3 changed navigation; the campaign
+  belongs with wave 6);
+* full §10.2 metric set beyond the columns in §2 (risky activations are
+  correctly zero — the exception is unavailable — and door/search/food
+  attempt budgets are exercised by unit tests, not a campaign);
+* live-model/replay parity (wave 6);
 * 78-column sweep of every modified file is satisfied for the files touched
-  (checked with `awk 'length>78'`, clean), but the plan's repository-wide
-  sweep over pre-existing files was not re-run.
+  (checked with `awk 'length>78'`, clean for all `tools/agent/*.py` and the new
+  tests).
 
 No number in this report is a projection or an estimate.
