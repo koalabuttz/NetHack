@@ -492,6 +492,198 @@ def render_criterion(candidate, need_kind: str, context) -> Tuple[
     return _command_text(candidate, stem, context)
 
 
+# -- state payload ---------------------------------------------------------
+
+GAME = "NetHack"
+OBJECTIVE = "Survive, explore safely, and descend when prepared."
+
+#: The fixed, fully inlined glyph legend.  Keys and values are verbatim and
+#: snapshot-tested, and every glyph the map renderer can emit is covered.
+LEGEND = {
+    " ": "unknown or unobserved",
+    ".": "floor or doorway",
+    "#": "corridor or tree; color distinguishes",
+    "-": "wall or open door",
+    "|": "wall or open door",
+    "+": "closed door or wall; color distinguishes",
+    ">": "stairs down",
+    "<": "stairs up",
+    "@": "your hero (from state.hero)",
+    "*": "a creature; species unknown",
+    "^": "trap",
+    "}": "water or lava; color distinguishes",
+    "0": "boulder",
+    "{": "fountain",
+    "_": "altar",
+}
+
+#: Deterministic summaries for the nine strategy goals, in the fixed priority
+#: order the directive vocabulary already has.
+DIRECTIVE_SUMMARIES = {
+    "survive": "Prioritize survival.",
+    "acquire_food": "Acquire food.",
+    "eat_known_safe_food": "Eat known safe food when hungry.",
+    "recover": "Recover to a safe state.",
+    "explore_frontier": "Explore the edge of known terrain.",
+    "search_dead_ends": "Search dead ends for hidden passages.",
+    "descend_known_stairs": "Head toward known stairs down.",
+    "inspect_inventory": "Review inventory when information is stale.",
+    "disengage": "Withdraw from danger.",
+}
+
+#: The number of recent messages the payload carries, and the inventory row
+#: cap whose overflow sets ``truncated``.
+MESSAGE_LIMIT = 6
+INVENTORY_LIMIT = 40
+
+
+def _conditions(snapshot):
+    """The displayed condition names, or ``None`` on extraction failure."""
+    try:
+        from .policy import condition_texts
+        return list(condition_texts(snapshot))
+    except Exception:                           # noqa: BLE001
+        return None
+
+
+def _int_or_none(value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _directive_summaries(context) -> List[str]:
+    """Deterministic directive summaries in existing priority order.
+
+    The nine goals map to fixed strings and keep their order; only the
+    controlled ``target`` / ``risk`` / ``preconditions`` clauses are appended,
+    and only when present.  An ``explanation`` is never passed through as an
+    instruction and a ``ttl`` is never emitted.
+    """
+    out: List[str] = []
+    seen = set()
+    for view in getattr(context, "directives", ()) or ():
+        dset = getattr(view, "dset", None)
+        if dset is None:
+            continue
+        for goal in getattr(dset, "goals", ()) or ():
+            text = DIRECTIVE_SUMMARIES.get(goal)
+            if text is not None and goal not in seen:
+                out.append(text)
+                seen.add(goal)
+        target = getattr(dset, "target", None)
+        if target is not None:
+            out.append("Target: %d,%d." % (int(target[0]), int(target[1])))
+        risk = getattr(dset, "risk", 0.0) or 0.0
+        if risk:
+            out.append("Risk level %s." % ("%g" % float(risk)))
+        for precondition in getattr(dset, "preconditions", ()) or ():
+            out.append("`%s` must hold." % precondition)
+    return out
+
+
+def _inventory_payload(mem, st) -> Dict[str, Any]:
+    inv = getattr(mem, "inventory", None)
+    if inv is None or getattr(inv, "seen_tick", None) is None:
+        return {"items": None, "cached": False, "age_turns": None,
+                "truncated": False}
+    rendered = []
+    for row in getattr(inv, "rows", None) or []:
+        text = row.get("text") if isinstance(row, dict) else row
+        if isinstance(text, str) and text:
+            rendered.append(text)
+    age = None
+    game_time = _int_or_none(getattr(st, "time", None))
+    seen_time = _int_or_none(getattr(inv, "seen_time", None))
+    if game_time is not None and seen_time is not None:
+        age = max(0, game_time - seen_time)
+    return {"items": rendered[:INVENTORY_LIMIT], "cached": True,
+            "age_turns": age, "truncated": len(rendered) > INVENTORY_LIMIT}
+
+
+def _messages_payload(mem):
+    recent = getattr(mem, "recent_messages", None)
+    if not callable(recent):
+        return None
+    try:
+        return [str(m) for m in recent(MESSAGE_LIMIT)]
+    except Exception:                           # noqa: BLE001
+        return None
+
+
+def _stairs_payload(mem):
+    try:
+        down = sorted(tuple(p) for p in getattr(mem, "stairs_down", ()) or ())
+        up = sorted(tuple(p) for p in getattr(mem, "stairs_up", ()) or ())
+    except Exception:                           # noqa: BLE001
+        return None
+    if not down and not up:
+        return None
+    return {"down": [[int(p[0]), int(p[1])] for p in down],
+            "up": [[int(p[0]), int(p[1])] for p in up]}
+
+
+def _map_payload(context, mem):
+    try:
+        return state.bounded_map(
+            getattr(context, "terrain", None),
+            getattr(mem, "hero", None),
+            getattr(context, "snapshot", None),
+            getattr(mem, "stairs_down", ()) or (),
+            getattr(mem, "stairs_up", ()) or ())
+    except Exception:                           # noqa: BLE001
+        return None
+
+
+def _intent_payload(context) -> Optional[str]:
+    """The pending operation, only when it adds to directives/need.
+
+    Boilerplate ``navigate`` (already conveyed by the need and the criteria)
+    is never repeated.
+    """
+    intent = getattr(context, "intent", "") or ""
+    if not intent or intent == "navigate":
+        return None
+    return intent
+
+
+def render_state(context) -> Dict[str, Any]:
+    """The compact remembered-state payload sent with every request.
+
+    One JSON object; every required field is present with ``null`` when
+    unavailable, a list is ``null`` when unavailable and ``[]`` only when
+    genuinely empty, and zero values are preserved.  Rendering is pure: no
+    helper here mutates memory, the terrain memory, the snapshot or the
+    directive book.
+    """
+    mem = getattr(context, "memory", None)
+    st = getattr(mem, "status", None)
+    need = context.need or {}
+    hero = getattr(mem, "hero", None)
+    return {
+        "game": GAME,
+        "objective": OBJECTIVE,
+        "legend": dict(LEGEND),
+        "status": {
+            "hp": _int_or_none(getattr(st, "hp", None)),
+            "hp_max": _int_or_none(getattr(st, "hp_max", None)),
+            "hunger": getattr(st, "hunger", "") or "",
+            "dungeon_level": getattr(st, "dlvl", "") or "",
+            "experience_level": _int_or_none(getattr(st, "level", None)),
+            "conditions": _conditions(getattr(context, "snapshot", None)),
+        },
+        "hero": [int(hero[0]), int(hero[1])] if hero is not None else None,
+        "inventory": _inventory_payload(mem, st),
+        "directives": _directive_summaries(context),
+        "intent": _intent_payload(context),
+        "messages": _messages_payload(mem),
+        "need": {"kind": need.get("kind") or "",
+                 "prompt": need.get("prompt") or None},
+        "map": _map_payload(context, mem),
+        "stairs": _stairs_payload(mem),
+    }
+
+
 # -- build result ----------------------------------------------------------
 
 @dataclass(frozen=True)

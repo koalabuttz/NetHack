@@ -54,7 +54,8 @@ from .events import (BoundaryQueue, EventLedger, directive_event,
                      hunger_index)
 from .policy import INV_STALE_TICKS, ScriptedReflex, condition_texts
 from .protocol import NeedKey, Request, Snapshot
-from .providers import (NullStrategy, ProviderConfig, ReflexContext,
+from .providers import (JEV_ADAPTER_VERSION, JEV_PRESENTATION_VERSION,
+                        NullStrategy, ProviderConfig, ReflexContext,
                         ReflexTimeout, ScriptedReflexProvider,
                         StrategyContext, StrategyConversation,
                         StrategyExchange, prepare_strategy_request,
@@ -2875,6 +2876,12 @@ def _safe_config(config: ProviderConfig) -> dict:
         "jev_base_url": ("configured" if getattr(config, "jev_base_url", None)
                          else None),
         "jev_accept_terms": bool(getattr(config, "jev_accept_terms", False)),
+        # The Jev presentation contract version.  Allowlisted metadata is the
+        # sole artifact-level location for it: it is never a wire field and
+        # never a decision-sidecar schema change.  An old artifact without it
+        # stays compatible (absence simply means legacy).
+        "jev_adapter_version": JEV_ADAPTER_VERSION,
+        "jev_presentation_version": JEV_PRESENTATION_VERSION,
         "usd_cap": getattr(config, "usd_cap", None),
         "token_cap": getattr(config, "token_cap", None),
     }

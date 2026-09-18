@@ -18,6 +18,10 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from . import protocol
 from .events import Boundary, BoundaryDetector, HUNGER_STAGES
+from .instances import (T_ALTAR, T_BARS, T_BOULDER, T_CLOSED_DOOR,
+                        T_CORRIDOR, T_DOORWAY, T_FLOOR, T_FOUNTAIN, T_LAVA,
+                        T_OPEN_DOOR, T_STAIRS_DOWN, T_STAIRS_UP, T_TRAP,
+                        T_TREE, T_UNKNOWN, T_WALL, T_WATER)
 
 # Monster classes drawn with punctuation rather than a letter.  Taken from the
 # engine's public glyph table (include/defsym.h MONSYM entries): golem ('),
@@ -244,6 +248,99 @@ def render_map(mem: "EpisodeMemory", legend: bool = True) -> str:
                      % (protocol.MAP_MIN_X, protocol.MAP_MAX_X,
                         protocol.MAP_MIN_Y, protocol.MAP_MAX_Y))
     return "\n".join(lines)
+
+
+#: The exhaustive, snapshot-exact terrain-class -> canonical glyph table.
+#: ``instances.TerrainMemory.terrain`` stores classification strings; every
+#: class maps to exactly one glyph so the payload's one-key-per-emitted-
+#: character legend claim stays true.  Orientation is lost for ``|-`` (the
+#: legend wording already covers both orientations) and a doorway whose open
+#: state is unknown renders as the closed-door glyph.
+TERRAIN_GLYPHS = {
+    T_FLOOR: ".",
+    T_CORRIDOR: "#",
+    T_WALL: "|",
+    T_OPEN_DOOR: "-",
+    T_CLOSED_DOOR: "+",
+    T_DOORWAY: "+",
+    T_STAIRS_DOWN: ">",
+    T_STAIRS_UP: "<",
+    T_TREE: "#",
+    T_WATER: "}",
+    T_LAVA: "}",
+    T_TRAP: "^",
+    T_BARS: "|",
+    T_BOULDER: "0",
+    T_FOUNTAIN: "{",
+    T_ALTAR: "_",
+    T_UNKNOWN: " ",
+}
+
+#: The single canonical marker every currently observed non-hero creature
+#: renders as, whatever its raw glyph.  Raw monster glyphs are never emitted.
+OCCUPANT_MARKER = "*"
+
+#: The confirmed hero's own marker (final precedence).
+HERO_MARKER = "@"
+
+
+def bounded_map(terrain,
+                hero: Optional[Tuple[int, int]],
+                snapshot,
+                stairs_down=(),
+                stairs_up=()) -> Optional[dict]:
+    """The bounded remembered-map crop for the presentation payload.
+
+    Read-only, pure and deterministic.  The glyph of a cell comes from the
+    *persistent classified* ``terrain`` (``instances.TerrainMemory``), so
+    remembered ground survives under a current occupant; dynamic occupancy
+    comes **only** from the current ``snapshot``, with every observed non-hero
+    creature rendered as the single canonical :data:`OCCUPANT_MARKER`, and
+    the confirmed hero cell rendered as :data:`HERO_MARKER` with final
+    precedence.  ``EpisodeMemory.grid`` is never a glyph source (its raw cells
+    are overwritten by occupants), and a stale remembered monster is never
+    drawn as current.
+
+    The crop is the union of the nonblank rendered glyphs, the confirmed hero
+    and the remembered stairs, expanded by one blank margin and clamped to the
+    protocol rectangle.  With no evidence at all the result is ``None``.
+    """
+    glyphs: Dict[Tuple[int, int], str] = {}
+    if terrain is not None:
+        for pos, klass in terrain.terrain.items():
+            glyph = TERRAIN_GLYPHS.get(klass, " ")
+            if glyph != " ":
+                glyphs[pos] = glyph
+    for pos in stairs_down:
+        glyphs.setdefault(tuple(pos), ">")
+    for pos in stairs_up:
+        glyphs.setdefault(tuple(pos), "<")
+    hero_pos = tuple(hero) if hero is not None else None
+    cells = getattr(snapshot, "map", None) or {}
+    for pos, cell in cells.items():
+        glyph = cell[0] if cell else ""
+        if not glyph or pos == hero_pos:
+            continue
+        if monster_cell(glyph, hero_pos, pos):
+            glyphs[pos] = OCCUPANT_MARKER
+    if hero_pos is not None:
+        glyphs[hero_pos] = HERO_MARKER
+    evidence = [pos for pos, glyph in glyphs.items() if glyph != " "]
+    if not evidence:
+        return None
+    xs = [pos[0] for pos in evidence]
+    ys = [pos[1] for pos in evidence]
+    x_min = max(protocol.MAP_MIN_X, min(xs) - 1)
+    x_max = min(protocol.MAP_MAX_X, max(xs) + 1)
+    y_min = max(protocol.MAP_MIN_Y, min(ys) - 1)
+    y_max = min(protocol.MAP_MAX_Y, max(ys) + 1)
+    lines = []
+    for y in range(y_min, y_max + 1):
+        row = "".join(glyphs.get((x, y), " ")
+                      for x in range(x_min, x_max + 1))
+        lines.append("%2d %s" % (y, row))
+    return {"x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max,
+            "text": "\n".join(lines)}
 
 
 class Inventory(object):

@@ -437,5 +437,68 @@ class TestJevCriteria(unittest.TestCase):
         self.assertEqual(text, presentation.QUIT_BOUND_TEMPLATE)
 
 
+# ------------------------------------------------------------------ AC.9
+
+class TestJevVersion(WireHarness):
+    """Presentation version traceability (metadata only, never on the wire)."""
+
+    def test_version_in_safe_config_metadata(self):
+        cfg = ProviderConfig(reflex="jev", jev_accept_terms=True)
+        safe = controller._safe_config(cfg)
+        self.assertEqual(safe["jev_presentation_version"],
+                         providers.JEV_PRESENTATION_VERSION)
+        self.assertEqual(safe["jev_adapter_version"],
+                         providers.JEV_ADAPTER_VERSION)
+        self.assertEqual(providers.JEV_PRESENTATION_VERSION,
+                         presentation.PRESENTATION_VERSION)
+        # it reaches the episode/campaign metadata artifact
+        summary = controller.campaign_summary([], cfg, 1.0)
+        self.assertEqual(summary["config"]["jev_presentation_version"],
+                         providers.JEV_PRESENTATION_VERSION)
+        # and the safe config never carries key material
+        for secret in ("jev_key_file", "deepseek_key_file", "api_key"):
+            self.assertNotIn(secret, safe)
+
+    def test_legacy_artifact_without_version_accepted(self):
+        cfg = ProviderConfig(reflex="jev", jev_accept_terms=True)
+        modern = controller._safe_config(cfg)
+        versioned = ("jev_adapter_version", "jev_presentation_version")
+        legacy = {k: v for k, v in modern.items() if k not in versioned}
+        # the version keys are purely additive: an artifact written before
+        # them is a strict subset of the same schema, so its absence reads as
+        # "legacy", never as an error
+        self.assertTrue(set(legacy) < set(modern))
+        self.assertEqual(json.loads(json.dumps(legacy)), legacy)
+        self.assertNotIn("jev_presentation_version", legacy)
+
+        # the decision-sidecar schema is unchanged by the version: a decision
+        # record never grows a version field
+        rec = recording.EpisodeRecorder(self.dir, 1)
+        rec.record_decision({"key": 115}, {"key": 115}, "scripted", "reason")
+        rec.finalize({})
+        path = os.path.join(self.dir, "ep-1.decisions.jsonl")
+        with open(path) as handle:
+            record = json.loads(handle.readline())
+        for key in versioned:
+            self.assertNotIn(key, record)
+
+    def test_version_absent_from_wire_request(self):
+        cfg = ProviderConfig(reflex="jev", jev_accept_terms=True)
+        prov = providers.JevReflex(cfg, jev_dispatch_enabled=True)
+        ctx = context_of(COMMAND)
+        ctx.prepared = prepared_of([cand(KEY.KEY_H, "navigate"),
+                                    cand(KEY.KEY_L, "navigate")])
+        built = prov.build_choices(ctx)
+        self.assertIsNotNone(built)
+        # the official body is exactly state/model/questions
+        self.assertEqual(sorted(built.payload.keys()),
+                         ["model", "questions", "state"])
+        self.assertEqual(sorted(built.payload["questions"].keys()), ["action"])
+        blob = json.dumps(built.payload)
+        self.assertNotIn(providers.JEV_PRESENTATION_VERSION, blob)
+        self.assertNotIn("presentation_version", blob)
+        self.assertNotIn("adapter_version", blob)
+
+
 if __name__ == "__main__":
     unittest.main()
