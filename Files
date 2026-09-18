@@ -605,7 +605,8 @@ tools/agent:
 .gitignore          __init__.py         __main__.py         budget.py
 codec.py            controller.py       directives.py       evaluate.py
 events.py           policy.py           protocol.py         providers.py
-recording.py        state.py            worker.py
+recording.py        render.py           spectating.py       state.py
+worker.py
 
 util:
 (files for all versions)

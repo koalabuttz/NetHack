@@ -84,9 +84,20 @@ sys.path.insert(0, HERE)
 import format_obs  # noqa: E402  (test-side independent chunk/page decoder)
 
 REPO_ROOT = os.path.dirname(os.path.dirname(HERE))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+# The deterministic presentation layer (pure formatters + FramePainter) was
+# promoted to the harness package so the live autoplay controller and this
+# spectator tool share one implementation.  Import and re-export every name
+# this tool always published, so callers (driver.py, test_spectate.py, the
+# selftest) keep working unchanged.
+from tools.agent.render import (  # noqa: E402
+    DEFAULT_MESSAGES, FramePainter, obs_frame, one_liner,
+    _sgr, _map_row, _status_line, _need_text)
+
 DEFAULT_LAUNCHER = os.path.join(REPO_ROOT, "src", "nethack-agent")
 DEFAULT_MIN_FRAME_INTERVAL = 0.15
-DEFAULT_MESSAGES = 3
 
 # Live-render safety limits.  These are named constants rather than flags on
 # purpose: they are operational bounds, not a user-facing policy surface.
@@ -114,25 +125,6 @@ _WRITER_MARKER_ENV = "SPECTATE_WRITER_MARKER"
 _WRITER_MARKER_VALUE = "spectate-writer-v1"
 _ACK_ERROR_ID = 0xFFFFFFFF
 
-# The 16 frozen public color names -> SGR foreground / background codes.
-# Slot 8 is the native NO_COLOR ("none") and maps to the terminal default.
-_FOREGROUND = {
-    "black": 30, "red": 31, "green": 32, "brown": 33, "blue": 34,
-    "magenta": 35, "cyan": 36, "gray": 37,
-    "orange": 91, "brightgreen": 92, "yellow": 93, "brightblue": 94,
-    "brightmagenta": 95, "brightcyan": 96, "white": 97, "none": 39,
-}
-_BACKGROUND = {
-    "black": 40, "red": 41, "green": 42, "brown": 43, "blue": 44,
-    "magenta": 45, "cyan": 46, "gray": 47,
-    "orange": 101, "brightgreen": 102, "yellow": 103, "brightblue": 104,
-    "brightmagenta": 105, "brightcyan": 106, "white": 107, "none": 49,
-}
-# style bitmask: bold=1 dim=2 italic=4 underline=8 blink=16 inverse=32
-_STYLE_BITS = ((1, 1), (2, 2), (4, 3), (8, 4), (16, 5), (32, 7))
-_RESET = "\x1b[0m"
-
-
 class UsageError(Exception):
     """A command line this tool cannot act on (exit 2)."""
 
@@ -155,174 +147,6 @@ class _Terminated(Exception):
     def __init__(self, signum):
         Exception.__init__(self, "signal %d" % signum)
         self.signum = signum
-
-
-# ------------------------------------------------------------------
-# formatting: one logical record -> the lines of one frame
-# ------------------------------------------------------------------
-
-
-def _sgr(cell):
-    """The SGR sequence for one palette cell, or "" for a plain cell."""
-    _char, color, style, frame = cell
-    codes = [code for bit, code in _STYLE_BITS if style & bit]
-    if color != "none":
-        codes.append(_FOREGROUND.get(color, 39))
-    if frame != "none":
-        codes.append(_BACKGROUND.get(frame, 49))
-    if not codes:
-        return ""
-    return "\x1b[" + ";".join(str(c) for c in codes) + "m"
-
-
-def _map_row(grid, cur, y, color):
-    """One map row as a string of exactly MAP_W columns (ANSI-colored)."""
-    out = []
-    current = None
-    for x in range(format_obs.MAP_W):
-        if x == 0:
-            out.append(" ")
-            continue
-        if cur and [x, y] == cur:
-            cell = ("*", "none", 0, "none")
-        else:
-            cell = grid[y][x]
-        if color:
-            want = _sgr(cell)
-            if want != current:
-                out.append(_RESET if current else "")
-                out.append(want)
-                current = want
-        out.append(cell[0])
-    if color and current:
-        out.append(_RESET)
-    return "".join(out)
-
-
-def _status_line(rec):
-    s = rec.get("s") or {}
-    parts = []
-    for key in sorted(s):
-        value = s[key]
-        parts.append("%s=%s" % (key, value["text"] if value else "(deleted)"))
-    return " ".join(parts)
-
-
-def _need_text(need, windows):
-    """The outstanding request as one compact line body (kind + identity)."""
-    if need is None:
-        return None
-    kind = need.get("kind")
-    if kind in ("command", "key", "direction"):
-        text = kind
-        if need.get("prompt"):
-            text += " prompt=%s" % json.dumps(need["prompt"])
-    elif kind == "position":
-        text = "position prompt=%s rect=[%d,%d..%d,%d]" % (
-            json.dumps(need.get("prompt", "")), need.get("x0"),
-            need.get("y0"), need.get("x1"), need.get("y1"))
-    elif kind == "yn":
-        text = "yn prompt=%s choices=%s default=%s numeric=%s" % (
-            json.dumps(need.get("prompt", "")),
-            json.dumps(need.get("choices")), need.get("default"),
-            need.get("numeric"))
-    elif kind in ("line", "extcmd"):
-        text = "%s prompt=%s max=%s" % (
-            kind, json.dumps(need.get("prompt", "")), need.get("max"))
-    elif kind == "menu":
-        text = "menu %s mode=%s content=%s pages=%s" % (
-            need.get("menu"), need.get("mode"), need.get("content"),
-            need.get("pages"))
-        titles = [w["title"] for w in windows if w.get("kind") == "menu"]
-        if titles:
-            text += " title=%s" % json.dumps(
-                titles[0] if len(titles) == 1 else titles)
-    elif kind == "ack":
-        text = "ack content=%s pages=%s" % (
-            need.get("content"), need.get("pages"))
-    else:
-        text = json.dumps(need, sort_keys=True)
-    return "  need: " + text
-
-
-def obs_frame(rec, messages=DEFAULT_MESSAGES, color=True):
-    """The frame for one observation: map, status, messages, need."""
-    lines = ["obs d=%s seq=%s base=%s"
-             % (rec.get("d"), rec.get("seq"), rec.get("base"))]
-    status = _status_line(rec)
-    lines.append("  status: " + (status if status else "-"))
-    cond = rec.get("cond") or []
-    if cond:
-        lines.append("  cond: " + " ".join(c["text"] for c in cond))
-
-    grid, cur = format_obs.map_grid(rec)
-    for y in range(format_obs.MAP_H):
-        lines.append("  |" + _map_row(grid, cur, y, color) + "|")
-
-    msgs = rec.get("msg") or []
-    if messages > 0:
-        for entry in msgs[-messages:]:
-            lines.append("  msg[%s] %s" % (entry.get("e"), entry.get("text")))
-    need_line = _need_text(rec.get("need"), rec.get("windows") or [])
-    if need_line:
-        lines.append(need_line)
-    return lines
-
-
-def one_liner(rec):
-    """A one-line form of a non-obs record (None if we do not show it)."""
-    t = rec.get("type")
-    if t == "hello":
-        return ("hello profile=%s policy=%s caps=%s size=%s limits=%s"
-                % (rec.get("profile"), rec.get("policy"),
-                   ",".join(rec.get("caps") or []), rec.get("size"),
-                   json.dumps(rec.get("limits"), sort_keys=True)))
-    if t == "closed":
-        return "closed"
-    if t == "invalid":
-        return "invalid d=%s code=%s" % (rec.get("d"), rec.get("code"))
-    if t == "page":
-        return "page content=%s %s/%s rows=%d" % (
-            rec.get("content"), rec.get("page"), rec.get("pages"),
-            len(rec.get("rows") or []))
-    if t in ("chunk",):
-        return None
-    return "? " + json.dumps(rec, sort_keys=True)
-
-
-class FramePainter(object):
-    """Turn frames into bytes; owns only the TTY redraw height.
-
-    Pure and synchronous: replay and the selftests drive it directly, while
-    the live worker owns the scheduling (deadline, coalescing) around it.
-    """
-
-    def __init__(self, messages=DEFAULT_MESSAGES, color=True, tty=False):
-        self.messages = messages
-        self.color = color
-        self.tty = tty
-        self.height = 0
-
-    def frame(self, lines):
-        """The bytes for drawing ``lines``, redrawing in place on a TTY."""
-        if not self.tty:
-            return "".join(line + "\n" for line in lines).encode(
-                "utf-8", "replace")
-        out = []
-        if self.height:
-            out.append("\x1b[%dA" % self.height)
-        for line in lines:
-            out.append(line + "\n")
-        if self.height > len(lines):
-            out.append("\x1b[0J")
-        self.height = len(lines)
-        return "".join(out).encode("utf-8", "replace")
-
-    def obs(self, rec):
-        return self.frame(obs_frame(rec, self.messages, self.color))
-
-    def note(self, text):
-        return self.frame(str(text).split("\n"))
 
 
 # ------------------------------------------------------------------
