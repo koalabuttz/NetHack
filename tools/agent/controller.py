@@ -865,7 +865,12 @@ class _EpisodeRunner(object):
             return bool(self.spectate.flush(deadline_cap=bound))
         except Exception:                    # noqa: BLE001 - render only
             self._spectate_fail("write-error")
-            return False
+            # The flush may have begun servicing the due frame (and the
+            # disable diagnostic may have written) before the exception:
+            # treat the attempt as serviced so the caller re-evaluates the
+            # unchanged wire bound.  The recheck is a no-op unless the bound
+            # is actually exhausted.
+            return True
         finally:
             self._spectate_sync()
 

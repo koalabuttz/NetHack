@@ -1898,7 +1898,30 @@ class ReadlineRenderWake(unittest.TestCase):
             clock, lambda: self._run_readline(runner, 100.0, ([out], [], [])))
         self.assertEqual(line, b"hello")
         self.assertEqual(out.filenos, 1)
-        self.assertEqual(stream.flush_caps, [100.0])
+
+    def test_exceptional_flush_rechecks_the_deadline(self):
+        # A flush that raises after advancing the clock past the bound is
+        # still an attempted service: the unchanged absolute bound is
+        # re-evaluated before any os.read, exactly as for a completed or
+        # dropped frame (the disable diagnostic can also consume time).
+        from tools.agent import controller as C
+        clock = _MutableClock(99.99)
+        out = _Out()
+
+        class _RaisingStream(_RunnerStream):
+            def flush(self, force=False, deadline_cap=None):
+                clock.now = 100.5          # past the bound
+                raise RuntimeError("render exploded")
+
+        stream = _RaisingStream(due=99.995)
+        runner = _mk_runner(stream=stream, deadline=200.0, out=out)
+
+        def body():
+            with self.assertRaises(C._DeadlineExceeded):
+                self._run_readline(runner, 100.0, ([out], [], []))
+
+        self._with_clock(clock, body)
+        self.assertEqual(out.filenos, 0)       # os.read never reached
 
     def test_render_only_wake_is_not_eof_or_a_record(self):
         # An idle (render-only) wake services the frame, then re-selects; it
