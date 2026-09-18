@@ -315,7 +315,7 @@ class AutoFrameImmutability(unittest.TestCase):
 
 
 class AutoFrameGolden(unittest.TestCase):
-    """One full frame, pinned verbatim (map, cursor, status, need, counters)."""
+    """One full frame, pinned verbatim (map, cursor, status, counters)."""
 
     GOLDEN = "\n".join([
         "auto episode=2 seq=42 tick=9",
@@ -1289,7 +1289,7 @@ def _run_episode(spectate="none", frame_path=None, inject=None,
 
 
 class IntegrationIsolation(unittest.TestCase):
-    """none vs spectate must be byte-identical on every non-render artifact."""
+    """none vs spectate must be byte-identical on the wire artifacts."""
 
     def test_none_and_spectate_artifacts_are_identical(self):
         none_res, none_c, none_dir = _run_episode("none")
@@ -1362,13 +1362,15 @@ class IntegrationIsolation(unittest.TestCase):
 
 
 class HookIsolation(unittest.TestCase):
-    """A fault in any render hook never changes wire-side outcomes or counts."""
+    """A fault in any render hook never changes the wire outcome."""
 
     def _framed(self):
-        return os.path.join(tempfile.mkdtemp(prefix="spectate-hook."), "f.txt")
+        d = tempfile.mkdtemp(prefix="spectate-hook.")
+        return os.path.join(d, "f.txt")
 
     def _inject_and_run(self, inject):
-        return _run_episode("stderr", frame_path=self._framed(), inject=inject)
+        return _run_episode("stderr", frame_path=self._framed(),
+                            inject=inject)
 
     def _fail(self, target, attr):
         def inject():

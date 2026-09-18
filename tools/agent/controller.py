@@ -703,7 +703,7 @@ class _EpisodeRunner(object):
             if dest.note is not None and not self.c._spectate_noted:
                 self.c._spectate_noted = True
                 self.spectate.offer([dest.note])
-        except Exception:                    # noqa: BLE001 - never a spawn fail
+        except Exception:  # noqa: BLE001 - never a spawn failure
             self.spectate = None
             self._spectate_diag_ok = False
             self.result.spectate_disabled_reason = "open-failed"
@@ -728,10 +728,12 @@ class _EpisodeRunner(object):
             pass
 
     def _spectate_sync(self):
-        """Mirror the render-only stats into the result (cheap, idempotent)."""
+        """Copy the render stats into the result (cheap, idempotent)."""
         if self.spectate is not None:
-            self.result.spectate_frames_rendered = self.spectate.frames_rendered
-            self.result.spectate_disabled_reason = self.spectate.disabled_reason
+            self.result.spectate_frames_rendered = (
+                self.spectate.frames_rendered)
+            self.result.spectate_disabled_reason = (
+                self.spectate.disabled_reason)
 
     def _spectate_fail(self, category):
         """Disable rendering once, with a fixed category, never raising."""

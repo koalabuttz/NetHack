@@ -48,7 +48,7 @@ def build_parser():
     auto.add_argument("--spectate", nargs="?", const="stderr", default="none",
                       choices=("tty", "stderr", "none"),
                       help="live spectating side channel: tty, stderr or "
-                           "none (bare --spectate means stderr; default none)")
+                           "none (bare --spectate is stderr; default none)")
     auto.add_argument("--spectate-interval", type=float, default=0.15,
                       dest="spectate_interval",
                       help="minimum seconds between live frames (0 is "

@@ -37,8 +37,11 @@ environment alone never starts paid calls:
 ```sh
 ./agent.sh auto --episodes 1 --reflex scripted --strategy deepseek \
     --deepseek-key-file ~/.config/nethack-agent/deepseek.key \
-    --strategy-call-cap 8 --output-dir /tmp/auto-ds
+    --strategy-call-cap 8 --output-dir /tmp/auto-ds --spectate tty
 ```
+
+Add `--spectate tty` (or `stderr`) to watch a run live; see "Live
+spectating" below.
 
 A recording can be replayed offline -- no game, no network -- and compared to
 its own actions with `python3 -m tools.agent.evaluate`; see "Offline
@@ -69,6 +72,15 @@ evaluation" below.
 
 `--episode-timeout S` (default 300)
     wall-clock budget per episode.
+
+`--spectate [tty|stderr|none]` (default none; bare flag means stderr)
+    render the live presentation to a side channel while the episode runs.
+    `none` opens nothing at all.  Frames never go to fd 1 (the wire) or into
+    a recording; see "Live spectating".
+
+`--spectate-interval S` (default 0.15)
+    the minimum time between rendered frames; `0` is unthrottled.  A
+    negative, NaN or infinite value is rejected before any episode starts.
 
 ### Deadlines
 
@@ -324,7 +336,7 @@ Every started strategy operation settles exactly once.  A call that may have
 reached the wire is committed as **dispatched** -- with its reported usage if
 it returned one, and as counted unknown exposure if it did not; an ambiguous
 missing result after the thread started is *never* treated as proof that no
-dispatch happened.  A result that proves a **known local refusal** -- a missing
+dispatch happened. A result that proves a **known local refusal** -- a missing
 key, a cooldown, a spawn failure or an oversize payload -- never crossed the
 dispatch boundary and is *released* rather than booked as phantom exposure,
 matching the postmortem's treatment.  Either way the boundary set is
@@ -444,7 +456,10 @@ Each episode writes five sidecars under `--output-dir`:
     finalised in the round that produced it with `terminal: null`, and the
     in-memory detail window is capped while emission continues.
   * `ep-N.meta.json` — schema versions, allowlisted configuration, the stop
-    reason, the visible outcome and the **budget ledger**.
+    reason, the visible outcome and the **budget ledger**.  It also carries
+    two live-spectating keys (`spectate_frames_rendered`,
+    `spectate_disabled_reason`) on every episode, `0`/`null` when spectating
+    is off; see "Live spectating".
 
 A campaign also writes `campaign.json` into `--output-dir`: a compact,
 secret-free rollup of every episode (stop reason, visible outcome, protocol
@@ -464,6 +479,77 @@ full queue or disk failure marks the recording **incomplete**
 (`recording_complete: false`) rather than silently dropping bytes.
 Directories are `0700` and files `0600`.  No secrets are recorded.  Note that
 game names and game text may themselves be private.
+
+## Live spectating
+
+`--spectate [tty|stderr|none]` renders the live presentation to a side
+channel while an episode plays, without ever touching the wire or a
+recording.  `none` (the default) opens, duplicates and probes nothing.  A
+bare `--spectate` means `stderr`; `tty` opens `/dev/tty` separately and falls
+back to fd 2 (with one best-effort note per campaign) when there is no
+controlling terminal.  fd 1 and any detectable stdout alias — a shared FIFO,
+regular file or socket, including a `2>&1` redirection — are refused, because
+frames there would corrupt the wire; a genuinely separate terminal device is
+fine.  Redirect the side channel to a file only by keeping fd 1 clear:
+
+```sh
+./agent.sh auto --episodes 3 --strategy off \
+    --output-dir /tmp/auto --spectate tty
+
+./agent.sh auto --output-dir /tmp/auto \
+    --spectate --spectate-interval 0.25 2>/tmp/auto-frames.txt
+```
+
+fd 2 also carries ordinary diagnostics, so neither file is an authoritative
+recording — the sidecars are.  Note that the rendered game names and game
+text may themselves be private.
+
+**Frames.** One frame is 21 bare 80-column ASCII map rows plus compact
+status, message, need, directive and counter lines clipped to 80 columns.
+The map is the **currently applied `Snapshot`** — the presentation authority —
+never the remembered terrain, so a cell that has disappeared from the live
+presentation is drawn blank.  The cursor is the snapshot's own, overlaid as
+`*` at its valid coordinate (never inferred from the remembered hero).
+Status comes from durable memory with `?` for any unknown field (never an
+invented zero).  The trailing messages are **episode history**
+(`recent_messages(3)`), so a new observation that carries no message keeps the
+previous lines.  Active directives are shown through a *peeked* read that
+never expires or logs them.
+
+**Scheduling.** `--spectate-interval` is the minimum time between frames;
+`0` is unthrottled.  One observation candidate is taken per successfully
+applied and need-validated snapshot, and throttling **coalesces**: only the
+newest candidate is retained.  The controller's own select loop is woken by
+the next due frame, so a throttled trailing frame is still delivered without
+a new wire record, and its write deadline is capped by any active wire
+deadline so a render wake can never extend a wire timeout.
+
+**Timing.** Advice settled during a strategy service first appears in the
+**next** snapshot's frame, never retroactively.  The final frame is a fresh
+composition — recentred on the settled counters, current directives and the
+*current* outstanding need — after the outcome is resolved; it is never a
+replay of an older candidate.  With no accepted snapshot there is no
+fabricated final frame.
+
+**Failure handling.** Writes are select-gated in chunks no larger than
+`PIPE_BUF` against one absolute per-frame deadline (0.25s) that progress,
+`EINTR` and `EAGAIN` never extend.  An exhausted frame is dropped and never
+resumed; after three consecutive exhausted frames spectating disables itself
+for the episode with `spectate_disabled_reason: write-deadline`.  A partial
+frame may remain visible on the side channel — that is not wire corruption.
+On a TTY the redraw height commits only after complete delivery, and a
+partially written frame forces an absolute resynchronization before the next
+ordinary frame.  A presentation failure never changes the wire, recorder
+health, provider policy, budget settlement, event emission, outcome or exit
+accounting; it only sets the episode's `spectate_disabled_reason`.  All
+render-only state resets per episode.
+
+Honest limitation: a synchronous deadline cannot preempt a blocking syscall
+in an exceptional stderr race or a pathological device/filesystem stall (an
+owned nonblocking fd avoids the common case, but a duplicated blocking fd 2
+can still, very rarely, block in one short write).  The bounded exhaustion
+and disable path — not the absence of every adversarial race — is what is
+tested.
 
 ## Prompt-cache utilization
 
@@ -557,7 +643,7 @@ another's.
 An explicitly `--allow-network --strategy deepseek` pass keeps the **same**
 continuity policy as live play -- the same K/byte eviction, render and
 preparation helper, whole-request bound, and successful-settlement commit rule
--- and starts each pass from an **empty** conversation.  Comparison passes with
+-- and starts each pass from an **empty** conversation. Comparison passes with
 the strategy off stay off and unchanged.  The evaluator's own
 `--deepseek-history-pairs`, `--deepseek-context-max-bytes` and
 `--deepseek-price-cache-hit` flags mirror the live CLI.

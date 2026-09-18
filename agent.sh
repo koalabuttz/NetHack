@@ -1,11 +1,11 @@
 #!/bin/sh
 # Convenience front end for the NetHack headless agent interface.
 #
-#   ./agent.sh build        build/refresh the agent binaries (automatic on demand)
+#   ./agent.sh build        build/refresh the agent binaries (on demand)
 #   ./agent.sh auto OPTS    run autonomous scripted episodes (tools/agent)
 #   ./agent.sh watch [N]    watch N scripted episodes live (default 1)
 #   ./agent.sh play [N]     run N scripted episodes headlessly
-#   ./agent.sh serve        expose the JSON wire on stdin/stdout (LLM harness mode)
+#   ./agent.sh serve        expose the JSON wire on stdin/stdout (LLM mode)
 #   ./agent.sh replay FILE  replay a saved spectate transcript
 #
 # The wire protocol is specified in doc/agent-interface.md; driving it from
@@ -107,7 +107,8 @@ serve() {
 }
 
 replay() {
-    [ -f "$1" ] || { echo "agent.sh: replay needs a transcript file" >&2; exit 2; }
+    [ -f "$1" ] || { echo "agent.sh: replay needs a transcript file" >&2
+        exit 2; }
     exec python3 test/agent/spectate.py replay "$1"
 }
 
@@ -115,8 +116,10 @@ auto() {
     build
     stage
     # The autonomous harness is a package, not a single script: it owns the
-    # game pipe itself and writes ep-N recordings into --output-dir.  This
-    # wave ships scripted-only play; the strategy tier is a later addition.
+    # game pipe itself, writes ep-N recordings into --output-dir, and can
+    # render the live presentation to a side channel with --spectate
+    # (tty|stderr|none; default none).  Scripted play and the DeepSeek
+    # strategy tier both run here.
     python3 -m tools.agent auto "$@" \
         --worker "$PWD/$BIN" --runner "$RUNNER" \
         --data "$DATA" --sysconf "$DATA/sysconf"
