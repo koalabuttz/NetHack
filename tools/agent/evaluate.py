@@ -48,10 +48,11 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import protocol, recording, state
+from . import arbitration, candidates, instances, protocol, recording, state
 from .budget import BudgetLedger
 from .codec import AssemblerLimit, ChunkError, IncrementalAssembler
-from .controller import _EpisodeRunner, _crossed_dispatch_boundary
+from .controller import (_EpisodeRunner, _classified_terrain,
+                         _crossed_dispatch_boundary)
 from .directives import DirectiveBook, PreconditionState
 from .events import BoundaryQueue, EventLedger, directive_event, hunger_index
 from .policy import INV_STALE_TICKS, ScriptedReflex
@@ -487,6 +488,23 @@ class ReplayPass(object):
         self._last_need_kind: Optional[str] = None
         self._invalid_seen: Dict[Tuple[int, int], int] = {}
         self._rows_by_key: Dict[Tuple[int, int], list] = {}
+        # Shared-arbitration migration (plan 6.2): the replay owns the same
+        # instance/hero scope and the same "propose, then commit the selected
+        # effect only after the reconciled observation" lifecycle as the live
+        # controller.  The instance automaton, classified terrain and hero
+        # possibility set are per pass, exactly like the live memory.
+        self.instance = instances.LevelInstanceAutomaton()
+        self.terrain = instances.TerrainMemory()
+        self.herores = None
+        self._resolved_hero = None
+        self.observation_generation = 0
+        # The modeled *sent* action (plan 6.2: only recorded/modeled sent
+        # actions drive recorded-state reconciliation) and its frozen effect.
+        self._sent_before: Optional[dict] = None
+        self._sent_action = None
+        self._sent_stair = False
+        self._pending_effect = None
+        self._last_observed_kind = ""
 
     # -- provider construction ------------------------------------------
     def _build_reflex(self, name):
@@ -579,11 +597,20 @@ class ReplayPass(object):
         self.last_seq = seq
         try:
             self.snap.apply(rec)
-            self.mem.observe(self.snap)
+            staged = self.mem.stage(self.snap)
         except protocol.ProtocolError as exc:
             self.protocol_failure = "invalid snapshot: %s" % exc
             self.closed = True
             return
+        # Parse is not commit (plan 3.4/6.2): the hero possibility set and the
+        # level-instance scope are settled from the staged frame and the
+        # modeled sent action first, then memory commits exactly once, then
+        # the committed observation is folded into the recovery evidence and
+        # the frozen effect of the modeled send is committed.
+        self._reconcile(staged)
+        self.mem.commit(staged, hero=self._resolved_hero)
+        self.reflex.note_observation(self.mem)
+        self._commit_effect()
         # a new obs supersedes any need still awaiting pages: that need was
         # never answered in the recorded trajectory
         if self._pending is not None and not self._pending.decided:
@@ -654,6 +681,99 @@ class ReplayPass(object):
     def _fail(self, reason: str) -> None:
         self.protocol_failure = reason
         self.closed = True
+
+    # -- shared-arbitration reconciliation (plan 6.2) --------------------
+    def _reconcile(self, staged) -> None:
+        """Reconcile the modeled sent action and the instance before commit.
+
+        Mirrors the live controller's order exactly (plan 4.1/4.2): classify
+        the modeled attempt's outcome, reconcile the hero possibility set from
+        the prior set and that attempt, let the instance automaton decide, and
+        only then merge the arrival cells into the (possibly fresh) scope.
+        """
+        self.observation_generation += 1
+        at_cells = tuple(staged.hero_cells)
+        before = self._sent_before or {}
+        kind = ""
+        signals = []
+        if before.get("dlvl") is not None \
+                and before.get("dlvl") != staged.status.dlvl:
+            signals.append(instances.S_LABEL)
+        if self._sent_stair:
+            signals.append(instances.S_STAIR)
+        if arbitration.arrival_outcome(staged.messages):
+            signals.append(instances.S_OUTCOME)
+        if self._structural_conflict(staged):
+            signals.append(instances.S_DISCONT)
+        if before:
+            same = (staged.hero is not None
+                    and tuple(staged.hero) == tuple(before.get("hero") or ()))
+            bt = before.get("time")
+            nt = staged.status.time
+            delta = (nt - bt) if (bt is not None and nt is not None) else None
+            _outcome, kind = arbitration.classify_outcome(
+                same, staged.hero is not None, delta)
+        ev = self._movement_evidence(before, kind)
+        prior = self.herores
+        if prior is None:
+            herores = instances.bootstrap_hero(
+                at_cells, True, self.observation_generation)
+        else:
+            herores = instances.reconcile_hero(
+                prior, ev, at_cells, self.observation_generation)
+        if not signals and herores.resolved and kind != "moved":
+            signals = (instances.S_NOARRIVAL,)
+        was = self.instance.current()
+        state_ = self.instance.observe(tuple(signals), herores.resolved)
+        fresh = (state_.instance_id is not None and state_.instance_id != was
+                 and self.instance.active())
+        if fresh:
+            self.mem.begin_instance(state_.instance_id)
+            self.terrain = instances.TerrainMemory()
+            self.book.on_instance_change(state_.instance_id, self.tick)
+            self.reflex.begin_instance(state_.instance_id)
+            herores = instances.bootstrap_hero(
+                at_cells, bool(at_cells), self.observation_generation)
+        self.herores = herores
+        self._resolved_hero = herores.confirmed if herores.resolved else None
+        self._last_observed_kind = kind
+        self.terrain.merge(staged.cells)
+
+    def _movement_evidence(self, before, kind):
+        """Public movement evidence of the modeled attempt (plan 4.2)."""
+        if not before:
+            return instances.MovementEvidence()
+        expected = None
+        hero = before.get("hero")
+        delta = arbitration.direction_delta(self._sent_action,
+                                            protocol.DIR_KEYS)
+        if delta is not None and hero is not None:
+            expected = (hero[0] + delta[0], hero[1] + delta[1])
+        return instances.MovementEvidence(
+            nonmovement=(kind == "no-time"),
+            time_advanced=(kind == "stationary-time-advanced"),
+            expected=expected,
+            unexpected=bool(kind == "moved" and expected is None),
+            coherent=True)
+
+    def _structural_conflict(self, staged) -> bool:
+        for pos, raw in staged.cells.items():
+            klass = _classified_terrain(raw)
+            if klass not in instances.FIXED_TERRAIN:
+                continue
+            old = self.terrain.terrain.get(pos)
+            if old in instances.FIXED_TERRAIN and old != klass:
+                return True
+        return False
+
+    def _commit_effect(self) -> None:
+        """Commit the frozen effect of the modeled send (plan 3.1/6.2)."""
+        if self._pending_effect is None:
+            return
+        effect, label = self._pending_effect
+        self.reflex.commit_effect(effect, label, self.tick, self.mem,
+                                  observed_kind=self._last_observed_kind)
+        self._pending_effect = None
 
     def _on_invalid(self, rec) -> None:
         self.invalids += 1
@@ -916,6 +1036,26 @@ class ReplayPass(object):
             "directives": [view.dset.to_dict()] if view.active else [],
         })
         self.answered += 1
+        # Model the send (plan 6.2): the selected gameplay action is treated
+        # as sent, so its frozen effect is committed at the NEXT reconciled
+        # observation -- never here.  A non-command need models no send.
+        self._pending_effect = None
+        self._sent_action = None
+        self._sent_stair = False
+        self._sent_before = None
+        if need.need.get("kind") in ("command", "key", "direction"):
+            self._sent_action = candidates.wire_to_action(selected)
+            self._sent_stair = (self._sent_action.tag == "key"
+                                and self._sent_action.payload[0]
+                                in (ord(">"), ord("<")))
+            self._sent_before = {"hero": self.mem.hero,
+                                 "time": self.mem.status.time,
+                                 "dlvl": self.mem.status.dlvl}
+            cand = getattr(self.reflex, "last_candidate", None)
+            if cand is not None and \
+                    candidates.candidate_to_wire(cand) == selected:
+                self._pending_effect = (cand.proposed_effect,
+                                        cand.semantic_label)
         if need.need.get("kind") in ("command", "key", "direction"):
             self.tick += 1
         self._pending = None
