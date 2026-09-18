@@ -21,6 +21,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -956,6 +957,511 @@ emit({"fd": fd_none, "probe": probe, "fd2_ok": fd2_ok,
         self.assertTrue(data["probe"])
         self.assertTrue(data["fd2_ok"])
         self.assertEqual(data["leak"], 0)
+
+
+# ==================================================================
+# Commit 4 -- controller / CLI integration (isolation)
+# ==================================================================
+
+class _PStdout(object):
+    def __init__(self, fd):
+        self._fd = fd
+
+    def fileno(self):
+        return self._fd
+
+
+class _PStdin(object):
+    def __init__(self, fd):
+        self._fd = fd
+
+    def fileno(self):
+        return self._fd
+
+    def write(self, b):
+        return os.write(self._fd, b)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class _PStderr(object):
+    def readline(self, *a):
+        return b""
+
+
+class _PProc(object):
+    """A process-shaped peer with real pipes in both directions."""
+
+    def __init__(self, out_r, in_w):
+        self.stdout = _PStdout(out_r)
+        self.stdin = _PStdin(in_w)
+        self.stderr = _PStderr()
+        self.returncode = 0
+        self.pid = None
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        pass
+
+    def terminate(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def _wline(obj):
+    return (json.dumps(obj) + "\n").encode()
+
+
+def _wrow(r, text, selectable=True):
+    return {"r": r, "text": text, "selectable": selectable, "key": None,
+            "group": None, "initial": None, "style": 0, "color": "none",
+            "icon": None}
+
+
+def _wpage(content, k, pages, rows):
+    return {"v": 1, "ch": "control", "type": "page", "d": 1,
+            "content": content, "page": k, "pages": pages, "rows": rows}
+
+
+WHELLO = {"v": 1, "ch": "control", "type": "hello", "d": 1,
+          "profile": "normal-ascii-color-v1", "policy": "llm-final-v1",
+          "caps": ["snapshot", "menu", "paging"], "coord": "engine-map",
+          "size": [80, 21], "x0": 1, "y0": 0,
+          "limits": {"line": 65536, "page_bytes": 16384, "page_rows": 128,
+                     "count": 2147483647}}
+WCLOSED = {"v": 1, "ch": "control", "type": "closed"}
+
+
+def _wobs(seq, need=None, msg=(), map_=None, cur=None, windows=(), pal=None):
+    return {"v": 1, "ch": "player", "type": "obs", "d": seq, "seq": seq,
+            "base": None, "s": {"time": {"text": str(seq), "color": "none",
+                                         "style": 0}},
+            "cond": [], "pal": pal or [[0, " ", "none", 0, "none"]],
+            "map": map_ or [], "cur": cur, "msg": list(msg), "hist": [],
+            "windows": list(windows), "need": need}
+
+
+WPAL = [[0, " ", "none", 0, "none"], [1, "@", "white", 0, "none"]]
+
+
+def _chunked_obs_lines(rid, seq, need):
+    head = [{"p": "h", "k": "v", "val": 1},
+            {"p": "h", "k": "ch", "val": "player"},
+            {"p": "h", "k": "type", "val": "obs"},
+            {"p": "h", "k": "seq", "val": seq},
+            {"p": "h", "k": "base", "val": None}]
+    part0 = head + [
+        {"p": "s", "k": "time", "val": {"text": str(seq), "color": "none",
+                                        "style": 0}},
+        {"p": "pal", "val": [0, " ", "none", 0, "none"]},
+        {"p": "pal", "val": [1, "@", "white", 0, "none"]},
+        {"p": "map", "val": [10, 5, 1]},
+        {"p": "cur", "val": [10, 5]}]
+    part1 = [{"p": "msg", "val": {"e": 1, "text": "chunked hello",
+                                 "style": 0}},
+             {"p": "need", "val": need}]
+    return [_wline({"v": 1, "ch": "control", "type": "chunk", "d": 1,
+                    "rid": rid, "i": 0, "last": False, "parts": part0}),
+            _wline({"v": 1, "ch": "control", "type": "chunk", "d": 1,
+                    "rid": rid, "i": 1, "last": True, "parts": part1})]
+
+
+class _ScriptPeer(object):
+    """A deterministic bidirectional peer: HELLO, full/chunked obs, a menu
+    need with a page, one `invalid` retry, then `closed`."""
+
+    def __init__(self):
+        self.out_r, self.out_w = os.pipe()
+        self.in_r, self.in_w = os.pipe()
+        self.proc = _PProc(self.out_r, self.in_w)
+        self.inbound = bytearray()
+        self.acts = []
+        self.get_pages = []
+        self.home = [WHELLO,
+                     _wobs(1, {"id": 1, "kind": "command"},
+                           msg=[{"e": 1, "text": "Welcome.", "style": 0}],
+                           pal=WPAL, map_=[[10, 5, 1]], cur=[10, 5])]
+        self.after = [
+            _chunked_obs_lines(2, 2, {"id": 2, "kind": "command"}),
+            [_wline(_wobs(3, {"id": 3, "kind": "menu", "menu": "m1",
+                              "mode": "one", "content": "c1", "pages": 1},
+                          windows=[{"w": "w1", "kind": "menu",
+                                    "title": "What do you want to eat?",
+                                    "content": "c1", "pages": 1}]))],
+            [_wline({"v": 1, "ch": "player", "type": "invalid", "d": 3,
+                     "code": "kind"})],
+        ]
+        self._t = threading.Thread(target=self._serve, daemon=True)
+        self._t.start()
+
+    def _serve(self):
+        w = None
+        try:
+            w = os.fdopen(self.out_w, "wb", buffering=0)
+            for rec in self.home:
+                w.write(_wline(rec))
+            idx = 0
+            buf = b""
+            while True:
+                chunk = os.read(self.in_r, 4096)
+                if not chunk:
+                    break
+                self.inbound += chunk
+                buf += chunk
+                while b"\n" in buf:
+                    raw, buf = buf.split(b"\n", 1)
+                    if not raw.strip():
+                        continue
+                    msg = json.loads(raw)
+                    t = msg.get("type")
+                    if t == "act":
+                        self.acts.append(msg)
+                        if idx < len(self.after):
+                            for rec in self.after[idx]:
+                                w.write(rec)
+                            idx += 1
+                        else:
+                            w.write(_wline(WCLOSED))
+                            return
+                    elif t == "get_page":
+                        self.get_pages.append(msg)
+                        w.write(_wline(_wpage(
+                            msg["content"], msg["page"], 1,
+                            [_wrow(14, "a food ration")])))
+        except OSError:
+            pass
+        finally:
+            if w is not None:
+                try:
+                    w.close()
+                except OSError:
+                    pass
+
+    def join(self):
+        self._t.join(timeout=5)
+
+    def close(self):
+        for fd in (self.in_w, self.out_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.join()
+        for fd in (self.out_r, self.in_r):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+class _Counters(object):
+    def __init__(self):
+        self.record_event = 0
+        self.health = 0
+        self.cancel = 0
+        self.event_sink = 0
+
+
+def _read_jsonl(path):
+    out = []
+    with open(path) as fh:
+        for line in fh:
+            if line.strip():
+                out.append(json.loads(line))
+    return out
+
+
+def _normalize_actions(rows):
+    return [{k: v for k, v in r.items() if k != "t"} for r in rows]
+
+
+def _normalize_decisions(rows):
+    return [{k: v for k, v in r.items() if k not in ("t", "latency")}
+            for r in rows]
+
+
+def _normalize_events(rows):
+    return [{k: v for k, v in r.items() if k != "wall"} for r in rows]
+
+
+def _normalize_meta(meta):
+    meta = dict(meta)
+    meta.pop("spectate_frames_rendered", None)
+    meta.pop("spectate_disabled_reason", None)
+    return meta
+
+
+def _run_episode(spectate="none", frame_path=None, inject=None,
+                 interval=0.0):
+    """Run one deterministic episode; return (result, counters, out_dir)."""
+    from tools.agent import controller as C
+    from tools.agent.providers import ProviderConfig
+    out_dir = tempfile.mkdtemp(prefix="spectate-iso.")
+    config = ProviderConfig(reflex="scripted", strategy="off", max_ticks=200)
+    ctl = C.Controller(
+        config, C.ControllerPaths(worker="w", runner="r", data="d",
+                                  sysconf="s"),
+        out_dir, episode_timeout=10.0, spectate=spectate,
+        spectate_interval=interval)
+    counters = _Counters()
+
+    orig_health = C._EpisodeRunner._note_recorder_health
+    orig_sink = C._EpisodeRunner._event_sink
+    orig_new = C.Controller._new_strategy_provider
+    from tools.agent import recording as R
+
+    orig_record_event = R.EpisodeRecorder.record_event
+
+    def health(self):
+        counters.health += 1
+        return orig_health(self)
+
+    def event_sink(self, rec):
+        counters.event_sink += 1
+        return orig_sink(self, rec)
+
+    def record_event(self, obj):
+        counters.record_event += 1
+        return orig_record_event(self, obj)
+
+    def new_provider(self):
+        prov = orig_new(self)
+        real_cancel = prov.cancel
+
+        def cancel():
+            counters.cancel += 1
+            return real_cancel()
+
+        try:
+            prov.cancel = cancel
+        except (AttributeError, TypeError):
+            pass
+        return prov
+
+    C._EpisodeRunner._note_recorder_health = health
+    C._EpisodeRunner._event_sink = event_sink
+    R.EpisodeRecorder.record_event = record_event
+    C.Controller._new_strategy_provider = new_provider
+
+    restore = []
+    if frame_path is not None:
+        fd = os.open(frame_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        orig_open = spectating.open_destination
+
+        def fake_open(destination, clock=None, **kw):
+            if destination == "none":
+                if clock is None:
+                    return orig_open(destination, **kw)
+                return orig_open(destination, clock=clock, **kw)
+            return spectating.RenderDestination(fd, owned=True, tty=False,
+                                                label="file")
+
+        spectating.open_destination = fake_open
+        restore.append(lambda: setattr(spectating, "open_destination",
+                                       orig_open))
+
+    if inject is not None:
+        restore.append(inject())
+
+    peer = _ScriptPeer()
+    ctl._spawn = lambda priv: peer.proc
+    try:
+        results = ctl.run_campaign(1)
+    finally:
+        peer.close()
+        for fn in reversed(restore):
+            fn()
+        C._EpisodeRunner._note_recorder_health = orig_health
+        C._EpisodeRunner._event_sink = orig_sink
+        R.EpisodeRecorder.record_event = orig_record_event
+        C.Controller._new_strategy_provider = orig_new
+    with open(os.path.join(out_dir, "stdin.bin"), "wb") as fh:
+        fh.write(bytes(peer.inbound))
+    return results[0], counters, out_dir
+
+
+class IntegrationIsolation(unittest.TestCase):
+    """none vs spectate must be byte-identical on every non-render artifact."""
+
+    def test_none_and_spectate_artifacts_are_identical(self):
+        none_res, none_c, none_dir = _run_episode("none")
+        frame_path = os.path.join(none_dir, "frames.txt")
+        spec_res, spec_c, spec_dir = _run_episode("stderr",
+                                                  frame_path=frame_path)
+
+        # Same success, exit status and outcome.
+        self.assertEqual(none_res.stop_reason, spec_res.stop_reason)
+        self.assertEqual(none_res.outcome, spec_res.outcome)
+        self.assertEqual(none_res.returncode, spec_res.returncode)
+        self.assertEqual(none_res.ticks, spec_res.ticks)
+        self.assertEqual(none_res.needs, spec_res.needs)
+        self.assertEqual(none_res.invalids, spec_res.invalids)
+        self.assertEqual(none_res.actions, spec_res.actions)
+        self.assertEqual(none_res.budget, spec_res.budget)
+
+        # The wire and the captured outbound stdin bytes are byte-for-byte.
+        with open(os.path.join(none_dir, "ep-1.wire.jsonl"), "rb") as fh:
+            none_wire = fh.read()
+        with open(os.path.join(spec_dir, "ep-1.wire.jsonl"), "rb") as fh:
+            spec_wire = fh.read()
+        self.assertEqual(none_wire, spec_wire)
+        self.assertNotEqual(len(none_wire), 0)
+
+        # The controller's outbound stdin bytes are byte-for-byte too.
+        with open(os.path.join(none_dir, "stdin.bin"), "rb") as fh:
+            none_out = fh.read()
+        with open(os.path.join(spec_dir, "stdin.bin"), "rb") as fh:
+            spec_out = fh.read()
+        self.assertEqual(none_out, spec_out)
+        self.assertNotEqual(len(none_out), 0)
+
+        # Same sidecars after normalizing only the approved timing fields.
+        for name, norm, nonempty in (("actions", _normalize_actions, True),
+                                     ("decisions", _normalize_decisions,
+                                      True),
+                                     ("events", _normalize_events, False)):
+            a = _read_jsonl(os.path.join(none_dir, "ep-1.%s.jsonl" % name))
+            b = _read_jsonl(os.path.join(spec_dir, "ep-1.%s.jsonl" % name))
+            self.assertEqual(norm(a), norm(b), name)
+            if nonempty:
+                self.assertTrue(a, name)
+
+        for tag, d in (("none", none_dir), ("spec", spec_dir)):
+            with open(os.path.join(d, "ep-1.meta.json")) as fh:
+                meta = json.load(fh)
+            if tag == "none":
+                self.assertEqual(meta["spectate_frames_rendered"], 0)
+                self.assertIsNone(meta["spectate_disabled_reason"])
+        with open(os.path.join(none_dir, "ep-1.meta.json")) as fh:
+            none_meta = _normalize_meta(json.load(fh))
+        with open(os.path.join(spec_dir, "ep-1.meta.json")) as fh:
+            spec_meta = _normalize_meta(json.load(fh))
+        self.assertEqual(none_meta, spec_meta)
+
+        # Campaign rollup is identical too.
+        with open(os.path.join(none_dir, "campaign.json")) as fh:
+            none_camp = json.load(fh)
+        with open(os.path.join(spec_dir, "campaign.json")) as fh:
+            spec_camp = json.load(fh)
+        self.assertEqual(none_camp, spec_camp)
+
+        # The spectate run rendered frames to the attached file.
+        with open(frame_path, "rb") as fh:
+            frames = fh.read()
+        self.assertIn(b"auto episode=1", frames)
+        self.assertGreaterEqual(spec_res.spectate_frames_rendered, 1)
+        self.assertIsNone(spec_res.spectate_disabled_reason)
+
+
+class HookIsolation(unittest.TestCase):
+    """A fault in any render hook never changes wire-side outcomes or counts."""
+
+    def _framed(self):
+        return os.path.join(tempfile.mkdtemp(prefix="spectate-hook."), "f.txt")
+
+    def _inject_and_run(self, inject):
+        return _run_episode("stderr", frame_path=self._framed(), inject=inject)
+
+    def _fail(self, target, attr):
+        def inject():
+            original = getattr(target, attr)
+
+            def boom(*a, **k):
+                raise RuntimeError("injected %s" % attr)
+
+            setattr(target, attr, boom)
+            return lambda: setattr(target, attr, original)
+        return inject
+
+    def test_each_hook_fault_is_isolated(self):
+        from tools.agent import controller as C
+
+        clean_res, clean_c, _ = _run_episode("stderr",
+                                             frame_path=self._framed())
+        injections = [
+            self._fail(spectating, "open_destination"),
+            self._fail(C, "auto_frame"),
+            self._fail(spectating.RenderStream, "offer"),
+            self._fail(spectating.RenderStream, "flush"),
+            self._fail(spectating.RenderStream, "finish"),
+            self._fail(spectating.RenderStream, "close"),
+            self._fail(spectating.RenderDestination, "write"),
+        ]
+        for inject in injections:
+            res, counters, _ = self._inject_and_run(inject)
+            # The episode is unaffected: same success, outcome, wire counts.
+            self.assertEqual(res.stop_reason, clean_res.stop_reason)
+            self.assertEqual(res.outcome, clean_res.outcome)
+            self.assertEqual(res.actions, clean_res.actions)
+            self.assertEqual(res.ticks, clean_res.ticks)
+            self.assertTrue(res.recording_complete)
+            # The fault never touches recorder health, the event sink or paid
+            # work cancellation: those counts match a clean run exactly.
+            self.assertEqual(counters.health, clean_c.health)
+            self.assertEqual(counters.event_sink, clean_c.event_sink)
+            self.assertEqual(counters.record_event, clean_c.record_event)
+            self.assertEqual(counters.cancel, clean_c.cancel)
+            # The fault disables rendering (recorded honestly in the meta).
+            self.assertIsNotNone(res.spectate_disabled_reason)
+
+    def test_open_failure_never_becomes_a_spawn_failure(self):
+        def inject():
+            original = spectating.open_destination
+
+            def boom(*a, **k):
+                raise OSError("injected open failure")
+
+            spectating.open_destination = boom
+            return lambda: setattr(spectating, "open_destination", original)
+
+        res, counters, _ = self._inject_and_run(inject)
+        self.assertTrue(res.spawn_ok)
+        self.assertEqual(res.stop_reason, "closed")
+        self.assertEqual(res.spectate_disabled_reason, "open-failed")
+        self.assertEqual(res.spectate_frames_rendered, 0)
+
+
+class MultiEpisodeIsolation(unittest.TestCase):
+    def test_renderer_restored_per_episode_and_none_is_zero_null(self):
+        from tools.agent import controller as C
+        from tools.agent.providers import ProviderConfig
+        out_dir = tempfile.mkdtemp(prefix="spectate-multi.")
+        config = ProviderConfig(reflex="scripted", strategy="off",
+                                max_ticks=200)
+        ctl = C.Controller(
+            config, C.ControllerPaths(worker="w", runner="r", data="d",
+                                      sysconf="s"),
+            out_dir, episode_timeout=10.0, spectate="none")
+        peers = []
+
+        def spawn(priv):
+            peer = _ScriptPeer()
+            peers.append(peer)
+            return peer.proc
+
+        ctl._spawn = spawn
+        try:
+            results = ctl.run_campaign(2)
+        finally:
+            for peer in peers:
+                peer.close()
+        self.assertEqual(len(results), 2)
+        for res in results:
+            self.assertEqual(res.spectate_frames_rendered, 0)
+            self.assertIsNone(res.spectate_disabled_reason)
+        for i in (1, 2):
+            with open(os.path.join(out_dir, "ep-%d.meta.json" % i)) as fh:
+                meta = json.load(fh)
+            self.assertEqual(meta["spectate_frames_rendered"], 0)
+            self.assertIsNone(meta["spectate_disabled_reason"])
 
 
 if __name__ == "__main__":

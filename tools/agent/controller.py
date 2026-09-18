@@ -43,7 +43,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from . import protocol, recording
+from . import protocol, recording, spectating
 from .budget import BudgetLedger
 from .codec import AssemblerLimit, ChunkError, IncrementalAssembler
 from .directives import DirectiveBook, PreconditionState
@@ -56,6 +56,7 @@ from .providers import (NullStrategy, ProviderConfig, ReflexContext,
                         StrategyContext, StrategyConversation,
                         StrategyExchange, prepare_strategy_request,
                         strategy_provider, tariff_from_config)
+from .render import auto_frame
 from .state import EpisodeMemory, render_map
 
 # How many detected boundary records the episode keeps as *boundary history*
@@ -147,6 +148,11 @@ class EpisodeResult(object):
     boundaries: int = 0
     strategy_calls: int = 0
     directives_applied: int = 0
+    # Render-only outcome of live spectating for this episode.  These are the
+    # only two fields the presentation layer contributes to a result, and they
+    # are written on every episode (0/null in none mode).
+    spectate_frames_rendered: int = 0
+    spectate_disabled_reason: Optional[str] = None
 
 
 @dataclass
@@ -161,7 +167,9 @@ class Controller(object):
     def __init__(self, config: ProviderConfig, paths: ControllerPaths,
                  output_dir: str, episode_timeout: float = 300.0,
                  read_slack: float = 30.0, max_retries: int = 3,
-                 reap_grace: float = 5.0):
+                 reap_grace: float = 5.0, *,
+                 spectate: str = "none",
+                 spectate_interval: float = spectating.DEFAULT_INTERVAL):
         self.config = config
         # One validation authority: a programmatically built ProviderConfig
         # cannot bypass the checks the CLI enforces (the validate() docstring
@@ -169,6 +177,19 @@ class Controller(object):
         err = config.validate(episode_timeout=episode_timeout)
         if err is not None:
             raise ValueError(err)
+        # Live spectating is validated here too, through its own authority,
+        # so a programmatic Controller cannot bypass the CLI's checks.  It is
+        # deliberately *not* a ProviderConfig field: presentation is not
+        # provider policy.
+        spectate_err = spectating.validate_spectate(spectate,
+                                                    spectate_interval)
+        if spectate_err is not None:
+            raise ValueError(spectate_err)
+        self.spectate = spectate
+        self.spectate_interval = float(spectate_interval)
+        # The tty->fd2 fallback note is best-effort and emitted at most once
+        # per campaign, so it lives on the campaign-scoped Controller.
+        self._spectate_noted = False
         self.paths = paths
         self.output_dir = output_dir
         self.episode_timeout = episode_timeout
@@ -233,6 +254,7 @@ class Controller(object):
         priv = tempfile.mkdtemp(prefix="nh-auto-ep.")
         rec = None
         proc = None
+        runner = None
         try:
             rec = recording.EpisodeRecorder(self.output_dir, index)
             proc = self._spawn(priv)
@@ -254,6 +276,13 @@ class Controller(object):
         finally:
             self._reap(proc, result)
             shutil.rmtree(priv, ignore_errors=True)
+            # Render-only cleanup and its stats-to-result copy run BEFORE the
+            # recording is finalized: a close fault still lands in the meta,
+            # and the two spectate keys are written on every episode.  The
+            # close is guarded and idempotent, and never touches recording
+            # health, paid work, events or the wire.
+            if runner is not None:
+                runner.spectate_close()
             if rec is not None:
                 self._finalize_recording(rec, result)
         return result
@@ -284,6 +313,11 @@ class Controller(object):
             "boundaries": result.boundaries,
             "strategy_calls": result.strategy_calls,
             "directives_applied": result.directives_applied,
+            # The two permitted presentation keys, written on every episode
+            # (0/null in none mode).  No drops, interval, destination or
+            # diagnostics are persisted.
+            "spectate_frames_rendered": result.spectate_frames_rendered,
+            "spectate_disabled_reason": result.spectate_disabled_reason,
         }
         rec.finalize(meta)
         result.recording_complete = not rec.incomplete
@@ -546,6 +580,24 @@ def _quench_provider(provider) -> None:
             pass
 
 
+class _FrozenPresentation(object):
+    """A detached copy of one accepted snapshot's presentation.
+
+    ``Snapshot.apply`` is not atomic (it assigns pal/map before cursor and
+    windows can fail), and the live ``Snapshot`` is mutated again by the very
+    next observation.  A candidate therefore captures only the presentation
+    authority -- the map cells and the cursor -- from the *successfully
+    applied* snapshot, deep-copied, so a delayed frame renders the observation
+    it describes rather than a later one.
+    """
+
+    __slots__ = ("map", "cur")
+
+    def __init__(self, cells, cur):
+        self.map = cells
+        self.cur = cur
+
+
 class _EpisodeRunner(object):
     def __init__(self, controller, proc, rec, result):
         self.c = controller
@@ -619,6 +671,172 @@ class _EpisodeRunner(object):
         self.action_ordinal = 0
         self.reflex_timeouts = 0
         self.rec_healthy = True
+        # -- render-only state (never feeds policy, health or the wire) ----
+        # The live RenderStream (None in none mode or after an open failure),
+        # the newest accepted candidate evidence, the accepted-seq marker that
+        # gates a single offer, and the last offered marker.
+        self.spectate = None
+        self._spectate_frozen = None      # _FrozenPresentation or None
+        self._spectate_need = None        # frozen observation need
+        self._spectate_windows = ()       # frozen need titles
+        self._spectate_accepted = 0       # success marker: last applied seq
+        self._spectate_offered = 0        # candidate already offered
+        self._spectate_diag_ok = False
+        self._open_spectate()
+
+    def _open_spectate(self):
+        """Guarded destination + stream creation (never a spawn failure).
+
+        ``none`` opens nothing.  Any failure here disables spectating for the
+        episode -- recorded as ``open-failed`` in the meta -- and must not
+        propagate: it runs inside ``run_episode``'s OSError/except boundary
+        that would otherwise misreport it as a spawn failure.
+        """
+        if self.c.spectate == "none":
+            return
+        try:
+            self._spectate_diag_ok = True
+            dest = spectating.open_destination(self.c.spectate)
+            self.spectate = spectating.RenderStream(
+                dest, self.c.spectate_interval,
+                diagnostic=self._spectate_diagnostic)
+            if dest.note is not None and not self.c._spectate_noted:
+                self.c._spectate_noted = True
+                self.spectate.offer([dest.note])
+        except Exception:                    # noqa: BLE001 - never a spawn fail
+            self.spectate = None
+            self._spectate_diag_ok = False
+            self.result.spectate_disabled_reason = "open-failed"
+
+    def _spectate_diagnostic(self, text):
+        """Best-effort note on the side channel, no fresh blocking allowance.
+
+        Never called for a write-deadline disable (that is exactly the case
+        where granting another blocking write could stall); the reason stays
+        in ``disabled_reason`` for the meta instead.
+        """
+        stream = self.spectate
+        if not self._spectate_diag_ok or stream is None:
+            return
+        if stream.disabled_reason == "write-deadline":
+            return
+        try:
+            stream.destination.write(
+                (text + "\n").encode("utf-8", "replace"),
+                deadline=time.monotonic() + spectating.FRAME_WRITE_TIMEOUT)
+        except Exception:                    # noqa: BLE001 - best effort
+            pass
+
+    def _spectate_sync(self):
+        """Mirror the render-only stats into the result (cheap, idempotent)."""
+        if self.spectate is not None:
+            self.result.spectate_frames_rendered = self.spectate.frames_rendered
+            self.result.spectate_disabled_reason = self.spectate.disabled_reason
+
+    def _spectate_fail(self, category):
+        """Disable rendering once, with a fixed category, never raising."""
+        if self.spectate is not None:
+            self.spectate.disable(category)
+
+    def _spectate_capture(self, seq, need):
+        """Freeze the presentation of one *successfully applied* snapshot.
+
+        Called only after apply, memory observe, boundary detection, need
+        validation and pending setup have all succeeded, so it can never
+        capture the half-applied state ``Snapshot.apply`` leaves on failure.
+        None mode copies nothing.
+        """
+        if self.spectate is None:
+            return
+        try:
+            self._spectate_frozen = _FrozenPresentation(
+                dict(self.snap.map), self.snap.cur)
+            self._spectate_windows = tuple(
+                dict(w) for w in self.snap.windows.values())
+            self._spectate_need = dict(need) if need is not None else None
+            self._spectate_accepted = seq
+        except Exception:                    # noqa: BLE001 - render only
+            self._spectate_fail("capture-error")
+        finally:
+            self._spectate_sync()
+
+    def _spectate_compose(self, *, final, need):
+        """Compose a frame from the frozen presentation and live state."""
+        return auto_frame(
+            self._spectate_frozen, self.mem,
+            episode=self.result.index, seq=self._spectate_accepted,
+            tick=self.tick, need=need, windows=self._spectate_windows,
+            directives=self.book.peek_view(
+                self.tick, self.mem.status.dlvl, self._precondition_state()),
+            strategy_calls=self.ledger.strategy_dispatched,
+            usage=self.ledger.as_dict()["usage"],
+            final_reason=self.result.stop_reason if final else None,
+            outcome=self.result.outcome if final else None)
+
+    def _spectate_boundary(self):
+        """Offer a new accepted candidate once, else flush a due frame.
+
+        Runs right after ``_service_strategy`` at the top of each loop so a
+        frame reflects advice settled there only from the *next* snapshot
+        (never retroactively), and so buffered input that never re-enters the
+        select loop still gets its due frame.
+        """
+        if self.spectate is None:
+            return
+        try:
+            if self._spectate_frozen is not None \
+                    and self._spectate_accepted != self._spectate_offered:
+                lines = self._spectate_compose(final=False,
+                                               need=self._spectate_need)
+                self._spectate_offered = self._spectate_accepted
+                self.spectate.offer(lines)
+            else:
+                self.spectate.flush()
+        except Exception:                    # noqa: BLE001 - render only
+            self._spectate_fail("compose-error")
+        finally:
+            self._spectate_sync()
+
+    def _spectate_readline_flush(self, bound):
+        """Service a due frame from the select loop, capped by the wire bound.
+
+        The frame deadline is ``min(now + write_timeout, bound)`` (Revision 3
+        correction 1): a render wake can never extend the wire's own timeout,
+        and an already-exhausted wire bound simply drops the frame.
+        """
+        if self.spectate is None:
+            return
+        try:
+            self.spectate.flush(deadline_cap=bound)
+        except Exception:                    # noqa: BLE001 - render only
+            self._spectate_fail("write-error")
+        finally:
+            self._spectate_sync()
+
+    def _spectate_finish(self):
+        """Force one freshly composed final frame after outcome resolution."""
+        if self.spectate is None:
+            return
+        try:
+            lines = None
+            if self._spectate_frozen is not None:
+                need = self.pending_need if self.pending else None
+                lines = self._spectate_compose(final=True, need=need)
+            self.spectate.finish(lines)
+        except Exception:                    # noqa: BLE001 - render only
+            self._spectate_fail("finish-error")
+        finally:
+            self._spectate_sync()
+
+    def spectate_close(self):
+        """Idempotent, guarded close; copies stats to the result first."""
+        try:
+            if self.spectate is not None:
+                self.spectate.close()
+        except Exception:                    # noqa: BLE001 - teardown
+            self._spectate_fail("close-error")
+        finally:
+            self._spectate_sync()
 
     # -- top loop --------------------------------------------------------
     def run(self):
@@ -626,6 +844,7 @@ class _EpisodeRunner(object):
         try:
             while not self.closed:
                 self._service_strategy()
+                self._spectate_boundary()
                 if self.pending:
                     need_dl = self._need_deadline()
                     if need_dl is not None and time.monotonic() >= need_dl:
@@ -690,6 +909,10 @@ class _EpisodeRunner(object):
             elif self.result.eof:
                 self.result.stop_reason = "transport-failure-eof"
         self.result.outcome = recording.infer_outcome(self.mem.messages)
+        # Final composition is the LAST thing _finish does: a fresh frame from
+        # the settled counters, the current peeked directives and the CURRENT
+        # outstanding need -- never a flush of an older candidate.
+        self._spectate_finish()
 
     # -- outbound (one send-and-record path) -----------------------------
     def _event_sink(self, rec) -> None:
@@ -816,8 +1039,21 @@ class _EpisodeRunner(object):
                 raise _ProtocolFailure(
                     "unterminated line exceeds %d bytes"
                     % protocol.MAX_PHYSICAL_LINE)
-            r, _, _ = select.select([self.proc.stdout], [], [],
-                                    min(remaining, 1.0))
+            # Cap the select wakeup by a due frame (Revision 3 correction 1),
+            # so a throttled trailing frame is attempted on its own deadline
+            # without a new wire record.  The wire bounds `remaining` itself
+            # are never extended.
+            wait = min(remaining, 1.0)
+            due = self.spectate.next_due() if self.spectate is not None \
+                else None
+            if due is not None:
+                wait = min(wait, max(0.0, due - time.monotonic()))
+            r, _, _ = select.select([self.proc.stdout], [], [], wait)
+            # Service a due display through a guarded flush capped by the
+            # remaining wire bound; this touches only render state and never
+            # resets the wire deadline, fabricates a record or becomes EOF.
+            if self.spectate is not None:
+                self._spectate_readline_flush(bound)
             if not r:
                 continue
             chunk = os.read(self.proc.stdout.fileno(), 65536)
@@ -963,6 +1199,12 @@ class _EpisodeRunner(object):
             self.pending_key = NeedKey(self.result.index, seq, need.get("id"))
         else:
             self.pending_key = None
+        # Render-only: capture the accepted presentation LAST, only after
+        # apply, memory, boundaries, need validation and pending setup have
+        # all succeeded.  A malformed snapshot or need raises above and never
+        # reaches here, so the previous accepted candidate is retained and no
+        # success marker is advanced.
+        self._spectate_capture(seq, need)
 
     def _on_page(self, rec):
         if not self.pending or self.req.need is None:

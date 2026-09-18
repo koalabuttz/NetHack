@@ -18,6 +18,7 @@ import sys
 
 from .controller import Controller, ControllerPaths, episode_ok
 from .providers import ProviderConfig, reflex_provider, strategy_provider
+from .spectating import validate_spectate
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))
@@ -44,6 +45,14 @@ def build_parser():
     auto.add_argument("--max-ticks", type=int, default=2000)
     auto.add_argument("--episode-timeout", type=float, default=300.0)
     auto.add_argument("--output-dir", required=True)
+    auto.add_argument("--spectate", nargs="?", const="stderr", default="none",
+                      choices=("tty", "stderr", "none"),
+                      help="live spectating side channel: tty, stderr or "
+                           "none (bare --spectate means stderr; default none)")
+    auto.add_argument("--spectate-interval", type=float, default=0.15,
+                      dest="spectate_interval",
+                      help="minimum seconds between live frames (0 is "
+                           "unthrottled; default 0.15)")
     auto.add_argument("--worker", default=os.path.join(_REPO, "src/nethack"))
     auto.add_argument("--runner",
                       default=os.path.join(_REPO, "src/nethack-agent"))
@@ -166,6 +175,11 @@ def validate_args(a):
 
 def cmd_auto(a) -> int:
     problem = validate_args(a)
+    if problem is None:
+        # The presentation destination/interval are validated through their
+        # own authority before any episode launches (and again in the
+        # Controller), so a bad --spectate value never starts a run.
+        problem = validate_spectate(a.spectate, a.spectate_interval)
     if problem:
         print("error: %s" % problem, file=sys.stderr)
         return 2
@@ -192,7 +206,9 @@ def cmd_auto(a) -> int:
         return 2
 
     controller = Controller(config, paths, a.output_dir,
-                            episode_timeout=a.episode_timeout)
+                            episode_timeout=a.episode_timeout,
+                            spectate=a.spectate,
+                            spectate_interval=a.spectate_interval)
     results = controller.run_campaign(a.episodes)
 
     failures = 0
