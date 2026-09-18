@@ -1,6 +1,6 @@
-# Jev Acceptance, Applied-Decision Cap, Navigation Recovery, and Room Awareness Plan (Revision 3 — pending plan review)
+# Jev Acceptance, Applied-Decision Cap, Navigation Recovery, and Room Awareness Plan (Revision 4 — pending plan review)
 
-**Status:** Revision 3 after plan review round 2 (VERDICT: REVISE — round-1 ledger: 5 FIXED, 3 PARTIAL; round-2 new findings: 2 High — 40-point boundary inversion and bars classification overpromise — and 4 Medium, all addressed here; the room-awareness section (§5) designed by `architect:architect-room-awareness` is merged and integrated into Phase 4).
+**Status:** Revision 4 after plan review round 3 (VERDICT: REVISE — round-2 ledger: 5 FIXED, 3 PARTIAL; round-3 findings: 2 Medium — remembered-bars openings contradiction and missing recovery-branch test names — and 1 Low stale sentence, all addressed here; room-awareness section (§5) merged and integrated into Phase 4).
 
 Design produced by `architect:architect-gate-osc`. Post-campaign follow-up to `doc/agent-jev-presentation-plan.md`; supersedes its D3 scope restrictions per operator approval.
 
@@ -67,7 +67,7 @@ Caller-supplied evidence: the four-episode jev-ds campaign accepted zero Jev dec
 - `tools/agent/recording.py:238–244` records proposal, selected action, provider, and a free-form reason. Preserve these keys and their types.
 - `tools/agent/evaluate.py:1265–1266,1412–1413` accepts companion decisions and carries reasons through. `1135–1171` has a separate paid-reflex fallback path; do not assume its module-level arbitration comments mean it currently validates Jev through the live choice gate.
 - `tools/agent/exploration_metrics.py:95–105,122–123` defines loop spans as repeated identical `(hero, displayed time)` frames. These fields do NOT measure alternating movements.
-- `doc/agent-jev-presentation-plan.md:213–218,266,315,323–324` preserves the old gate under deferred D3 and excludes policy changes. This approved follow-up explicitly supersedes those scope restrictions; it does not revise the presentation wire contract.
+- `doc/agent-jev-presentation-plan.md:213–218,266,315,323–324` preserves the old gate under deferred D3 and excludes policy changes. This approved follow-up explicitly supersedes those scope restrictions; it does not revise the request envelope or retained-candidate/key contract, while §5 (Phase 4) intentionally revises the nested Jev state and criterion presentation contract (with presentation-version bump and snapshot/golden regeneration).
 - `doc/agent-cache-plan.md:31–50,62–103,105–111` fixes DeepSeek rendering order, episode-owned history, transactional commits, reservations, and paid-failure settlement. All remain invariant.
 
 Inspection limitation: a search for `tools/agent/campaign.py` failed because that file does not exist. A filename search found no campaign-named file; searches under tools located the metrics consumer above. An external campaign summarizer may exist outside the inspected tree and needs caller/implementer verification.
@@ -330,7 +330,7 @@ Include one record per non-hero position for:
 - unclassified nonblank display;
 - current classified feature in `{tree,water,lava,trap,boulder,fountain,altar}`.
 
-**Bars limitation (exact):** `instances.classify_cell` never produces `T_BARS` from a current display cell (`#` resolves to tree/corridor/unknown by color; the protocol color vocabulary has no metal slot, and native bars use `#` with `HI_METAL`). Screen-derived `bars` records are therefore **not** promised and this is a documented, deliberate omission — a live iron-bar square may classify as corridor, tree, or unclassified. Remembered `T_BARS` from an already-classified memory source still renders via the terrain glyph table and may appear in `openings` with `source="memory"`. Do not extend `classify_cell` in this change: altering it would change navigation walkability and `TerrainMemory.merge` semantics; a pinned display-only bars rule is a separate, explicitly scoped task.
+**Bars limitation (exact):** `instances.classify_cell` never produces `T_BARS` from a current display cell (`#` resolves to tree/corridor/unknown by color; the protocol color vocabulary has no metal slot, and native bars use `#` with `HI_METAL`). Screen-derived `bars` records are therefore **not** promised and this is a documented, deliberate omission — a live iron-bar square may classify as corridor, tree, or unclassified. Remembered `T_BARS` renders as `|` in the map terrain underlay (legend-covered) but produces **no structured record** in either `room.contents` or `room.openings` — bars are deliberately excluded from both lists to keep the openings schema an exits/landmark contract rather than an obstruction inventory. Do not extend `classify_cell` in this change: altering it would change navigation walkability and `TerrainMemory.merge` semantics; a pinned display-only bars rule (map-only or structured) is a separate, explicitly scoped task. A named test asserts remembered bars stay legend-covered in the map without producing a structured record.
 
 Do not include ordinary floor, wall, corridor, doors, or stairs here; doors/stairs/corridor landmarks belong to `openings`.
 
@@ -475,6 +475,10 @@ Proposed additions in verified existing test files; the implementer runs them. N
 - `TestJevRoomAwareness::test_food_appearance_never_named_ration_or_safe`
 - `TestJevRoomAwareness::test_direction_answer_has_no_walking_or_destination_claim`
 - `TestJevRoomAwareness::test_conflicting_current_terrain_omits_stale_criterion_phrase`
+- `TestJevRoomAwareness::test_cycle_recovery_movement_gets_destination_appearance` (a `recovery-step` or `random-move` movement action carries the destination clause from the actual adjacent square)
+- `TestJevRoomAwareness::test_emergency_escape_movement_gets_destination_appearance` (an `escape` movement action carries the clause; emergency priority untouched)
+- `TestJevRoomAwareness::test_search_wait_and_nonmovement_recovery_omit_destination_appearance` (search, wait, and nonmovement `unblock`/recovery actions carry no destination clause)
+- `TestJevRoomAwareness::test_remembered_bars_render_in_map_without_structured_record`
 - `TestJevRoomAwareness::test_renderer_is_pure_and_repeatable`
 - `TestJevRoomAwareness::test_criteria_keys_order_indices_and_option_count_unchanged`
 - `TestJevRoomAwareness::test_maximum_lists_and_crop_have_bounded_serialized_size`
@@ -668,7 +672,7 @@ Each AC and RA below must be covered by the named tests (this mirrors the presen
 | RA.4 | `TestJevRoomAwareness::test_full_room_state_snapshot`; `TestJevRoomAwareness::test_contents_nearest_first_cap_and_exact_omitted_count`; `TestJevRoomAwareness::test_contents_row_major_without_hero`; `TestJevRoomAwareness::test_room_null_empty_and_unavailable_sources` |
 | RA.5 | `TestJevRoomAwareness::test_openings_screen_memory_sources_and_current_wall_override`; `TestJevRoomAwareness::test_remote_doors_stairs_precede_corridor_landmarks`; `TestJevRoomAwareness::test_openings_eight_compass_directions_here_and_unknown_hero`; `TestJevRoomAwareness::test_openings_cap_and_no_accessibility_claim` |
 | RA.6 | `TestJevRoomAwareness::test_openings_cap_and_no_accessibility_claim` |
-| RA.7 | `TestJevRoomAwareness::test_destination_appearance_not_route_target_or_capped_list`; `TestJevRoomAwareness::test_food_appearance_never_named_ration_or_safe`; `TestJevRoomAwareness::test_direction_answer_has_no_walking_or_destination_claim`; `TestJevRoomAwareness::test_conflicting_current_terrain_omits_stale_criterion_phrase` |
+| RA.7 | `TestJevRoomAwareness::test_destination_appearance_not_route_target_or_capped_list`; `TestJevRoomAwareness::test_cycle_recovery_movement_gets_destination_appearance`; `TestJevRoomAwareness::test_emergency_escape_movement_gets_destination_appearance`; `TestJevRoomAwareness::test_search_wait_and_nonmovement_recovery_omit_destination_appearance`; `TestJevRoomAwareness::test_food_appearance_never_named_ration_or_safe`; `TestJevRoomAwareness::test_direction_answer_has_no_walking_or_destination_claim`; `TestJevRoomAwareness::test_conflicting_current_terrain_omits_stale_criterion_phrase` |
 | RA.8 | `TestJevRoomAwareness::test_renderer_is_pure_and_repeatable`; `TestJevRoomAwareness::test_room_null_empty_and_unavailable_sources` |
 | RA.9 | `TestJevRoomAwareness::test_criteria_keys_order_indices_and_option_count_unchanged`; `test_auto_integration.py::test_room_enrichment_leaves_relative_acceptance_and_applied_cap_unchanged`; `test_auto_integration.py::test_room_enrichment_uses_same_frozen_snapshot_for_map_and_criteria` |
 | RA.10 | `TestJevRoomAwareness::test_maximum_lists_and_crop_have_bounded_serialized_size`; `test_auto_integration.py::test_room_enrichment_does_not_change_deepseek_payload_or_history` |
