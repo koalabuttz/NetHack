@@ -965,6 +965,191 @@ emit({"fd": fd_none, "probe": probe, "fd2_ok": fd2_ok,
         self.assertTrue(data["fd2_ok"])
         self.assertEqual(data["leak"], 0)
 
+    def test_relocation_failure_closes_the_dup(self):
+        # Medium 3: a failure in _relocate_low after the dup must not orphan
+        # the duplicate.  Force the low-fd path by closing fd 1 first.
+        body = r'''
+os.close(1)
+real = S._relocate_low
+def boom(fd):
+    raise OSError("injected relocation failure")
+S._relocate_low = boom
+before = len(open_fds())
+raised = None
+try:
+    S.open_destination("stderr")
+except Exception as exc:
+    raised = type(exc).__name__
+S._relocate_low = real
+after = len(open_fds())
+fd1_closed = True
+try:
+    os.fstat(1)
+    fd1_closed = False
+except OSError:
+    pass
+emit({"leak": after - before, "raised": raised, "fd1_closed": fd1_closed})
+'''
+        data, proc = self._run(body)
+        self.assertIsNotNone(data, proc.stderr.decode())
+        self.assertEqual(data["raised"], "OSError")
+        self.assertEqual(data["leak"], 0)
+        self.assertTrue(data["fd1_closed"])
+
+    def test_nonblock_failure_closes_the_tty_open(self):
+        # Medium 3: a failure after the independent tty open (the nonblocking
+        # setup) must close the descriptor, not orphan it.  /dev/tty is
+        # redirected to /dev/null so the open succeeds without a terminal.
+        body = r'''
+real_open = os.open
+def fake_open(path, flags, *a, **k):
+    if path == "/dev/tty":
+        return real_open("/dev/null", flags)
+    return real_open(path, flags, *a, **k)
+real_nb = S._set_nonblock
+def boom(fd):
+    raise OSError("injected nonblock failure")
+os.open = fake_open
+S._set_nonblock = boom
+before = len(open_fds())
+raised = None
+try:
+    S.open_destination("tty")
+except Exception as exc:
+    raised = type(exc).__name__
+os.open = real_open
+S._set_nonblock = real_nb
+after = len(open_fds())
+emit({"leak": after - before, "raised": raised})
+'''
+        data, proc = self._run(body)
+        self.assertIsNotNone(data, proc.stderr.decode())
+        self.assertEqual(data["raised"], "OSError")
+        self.assertEqual(data["leak"], 0)
+
+    def test_many_failed_opens_do_not_accumulate(self):
+        # Medium 3: repeated setup failures must not accumulate descriptors.
+        body = r'''
+real = S._relocate_low
+def boom(fd):
+    raise OSError("injected relocation failure")
+S._relocate_low = boom
+os.close(1)
+before = len(open_fds())
+for _ in range(100):
+    try:
+        S.open_destination("stderr")
+    except Exception:
+        pass
+S._relocate_low = real
+after = len(open_fds())
+emit({"leak": after - before})
+'''
+        data, proc = self._run(body)
+        self.assertIsNotNone(data, proc.stderr.decode())
+        self.assertEqual(data["leak"], 0)
+
+    def test_controller_stream_failure_closes_the_destination(self):
+        # Medium 3: a RenderStream construction failure after open_destination
+        # must close the destination the controller had just opened.
+        body = r'''
+from tools.agent import controller as C
+class Cfg:
+    spectate = "stderr"
+    spectate_interval = 0.15
+    _spectate_noted = False
+runner = object.__new__(C._EpisodeRunner)
+runner.c = Cfg()
+runner.result = C.EpisodeResult(index=1)
+runner._spectate_diag_ok = False
+runner._spectate_diagnostic = lambda text: None
+real = S.RenderStream
+def boom(*a, **k):
+    raise RuntimeError("injected stream construction failure")
+S.RenderStream = boom
+before = len(open_fds())
+runner._open_spectate()
+S.RenderStream = real
+after = len(open_fds())
+fd2_ok = True
+try:
+    os.fstat(2)
+except OSError:
+    fd2_ok = False
+emit({"leak": after - before,
+      "reason": runner.result.spectate_disabled_reason,
+      "has_stream": runner.spectate is not None,
+      "fd2_ok": fd2_ok})
+'''
+        data, proc = self._run(body)
+        self.assertIsNotNone(data, proc.stderr.decode())
+        self.assertEqual(data["leak"], 0)
+        self.assertEqual(data["reason"], "open-failed")
+        self.assertFalse(data["has_stream"])
+        self.assertTrue(data["fd2_ok"])
+
+    def test_controller_note_offer_failure_closes_the_destination(self):
+        # Medium 3: a failure in the fallback-note offer must close the
+        # half-built stream (which owns the destination).  With no terminal,
+        # the tty destination falls back to fd 2 and carries a note.
+        body = r'''
+from tools.agent import controller as C
+class Cfg:
+    spectate = "tty"
+    spectate_interval = 0.15
+    _spectate_noted = False
+runner = object.__new__(C._EpisodeRunner)
+runner.c = Cfg()
+runner.result = C.EpisodeResult(index=1)
+runner._spectate_diag_ok = False
+runner._spectate_diagnostic = lambda text: None
+real = S.RenderStream.offer
+def boom(self, lines):
+    raise RuntimeError("injected note offer failure")
+S.RenderStream.offer = boom
+before = len(open_fds())
+runner._open_spectate()
+S.RenderStream.offer = real
+after = len(open_fds())
+emit({"leak": after - before,
+      "reason": runner.result.spectate_disabled_reason,
+      "has_stream": runner.spectate is not None})
+'''
+        data, proc = self._run(body)
+        self.assertIsNotNone(data, proc.stderr.decode())
+        self.assertEqual(data["leak"], 0)
+        self.assertEqual(data["reason"], "open-failed")
+        self.assertFalse(data["has_stream"])
+
+    def test_controller_many_failed_episodes_do_not_accumulate(self):
+        body = r'''
+from tools.agent import controller as C
+class Cfg:
+    spectate = "stderr"
+    spectate_interval = 0.15
+    _spectate_noted = False
+def fresh():
+    r = object.__new__(C._EpisodeRunner)
+    r.c = Cfg()
+    r.result = C.EpisodeResult(index=1)
+    r._spectate_diag_ok = False
+    r._spectate_diagnostic = lambda text: None
+    return r
+real = S.RenderStream
+def boom(*a, **k):
+    raise RuntimeError("injected stream construction failure")
+S.RenderStream = boom
+before = len(open_fds())
+for _ in range(100):
+    fresh()._open_spectate()
+S.RenderStream = real
+after = len(open_fds())
+emit({"leak": after - before})
+'''
+        data, proc = self._run(body)
+        self.assertIsNotNone(data, proc.stderr.decode())
+        self.assertEqual(data["leak"], 0)
+
 
 # ==================================================================
 # Commit 4 -- controller / CLI integration (isolation)
@@ -1409,6 +1594,7 @@ class HookIsolation(unittest.TestCase):
             self._fail(spectating.RenderStream, "flush"),
             self._fail(spectating.RenderStream, "finish"),
             self._fail(spectating.RenderStream, "close"),
+            self._fail(spectating.RenderStream, "next_due"),
             self._fail(spectating.RenderDestination, "write"),
         ]
         for inject in injections:
@@ -1456,30 +1642,155 @@ class HookIsolation(unittest.TestCase):
         self.assertEqual(meta["spectate_disabled_reason"], "close-error")
         self.assertIn("spectate_frames_rendered", meta)
 
+    def test_next_due_fault_matches_none_mode(self):
+        # High 1: a RuntimeError from next_due (or the clock it reads) must
+        # not abort the campaign.  Compared against a deterministic none-mode
+        # run, the wire, the outbound stdin bytes, every sidecar and the two
+        # policy hooks are identical; only the two spectate meta keys differ.
+        none_res, none_c, none_dir = _run_episode("none")
+        frame_path = os.path.join(
+            tempfile.mkdtemp(prefix="spectate-due."), "f.txt")
+        spec_res, spec_c, spec_dir = _run_episode(
+            "stderr", frame_path=frame_path,
+            inject=self._fail(spectating.RenderStream, "next_due"))
+
+        self.assertEqual(none_res.stop_reason, spec_res.stop_reason)
+        self.assertEqual(none_res.outcome, spec_res.outcome)
+        self.assertEqual(none_res.returncode, spec_res.returncode)
+        self.assertEqual(none_res.ticks, spec_res.ticks)
+        self.assertEqual(none_res.needs, spec_res.needs)
+        self.assertEqual(none_res.invalids, spec_res.invalids)
+        self.assertEqual(none_res.actions, spec_res.actions)
+        self.assertEqual(none_res.budget, spec_res.budget)
+
+        with open(os.path.join(none_dir, "ep-1.wire.jsonl"), "rb") as fh:
+            none_wire = fh.read()
+        with open(os.path.join(spec_dir, "ep-1.wire.jsonl"), "rb") as fh:
+            spec_wire = fh.read()
+        self.assertEqual(none_wire, spec_wire)
+        self.assertNotEqual(len(none_wire), 0)
+
+        with open(os.path.join(none_dir, "stdin.bin"), "rb") as fh:
+            none_out = fh.read()
+        with open(os.path.join(spec_dir, "stdin.bin"), "rb") as fh:
+            spec_out = fh.read()
+        self.assertEqual(none_out, spec_out)
+        self.assertNotEqual(len(none_out), 0)
+
+        for name, norm in (("actions", _normalize_actions),
+                           ("decisions", _normalize_decisions),
+                           ("events", _normalize_events)):
+            a = _read_jsonl(os.path.join(none_dir, "ep-1.%s.jsonl" % name))
+            b = _read_jsonl(os.path.join(spec_dir, "ep-1.%s.jsonl" % name))
+            self.assertEqual(norm(a), norm(b), name)
+
+        with open(os.path.join(none_dir, "ep-1.meta.json")) as fh:
+            none_meta = _normalize_meta(json.load(fh))
+        with open(os.path.join(spec_dir, "ep-1.meta.json")) as fh:
+            spec_meta = _normalize_meta(json.load(fh))
+        self.assertEqual(none_meta, spec_meta)
+        with open(os.path.join(none_dir, "ep-1.meta.json")) as fh:
+            raw = json.load(fh)
+        self.assertEqual(raw["spectate_frames_rendered"], 0)
+        self.assertIsNone(raw["spectate_disabled_reason"])
+
+        # The recorder health, event sink, event records and paid-work
+        # cancellation counts are untouched by the renderer fault.
+        self.assertEqual(spec_c.health, none_c.health)
+        self.assertEqual(spec_c.event_sink, none_c.event_sink)
+        self.assertEqual(spec_c.record_event, none_c.record_event)
+        self.assertEqual(spec_c.cancel, none_c.cancel)
+
+        # The fault disables rendering once with the fixed category and never
+        # fabricates a frame.
+        self.assertEqual(spec_res.spectate_disabled_reason, "schedule-error")
+        self.assertEqual(spec_res.spectate_frames_rendered, 0)
+        self.assertTrue(spec_res.spawn_ok)
+        self.assertTrue(spec_res.recording_complete)
+
+
+class _MutableClock(object):
+    """A settable monotonic clock for controlled _readline edge tests."""
+
+    def __init__(self, now):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+class _Out(object):
+    """A stdout stand-in that counts fileno() calls (os.read's first step)."""
+
+    def __init__(self):
+        self.filenos = 0
+
+    def fileno(self):
+        self.filenos += 1
+        return -1
+
+
+class _RunnerStream(object):
+    """The read-only render-stream surface used by direct _readline tests.
+
+    Models a real ``RenderStream``: the ``disabled`` property, the two
+    stats fields ``_spectate_sync`` copies, ``disable`` for the guard's
+    failure path, ``next_due`` (optionally raising) and a ``flush`` that
+    returns whether a frame was serviced.
+    """
+
+    def __init__(self, due=None, on_flush=None, serviced=True,
+                 next_due_error=None):
+        self._due = due
+        self._on_flush = on_flush
+        self._serviced = serviced
+        self._next_due_error = next_due_error
+        self.frames_rendered = 0
+        self.disabled_reason = None
+        self.flush_caps = []
+        self.next_due_calls = 0
+
+    @property
+    def disabled(self):
+        return self.disabled_reason is not None
+
+    def next_due(self):
+        self.next_due_calls += 1
+        if self._next_due_error is not None:
+            raise self._next_due_error
+        return self._due
+
+    def flush(self, force=False, deadline_cap=None):
+        self.flush_caps.append(deadline_cap)
+        if self._on_flush is not None:
+            self._on_flush()
+        return self._serviced
+
+    def disable(self, reason, message=None):
+        if self.disabled_reason is None:
+            self.disabled_reason = reason
+
+
+def _mk_runner(stream=None, deadline=200.0, out=None):
+    from tools.agent import controller as C
+    runner = object.__new__(C._EpisodeRunner)
+    runner.buf = b""
+    runner.deadline = deadline
+    runner.spectate = stream
+    runner.proc = types.SimpleNamespace(
+        stdout=out if out is not None else _Out())
+    runner.result = C.EpisodeResult(index=1)
+    return runner
+
 
 class ReadlineRenderWake(unittest.TestCase):
-    """The _readline select timeout is capped by a due frame."""
+    """The _readline select timeout is capped by a due frame, and the wire
+    bound is re-evaluated after a render flush (Revision 3 correction 1)."""
 
     def test_select_timeout_is_capped_by_due_frame(self):
         from tools.agent import controller as C
-
-        class _Stream(object):
-            def __init__(self, due):
-                self._due = due
-                self.flushes = []
-
-            def next_due(self):
-                return self._due
-
-            def flush(self, force=False, deadline_cap=None):
-                self.flushes.append(deadline_cap)
-
-        runner = object.__new__(C._EpisodeRunner)
-        runner.buf = b""
-        runner.deadline = time.monotonic() + 5.0
-        runner.spectate = _Stream(time.monotonic() + 0.3)
-        runner.proc = types.SimpleNamespace(
-            stdout=types.SimpleNamespace(fileno=lambda: -1))
+        stream = _RunnerStream(due=time.monotonic() + 0.3)
+        runner = _mk_runner(stream=stream, deadline=time.monotonic() + 5.0)
 
         calls = []
 
@@ -1501,6 +1812,236 @@ class ReadlineRenderWake(unittest.TestCase):
         self.assertTrue(calls)
         # A due render wake caps the wait well below the 1.0s wire tick.
         self.assertLess(calls[0], 0.9)
+
+    def _with_clock(self, clock, fn):
+        from tools.agent import controller as C
+        original = C.time.monotonic
+        C.time.monotonic = clock
+        try:
+            return fn()
+        finally:
+            C.time.monotonic = original
+
+    def _run_readline(self, runner, bound, select_result):
+        from tools.agent import controller as C
+        original_select = C.select.select
+        original_read = C.os.read
+
+        def fake_select(r, w, x, timeout):
+            return select_result
+
+        C.select.select = fake_select
+        C.os.read = lambda fd, n: b"hello\n"
+        try:
+            return runner._readline(bound)
+        finally:
+            C.select.select = original_select
+            C.os.read = original_read
+
+    def test_post_flush_deadline_is_rechecked_before_read(self):
+        # The render flush advances the clock from just-before the wire bound
+        # to past it.  The unchanged absolute bound is re-evaluated before any
+        # os.read, so no record is consumed and the content deadline is
+        # classified exactly as the loop top would.
+        from tools.agent import controller as C
+        clock = _MutableClock(99.99)
+        out = _Out()
+
+        def on_flush():
+            clock.now = 100.5
+
+        stream = _RunnerStream(due=99.995, on_flush=on_flush)
+        runner = _mk_runner(stream=stream, deadline=200.0, out=out)
+
+        def body():
+            with self.assertRaises(C._DeadlineExceeded):
+                self._run_readline(runner, 100.0, ([out], [], []))
+
+        self._with_clock(clock, body)
+        self.assertEqual(out.filenos, 0)       # os.read never reached
+        self.assertEqual(stream.flush_caps, [100.0])
+        self.assertEqual(stream.frames_rendered, 0)
+
+    def test_post_flush_deadline_classifies_episode_timeout(self):
+        # When the episode deadline itself is spent, the re-evaluation raises
+        # the episode timeout, never a fabricated content deadline.
+        from tools.agent import controller as C
+        clock = _MutableClock(99.99)
+        out = _Out()
+
+        def on_flush():
+            clock.now = 100.5
+
+        stream = _RunnerStream(due=99.995, on_flush=on_flush)
+        runner = _mk_runner(stream=stream, deadline=100.0, out=out)
+
+        def body():
+            with self.assertRaises(TimeoutError):
+                self._run_readline(runner, None, ([out], [], []))
+
+        self._with_clock(clock, body)
+        self.assertEqual(out.filenos, 0)
+
+    def test_flush_before_bound_still_reads_the_record(self):
+        # Companion: a flush that finishes before the bound changes nothing;
+        # the record is consumed exactly as in none mode.
+        clock = _MutableClock(99.99)
+        out = _Out()
+
+        def on_flush():
+            clock.now = 99.995            # still before the bound
+
+        stream = _RunnerStream(due=99.995, on_flush=on_flush)
+        runner = _mk_runner(stream=stream, deadline=200.0, out=out)
+
+        line = self._with_clock(
+            clock, lambda: self._run_readline(runner, 100.0, ([out], [], [])))
+        self.assertEqual(line, b"hello")
+        self.assertEqual(out.filenos, 1)
+        self.assertEqual(stream.flush_caps, [100.0])
+
+    def test_render_only_wake_is_not_eof_or_a_record(self):
+        # An idle (render-only) wake services the frame, then re-selects; it
+        # never fabricates EOF or a wire record.
+        from tools.agent import controller as C
+        clock = _MutableClock(99.99)
+        out = _Out()
+        stream = _RunnerStream(due=99.995, on_flush=lambda: None)
+        runner = _mk_runner(stream=stream, deadline=200.0, out=out)
+
+        selects = []
+
+        class _Stop(Exception):
+            pass
+
+        def body():
+            original_select = C.select.select
+
+            def fake_select(r, w, x, timeout):
+                selects.append(timeout)
+                if len(selects) >= 2:
+                    raise _Stop()
+                return [], [], []          # render-only wake
+
+            C.select.select = fake_select
+            try:
+                with self.assertRaises(_Stop):
+                    runner._readline(100.0)
+            finally:
+                C.select.select = original_select
+
+        self._with_clock(clock, body)
+        self.assertGreaterEqual(len(stream.flush_caps), 1)
+        self.assertEqual(out.filenos, 0)       # no os.read
+
+
+class SpectateScheduleGuard(unittest.TestCase):
+    """next_due() is a guarded render-only call that can never abort a run."""
+
+    def test_off_returns_none_without_touching_a_stream(self):
+        runner = _mk_runner(stream=None)
+        self.assertIsNone(runner._spectate_next_due())
+
+    def test_disabled_returns_none_without_reading_the_clock(self):
+        stream = _RunnerStream()
+        stream.disabled_reason = "write-deadline"
+        runner = _mk_runner(stream=stream)
+        self.assertIsNone(runner._spectate_next_due())
+        self.assertEqual(stream.next_due_calls, 0)
+
+    def test_raising_next_due_disables_once_with_fixed_category(self):
+        stream = _RunnerStream(next_due_error=RuntimeError("injected"))
+        runner = _mk_runner(stream=stream)
+        self.assertIsNone(runner._spectate_next_due())
+        self.assertEqual(stream.disabled_reason, "schedule-error")
+        self.assertEqual(runner.result.spectate_disabled_reason,
+                         "schedule-error")
+        self.assertEqual(runner.result.spectate_frames_rendered, 0)
+        self.assertFalse(stream.flush_caps)    # no write/event/recorder hook
+
+    def test_raising_clock_disables_once_with_fixed_category(self):
+        # A real RenderStream whose injected clock raises: the fault reaches
+        # the guard through next_due and is classified identically.
+        def boom():
+            raise RuntimeError("injected clock")
+        dest = spectating.RenderDestination(None, owned=False, label="none")
+        stream = spectating.RenderStream(dest, 0.0, clock=boom)
+        stream._pending = ["frame"]            # a pending candidate exists
+        runner = _mk_runner(stream=stream)
+        self.assertIsNone(runner._spectate_next_due())
+        self.assertEqual(stream.disabled_reason, "schedule-error")
+        self.assertEqual(runner.result.spectate_disabled_reason,
+                         "schedule-error")
+
+    def test_keyboard_interrupt_propagates(self):
+        stream = _RunnerStream(next_due_error=KeyboardInterrupt())
+        runner = _mk_runner(stream=stream)
+        with self.assertRaises(KeyboardInterrupt):
+            runner._spectate_next_due()
+
+    def test_system_exit_propagates(self):
+        stream = _RunnerStream(next_due_error=SystemExit(1))
+        runner = _mk_runner(stream=stream)
+        with self.assertRaises(SystemExit):
+            runner._spectate_next_due()
+
+
+class OpenSetupGuard(unittest.TestCase):
+    """_open_spectate is transactional and never swallows BaseException."""
+
+    def _runner(self, spectate):
+        from tools.agent import controller as C
+        runner = object.__new__(C._EpisodeRunner)
+        runner.c = types.SimpleNamespace(
+            spectate=spectate, spectate_interval=0.15,
+            _spectate_noted=False)
+        runner.result = C.EpisodeResult(index=1)
+        runner.spectate = None
+        runner._spectate_diag_ok = False
+        runner._spectate_diagnostic = lambda text: None
+        return runner
+
+    def test_none_opens_nothing(self):
+        runner = self._runner("none")
+        runner._open_spectate()
+        self.assertIsNone(runner.spectate)
+
+    def _with_open(self, boom, fn):
+        original = spectating.open_destination
+        spectating.open_destination = boom
+        try:
+            return fn()
+        finally:
+            spectating.open_destination = original
+
+    def test_open_failure_sets_the_fixed_reason(self):
+        runner = self._runner("stderr")
+
+        def boom(*a, **k):
+            raise OSError("injected open failure")
+
+        self._with_open(boom, runner._open_spectate)
+        self.assertIsNone(runner.spectate)
+        self.assertEqual(runner.result.spectate_disabled_reason,
+                         "open-failed")
+
+    def test_keyboard_interrupt_propagates(self):
+        runner = self._runner("stderr")
+
+        def boom(*a, **k):
+            raise KeyboardInterrupt()
+
+        with self.assertRaises(KeyboardInterrupt):
+            self._with_open(boom, runner._open_spectate)
+
+    def test_system_exit_propagates(self):
+        runner = self._runner("stderr")
+
+        def boom(*a, **k):
+            raise SystemExit(2)
+
+        with self.assertRaises(SystemExit):
+            self._with_open(boom, runner._open_spectate)
 
 
 class ComparatorNormalizer(unittest.TestCase):
