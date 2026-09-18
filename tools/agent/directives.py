@@ -271,6 +271,24 @@ class DirectiveBook(object):
             self.active_instance = None
             self._log("expired", reason, tick, level)
 
+    def on_instance_change(self, instance: Optional[int],
+                           tick: Optional[int] = None) -> bool:
+        """Expire the active set when a fresh instance was allocated (4.4).
+
+        The controller calls this once at the reconciliation boundary where a
+        fresh arrival is settled, so the *old* instance's directive generation
+        is retired exactly once rather than carried into the new scope.  A set
+        already belonging to *instance* (or no set at all) is untouched, and a
+        set for a different instance logs exactly one expiry event.
+        """
+        if self._active is None:
+            return False
+        if self.active_instance is not None and instance is not None \
+                and instance == self.active_instance:
+            return False
+        self.expire("instance-changed", tick)
+        return True
+
     def active(self, tick: int, level: Optional[str],
                st: PreconditionState,
                instance: Optional[int] = None) -> Optional[DirectiveSet]:
