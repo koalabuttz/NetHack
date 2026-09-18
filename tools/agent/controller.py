@@ -671,6 +671,19 @@ class _EpisodeRunner(object):
         self.rejections = {}
         self.instance = instances.LevelInstanceAutomaton()
         self.terrain = instances.TerrainMemory()
+        # The controller-owned hero resolution (plan 4.2): the live
+        # possible-position set, reconciled from the prior set plus the
+        # matched SentAttempt before any memory commit.  ``mem.hero`` carries
+        # only a positively supported confirmed singleton; an unresolved set
+        # clears it so movement, stair/door actions and forced search are
+        # suppressed.
+        self.herores = None
+        self._resolved_hero = None
+        # The frozen effect of the in-flight attempt, committed only once the
+        # reconciled observation establishes the outcome (plan 3.1).
+        self._attempt_effect = None
+        self._attempt_label = ""
+        self._attempt_kind = ""
         self.observation_generation = 0
         self.attempts_armed = 0
         self.reconciliations = 0
@@ -686,6 +699,10 @@ class _EpisodeRunner(object):
         self._forced_next = None
         self._forced_suffix_ordinal = None
         self._forced_last_report = None
+        # The transaction's retained origin evidence, recorded when the prefix
+        # completes its send (plan 5.4): the suffix binds only while the
+        # post-prefix observation still matches it.
+        self._forced_origin = None
         # The fingerprint of the last *failed* activation, so gate 10 refuses
         # an unchanged failed retry (a successful activation clears it).
         self._forced_failed_fp = None
@@ -695,6 +712,7 @@ class _EpisodeRunner(object):
         self._strategy_call = None
         self._strategy_pb = None
         self._strategy_level = None
+        self._strategy_instance = None
         self._strategy_prepared = None
         # The conversation is episode-local and harness-owned: a provider or
         # worker respawn does not own or clear it, and it is never shared
@@ -708,6 +726,7 @@ class _EpisodeRunner(object):
         self._boundary_history = deque(maxlen=_BOUNDARY_HISTORY_MAX)
         self._pending_directives = None
         self._pending_directives_level = None
+        self._pending_directives_instance = None
         self.paid_disabled = False
         self.tick = 0
         self.retries = 0
@@ -1310,7 +1329,24 @@ class _EpisodeRunner(object):
         # against the single in-flight SentAttempt BEFORE hero/level/map
         # memory commits (plan 3.4).  Then memory is committed exactly once.
         self._reconcile_observation(staged)
-        self.mem.commit(staged)
+        self.mem.commit(staged, hero=self._resolved_hero)
+        # The committed observation is folded once into the reflex's bounded
+        # recovery/refusal/food evidence (plan 5.1/5.2).  This is the *only*
+        # place that mutation happens, so candidate construction and proposal
+        # stay observational (plan 3.1).
+        note = getattr(self.reflex, "note_observation", None)
+        if note is not None:
+            note(self.mem)
+        # The frozen effect of the attempt reconciled above is committed now,
+        # after a complete send AND the reconciled observation establishing
+        # the outcome (plan 3.1).  A local-invalid, write-failed, discarded or
+        # Jev-unselected candidate never reaches here.
+        if self._attempt_effect:
+            self.reflex.commit_effect(
+                self._attempt_effect, self._attempt_label, self.tick,
+                self.mem, observed_kind=self._attempt_kind)
+        self._attempt_effect = None
+        self._attempt_label = ""
         # Boundary detection runs once per applied snapshot, on public state
         # only.  An id is emitted once, so re-presenting the same snapshot
         # (or replaying history) yields no new events; simultaneous reasons
@@ -1352,55 +1388,140 @@ class _EpisodeRunner(object):
     def _reconcile_observation(self, staged):
         """Reconcile the in-flight attempt before any memory commit (3.4).
 
-        The classified terrain is fed from the staged cells; the single
-        in-flight SentAttempt is classified into a terminal outcome, released
-        and counted exactly once; and the level-instance automaton is settled
-        from the transition signals.  Parse is never commit and no gameplay
-        success is credited here.
+        Order is load-bearing (plan 3.4/4.1): the matched attempt is
+        classified
+        and released exactly once, the hero possibility set is reconciled from
+        the prior set and that attempt, **then** the level-instance automaton
+        decides whether this is a fresh arrival, and only after that decision
+        are the arrival cells merged -- into a brand-new empty scope when a
+        fresh instance was allocated.  No terrain/map/hero commit happens
+        before the automaton has settled the transition, so an old-instance
+        coordinate can never be merged into the new scope.
         """
         self.observation_generation += 1
         signals = self._transition_signals(staged)
-        self.terrain.merge(staged.cells)
-        hero_usable = staged.hero is not None
+        at_cells = tuple(staged.hero_cells)
         attempt = self.attempt
-        if attempt is None:
-            self.instance.observe(tuple(signals), hero_usable)
-            return
         before = self.attempt_before or {}
-        _outcome, kind = self._classify_attempt(before, staged)
-        ordinal = attempt.sent_ordinal
-        self.attempt = None
-        self.attempt_before = None
-        self.reconciliations += 1
-        # The suffix's first observation concludes the dangerous transaction
-        # (5.4): one observed, time-advanced outcome succeeds; anything else
-        # (no-time, unknown, unresolved) fails.  The prefix is never refunded.
-        if (self.forced is not None
-                and self.forced.state == forced_search.STATE_SUFFIX_SENT
-                and self._forced_suffix_ordinal is not None
-                and ordinal == self._forced_suffix_ordinal):
-            self._forced_conclude_suffix(staged, ordinal, before)
-        if not signals and hero_usable and kind != "moved":
-            # a coherent nonmovement with no arrival signal is affirmative
-            # no-arrival evidence (N): keep the old scope, no merge (4.1)
+        kind = None
+        ordinal = None
+        if attempt is not None:
+            _outcome, kind = self._classify_attempt(before, staged)
+            ordinal = attempt.sent_ordinal
+            self.attempt = None
+            self.attempt_before = None
+            self.reconciliations += 1
+            # The reconciled observed kind, used to commit the frozen effect
+            # only after the observation is folded into memory (plan 3.1).
+            self._attempt_kind = kind or ""
+            # The suffix's first observation concludes the dangerous
+            # transaction (5.4): one observed, time-advanced outcome succeeds;
+            # anything else (no-time, unknown, unresolved) fails.  The prefix
+            # is never refunded.
+            if (self.forced is not None
+                    and self.forced.state == forced_search.STATE_SUFFIX_SENT
+                    and self._forced_suffix_ordinal is not None
+                    and ordinal == self._forced_suffix_ordinal):
+                self._forced_conclude_suffix(staged, ordinal, before)
+        else:
+            self._attempt_kind = ""
+        # -- hero identity first: reconcile the prior set with this frame and
+        # the matched attempt, before the automaton or any commit (plan 4.2).
+        prior = getattr(self, "herores", None)
+        ev = self._movement_evidence(attempt, before, kind)
+        if prior is None:
+            herores = instances.bootstrap_hero(
+                at_cells, True, self.observation_generation)
+        else:
+            herores = instances.reconcile_hero(
+                prior, ev, at_cells, self.observation_generation)
+        # A coherent nonmovement with no arrival signal is affirmative
+        # no-arrival evidence (N): keep the old scope, no merge (4.1).
+        if not signals and herores.resolved and kind != "moved":
             signals = (instances.S_NOARRIVAL,)
-        self.instance.observe(tuple(signals), hero_usable)
+        # -- the automaton decides BEFORE any terrain/map commit (plan 4.1).
+        was = self.instance.current()
+        state = self.instance.observe(tuple(signals), herores.resolved)
+        fresh = (state.instance_id is not None and state.instance_id != was
+                 and self.instance.active())
+        if fresh:
+            self._begin_fresh_instance(state.instance_id)
+            herores = instances.bootstrap_hero(
+                at_cells, bool(at_cells), self.observation_generation)
+        self.herores = herores
+        self._resolved_hero = herores.confirmed if herores.resolved else None
+        # Only now are the arrival cells merged -- into the current (possibly
+        # brand-new) scope.  ``mem.commit`` runs in ``_on_obs`` with the
+        # resolved hero, so parse is never commit and no first ``@`` is
+        # adopted.
+        self.terrain.merge(staged.cells)
+
+    def _begin_fresh_instance(self, iid):
+        """Allocate a fresh instance scope and expire the old one (rule 6).
+
+        A fresh arrival gets empty map-local terrain/visits/stairs (via
+        :meth:`state.EpisodeMemory.begin_instance`) and a fresh classified
+        terrain view; the old instance's targets, continuations and any live
+        dangerous transaction are expired here rather than carried across.
+        """
+        self.mem.begin_instance(iid)
+        self.terrain = instances.TerrainMemory()
+        self.herores = None
+        if self.forced is not None or self._forced_next is not None:
+            self._forced_abort("instance transition")
+        book = getattr(self, "book", None)
+        if book is not None:
+            book.on_instance_change(iid)
+        reflex = getattr(self, "reflex", None)
+        begin = getattr(reflex, "begin_instance", None)
+        if begin is not None:
+            begin(iid)
+
+    def _movement_evidence(self, attempt, before, kind):
+        """Classify one matched attempt's movement evidence (plan 4.2).
+
+        Only public evidence: an explicit no-time nonmovement, a
+        same-position/time-advanced stationary turn, the expected destination
+        of a plain directional key, or an unexpected square/relocation.
+        """
+        if attempt is None:
+            return instances.MovementEvidence()
+        nonmovement = (kind == "no-time")
+        time_advanced = (kind == "stationary-time-advanced")
+        expected = None
+        hero = before.get("hero")
+        delta = self._direction_delta(attempt)
+        if delta is not None and hero is not None:
+            expected = (hero[0] + delta[0], hero[1] + delta[1])
+        unexpected = bool(kind == "moved" and expected is None)
+        return instances.MovementEvidence(
+            nonmovement=nonmovement, time_advanced=time_advanced,
+            expected=expected, unexpected=unexpected, coherent=True)
+
+    @staticmethod
+    def _direction_delta(attempt):
+        """The grid delta of a plain movement-direction key, else ``None``."""
+        if attempt is None:
+            return None
+        return arbitration.direction_delta(attempt.action, protocol.DIR_KEYS)
+
 
     def _transition_signals(self, staged):
         """The ``{S, L, O, D}`` transition signals of one observation.
 
         Signals are extracted from a *matched sent attempt* plus the temporary
-        observation (plan 4.1), never from an unattributed comparison: with no
-        in-flight attempt no action could have changed the level, so no
-        label-change signal is invented.  (Without this guard the empty
-        pre-action state of a prompt-following observation reads as a level
-        change and spuriously allocates a fresh instance.)
+        observation (plan 4.1).  The displayed-level signal ``L`` is a label
+        change against the last *committed* level: a label change alone
+        suffices (plan 4.1 rule 4), even with no in-flight attempt, because a
+        trapdoor/hole/levelport can move the hero without one -- but an empty
+        previous level (the pre-action state of a prompt-following frame) is
+        never a change, so that frame cannot spuriously allocate.
         """
         out = []
         if self._is_stair_action(self.attempt):
             out.append(instances.S_STAIR)
-        before = self.attempt_before
-        if before and before.get("dlvl") != staged.status.dlvl:
+        prev = self.mem.status.dlvl
+        if prev and prev != staged.status.dlvl:
             out.append(instances.S_LABEL)
         if self._arrival_outcome(staged.messages):
             out.append(instances.S_OUTCOME)
@@ -1416,16 +1537,11 @@ class _EpisodeRunner(object):
     def _arrival_outcome(self, messages):
         """Allowlisted, source-derived arrival recognizer (4.1 ``O``).
 
-        Only a current public arrival outcome counts; quoted/look/history
-        text never becomes authoritative here.
+        Delegates to the shared pure helper so live control and evaluation
+        cannot drift (plan 6.2).  Only a current public arrival outcome
+        counts; quoted/look/history text never becomes authoritative here.
         """
-        for _eid, text in messages:
-            low = (text or "").lower()
-            if ("you materialize" in low or "you fall" in low
-                    or "you are now on level" in low
-                    or "you climb down" in low or "you descend" in low):
-                return True
-        return False
+        return arbitration.arrival_outcome(messages)
 
     def _structural_conflict(self, staged):
         """An unexplained conflict in stable terrain (4.1 ``D``)."""
@@ -1469,6 +1585,10 @@ class _EpisodeRunner(object):
             matches = False
         if not matches:
             cand = candidates.make_candidate(selected, "sent")
+        # Freeze the candidate's proposed effect on the attempt; it is
+        # committed only after the reconciled observation (plan 3.1).
+        self._attempt_effect = cand.proposed_effect
+        self._attempt_label = cand.semantic_label
         table = _StubTable(self._last_table_id)
         hero = before["hero"]
         self.attempt = candidates.make_sent_attempt(
@@ -1565,6 +1685,9 @@ class _EpisodeRunner(object):
             self._exclude_attempt()
             self.attempt = None
             self.attempt_before = None
+            # a rejected attempt commits no effect (plan 3.1)
+            self._attempt_effect = None
+            self._attempt_label = ""
             if not had_attempt:
                 self.force_fallback = True
         # the engine left the SAME request outstanding: re-arm it, but keep
@@ -1579,6 +1702,9 @@ class _EpisodeRunner(object):
         self.instance.stop()
         self.attempt = None
         self.attempt_before = None
+        # a discarded attempt without a usable observation commits no effect
+        self._attempt_effect = None
+        self._attempt_label = ""
         # A prefix still armed when the episode ends cannot be cleared: record
         # the un-cleared dangerous prefix honestly rather than pretending a
         # graceful in-game quit was possible (plan 5.4).  No prefixed action
@@ -1692,9 +1818,11 @@ class _EpisodeRunner(object):
         self._strategy_prepared = prepared
         self._strategy_pb = \
             self.boundary_queue.mark_dispatched(self.tick, now)
-        # The level the advice was *produced* for, not the level at arrival:
-        # advice for another level is stale and is discarded on activation.
+        # The level *instance* the advice was produced for, not the displayed
+        # level at arrival (plan 4.4): advice for another instance is stale
+        # even on the same displayed level and is rejected before activation.
         self._strategy_level = self.mem.status.dlvl
+        self._strategy_instance = self.instance.current()
         deadline = now + self.c.strategy_deadline
         provider = self.strategy_provider
         self._strategy_call = _ReflexCall(
@@ -1745,6 +1873,7 @@ class _EpisodeRunner(object):
         if res is not None and res.ok and res.directives and not cancelled:
             self._pending_directives = res.directives[0]
             self._pending_directives_level = self._strategy_level
+            self._pending_directives_instance = self._strategy_instance
             self._commit_history(prepared, res)
         else:
             # a failed, discarded or cancelled call still terminates its set
@@ -1795,7 +1924,13 @@ class _EpisodeRunner(object):
                              assistant=self._assistant_text(res)))
 
     def _activate_pending_directives(self, need):
-        """Activate a returned directive set at the next command boundary."""
+        """Activate a returned directive set at the next command boundary.
+
+        Plan 4.4: advice produced for a *different* level instance is stale
+        even when the displayed level is unchanged, so it is rejected here
+        before activation -- exactly one stale-instance expiry event, zero
+        score contribution and no active directive on the new instance.
+        """
         if self._pending_directives is None:
             return
         if need.get("kind") not in ("command", "key", "direction"):
@@ -1804,12 +1939,22 @@ class _EpisodeRunner(object):
         self._pending_directives = None
         level = self.mem.status.dlvl
         dispatched_level = self._pending_directives_level
+        source_instance = self._pending_directives_instance
+        self._pending_directives_level = None
+        self._pending_directives_instance = None
+        current_instance = self.instance.current()
+        if source_instance is not None and current_instance is not None \
+                and source_instance != current_instance:
+            # the only lifecycle event for this advice: one stale-instance
+            # expiry, before any activation
+            self.boundary_queue.finish(False, "stale-instance")
+            return
         if dispatched_level is not None and level is not None \
                 and level != dispatched_level:
             self.boundary_queue.finish(False, "stale-level")
             return
         self.book.activate(dset, self.tick, level,
-                           instance=self.instance.current())
+                           instance=current_instance)
         self.boundary_queue.finish(True)
 
     def _remaining_budget(self):
@@ -2090,7 +2235,9 @@ class _EpisodeRunner(object):
         return forced_search.merge_controller_fields(
             base,
             hero_confirmed=self.mem.hero is not None,
-            command_need_coherent=kind in ("command", "key", "direction"),
+            # gate 1/8: the forced search binds only to a coherent *command*
+            # need, never a generic key/direction need (plan 5.3 gate 8)
+            command_need_coherent=(kind == "command"),
             instance_resolved=(self.instance.state == instances.ACTIVE),
             transition_pending=self._forced_transition_pending(),
             hp=st.hp, hp_max=st.hp_max,
@@ -2116,34 +2263,91 @@ class _EpisodeRunner(object):
                                   "time": self.mem.status.time})
 
     def _forced_bindable(self, need, following):
-        """Recheck the still-applicable gates before a suffix send (5.4)."""
+        """Recheck the still-applicable gates before a suffix send (5.4).
+
+        The suffix binds only when the *immediately following* need is exactly
+        a command need in the same instance, the transaction's retained origin
+        evidence is unchanged, and the binding gates still hold.
+        """
         report = forced_search.evaluate_binding_gates(
             self._forced_context(need, following))
-        evidence_unchanged = (
-            self.instance.current() == self.forced.instance
-            and not self._forced_transition_pending())
-        return (report, evidence_unchanged)
+        unchanged = self._forced_evidence_unchanged()
+        return (report, unchanged)
+
+    def _forced_evidence_unchanged(self):
+        """The post-prefix observation vs the transaction's origin (5.4).
+
+        The prefix is expected to consume no game time and change nothing.
+        Any unexpected change of instance, hero position set, displayed time,
+        HP or conditions refuses the binding, so the suffix is never sent
+        through a prefix whose origin evidence no longer holds.
+        """
+        origin = getattr(self, "_forced_origin", None)
+        if origin is None:
+            return False
+        if self.instance.current() != origin.get("instance"):
+            return False
+        if self._forced_transition_pending():
+            return False
+        st = self.mem.status
+        hero = self.mem.hero
+        if origin.get("hero") is not None:
+            if hero is None or tuple(hero) != tuple(origin["hero"]):
+                return False
+        elif hero is not None:
+            return False
+        if origin.get("time") is not None and st.time is not None \
+                and st.time != origin["time"]:
+            return False
+        if origin.get("hp") is not None and st.hp is not None \
+                and st.hp != origin["hp"]:
+            return False
+        if origin.get("hp_max") is not None and st.hp_max is not None \
+                and st.hp_max != origin["hp_max"]:
+            return False
+        if tuple(condition_texts(self.snap)) != tuple(origin.get("conditions",
+                                                                ())):
+            return False
+        return True
+
+    def _forced_cancel_or_terminate(self, cancellable, reason):
+        """Cancel with the native double-``m`` where the need allows it (5.4).
+
+        A command/key/direction need can carry the real native cancellation.
+        Any other need cannot, so the prefix cannot be cleared: the transport
+        is terminated rather than letting it modify a later action.
+        """
+        if cancellable:
+            return ({"key": forced_search.FORCED_SEARCH_PREFIX_CODE},
+                    reason, "cancel")
+        return (None, reason, "terminate")
 
     def _forced_override(self, need, selected):
         """Intercept one need for the two-send transaction (plan 5.4).
 
         Returns ``(action, reason, role)`` where *role* is one of ``prefix``
         (send ``m``), ``suffix`` (send the bound ``s``), ``cancel`` (clear the
-        armed prefix with native double-``m``) or ``trap`` (no transaction can
+        armed prefix with native double-``m``), ``terminate`` (the armed
+        prefix
+        cannot be cleared: end the transport) or ``trap`` (no transaction can
         continue: the trapped graceful quit); ``None`` leaves *selected*
         unchanged.  A live transaction is always resolved here, so an armed
         prefix is never handed to a later ordinary command.
         """
         kind = need.get("kind")
-        commandish = kind in ("command", "key", "direction")
+        # gate 8: the suffix binds ONLY to the exact immediately following
+        # *command* need; a key/direction need is a cancellable-but-not-
+        # bindable need, and a prompt/menu cannot carry the cancellation.
+        cancellable = kind in ("command", "key", "direction")
+        bindable = (kind == "command")
         following = candidates.normalize_need_key(self.pending_key)
         if self.forced is not None:
             tr = self.forced
             if tr.state == forced_search.STATE_PREFIX_SENT:
                 if self.tick >= self.reflex.max_ticks:
-                    return ({"key": forced_search.FORCED_SEARCH_PREFIX_CODE},
-                            "forced search: tick cap, cancel", "cancel")
-                if commandish:
+                    return self._forced_cancel_or_terminate(
+                        cancellable, "forced search: tick cap, cancel")
+                if bindable:
                     report, unchanged = self._forced_bindable(need, following)
                     if tr.bind_suffix(following, same_instance=True,
                                       evidence_unchanged=unchanged,
@@ -2151,17 +2355,25 @@ class _EpisodeRunner(object):
                         return (
                             {"key": forced_search.FORCED_SEARCH_SUFFIX_CODE},
                             "forced search: suffix s", "suffix")
-                    # cannot bind: cancel the armed prefix
-                    return ({"key": forced_search.FORCED_SEARCH_PREFIX_CODE},
-                            "forced search: cancel (double m)", "cancel")
-                # A non-command need cannot carry the double-m cancellation.
-                # The prefix flag persists until the *next command*, so answer
-                # the prompt normally and clear the prefix at the next command
-                # need; nothing prefixed is ever sent (plan 5.4).
-                return None
+                    # cannot bind (non-command need, changed evidence or a
+                    # failed binding gate): clear the armed prefix, never send
+                    # a prefixed ordinary action through it
+                    return self._forced_cancel_or_terminate(
+                        cancellable,
+                        "forced search: cancel (binding refused)")
+                if cancellable:
+                    # a key/direction need is not the immediately following
+                    # command need, so gate 8 forbids binding the suffix here;
+                    # the prefix is cleared with the native double-m instead
+                    return self._forced_cancel_or_terminate(
+                        True, "forced search: cancel (non-command need)")
+                # a prompt/menu/line cannot carry the native double-m: the
+                # armed prefix cannot be safely cleared, so terminate
+                return self._forced_cancel_or_terminate(
+                    False, "forced search: armed prefix cannot be cleared")
             # a suffix is in flight: hold, never send another prefixed action
             return None
-        if not commandish or not self._forced_nominated():
+        if not bindable or not self._forced_nominated():
             return None
         report = forced_search.evaluate_proposal_gates(
             self._forced_context(need, following))
@@ -2209,6 +2421,14 @@ class _EpisodeRunner(object):
             tr.on_prefix_sent("m%d" % ordinal)
             st = self.mem.status
             tr.note_before(st.hp, st.hp_max, st.time)
+            # Retain the transaction's origin evidence (plan 5.4): the suffix
+            # binds only while the post-prefix observation still matches it.
+            self._forced_origin = {
+                "instance": self.instance.current(),
+                "hero": tuple(self.mem.hero) if self.mem.hero else None,
+                "time": st.time, "hp": st.hp, "hp_max": st.hp_max,
+                "conditions": tuple(condition_texts(self.snap)),
+            }
             self.forced = tr
             self.result.forced_activations += 1
             self._forced_event("prefix-sent", tr, ordinal)
@@ -2324,6 +2544,15 @@ class _EpisodeRunner(object):
         role = ""
         override = self._forced_override(need, selected)
         if override is not None:
+            if override[2] == "terminate":
+                # The armed dangerous prefix cannot be cleared in this need
+                # (a prompt/menu cannot carry the native double-m).  End the
+                # transport rather than let the prefix modify a later action
+                # (plan 5.4); nothing prefixed is ever sent.
+                self._forced_abort("armed prefix cannot be cleared")
+                self.result.forced_uncleared += 1
+                raise _TransportFailure(
+                    "forced search: armed prefix cannot be cleared")
             selected, sel_reason, role = override
             provider = "scripted"
             low = (role == "trap")
