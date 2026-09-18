@@ -227,6 +227,10 @@ M07, M08, M09, M10, M12, M14, M15, M16, M17, M18, M20, M21.
 | `7e74fb4d4` | agent: neutral candidate/identity leaf (wave 1) |
 | `d821ae180` | agent: instance/terrain/hero memory (wave 2) |
 | `d298850c4` | agent: streaming exploration metrics module |
+| `550c823d6` | agent: isolate the leaf import-graph test |
+
+This report is itself committed on top of those, so its own hash is not
+listed here.
 
 All use explicit-path staging, author `NetHack Agent <agent@localhost>`,
 subject <= 50 and body wrapped at 72.  `AGENTS.md`, `build.log`,
