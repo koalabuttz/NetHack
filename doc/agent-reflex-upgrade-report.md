@@ -327,7 +327,17 @@ edited; no engine or profile changes; `make install` was never run;
    where the agent-only worker bootstraps (the earlier session's was broken for
    every engine fixture; see §10.6).
 
-## 13. Post-wiring campaign results (step 3 completed)
+## 13. Post-wiring campaign results (pre-fix artifacts)
+
+**Provenance.**  Every figure in this section is a **pre-fix** artifact: it was
+captured from the post-wiring build *before* the final isolation-review fixes
+(the non-command preparation/proposal purity pass, the evaluator/live-model
+parity fixture and the `Files`/report corrections) landed.  The figures
+therefore describe the build at the first wiring commit, not the current HEAD.
+They are kept as the honest end-to-end measurement that build supported and are
+not re-labelled as post-fix results.  Re-running these campaigns against the
+post-fix build is **deferred to the next natural campaign run**; no figure here
+is a projection of it.
 
 The previously blocked campaigns were completed after re-staging game data (the
 original blocker was stale staged data, not the binaries; verified by a clean
@@ -451,3 +461,66 @@ Still deliberately deferred:
 * live Jev enablement (terms/endpoint remain unapproved, as required);
 * re-running the campaigns against the *post-fix* build (the §13 figures are
   from the pre-fix post-wiring build).
+
+## 15. Final isolation-review fixes (this session)
+
+The isolation review of the wiring revision listed four items; this session
+closed the three that were still open and strengthened the second.
+
+1. **HIGH -- non-command preparation/proposal purity -- DONE.** The frozen
+   proposed-effect pattern now covers every non-command need, not only
+   gameplay commands.  `ScriptedReflex.prepare` builds the single non-command
+   candidate from a *pure* `_noncommand` proposal that returns
+   `(action, reason, effect, payload)` and mutates nothing; the effect tags
+   (`selection-done`, `eat-menu`, `eat-forced-menu`, `refresh-inventory-menu`,
+   and the `+`-joined combinations) and an optional frozen `effect_payload`
+   (the observed inventory rows, tick and game time) ride on the candidate.
+   `decide()` routes every kind through `prepare`/`_select`, so a proposal
+   that is not sent leaves the reflex and the inventory cache untouched.  The
+   controller freezes the candidate's effect on a *matching* non-command send
+   (`_freeze_noncommand_effect`; no `SentAttempt` is armed) and commits it with
+   `commit_effect(..., payload=...)` at the next reconciled observation, while
+   a local-invalid, write-failed, discarded or fallback send commits nothing.
+   `test_auto.py`'s tutorial assertion was updated to read the frozen effect
+   rather than a direct mutation.
+2. **MEDIUM -- evaluator migration + parity fixture -- DONE, strengthened.**
+   The evaluator already shared `arbitration`'s reconciliation helpers and
+   `PreparedReflex`; it now *also* models a non-command send (`_pending_effect`
+   carries the frozen payload), so a menu/prompt effect commits in the replay
+   exactly as live.  The M21 parity fixture
+   (`test_auto_integration.LiveEvaluatorParity`) now drives the real
+   `_EpisodeRunner` and the offline `evaluate.ReplayPass` over the *same* wire
+   and asserts the identical selected action for every need -- a gameplay
+   command *and* a non-command prompt -- alongside the canonical-table
+   agreement, the shared rejection set and determinism.
+3. **MEDIUM -- `Files` manifest -- DONE.** Added `forced_search.py`,
+   `navigation.py`, `recovery.py` to the `tools/agent` section and
+   `test_auto_forced_search.py`, `test_auto_navigation.py`,
+   `test_auto_recovery.py`, `test_auto_wiring.py` (plus the also-missing
+   `native_prefix_probe.py`) to the `test/agent` section.
+4. **LOW -- report §13 provenance -- DONE.** §13 is re-headed "pre-fix
+   artifacts" with an explicit provenance note; the post-fix campaigns are
+   deferred to the next natural run.
+
+Verification this session:
+
+* `test_auto*`: **712** green (707 + 5 new focused cases).
+* `test_spectate.py --selftest`: 43 green, twice; `spectate.py selftest`: ok.
+* `make -C test/agent check`: green (manifest + header + schema + formatter +
+  C fixtures).
+* Zero-key `--spectate` smoke: green (601 ticks / 654 actions / 0 invalids,
+  402 spectate frames, 0 failures) after re-staging data with
+  `make agent-test-data`.
+* Evaluator determinism: two runs over each of the three fixtures are
+  byte-identical.
+* 78-column sweep: 0 long lines in every changed Python file.
+* Mutation demos (observed red, then restored green): a direct `selection_done`
+  mutation (2 red), a dropped `refresh-inventory-menu` tag (1 red), a removed
+  send-match guard in `_freeze_noncommand_effect` (1 red), and a replay-only
+  fallback in `evaluate`'s selection (1 red -- live/replay parity).
+
+Two latent defects the purity pass exposed and fixed were pre-existing in the
+prior wiring revision: `prepare`'s non-command branch called `make_candidate`
+without its required `semantic_label` (dead until `decide` routed menus through
+it), and `ImmutableAction.menu` forced an integer generation while the wire
+carries a string content id (`"m2"`).
