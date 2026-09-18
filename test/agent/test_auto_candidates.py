@@ -21,6 +21,7 @@ import ast
 import json
 import math
 import os
+import subprocess
 import sys
 import unittest
 
@@ -83,12 +84,15 @@ class NeutralImportGraph(unittest.TestCase):
                          % leaked)
 
     def test_importing_the_leaf_pulls_no_heavy_module(self):
-        # A subprocess-free proxy: importing the leaf must not import policy
-        # or providers as a side effect.
-        import importlib
-        importlib.reload(candidates)
-        self.assertNotIn("tools.agent.policy", sys.modules)
-        self.assertNotIn("tools.agent.providers", sys.modules)
+        # Run in a fresh interpreter: other test modules legitimately import
+        # policy/providers, so an in-process sys.modules check would be a
+        # false failure.  The leaf must not pull them in on its own.
+        code = ("import sys, tools.agent.candidates; "
+                "print('tools.agent.policy' in sys.modules, "
+                "'tools.agent.providers' in sys.modules)")
+        out = subprocess.run([sys.executable, "-c", code], cwd=_ROOT,
+                             capture_output=True, text=True)
+        self.assertEqual(out.stdout.strip(), "False False", out.stderr)
 
 
 class CanonicalEncoding(unittest.TestCase):
