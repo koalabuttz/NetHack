@@ -826,13 +826,18 @@ class _EpisodeRunner(object):
         The frame deadline is ``min(now + write_timeout, bound)`` (Revision 3
         correction 1): a render wake can never extend the wire's own timeout,
         and an already-exhausted wire bound simply drops the frame.
+
+        Returns True when a frame was actually serviced, so the caller can
+        tell a real render wake from an idle select return and re-evaluate the
+        wire bound it may have consumed.
         """
         if self.spectate is None:
-            return
+            return False
         try:
-            self.spectate.flush(deadline_cap=bound)
+            return bool(self.spectate.flush(deadline_cap=bound))
         except Exception:                    # noqa: BLE001 - render only
             self._spectate_fail("write-error")
+            return False
         finally:
             self._spectate_sync()
 
@@ -1048,6 +1053,16 @@ class _EpisodeRunner(object):
             return None
         return self.need_deadline
 
+    def _wire_deadline_error(self):
+        """Raise the classified wire deadline error for a spent bound.
+
+        Shared by the loop top and the post-render re-evaluation so a deadline
+        edge classifies identically with and without a due render wake.
+        """
+        if self.deadline <= time.monotonic():
+            raise TimeoutError("episode deadline reached")
+        raise _DeadlineExceeded("content deadline reached")
+
     def _readline(self, deadline=None):
         if deadline is None:
             deadline = self.deadline
@@ -1055,9 +1070,7 @@ class _EpisodeRunner(object):
         while b"\n" not in self.buf:
             remaining = bound - time.monotonic()
             if remaining <= 0:
-                if self.deadline <= time.monotonic():
-                    raise TimeoutError("episode deadline reached")
-                raise _DeadlineExceeded("content deadline reached")
+                self._wire_deadline_error()
             if len(self.buf) > protocol.MAX_PHYSICAL_LINE:
                 raise _ProtocolFailure(
                     "unterminated line exceeds %d bytes"
@@ -1075,7 +1088,14 @@ class _EpisodeRunner(object):
             # remaining wire bound; this touches only render state and never
             # resets the wire deadline, fabricates a record or becomes EOF.
             if self.spectate is not None:
-                self._spectate_readline_flush(bound)
+                serviced = self._spectate_readline_flush(bound)
+                # Revision 3 correction 1: the capped flush can still spend
+                # the last of the wire allowance.  Re-evaluate the unchanged
+                # absolute bound before consuming a wire record, so a deadline
+                # edge takes the same episode-vs-content deadline path as none
+                # mode instead of recording a frame past the deadline.
+                if serviced and bound - time.monotonic() <= 0:
+                    self._wire_deadline_error()
             if not r:
                 continue
             chunk = os.read(self.proc.stdout.fileno(), 65536)

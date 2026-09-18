@@ -341,14 +341,19 @@ class RenderStream(object):
         ``deadline_cap`` is an absolute monotonic bound (the remaining wire
         deadline) that further caps the per-frame write deadline, so a render
         wake can never extend the wire's own timeout.
+
+        Returns True when a frame was actually serviced (attempted or
+        dropped), False when nothing was due or the stream is off -- so the
+        controller can tell a real render wake from an idle select return.
         """
         if self.disabled or self._closed or self._pending is None:
-            return
+            return False
         if not force and not self._due():
-            return
+            return False
         lines = self._pending
         self._pending = None
         self._attempt(lines, deadline_cap=deadline_cap)
+        return True
 
     def finish(self, lines=None):
         """Force one final frame (fresh ``lines`` or the pending candidate).
