@@ -360,5 +360,116 @@ class DefaultDestinationPool(unittest.TestCase):
         self.assertEqual(fallback.family, navigation.TFAM_UNVISITED)
 
 
+class CommittedBehaviour(unittest.TestCase):
+    """AC3/AC4/AC5/AC7/AC8: already-implemented behaviour, now named."""
+
+    def setUp(self):
+        self.ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+
+    def test_committed_reverse_survives_same_family_margin(self):
+        cells = {(x, 10): FLOOR for x in range(2, 9)}
+        mem = nav_test.mem_with(cells, (5, 10))
+        self.ref.recovery.previous_distinct = (4, 10)
+        # control: uncommitted, the west reversal is suppressed by the
+        # comparable east same-family frontier (strict >40 rule)
+        control = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.assertEqual(control.direction, (1, 0))
+        # committed: the held destination's required reversal is offered
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_EXPLORE_FRONTIER,
+                                pos=(2, 10), family=navigation.TFAM_FRONTIER)
+        held = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.assertEqual(held.direction, (-1, 0))
+
+    def test_hard_blockage_retires_and_suppresses_destination(self):
+        st = _store_with(pos=(3, 10))
+        st.retire("hard-blockage")
+        self.assertIsNone(st.held())
+        self.assertTrue(st.failed((3, 10)))
+        cells = {(x, 10): FLOOR for x in range(1, 6)}
+        tm = _terrain(cells)
+        dist, first = navigation.one_dijkstra(tm, (1, 10))
+        prop = navigation.resolve_destination(tm, (1, 10), dist, first, None,
+                                              store=st)
+        self.assertNotEqual(getattr(prop, "pos", None), (3, 10))
+
+    def test_locked_door_fails_once_and_next_target_progresses(self):
+        st = navigation.CommitmentStore()
+        st.commit(instance_id=1, purpose=navigation.COMMIT_OPEN_DOOR,
+                  pos=(5, 10), family=navigation.TFAM_DOOR)
+        st.retire("locked-door")            # an explicit refusal fails it
+        self.assertIsNone(st.held())
+        self.assertTrue(st.failed((5, 10)))
+        cells = {(3, 10): FLOOR, (4, 10): FLOOR, (5, 10): DOOR,
+                 (6, 10): FLOOR}
+        tm = _terrain(cells)
+        dist, first = navigation.one_dijkstra(tm, (3, 10))
+        prop = navigation.resolve_destination(tm, (3, 10), dist, first, None,
+                                              store=st)
+        self.assertIsNotNone(prop)
+        self.assertNotEqual(prop.pos, (5, 10))
+
+    def test_ineffective_door_attempts_are_bounded(self):
+        st = _store_with(purpose=navigation.COMMIT_OPEN_DOOR, pos=(5, 10),
+                         family=navigation.TFAM_DOOR)
+        self.assertFalse(st.door_attempts_exhausted)
+        st.note_interact_attempt()
+        self.assertFalse(st.door_attempts_exhausted)
+        st.note_interact_attempt()
+        self.assertTrue(st.door_attempts_exhausted)
+        # the policy retires the door at that cap (no monopolisation)
+        mem = nav_test.mem_with({(3, 10): FLOOR, (4, 10): FLOOR,
+                                 (5, 10): DOOR}, (4, 10))
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_OPEN_DOOR,
+                                pos=(5, 10), family=navigation.TFAM_DOOR)
+        cont = policy.ScriptedReflex._dest_payload(
+            "continue", self.ref.targets.held())
+        self.ref.commit_effect("navigate", "navigate", 1, mem,
+                               observed_kind="moved", payload=cont)
+        self.assertIsNotNone(self.ref.targets.held())
+        self.ref.commit_effect("navigate", "navigate", 2, mem,
+                               observed_kind="moved", payload=cont)
+        self.assertIsNone(self.ref.targets.held())
+
+    def test_door_no_time_outcome_folds_once(self):
+        mem = nav_test.mem_with({(3, 10): FLOOR, (4, 10): FLOOR,
+                                 (5, 10): DOOR}, (4, 10))
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_OPEN_DOOR,
+                                pos=(5, 10), family=navigation.TFAM_DOOR)
+        payload = policy.ScriptedReflex._dest_payload(
+            "continue", self.ref.targets.held())
+        self.ref.commit_effect("navigate", "navigate", 1, mem,
+                               observed_kind="no-time", payload=payload)
+        # exactly one ineffective interaction attempt per reconciled fold
+        self.assertEqual(self.ref.targets.interact_attempts, 1)
+        self.assertIsNotNone(self.ref.targets.held())
+
+    def test_emergency_singleton_precedes_destination_application(self):
+        mem = nav_test.mem_with({(x, 10): FLOOR for x in range(1, 8)},
+                                (4, 10))
+        mem.status.hp = 1
+        mem.status.hp_max = 20
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_EXPLORE_FRONTIER,
+                                pos=(7, 10), family=navigation.TFAM_FRONTIER)
+        old = self.ref.targets.held()
+        chosen = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.assertEqual(chosen.family, "emergency")
+        # the destination pipeline is suspended: no replacement is committed
+        self.assertEqual(self.ref.targets.held(), old)
+
+    def test_flee_arrival_does_not_ascend_or_exit_dungeon(self):
+        mem = nav_test.mem_with({(x, 10): FLOOR for x in range(1, 5)},
+                                (3, 10))
+        mem.grid[(3, 10)] = ("<", "white", 0, "none")   # hero on up stairs
+        view = DirectiveView(DirectiveSet(
+            schema_version=2, goals=("flee_to_upstairs",)), 1)
+        table = self.ref.prepare(nav_test.ctx(mem, directives=[view])).table
+        for cand in table.ordered_candidates:
+            self.assertNotEqual(cand.action.to_wire(), {"key": ord("<")})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -143,6 +143,25 @@ class PickupPolicyWiring(unittest.TestCase):
         table = self.ref.prepare(nav_test.ctx(mem)).table
         self.assertNotIn("pick-up", self._labels(table))
 
+    def test_destination_and_pickup_presentation_never_mutate_retained_table(
+            self):
+        mem = self._mem()
+        self._observe(mem)
+        table = self.ref.prepare(nav_test.ctx(mem)).table
+        before_bytes = table.canonical_bytes
+        before_ids = [c.candidate_id for c in table.ordered_candidates]
+        first, r1 = presentation.present("command", table.ordered_candidates,
+                                         nav_test.ctx(mem))
+        second, r2 = presentation.present("command", table.ordered_candidates,
+                                          nav_test.ctx(mem))
+        self.assertEqual((r1, r2), ("", ""))
+        self.assertEqual(list(first.keys), list(second.keys))
+        self.assertEqual(first.criteria, second.criteria)
+        # the retained table is untouched by rendering
+        self.assertEqual(table.canonical_bytes, before_bytes)
+        self.assertEqual([c.candidate_id for c in table.ordered_candidates],
+                         before_ids)
+
     def test_pickup_choice_criteria_object_key_index_and_n_frozen(self):
         mem = self._mem()
         self._observe(mem)

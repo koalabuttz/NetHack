@@ -385,6 +385,24 @@ class DirectiveSchemaV2(unittest.TestCase):
             self.assertIsNone(dset, obj)
             self.assertIn(needle, why)
 
+    def test_replay_reads_v1_and_v2_directives_with_original_versions(self):
+        # a replay that reads a mixed v1/v2 artifact keeps each directive's
+        # originally accepted version (no normalization to one version)
+        v1, why1 = DSEV.validate_directive_set(
+            {"schema_version": 1, "goals": ["survive"], "ttl": 5})
+        v2, why2 = DSEV.validate_directive_set(
+            {"schema_version": 2, "goals": ["collect_items"], "target": [5, 5],
+             "ttl": 5})
+        self.assertEqual((why1, why2), ("", ""))
+        self.assertEqual(v1.to_dict()["schema_version"], 1)
+        self.assertEqual(v2.to_dict()["schema_version"], 2)
+        # the lifecycle log of each activation records its own version
+        book = DSEV.DirectiveBook()
+        book.activate(v1, 1, "1")
+        self.assertEqual(book.events[-1]["directive"]["schema_version"], 1)
+        book.activate(v2, 2, "1")
+        self.assertEqual(book.events[-1]["directive"]["schema_version"], 2)
+
     def test_v2_target_legality_matrix(self):
         cases = [
             (["collect_items"], [5, 5], True),
