@@ -173,6 +173,13 @@ class ScriptedReflex(object):
         # its reconcile boundary (plan 1.5 "directive"): a
         # ``(outcome, generation, reason)`` tuple or ``None``.
         self.directive_settlement = None
+        # The in-flight pickup intent (plan 3.3): its purpose, the frozen
+        # evidence token it was authorized against, the inventory signature at
+        # initiation (for the success delta) and the originating generation.
+        self.pickup_purpose = ""
+        self.pickup_evidence = None
+        self.pickup_init_inventory = None
+        self.pickup_generation = 0
         self._cycled = False
         # The last prepared table and retained candidate, exposed for the
         # controller-owned SentAttempt lifecycle (set in decide()).
@@ -328,7 +335,7 @@ class ScriptedReflex(object):
     #: frozen proposal rather than during preparation (plan 3.1).
     _NONCOMMAND_EFFECTS = ("selection-done", "eat-menu", "eat-forced-menu",
                            "refresh-inventory-menu", "pickup-menu",
-                           "pickup-menu-cancel")
+                           "pickup-menu-cancel", "pickup-refuse")
 
     def commit_effect(self, effect, semantic_label, tick, mem,
                       observed_kind="", payload=()) -> None:
@@ -419,6 +426,14 @@ class ScriptedReflex(object):
                 if mem.hero is not None:
                     self.floor.note_negative(self.instance_id, mem.hero,
                                              pickup.OUTCOME_CANCELED)
+            elif tag == "pickup-refuse":
+                # a declined capacity/burden prompt is a terminal refusal
+                self.intent = ""
+                self.pickup_purpose = ""
+                if mem.hero is not None:
+                    self.floor.note_negative(self.instance_id, mem.hero,
+                                             pickup.OUTCOME_REFUSED)
+                self._settle_pickup_target(pickup.OUTCOME_REFUSED)
 
     def _commit_pickup(self, payload, tick, mem) -> None:
         """Commit one selected, sent and reconciled pickup initiation (3.3).
@@ -430,7 +445,7 @@ class ScriptedReflex(object):
         """
         if not payload or payload[0] != "pickup":
             return
-        (_tag, mode, iid, x, y, epoch) = payload
+        (_tag, mode, iid, x, y, epoch) = payload[:6]
         pos = (int(x), int(y))
         ev = self.floor.evidence(pos)
         if ev is None or ev.source_epoch != int(epoch):
@@ -441,6 +456,11 @@ class ScriptedReflex(object):
             return
         self.floor.note_initiation(ev)
         self.intent = "pickup"
+        self.pickup_purpose = mode
+        self.pickup_evidence = ev
+        self.pickup_init_inventory = mem.inventory_signature()
+        self.pickup_generation = (int(payload[6]) if len(payload) > 6
+                                  else int(self.directives.generation))
 
     def _commit_destination(self, payload, tick, mem) -> None:
         """Apply one frozen destination effect (compare-and-apply, plan 1.4).
@@ -597,7 +617,9 @@ class ScriptedReflex(object):
                 usable_cached_food=bool(mem.inventory.food_rows()),
                 exact_ration_name=ev.ration_name))
             decision, row, why = pickup.menu_decision(
-                pickup.parse_rows(context.pages), urgent_food=urgent)
+                pickup.parse_rows(context.pages),
+                purpose=self.pickup_purpose or "opportunistic",
+                urgent_food=urgent)
             if decision == "select" and row is not None:
                 return ({"menu": need.get("menu"), "commit": [[row.index, -1]]},
                         why, "pickup-menu", ())
@@ -673,7 +695,12 @@ class ScriptedReflex(object):
         if "shall i pick" in low:
             return {"yn": KEY.KEY_N}, "decline auto-pick", "prompt", ()
         if pickup.is_capacity_prompt(prompt):
-            # a capacity/burden question is always declined (plan 3.5)
+            # a capacity/burden question is always declined (plan 3.5); under an
+            # active pickup intent the decline is a terminal refusal, not a
+            # generic prompt continuation
+            if self.intent == "pickup":
+                return ({"yn": KEY.KEY_N}, "decline capacity prompt",
+                        "pickup-refuse", ())
             return {"yn": KEY.KEY_N}, "decline capacity prompt", "prompt", ()
         if "really quit" in low or "quit without saving" in low:
             return {"yn": KEY.KEY_Y}, "confirm quit", "prompt", ()
@@ -1077,12 +1104,15 @@ class ScriptedReflex(object):
             hungry=self._hungry(mem.status),
             usable_cached_food=bool(mem.inventory.food_rows()),
             exact_ration_name=ev.ration_name)
-        if collect or urgent:
+        if collect:
+            mode, score = "collect", 900
+        elif urgent:
             mode, score = "urgent", 900
         else:
             mode, score = "opportunistic", -1
         payload = ("pickup", mode, int(ev.instance), int(ev.pos[0]),
-                   int(ev.pos[1]), int(ev.source_epoch))
+                   int(ev.pos[1]), int(ev.source_epoch),
+                   int(self.directives.generation), str(ev.appearance))
         reason = "pick up the items here (%s)" % mode
         return self._cand({"key": KEY.KEY_PICKUP}, "pick-up", "pickup", score,
                           reason, "pickup", effect_payload=payload)
@@ -1300,6 +1330,7 @@ class ScriptedReflex(object):
             # destination cannot re-drive the loop (plan 1.5 "Cycle").
             self.targets.invalidate_cycle()
         self._fold_floor(mem)
+        self._fold_pickup_outcome(mem)
         instance = getattr(mem, "instance", None)
         if instance is None:
             instance = self.instance_id
@@ -1339,6 +1370,68 @@ class ScriptedReflex(object):
                 self.floor.observe_item(instance, pos, app.category)
         if hero is not None and self.floor.evidence(hero) is not None:
             self.floor.retain_on_arrival(instance, hero)
+            # A location-bound floor message names an item at the hero's *own*
+            # reconciled square: bind it here so the narrow urgent-food rule
+            # can consult an exact recognized ration name (plan 3.1).
+            for text in mem.recent_messages(6):
+                name = pickup.ration_name_in(text)
+                if name:
+                    self.floor.bind_ration_name(instance, tuple(hero), name,
+                                                tuple(hero))
+                    break
+
+    def _fold_pickup_outcome(self, mem) -> None:
+        """Classify one reconciled pickup attempt into an outcome (plan 3.3).
+
+        Player-visible evidence only: an inventory delta is success; the
+        explicit "nothing here to pick up" line is no-items; an unpaid /
+        refusal line is refused; anything else is unknown.  A terminal outcome
+        updates the floor ledger, clears the pickup intent and settles the
+        directive-owned collection target.
+        """
+        if self.intent != "pickup":
+            return
+        ev = self.pickup_evidence
+        joined = " ".join(t.lower() for t in mem.recent_messages(6))
+        sig = mem.inventory_signature()
+        if (sig is not None and self.pickup_init_inventory is not None
+                and sig != self.pickup_init_inventory):
+            outcome = pickup.OUTCOME_SUCCESS
+        elif "nothing here to pick up" in joined:
+            outcome = pickup.OUTCOME_NO_ITEMS
+        elif any(k in joined for k in ("unpaid", "you can't pick",
+                                       "you cannot pick",
+                                       "don't have enough")):
+            outcome = pickup.OUTCOME_REFUSED
+        else:
+            outcome = pickup.OUTCOME_UNKNOWN
+        terminal = pickup.terminates_target(outcome)
+        self.intent = ""
+        self.pickup_purpose = ""
+        self.pickup_init_inventory = None
+        hero = mem.hero
+        if ev is not None:
+            self.floor.note_outcome(ev, outcome)
+            if terminal and hero is not None:
+                self.floor.note_negative(self.instance_id, tuple(hero), outcome)
+        if terminal:
+            self._settle_pickup_target(outcome)
+
+    def _settle_pickup_target(self, outcome: str) -> None:
+        """Settle a directive-owned collection target after an outcome (3.3)."""
+        held = self.targets.held()
+        self.pickup_evidence = None
+        if held is None or held.source != navigation.SRC_DIRECTIVE:
+            return
+        if outcome == pickup.OUTCOME_SUCCESS:
+            self.targets.note_serviced(held.pos, ())
+            self.targets.retire("collected")
+            self._settle_directive("reached", held.generation,
+                                   "pickup-success")
+        else:
+            self.targets.retire("pickup-" + outcome)
+            self._settle_directive("failed", held.generation,
+                                   "pickup-" + outcome)
 
     def begin_instance(self, iid) -> None:
         """Start a fresh level-instance scope (plan 4.1 rule 6).
@@ -1355,6 +1448,11 @@ class ScriptedReflex(object):
         # serviced/failed ledgers (plan 1.5 "Level instance change").
         self.targets.reset()
         self.floor.reset()
+        self.pickup_purpose = ""
+        self.pickup_evidence = None
+        self.pickup_init_inventory = None
+        self.pickup_generation = 0
+        self.directive_settlement = None
         self._cycled = False
         self.stuck = 0
         self.last_hero = None

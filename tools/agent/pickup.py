@@ -87,6 +87,7 @@ class FloorLedger(object):
         self._attempts: Dict[tuple, int] = {}
         self._declined: Dict[tuple, bool] = {}
         self._negatives: Dict[tuple, str] = {}
+        self._outcomes: Dict[tuple, str] = {}
         self._epoch = 0
 
     # -- observations ----------------------------------------------------
@@ -168,6 +169,16 @@ class FloorLedger(object):
 
     def negative(self, instance: int, pos: Tuple[int, int]) -> Optional[str]:
         return self._negatives.get((int(instance), tuple(pos)))
+
+    def note_outcome(self, ev: FloorEvidence, outcome: str) -> None:
+        """Record the classified outcome of a reconciled pickup attempt."""
+        self._outcomes[ev.token] = outcome
+        if terminates_target(outcome):
+            # a terminal outcome also closes the site's acquisition
+            self._declined[ev.token] = True
+
+    def outcome(self, ev: FloorEvidence) -> Optional[str]:
+        return self._outcomes.get(ev.token)
 
     def expire_instance(self, instance: int) -> None:
         for key in [k for k in self._groups if k[0] != int(instance)]:
@@ -254,14 +265,17 @@ def unique_authorized_row(rows: Sequence[PickupRow], pred
     return matches[0], "unique authorized row"
 
 
-def menu_decision(rows: Sequence[PickupRow], *, urgent_food: bool = False,
+def menu_decision(rows: Sequence[PickupRow], *, purpose: str = "opportunistic",
+                  urgent_food: bool = False,
                   bound_row_index: Optional[int] = None
                   ) -> Tuple[str, Optional[PickupRow], str]:
     """The conservative menu decision (``select``/``cancel``, row, reason).
 
-    A targeted ``collect_items`` selection uses the single *bound* row; an
-    urgent-food selection uses the uniquely authorized exact recognized food
-    row; anything broad or ambiguous is cancelled rather than model-chosen.
+    A targeted ``collect_items`` pickup selects the **single bound row** (a
+    uniquely authorized exact row); an urgent-food pickup selects the uniquely
+    authorized exact recognized food row; an explicit ``bound_row_index``
+    binds that one row.  Anything broad or ambiguous is cancelled rather than
+    model-chosen, and a row explicitly marked unpaid is never selected.
     """
     if bound_row_index is not None:
         row = next((r for r in selectable_rows(rows)
@@ -269,12 +283,36 @@ def menu_decision(rows: Sequence[PickupRow], *, urgent_food: bool = False,
         if row is None:
             return "cancel", None, "the bound row is not selectable"
         return "select", row, "the bound authorized row"
+    if purpose == "collect":
+        candidates = selectable_rows(rows)
+        if len(candidates) == 1:
+            return "select", candidates[0], "the single bound row"
+        if not candidates:
+            return "cancel", None, "no authorized row"
+        return "cancel", None, ("ambiguous pile: %d authorized rows"
+                                % len(candidates))
     if urgent_food:
         row, why = unique_authorized_row(rows, is_recognized_food_text)
         if row is None:
             return "cancel", None, why
         return "select", row, why
     return "cancel", None, "no authorization for this pile"
+
+
+def ration_name_in(text: str) -> str:
+    """The recognized ration name a location-bound floor message names.
+
+    Only a current-location floor observation ("You see here ...") names an
+    item at the hero's square; any other message yields ``""`` so a stale or
+    unrelated line can never bind a ration to the current location.
+    """
+    low = (text or "").lower()
+    if "you see here" not in low:
+        return ""
+    for marker in _FOOD_MARKERS:
+        if marker.lower() in low:
+            return marker
+    return ""
 
 
 #: Recognized-food row text fragments (an appearance, not a safety claim).
@@ -316,5 +354,6 @@ __all__ = [
     "urgent_food_fallback", "terminates_target", "PickupRow", "parse_rows",
     "is_unpaid_row", "is_capacity_prompt", "selectable_rows",
     "authorized_rows", "unique_authorized_row", "menu_decision",
-    "is_recognized_food_text", "single_entry_autoselect_uncertainty",
+    "is_recognized_food_text", "ration_name_in",
+    "single_entry_autoselect_uncertainty",
 ]

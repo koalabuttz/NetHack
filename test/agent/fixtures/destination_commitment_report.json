@@ -1,6 +1,10 @@
 {
  "commits": [
   {
+   "hash": "67cdedb09fd43bc00eba14649f701e6f2c4de44e",
+   "subject": "agent: semantic v2 destination resolution"
+  },
+  {
    "hash": "ef67b0f6330f04aca1f1a5b157248328eafdf752",
    "subject": "agent: delivery-repair activation test"
   },
@@ -27,10 +31,6 @@
   {
    "hash": "7bfa476d6ce8090e6dbc06a9e8e268feb8b71fed",
    "subject": "agent: persistent terrain routing (AC12)"
-  },
-  {
-   "hash": "b76b42b78e35ee0adb30f489a9c4c4ae47d06403",
-   "subject": "agent: named lifecycle and pickup tests"
   }
  ],
  "gates": {

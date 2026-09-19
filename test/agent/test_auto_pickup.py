@@ -23,7 +23,7 @@ for _p in (_ROOT, _HERE):
         sys.path.insert(0, _p)
 
 import pickup_shapes  # noqa: E402
-from tools.agent import pickup, policy, presentation  # noqa: E402
+from tools.agent import navigation, pickup, policy, presentation  # noqa: E402
 from tools.agent.directives import DirectiveSet, DirectiveView  # noqa: E402
 from tools.agent.providers import ProviderConfig  # noqa: E402
 
@@ -161,6 +161,85 @@ class PickupPolicyWiring(unittest.TestCase):
         self.assertEqual(table.canonical_bytes, before_bytes)
         self.assertEqual([c.candidate_id for c in table.ordered_candidates],
                          before_ids)
+
+    def test_no_items_evidence_terminates_target(self):
+        # issue a real pickup command, then fold the engine's no-items line
+        mem = self._mem()
+        ev = self._observe(mem)
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_COLLECT_ITEMS,
+                                pos=tuple(mem.hero),
+                                family=navigation.TFAM_FRONTIER,
+                                source=navigation.SRC_DIRECTIVE)
+        payload = ("pickup", "collect", ev.instance, ev.pos[0], ev.pos[1],
+                   ev.source_epoch, 0, ev.appearance)
+        self.ref.commit_effect("pickup", "pick-up", 1, mem,
+                               observed_kind="no-time", payload=payload)
+        self.assertEqual(self.ref.intent, "pickup")
+        self.assertEqual(self.ref.pickup_purpose, "collect")
+        self.ref.directive_settlement = None
+        # the reconciled observation carries the no-items evidence
+        mem.messages.append("There is nothing here to pick up.")
+        self.ref.note_observation(mem)
+        self.assertEqual(self.ref.intent, "")
+        self.assertEqual(self.ref.floor.outcome(ev), pickup.OUTCOME_NO_ITEMS)
+        self.assertEqual(self.ref.floor.negative(self.ref.instance_id,
+                                                 mem.hero),
+                         pickup.OUTCOME_NO_ITEMS)
+        self.assertIsNone(self.ref.targets.held())          # settled
+        self.assertEqual(self.ref.directive_settlement[0], "failed")
+        # ... and the site is not re-offered
+        table = self.ref.prepare(nav_test.ctx(mem)).table
+        self.assertNotIn("pick-up", self._labels(table))
+
+    def test_confirmed_pickup_success_records_inventory_delta(self):
+        mem = self._mem()
+        ev = self._observe(mem)
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_COLLECT_ITEMS,
+                                pos=tuple(mem.hero),
+                                family=navigation.TFAM_FRONTIER,
+                                source=navigation.SRC_DIRECTIVE)
+        mem.inventory.refresh([{"text": "a dagger"}], 1, 100)
+        payload = ("pickup", "collect", ev.instance, ev.pos[0], ev.pos[1],
+                   ev.source_epoch, 0, ev.appearance)
+        self.ref.commit_effect("pickup", "pick-up", 1, mem,
+                               observed_kind="moved", payload=payload)
+        init_sig = self.ref.pickup_init_inventory
+        # the reconciled observation shows an inventory delta (the acquisition)
+        mem.inventory.refresh([{"text": "a dagger"},
+                               {"text": "some gold pieces"}], 2, 101)
+        self.ref.directive_settlement = None
+        self.ref.note_observation(mem)
+        self.assertEqual(self.ref.intent, "")
+        self.assertNotEqual(mem.inventory_signature(), init_sig)
+        self.assertEqual(self.ref.floor.outcome(ev), pickup.OUTCOME_SUCCESS)
+        self.assertEqual(self.ref.directive_settlement[0], "reached")
+
+    def test_yes_no_refusal_is_decline_not_failure(self):
+        mem = self._mem()
+        ev = self._observe(mem)
+        payload = ("pickup", "collect", ev.instance, ev.pos[0], ev.pos[1],
+                   ev.source_epoch, 0, ev.appearance)
+        self.ref.commit_effect("pickup", "pick-up", 1, mem,
+                               observed_kind="no-time", payload=payload)
+        ctx = nav_test.ctx(mem)
+        ctx.need = {"kind": "yn",
+                    "prompt": "Your backpack is getting hard to carry, "
+                              "continue? [yn]"}
+        action, _reason, effect, _payload = self.ref._noncommand(ctx, "yn")
+        # the capacity/burden prompt is declined with a terminal refusal
+        self.assertEqual(action, {"yn": ord("n")})
+        self.assertEqual(effect, "pickup-refuse")
+        self.ref.directive_settlement = None
+        self.ref.commit_effect(effect, "prompt", 2, mem,
+                               observed_kind="prompt-opened", payload=())
+        self.assertEqual(self.ref.intent, "")
+        self.assertEqual(self.ref.floor.negative(self.ref.instance_id,
+                                                 mem.hero),
+                         pickup.OUTCOME_REFUSED)
+        self.assertNotEqual(self.ref.floor.outcome(ev) or "",
+                            pickup.OUTCOME_SUCCESS)
 
     def test_pickup_choice_criteria_object_key_index_and_n_frozen(self):
         mem = self._mem()
@@ -327,18 +406,8 @@ class PickupEvidenceAndIntent(unittest.TestCase):
         self.assertTrue(pickup.terminates_target(pickup.OUTCOME_REFUSED))
         self.assertFalse(pickup.terminates_target(pickup.OUTCOME_UNKNOWN))
 
-    def test_no_items_evidence_terminates_target(self):
-        self.assertTrue(pickup.terminates_target(pickup.OUTCOME_NO_ITEMS))
-
     def test_deliberate_cancellation_terminates_site(self):
         self.assertTrue(pickup.terminates_target(pickup.OUTCOME_CANCELED))
-
-    def test_confirmed_pickup_success_records_inventory_delta(self):
-        # success is terminal and distinct from the unproven autoselect path
-        self.assertTrue(pickup.terminates_target(pickup.OUTCOME_SUCCESS))
-        residual = pickup.single_entry_autoselect_uncertainty()
-        self.assertFalse(residual["claimed"])
-        self.assertEqual(residual["evidence"], pickup.OUTCOME_UNKNOWN)
 
     def test_pickup_initiation_recorded_distinct_from_outcome(self):
         # initiation counting is separate from the outcome vocabulary
