@@ -384,6 +384,19 @@ def directive_event(ev: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def lifecycle_event(ev: Dict[str, Any]) -> Dict[str, Any]:
+    """Wrap one destination/pickup lifecycle event as a ledger record (5).
+
+    Additive: the same event sidecar gains a ``record: "lifecycle"`` line
+    type; readers that do not know it ignore it, and an artifact produced
+    before it existed simply has no lifecycle stream (unavailable, never
+    zero).
+    """
+    out = {"schema": EVENT_SCHEMA, "record": "lifecycle"}
+    out.update(ev)
+    return out
+
+
 class BoundaryQueue(object):
     """Coalesce detected boundaries and rate-limit dispatch to the
     strategy."""

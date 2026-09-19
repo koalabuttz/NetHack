@@ -11,6 +11,8 @@ event stream.  Two properties are deliberate:
   must not masquerade as a measured zero.
 """
 
+import json
+import os
 from typing import Any, Dict, Iterable, List, Optional
 
 SCHEMA_VERSION = 1
@@ -48,6 +50,13 @@ KIND_DIRECTIVE = "directive"
 _TERMINAL_DEST = (DEST_REACHED, DEST_FAILED, DEST_EXPIRED)
 
 
+def _hashable(value):
+    """A hashable view of a JSON-round-tripped (nested list) value."""
+    if isinstance(value, (list, tuple)):
+        return tuple(_hashable(v) for v in value)
+    return value
+
+
 def _percentile(values: List[int], q: float) -> Optional[int]:
     """The nearest-rank percentile of *values* (deterministic, no float noise)."""
     if not values:
@@ -60,18 +69,69 @@ def _percentile(values: List[int], q: float) -> Optional[int]:
 
 
 class LifecycleRecorder(object):
-    """An additive, schema-versioned lifecycle event stream."""
+    """An additive, schema-versioned lifecycle event stream.
 
-    def __init__(self) -> None:
+    ``sink`` receives a copy of every event as it is recorded (the recording
+    sidecar's writer); the in-memory list is a bounded replay-visible window,
+    capped exactly like the boundary/directive ledgers.
+    """
+
+    EVENT_CAP = 4096
+
+    def __init__(self, sink=None, cap: int = EVENT_CAP) -> None:
+        self.sink = sink
+        self.cap = int(cap)
         self.events: List[Dict[str, Any]] = []
 
     def record(self, kind: str, outcome: str, **fields: Any) -> None:
         ev = {"schema": SCHEMA_VERSION, "kind": kind, "outcome": outcome}
         ev.update(fields)
         self.events.append(ev)
+        if len(self.events) > self.cap:
+            del self.events[:len(self.events) - self.cap]
+        if self.sink is not None:
+            self.sink(dict(ev))
 
     def summarize(self) -> Dict[str, Any]:
         return summarize(self.events)
+
+
+def load_events(records: Optional[Iterable[dict]]) -> List[dict]:
+    """The lifecycle events carried by a produced artifact's event records.
+
+    A record is a lifecycle event iff it carries the ``record:
+    "lifecycle"`` envelope; every other record type is ignored.  An artifact
+    produced before this field existed therefore yields an *empty* stream --
+    every metric stays unavailable -- rather than a manufactured zero.
+    """
+    out = []
+    for r in records or ():
+        if isinstance(r, dict) and r.get("record") == "lifecycle":
+            out.append({k: v for k, v in r.items() if k != "record"})
+    return out
+
+
+def summarize_artifact(path: str) -> Dict[str, Any]:
+    """Derive the metrics from a produced ``ep-N.events.jsonl`` artifact.
+
+    Reads the persisted event sidecar line by line; a missing file, an
+    unreadable line or an artifact without lifecycle records all yield the
+    "unavailable" summary (``None`` per metric), never a zero.
+    """
+    records: List[dict] = []
+    if path and os.path.exists(path):
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue                # a torn line is not a metric zero
+                if isinstance(obj, dict):
+                    records.append(obj)
+    return summarize(load_events(records))
 
 
 def summarize(events: Optional[Iterable[dict]]) -> Dict[str, Any]:
@@ -126,6 +186,7 @@ def summarize(events: Optional[Iterable[dict]]) -> Dict[str, Any]:
     for e in pick:
         if e.get("outcome") == PICKUP_ATTEMPTED:
             tok = e.get("token")
+            tok = _hashable(tok)              # JSON round-trip: lists -> tuples
             attempts_by_token[tok] = attempts_by_token.get(tok, 0) + 1
 
     return {
@@ -164,5 +225,5 @@ __all__ = [
     "PICKUP_OFFERED", "PICKUP_DECLINED", "PICKUP_ATTEMPTED", "PICKUP_SUCCEEDED",
     "PICKUP_NO_ITEMS", "PICKUP_CANCELED", "PICKUP_REFUSED", "PICKUP_UNKNOWN",
     "DIR_ELIGIBLE", "DIR_RESOLVED", "DIR_FIRST_ACTION", "DIR_TERMINAL",
-    "LifecycleRecorder", "summarize",
+    "LifecycleRecorder", "summarize", "load_events", "summarize_artifact",
 ]

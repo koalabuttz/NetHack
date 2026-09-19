@@ -54,7 +54,8 @@ from .codec import AssemblerLimit, ChunkError, IncrementalAssembler
 from .controller import (_EpisodeRunner, _classified_terrain,
                          _crossed_dispatch_boundary)
 from .directives import DirectiveBook, PreconditionState
-from .events import BoundaryQueue, EventLedger, directive_event, hunger_index
+from .events import (BoundaryQueue, EventLedger, directive_event, hunger_index,
+                     lifecycle_event)
 from .policy import INV_STALE_TICKS, ScriptedReflex
 from .protocol import NeedKey, Request, Snapshot
 from .providers import (NullStrategy, ProviderConfig, ReflexContext,
@@ -1265,6 +1266,12 @@ class ReplayPass(object):
         self.event_ledger.flush()
         for ev in self.book.events:
             self.event_records.append(directive_event(ev))
+        # The destination/pickup lifecycle stream is persisted additively in
+        # the same event sidecar (plan section 5), in the evaluator exactly as
+        # in the live controller.
+        for ev in getattr(getattr(self.reflex, "lifecycle", None), "events",
+                          ()):
+            self.event_records.append(lifecycle_event(ev))
         if self._pending is not None and not self._pending.decided:
             self.need_unanswered += 1
             self._pending = None

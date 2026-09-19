@@ -1,9 +1,13 @@
 {
  "commit_range": {
   "base": "56c0c45a0739b29a3173b08b343d5fc786a56712",
-  "head": "f214fd9a75c5d4caff5b61f68fcf77d6fac1b9fb"
+  "head": "9a2b6d24a9022a2134b38059ecb1dab6c07527bb"
  },
  "commits": [
+  {
+   "hash": "9a2b6d24a9022a2134b38059ecb1dab6c07527bb",
+   "subject": "agent: regenerate report at final head"
+  },
   {
    "hash": "f214fd9a75c5d4caff5b61f68fcf77d6fac1b9fb",
    "subject": "agent: persist lifecycle events live and evaluator"
@@ -31,10 +35,6 @@
   {
    "hash": "03d220b3e7f49b3dee44421bf1335edcea623ff4",
    "subject": "agent: local evidence signatures and door caps"
-  },
-  {
-   "hash": "e2587e70c51d8d074107985435ecbae259332da7",
-   "subject": "agent: pickup outcome lifecycle end-to-end"
   }
  ],
  "gates": {
@@ -195,5 +195,5 @@
   ]
  },
  "schema_version": 1,
- "suite_count": 1018
+ "suite_count": 1019
 }

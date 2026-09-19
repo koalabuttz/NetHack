@@ -262,18 +262,22 @@ def _commit_range():
     return {"base": base, "head": head}
 
 
-def _lifecycle_summary():
+def _lifecycle_summary(artifact=None):
     """The lifecycle metric summary recorded in the validation report.
 
-    The harness runs offline, so no live destination/pickup lifecycle events
-    exist here: every metric is reported as *unavailable* (``None``), never a
-    manufactured zero (plan section 5).
+    Derived from a *produced artifact* when one is supplied (its persisted
+    event sidecar carries the ``record: "lifecycle"`` stream); without an
+    artifact no lifecycle events exist here, so every metric is reported as
+    *unavailable* (``None``), never a manufactured zero (plan section 5).
     """
+    if artifact:
+        from tools.agent import lifecycle_metrics
+        return lifecycle_metrics.summarize_artifact(artifact)
     from tools.agent import lifecycle_metrics
     return lifecycle_metrics.summarize([])
 
 
-def build_report(*, gates=None, mutations=None):
+def build_report(*, gates=None, mutations=None, artifact=None):
     commits = []
     for line in _git("log", "--format=%H %s", "-8").splitlines():
         sha, _, subject = line.partition(" ")
@@ -289,7 +293,7 @@ def build_report(*, gates=None, mutations=None):
         "commits": commits,
         "commit_range": _commit_range(),
         "suite_count": _suite_count(),
-        "lifecycle_metrics": _lifecycle_summary(),
+        "lifecycle_metrics": _lifecycle_summary(artifact),
         "gates": gates if gates is not None else dict(DEFAULT_GATES),
         "named_mutations": mutations,
         "pickup_shape_disposition": pickup_shapes.disposition(),
@@ -307,10 +311,13 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--write", action="store_true",
                     help="run the mutations and write the report fixture")
+    ap.add_argument("--artifact", default=None,
+                    help="a produced ep-N.events.jsonl sidecar to derive the "
+                         "lifecycle metrics from")
     ap.add_argument("--out", default=REPORT_PATH)
     args = ap.parse_args(argv)
     results = [run_mutation(m) for m in MUTATIONS]
-    report = build_report(mutations=results)
+    report = build_report(mutations=results, artifact=args.artifact)
     if args.write:
         os.makedirs(os.path.dirname(args.out), exist_ok=True)
         with open(args.out, "w") as fh:

@@ -51,6 +51,7 @@ from .budget import BudgetLedger
 from .codec import AssemblerLimit, ChunkError, IncrementalAssembler
 from .directives import DirectiveBook, PreconditionState
 from .events import (BoundaryQueue, EventLedger, directive_event,
+                     lifecycle_event,
                      hunger_index)
 from .policy import INV_STALE_TICKS, ScriptedReflex, condition_texts
 from .protocol import NeedKey, Request, Snapshot
@@ -1112,6 +1113,12 @@ class _EpisodeRunner(object):
         self.event_ledger.flush()
         for ev in self.book.events:
             self.rec.record_event(directive_event(ev))
+        # The destination/pickup lifecycle stream is persisted additively in
+        # the same event sidecar (plan section 5), so a produced artifact can
+        # feed the lifecycle metrics.
+        for ev in getattr(getattr(self.reflex, "lifecycle", None), "events",
+                          ()):
+            self.rec.record_event(lifecycle_event(ev))
         self._note_recorder_health()
 
     def _emit(self, kind, obj, need_key=None, write_deadline=None):

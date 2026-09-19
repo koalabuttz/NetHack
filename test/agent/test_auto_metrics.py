@@ -392,6 +392,22 @@ class LifecycleRecording(unittest.TestCase):
             out.append((ref, mem, nav))
         return out
 
+    def _persisted_summary(self, ref, tmp):
+        """Persist the recorder's stream through the real sidecar and read it.
+
+        Returns the metric summary derived from the *produced artifact*, so an
+        assertion is on the persisted file rather than on in-process state.
+        """
+        import glob
+        from tools.agent import events, lifecycle_metrics, recording
+        rec = recording.EpisodeRecorder(tmp, 1)
+        for ev in ref.lifecycle.events:
+            rec.record_event(events.lifecycle_event(ev))
+        rec.finalize({})                      # drain the sidecar writers
+        paths = glob.glob(os.path.join(tmp, "*.events.jsonl"))
+        self.assertTrue(paths, "no events sidecar was written")
+        return lifecycle_metrics.summarize_artifact(paths[0]), paths[0]
+
     def test_live_and_evaluator_persist_destination_lifecycle_events(self):
         for ref, mem, nav in self._drivers():
             cand = ref.prepare(nav.ctx(mem)).table.scripted()
@@ -407,9 +423,12 @@ class LifecycleRecording(unittest.TestCase):
             self.assertEqual(dest[:2], ["acquired", "action"])
             # additive and schema-versioned
             self.assertTrue(all("schema" in e for e in ref.lifecycle.events))
-            summary = ref.lifecycle.summarize()
+            with tempfile.TemporaryDirectory() as tmp:
+                summary, path = self._persisted_summary(ref, tmp)
+            # the persisted artifact yields the same non-unavailable metrics
             self.assertTrue(summary["available"])
             self.assertIsNotNone(summary["commitment_length_median"])
+            self.assertEqual(summary["destination_switch_rate"], 0.0)
 
     def test_live_and_evaluator_persist_pickup_lifecycle_events(self):
         from tools.agent.directives import DirectiveSet, DirectiveView
@@ -428,9 +447,32 @@ class LifecycleRecording(unittest.TestCase):
             self.assertIn(("pickup", "offered"), events)
             self.assertIn(("pickup", "attempted"), events)
             self.assertIn(("pickup", "no-items"), events)
-            summary = ref.lifecycle.summarize()
+            with tempfile.TemporaryDirectory() as tmp:
+                summary, _path = self._persisted_summary(ref, tmp)
+            self.assertTrue(summary["available"])
             self.assertEqual(summary["pickup_attempts"], 1)
             self.assertEqual(summary["pickup_outcomes"]["no-items"], 1)
+
+    def test_legacy_sidecar_without_lifecycle_events_reads_unavailable(self):
+        from tools.agent import lifecycle_metrics
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "ep-1.events.jsonl")
+            lines = [
+                {"schema": 1, "record": "boundary", "eid": "b1",
+                 "terminal": {"state": "applied"}},
+                {"schema": 1, "record": "directive", "state": "applied"},
+            ]
+            with open(path, "w") as fh:
+                for rec in lines:
+                    fh.write(json.dumps(rec) + "\n")
+            summary = lifecycle_metrics.summarize_artifact(path)
+        # an artifact predating the field is unavailable, never a zero
+        self.assertFalse(summary["available"])
+        self.assertIsNone(summary["commitment_length_median"])
+        self.assertIsNone(summary["pickup_outcomes"])
+        self.assertIsNone(summary["directive_override_execution_rate"])
+        self.assertIsNone(lifecycle_metrics.summarize_artifact(
+            os.path.join(tmp, "missing.events.jsonl"))["target_reach_rate"])
 
 
 class ValidationReport(unittest.TestCase):
