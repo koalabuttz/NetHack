@@ -61,6 +61,11 @@ def _is_diagonal(step: Tuple[int, int]) -> bool:
     return step[0] != 0 and step[1] != 0
 
 
+def door_open(terrain: "TerrainMemory", pos: Tuple[int, int]) -> bool:
+    """True when *pos* is a doorway or an open door (the door opened)."""
+    return terrain.ter(pos) in _DOOR_TERRAIN
+
+
 def edge_legal(terrain: TerrainMemory, a: Tuple[int, int],
                b: Tuple[int, int]) -> bool:
     """True when a *known-safe* edge exists from *a* to *b* (4.5).
@@ -316,9 +321,340 @@ class TargetStore(object):
             self.current = None
 
 
+# -- destination commitment lifecycle (plan section 1) ---------------------
+#
+# A destination is elected once and then *held*: the reflex recomputes its
+# route every command turn but does not re-elect a new destination merely
+# because another target now scores higher, a frontier reclassifies, or a
+# visit penalty rises.  Commitment is enforced here, in the pure layer, and is
+# only ever mutated at a reconcile/effect boundary -- never during a render or
+# a preparation (AC6).
+
+# Purposes (the plan's destination record taxonomy).
+COMMIT_EXPLORE_FRONTIER = "explore-frontier"
+COMMIT_EXPLORE_UNVISITED = "explore-unvisited"
+COMMIT_OPEN_DOOR = "open-door"
+COMMIT_COLLECT_ITEMS = "collect-items"
+COMMIT_FLEE_UPSTAIRS = "flee-upstairs"
+COMMIT_STAIR = "stair"
+
+# Phases.
+PHASE_TRAVELLING = "travelling"
+PHASE_INTERACTING = "interacting"
+
+# Sources.
+SRC_DEFAULT = "default"
+SRC_DIRECTIVE = "directive"
+
+#: Ineffective door-interaction attempts allowed per unchanged evidence.
+DOOR_INTERACT_MAX = 2
+#: Navigation attempts without a new cell toward the route (stall budget).
+STALL_MAX = 3
+#: A generous total selected-navigation cap: ``max(16, 4*hops + 8)``.
+STALL_TOTAL_MIN = 16
+STALL_TOTAL_FACTOR = 4
+STALL_TOTAL_SLACK = 8
+
+_PURPOSE_BY_FAMILY = {
+    TFAM_FRONTIER: COMMIT_EXPLORE_FRONTIER,
+    TFAM_UNVISITED: COMMIT_EXPLORE_UNVISITED,
+    TFAM_DOOR: COMMIT_OPEN_DOOR,
+    TFAM_STAIR: COMMIT_STAIR,
+}
+
+
+@dataclass(frozen=True)
+class Commitment:
+    """One persistent committed destination (plan section 1.1)."""
+
+    instance_id: int
+    serial: int
+    purpose: str
+    pos: Tuple[int, int]
+    family: str
+    approach: Optional[Tuple[int, int]] = None
+    source: str = SRC_DEFAULT
+    generation: int = 0
+    evidence_token: tuple = ()
+    acquisition_tick: int = 0
+    phase: str = PHASE_TRAVELLING
+
+
+def commitment_for(target: Target, *, instance_id: int, serial: int,
+                   source: str = SRC_DEFAULT, generation: int = 0,
+                   tick: int = 0, evidence_token: tuple = (),
+                   purpose: Optional[str] = None) -> Commitment:
+    """Build a :class:`Commitment` from an elected :class:`Target`."""
+    return Commitment(
+        instance_id=int(instance_id), serial=int(serial),
+        purpose=purpose or _PURPOSE_BY_FAMILY.get(target.family,
+                                                  COMMIT_EXPLORE_FRONTIER),
+        pos=tuple(target.pos), family=target.family,
+        approach=None, source=source, generation=int(generation),
+        evidence_token=tuple(evidence_token), acquisition_tick=int(tick))
+
+
+class CommitmentStore(object):
+    """The instance-scoped destination commitment and its scoped ledgers.
+
+    Pure: it holds no reference to policy, providers or the wire.  Every
+    mutating method is a *fold* operation the caller performs only at a
+    reconcile/effect boundary or a genuine observation fold; the read methods
+    are side-effect free.
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.current: Optional[Commitment] = None
+        self._serial = 0
+        self._serviced: Dict[Tuple[int, int], tuple] = {}
+        self._failed: Dict[Tuple[int, int], tuple] = {}
+        self.stall_attempts = 0
+        self.interact_attempts = 0
+        self.total_attempts = 0
+        self.progress_pos: Optional[Tuple[int, int]] = None
+        self.last_progress_tick: Optional[int] = None
+        self.stall_cap = STALL_TOTAL_MIN
+        self.events: list = []
+
+    # -- reads (pure) ----------------------------------------------------
+    def held(self) -> Optional[Commitment]:
+        return self.current
+
+    def holds(self, instance_id: int, terrain: "TerrainMemory",
+              hero: Tuple[int, int]) -> bool:
+        """False when the commitment is no longer valid for this state."""
+        c = self.current
+        if c is None:
+            return False
+        if c.instance_id != instance_id:
+            return False
+        if tuple(hero) == c.pos:
+            return False                    # arrived: the caller is done
+        if c.purpose == COMMIT_OPEN_DOOR:
+            return terrain.ter(c.pos) == T_CLOSED_DOOR
+        if terrain.ter(c.pos) in _DOOR_TERRAIN:
+            return True
+        return terrain.walkable(c.pos) and terrain.occupant(c.pos) == OCC_NONE
+
+    def serviced(self, pos: Tuple[int, int]) -> bool:
+        return tuple(pos) in self._serviced
+
+    def serviced_signature(self, pos: Tuple[int, int]) -> Optional[tuple]:
+        return self._serviced.get(tuple(pos))
+
+    def failed(self, pos: Tuple[int, int]) -> bool:
+        return tuple(pos) in self._failed
+
+    def failed_signature(self, pos: Tuple[int, int]) -> Optional[tuple]:
+        return self._failed.get(tuple(pos))
+
+    # -- folds -----------------------------------------------------------
+    def commit(self, *, instance_id: int, purpose: str, pos: Tuple[int, int],
+               family: str, source: str = SRC_DEFAULT, generation: int = 0,
+               evidence_token: tuple = (), tick: int = 0,
+               approach: Optional[Tuple[int, int]] = None,
+               expected_serial: Optional[int] = None,
+               hops: Optional[int] = None) -> bool:
+        """Install a new commitment (compare-and-apply).
+
+        ``expected_serial`` implements the compare-and-apply contract: when it
+        is given and the active serial has changed since the proposal was
+        frozen, the effect is stale and is dropped.  ``None`` means "fresh
+        acquisition" and always installs.
+        """
+        if expected_serial is not None:
+            cur = self.current
+            if cur is None or cur.serial != int(expected_serial):
+                return False
+        self._serial += 1
+        self.current = Commitment(
+            instance_id=int(instance_id), serial=self._serial,
+            purpose=purpose, pos=tuple(pos), family=family,
+            approach=None if approach is None else tuple(approach),
+            source=source, generation=int(generation),
+            evidence_token=tuple(evidence_token), acquisition_tick=int(tick))
+        self.stall_attempts = 0
+        self.interact_attempts = 0
+        self.total_attempts = 0
+        self.progress_pos = tuple(pos)
+        self.last_progress_tick = int(tick)
+        if hops is not None:
+            self.set_stall_cap(hops)
+        return True
+
+    def set_stall_cap(self, hops: int) -> None:
+        self.stall_cap = max(STALL_TOTAL_MIN,
+                             STALL_TOTAL_FACTOR * int(hops) + STALL_TOTAL_SLACK)
+
+    def note_nav_attempt(self) -> None:
+        self.total_attempts += 1
+        self.stall_attempts += 1
+
+    def note_progress(self, pos: Tuple[int, int], tick: int) -> None:
+        """A new cell toward the route: reset the no-progress budget."""
+        if self.current is None:
+            return
+        if self.progress_pos is None or tuple(pos) != self.progress_pos:
+            self.progress_pos = tuple(pos)
+            self.last_progress_tick = int(tick)
+            self.stall_attempts = 0
+
+    def stalled(self) -> bool:
+        return (self.stall_attempts > STALL_MAX
+                or self.total_attempts > self.stall_cap)
+
+    @property
+    def door_attempts_exhausted(self) -> bool:
+        return self.interact_attempts >= DOOR_INTERACT_MAX
+
+    def note_interact_attempt(self) -> None:
+        self.interact_attempts += 1
+
+    def note_serviced(self, pos: Tuple[int, int], signature: tuple) -> None:
+        self._serviced[tuple(pos)] = tuple(signature)
+
+    def note_failed(self, pos: Tuple[int, int], signature: tuple) -> None:
+        self._failed[tuple(pos)] = tuple(signature)
+
+    def retire(self, reason: str, *, pos: Optional[Tuple[int, int]] = None,
+               signature: tuple = ()) -> None:
+        """Clear the active commitment, optionally recording its failure."""
+        c = self.current
+        target_pos = c.pos if (pos is None and c is not None) else pos
+        if target_pos is not None and reason:
+            self._failed[tuple(target_pos)] = tuple(signature)
+        self.current = None
+        self.events.append({"event": "retired", "reason": reason,
+                            "pos": target_pos})
+
+    def invalidate_cycle(self, signature: tuple = ()) -> None:
+        """Cycle recovery invalidates and suppresses the held destination."""
+        c = self.current
+        if c is None:
+            return
+        self._failed[tuple(c.pos)] = tuple(signature)
+        self.current = None
+        self.events.append({"event": "cycle-invalidated", "pos": c.pos})
+
+    def expire_instance(self, instance_id: int) -> None:
+        """A fresh instance clears the commitment and the scoped ledgers."""
+        c = self.current
+        if c is not None and c.instance_id != int(instance_id):
+            self.current = None
+        self._serviced.clear()
+        self._failed.clear()
+
+
+def resolve_destination(terrain: "TerrainMemory", hero: Tuple[int, int],
+                        dist: Dict[Tuple[int, int], int],
+                        first: Dict[Tuple[int, int], Tuple[int, int]],
+                        visits: Optional[Dict[Tuple[int, int], int]] = None,
+                        store: Optional[CommitmentStore] = None,
+                        *, prefer_stairs: bool = False,
+                        directive_pos: Optional[Tuple[int, int]] = None,
+                        directive_purpose: Optional[str] = None,
+                        source: str = SRC_DEFAULT,
+                        generation: int = 0, tick: int = 0,
+                        hops: Optional[int] = None) -> Optional[Commitment]:
+    """Elect a destination from the current plan, purely (plan 1.2).
+
+    Ordering: an explicit directive target first; then reachable doors and
+    frontiers (the default pool) before down-stairs; then unvisited known
+    cells; and only then stairs.  Serviced and failed sites under their local
+    evidence signature are suppressed.  Returns a *proposed* commitment; the
+    caller installs it through :meth:`CommitmentStore.commit` at a reconcile
+    boundary -- this function never mutates the store.
+    """
+    targets = enumerate_targets(terrain, hero, dist, first, visits)
+    store = store or CommitmentStore()
+
+    def eligible(t):
+        return not store.serviced(t.pos) and not store.failed(t.pos)
+
+    chosen = None
+    if directive_pos is not None:
+        for t in targets:
+            if tuple(t.pos) == tuple(directive_pos):
+                chosen = t
+                break
+    else:
+        stair = [t for t in targets if t.family == TFAM_STAIR and eligible(t)]
+        explore = [t for t in targets
+                   if t.family in (TFAM_DOOR, TFAM_FRONTIER) and eligible(t)]
+        unvisited = [t for t in targets
+                     if t.family == TFAM_UNVISITED and eligible(t)]
+        if prefer_stairs and stair:
+            chosen = stair[0]
+        elif explore:
+            chosen = explore[0]
+        elif unvisited:
+            chosen = unvisited[0]
+        elif stair:
+            chosen = stair[0]
+    if chosen is None:
+        return None
+    serial = store._serial + 1
+    c = commitment_for(chosen, instance_id=store.current.instance_id
+                       if store.current else 0, serial=serial,
+                       source=source, generation=generation, tick=tick,
+                       purpose=directive_purpose)
+    return c
+
+
+def route_held_destination(c: Commitment, terrain: "TerrainMemory",
+                           hero: Tuple[int, int],
+                           dist: Dict[Tuple[int, int], int],
+                           first: Dict[Tuple[int, int], Tuple[int, int]]
+                           ) -> Tuple[Optional[Tuple[int, int]], Optional[str],
+                                      str]:
+    """The next step/terminal for a held commitment (plan 1.3).
+
+    Returns ``(step, terminal, reason)``: exactly one of *step* (a wire
+    direction) or *terminal* (``"arrive"`` for a reached target or
+    ``"interact"`` for a door) is set.  The semantic door coordinate stays
+    stable; a closed door is not completed by reaching its approach.
+    """
+    pos = c.pos
+    if c.purpose == COMMIT_OPEN_DOOR:
+        if tuple(hero) == pos:
+            return None, "interact", "already at the closed door"
+        # a closed door is not walkable, so it has no Dijkstra entry: the route
+        # is to its cheapest reachable cardinal approach, then into the door
+        approach = None
+        for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+            nb = (pos[0] + dx, pos[1] + dy)
+            if nb in dist and terrain.walkable(nb):
+                if approach is None or (dist[nb], nb) < (dist[approach],
+                                                         approach):
+                    approach = nb
+        if approach is not None:
+            step = first.get(approach)
+            if step is not None:
+                return step, None, "approach the closed door"
+            # the hero stands on the approach: step into the door to open it
+            d = (pos[0] - hero[0], pos[1] - hero[1])
+            if d != (0, 0):
+                return d, None, "open the door"
+        return None, None, "no route to the closed door"
+    if tuple(hero) == pos:
+        return None, "arrive", "reached the destination"
+    if pos in first:
+        return first[pos], None, "continue to the destination"
+    return None, None, "no route to the destination"
+
+
 __all__ = [
     "DIRECTIONS", "DIR_RANK", "BASE_STEP", "VISIT_PENALTY", "FAILED_PENALTY",
     "TFAM_STAIR", "TFAM_DOOR", "TFAM_FRONTIER", "TFAM_UNVISITED",
     "edge_legal", "one_dijkstra", "enumerate_targets", "is_frontier",
-    "Target", "NavPlan", "plan", "PersistedTarget", "TargetStore",
+    "door_open", "Target", "NavPlan", "plan", "PersistedTarget", "TargetStore",
+    "COMMIT_EXPLORE_FRONTIER", "COMMIT_EXPLORE_UNVISITED", "COMMIT_OPEN_DOOR",
+    "COMMIT_COLLECT_ITEMS", "COMMIT_FLEE_UPSTAIRS", "COMMIT_STAIR",
+    "PHASE_TRAVELLING", "PHASE_INTERACTING", "SRC_DEFAULT", "SRC_DIRECTIVE",
+    "DOOR_INTERACT_MAX", "STALL_MAX", "STALL_TOTAL_MIN", "STALL_TOTAL_FACTOR",
+    "STALL_TOTAL_SLACK", "Commitment", "CommitmentStore", "commitment_for",
+    "resolve_destination", "route_held_destination",
 ]

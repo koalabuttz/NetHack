@@ -158,6 +158,10 @@ class ScriptedReflex(object):
         # only; a proposal never mutates gameplay memory here.
         self.recovery = recovery.RecoveryState()
         self.food = recovery.FoodNegatives()
+        # The instance-scoped destination commitment (plan section 1): one
+        # persistent committed destination plus its serviced/failed ledgers.
+        # Mutated only at a reconcile/effect boundary, never during prepare.
+        self.targets = navigation.CommitmentStore()
         self._cycled = False
         # The last prepared table and retained candidate, exposed for the
         # controller-owned SentAttempt lifecycle (set in decide()).
@@ -340,6 +344,8 @@ class ScriptedReflex(object):
         if tags and all(t in self._NONCOMMAND_EFFECTS for t in tags):
             self._commit_noncommand(tags, payload, mem)
             return
+        if payload and payload[0] == "dest":
+            self._commit_destination(payload, tick, mem)
         self.intent = ""
         no_time = (observed_kind == "no-time")
         if effect == "quit":
@@ -387,6 +393,61 @@ class ScriptedReflex(object):
             elif tag == "refresh-inventory-menu":
                 rows, seen_tick, game_time = self._refresh_payload(payload)
                 mem.inventory.refresh(rows, seen_tick, game_time)
+
+    def _commit_destination(self, payload, tick, mem) -> None:
+        """Apply one frozen destination effect (compare-and-apply, plan 1.4).
+
+        Reached only through :meth:`commit_effect`, i.e. only after a complete
+        send and its reconciled observation, so a discarded, unselected or
+        write-failed proposal can never acquire, continue or retire a
+        destination.  A fresh acquisition installs; a continuation applies
+        only against the unchanged expected serial; an arrival services and
+        retires exactly once.
+        """
+        if not payload or payload[0] != "dest":
+            return
+        (_tag, op, iid, purpose, x, y, family, source, generation,
+         expected) = payload
+        pos = (int(x), int(y))
+        hero = mem.hero
+        if op == "acquire":
+            if hero is not None and tuple(hero) == pos:
+                # the observation that justified acquisition already satisfied
+                # it: record reached instead of installing (plan 1.4)
+                self.targets.note_serviced(pos, ())
+                return
+            cur = self.targets.held()
+            if (cur is not None and cur.pos == pos
+                    and cur.purpose == purpose and cur.instance_id == iid):
+                return                      # idempotent: already committed
+            self.targets.commit(instance_id=iid or self.instance_id,
+                                purpose=purpose, pos=pos, family=family,
+                                source=source, generation=int(generation),
+                                tick=tick)
+            return
+        cur = self.targets.held()
+        if cur is None or cur.serial != int(expected):
+            return                          # stale continuation: drop it
+        if op == "arrive" or (hero is not None and tuple(hero) == pos):
+            self.targets.note_serviced(pos, ())
+            self.targets.retire("reached")
+            return
+        # continue / interact
+        self.targets.note_nav_attempt()
+        if hero is not None:
+            self.targets.note_progress(tuple(hero), tick)
+        if cur.purpose == navigation.COMMIT_OPEN_DOOR:
+            if hero is not None and recovery.chebyshev(hero, pos) <= 1:
+                self.targets.note_interact_attempt()
+            if navigation.door_open(self._terrain(mem), pos):
+                self.targets.note_serviced(pos, ())
+                self.targets.retire("door-opened")
+                return
+            if self.targets.door_attempts_exhausted:
+                self.targets.retire("door-ineffective")
+                return
+        if self.targets.stalled():
+            self.targets.retire("stalled")
 
     @staticmethod
     def _refresh_payload(payload):
@@ -632,50 +693,43 @@ class ScriptedReflex(object):
 
     @staticmethod
     def _cand(action, label, family, score, reason, effect,
-              direction=(), direction_rank=0):
+              direction=(), direction_rank=0, effect_payload=()):
         """Build one content-addressed candidate with its semantic label."""
         return candidates.make_candidate(
             action, label, family=family, score=score, reason=reason,
             proposed_effect=effect, direction=direction,
-            direction_rank=direction_rank)
+            direction_rank=direction_rank, effect_payload=effect_payload)
 
     def _navigation_candidates(self, context, mem, hero):
-        """One-Dijkstra navigation candidates over all reachable targets.
+        """The commitment pipeline: resolve → route → build (plan 1.3).
 
-        This replaces the old priority-return navigation: a single Dijkstra
-        enumerates every reachable down stair, closed-door approach, frontier
-        and unvisited cell, and the retained argmax picks the first step.  A
-        directive only reorders candidates the reflex already knows how to
-        build; it never supplies a key.
-
-        Before candidates are constructed, the scored targets pass through the
-        bounded same-family anti-backtrack preference (:meth:`_antibacktrack`),
-        which suppresses a *comparable* immediate reversal without ever
-        forbidding an edge or dropping a uniquely required retreat.
+        Each command boundary recomputes at most one navigation Dijkstra.  A
+        *held* destination is routed, not re-elected: only its next step is
+        offered, so a newly higher-scoring target, a frontier reclassification
+        or a visit-penalty change cannot cancel progress.  With no held
+        destination the reflex elects one from the default pool (doors and
+        frontiers before down-stairs, unvisited cells as fallback) and offers
+        the retained scored multi-candidate set so the controller (or Jev)
+        selects one; the elected destination is committed only at the
+        reconcile boundary, never here.
         """
         explore_first = self.directives.prefers_frontier() \
             and not self.directives.prefers_stairs()
+        prefer_stairs = self.directives.prefers_stairs()
         if hero in mem.stairs_down and not explore_first:
             return (self._cand({"key": ord(">")}, "descend", "descend", 900,
                                "descend the known stairs", "descend"),)
         terrain = self._terrain(mem)
         plan = navigation.plan(terrain, hero, mem.visits, None,
                                self._check_deadline)
-        scored = []
-        for target in plan.targets:
-            key = KEY.DIR_KEYS[target.first_step]
-            score = _target_score(target.family, target.cost, explore_first)
-            score += self._directive_component(target)
-            scored.append((target, _NAV_FAMILY[target.family], key, score,
-                           target.first_step))
-        kept = self._antibacktrack(scored, hero, getattr(context, "rejected",
-                                                         None))
-        cands = []
-        for target, family, key, score, step, extra in kept:
-            cands.append(self._cand(
-                {"key": key}, "navigate", family, score,
-                "%s: %s" % (self._nav_reason(extra), target.reason), "navigate",
-                direction=step, direction_rank=navigation.DIR_RANK[step]))
+        held = self.targets.held()
+        if held is not None and self.targets.holds(self.instance_id, terrain,
+                                                   hero):
+            routed = self._route_committed(held, terrain, hero, plan)
+            if routed is not None:
+                return (routed,)
+        cands = self._acquisition_candidates(context, mem, hero, plan,
+                                             prefer_stairs, explore_first)
         if cands:
             return tuple(cands)
         if mem.searches_since_progress < 3 \
@@ -686,6 +740,84 @@ class ScriptedReflex(object):
                                "search for secret doors",
                                "secret-search"),)
         return self._search_fallback(mem, hero)
+
+    def _route_committed(self, held, terrain, hero, plan):
+        """The held destination's single next step, or ``None`` (plan 1.3)."""
+        step, terminal, reason = navigation.route_held_destination(
+            held, terrain, hero, plan.dist, plan.first)
+        if step is not None:
+            payload = self._dest_payload("continue", held)
+            return self._cand({"key": KEY.DIR_KEYS[step]}, "navigate",
+                              _NAV_FAMILY[held.family], 0, reason, "navigate",
+                              direction=step,
+                              direction_rank=navigation.DIR_RANK[step],
+                              effect_payload=payload)
+        if terminal == "arrive":
+            payload = self._dest_payload("arrive", held)
+            return self._cand({"key": KEY.KEY_SEARCH}, "navigate",
+                              _NAV_FAMILY[held.family], 0, reason, "navigate",
+                              effect_payload=payload)
+        return None
+
+    def _acquisition_candidates(self, context, mem, hero, plan, prefer_stairs,
+                                explore_first):
+        """The default/directive destination pool, scored (plan 1.2)."""
+        targets = plan.targets
+        directive_pos = (self.directives.target
+                         if self.directives.active else None)
+        if directive_pos is not None:
+            pool = [t for t in targets
+                    if tuple(t.pos) == tuple(directive_pos)]
+        else:
+            def ok(t):
+                return (not self.targets.serviced(t.pos)
+                        and not self.targets.failed(t.pos))
+
+            pool = [t for t in targets if ok(t)]
+        if not pool:
+            return []
+        scored = []
+        for target in pool:
+            key = KEY.DIR_KEYS[target.first_step]
+            score = _target_score(target.family, target.cost, explore_first)
+            score += self._directive_component(target)
+            scored.append((target, _NAV_FAMILY[target.family], key, score,
+                           target.first_step))
+        kept = self._antibacktrack(scored, hero,
+                                   getattr(context, "rejected", None))
+        cands = []
+        for target, family, key, score, step, extra in kept:
+            payload = self._dest_payload("acquire", None, target=target)
+            cands.append(self._cand(
+                {"key": key}, "navigate", family, score,
+                "%s: %s" % (self._nav_reason(extra), target.reason), "navigate",
+                direction=step, direction_rank=navigation.DIR_RANK[step],
+                effect_payload=payload))
+        return cands
+
+    @staticmethod
+    def _dest_payload(op, held, target=None):
+        """The frozen destination effect payload (plan 1.4).
+
+        Binds the operation (``acquire``/``continue``/``arrive``), the level
+        instance, the semantic destination coordinate and family, the source
+        and originating generation, and -- for a continuation -- the expected
+        commitment serial, so the reconcile fold can compare-and-apply.  A
+        fresh acquisition carries ``-1`` (no expected serial).
+        """
+        if held is not None:
+            iid, purpose = held.instance_id, held.purpose
+            pos, family = held.pos, held.family
+            source, generation, expected = (held.source, held.generation,
+                                            held.serial)
+        else:
+            iid = 0
+            purpose = navigation._PURPOSE_BY_FAMILY.get(
+                target.family, navigation.COMMIT_EXPLORE_FRONTIER)
+            pos, family = tuple(target.pos), target.family
+            source, generation, expected = ("default", 0, -1)
+        return ("dest", op, int(iid), purpose, int(pos[0]), int(pos[1]),
+                family, source, int(generation), int(expected))
 
     # The bounded same-family margin: a reversal is kept only when it scores
     # strictly more than 40 above the best non-reversing alternative in its
@@ -894,6 +1026,11 @@ class ScriptedReflex(object):
         recent = mem.recent_messages(6)
         self.recovery.observe(recent, hero, self._search_site(hero))
         self._cycled = self.recovery.note_cycle(hero)
+        if self._cycled:
+            # Cycle recovery invalidates the active destination before the
+            # existing edge-legal recovery singleton runs, so a stale
+            # destination cannot re-drive the loop (plan 1.5 "Cycle").
+            self.targets.invalidate_cycle()
         instance = getattr(mem, "instance", None)
         if instance is None:
             instance = self.instance_id
@@ -915,6 +1052,9 @@ class ScriptedReflex(object):
         self.instance_id = int(iid or 0)
         self.recovery = recovery.RecoveryState()
         self.food = recovery.FoodNegatives()
+        # A fresh level-instance scope clears the commitment and the scoped
+        # serviced/failed ledgers (plan 1.5 "Level instance change").
+        self.targets.reset()
         self._cycled = False
         self.stuck = 0
         self.last_hero = None
