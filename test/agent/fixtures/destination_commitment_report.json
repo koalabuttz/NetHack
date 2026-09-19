@@ -1,36 +1,36 @@
 {
  "commits": [
   {
-   "hash": "951dfc6de31252e0ea71ea7dacf03144341e850f",
-   "subject": "agent: pickup evidence and menu model (phase 3)"
+   "hash": "7bfa476d6ce8090e6dbc06a9e8e268feb8b71fed",
+   "subject": "agent: persistent terrain routing (AC12)"
   },
   {
-   "hash": "41f38146288e33563304be31026568005d7240ee",
-   "subject": "agent: command-gated v2 activation and parity"
+   "hash": "b76b42b78e35ee0adb30f489a9c4c4ae47d06403",
+   "subject": "agent: named lifecycle and pickup tests"
   },
   {
-   "hash": "64be4156e167407eb8ecaff3c4c5868cecc338a8",
-   "subject": "agent: v2 strategy prompt and goal summaries"
+   "hash": "3293782b2ae1ff8064f7a49683394937cd9568bf",
+   "subject": "agent: presentation /3 golden and test"
   },
   {
-   "hash": "2c69b37939e9c991d2e7df70e4d08103442176eb",
-   "subject": "agent: directive schema v2 validator (phase 2)"
+   "hash": "7761274b1d9c3dcb5b926980230e49189aea866c",
+   "subject": "agent: fix golden capture helper"
   },
   {
-   "hash": "59664c06845cea1a541b94a75faf1221c13473be",
-   "subject": "agent: door/frontier-first default pool (AC2)"
+   "hash": "90435687c57c07107b961c747e27851005d156a3",
+   "subject": "agent: golden request capture helper"
   },
   {
-   "hash": "86b8c275e9dd21415854ea803417fc652904e559",
-   "subject": "agent: destination commitment (phase 1)"
+   "hash": "ae4f008289510dd9cf2ebdfee8d78672df8ac219",
+   "subject": "agent: presentation /3 commitment context"
   },
   {
-   "hash": "2f8b815b5c940182494f2cc37d725e011e658d23",
-   "subject": "agent: native pickup-shape probe (phase 0)"
+   "hash": "20f37548c4f2e65127eb6b9c222a7dbf5dae34c6",
+   "subject": "agent: wire pickup intent into policy"
   },
   {
-   "hash": "56c0c45a0739b29a3173b08b343d5fc786a56712",
-   "subject": "agent: revise destination plan to rev 4"
+   "hash": "a752ff1306c89b426aecba3f0952f0786dca3469",
+   "subject": "agent: mutation checks and validation report (phase 4)"
   }
  ],
  "gates": {
@@ -92,28 +92,24 @@
    "status": "killed"
   },
   {
-   "killer": null,
+   "killer": "test_auto_commitment.CommittedBehaviour.test_committed_reverse_survives_same_family_margin",
    "name": "mutation_apply_antibacktrack_to_committed_target",
-   "reason": "named killer test_committed_reverse_survives_same_family_margin not implemented",
-   "status": "not-performed"
+   "status": "killed"
   },
   {
-   "killer": null,
+   "killer": "test_auto_providers.DirectiveSchemaV2.test_served_generation_does_not_reassert_destination",
    "name": "mutation_reactivate_failed_directive_each_tick",
-   "reason": "named killer tests test_served_generation_does_not_reassert_destination / test_identical_new_generation_does_not_reset_failure_budget not implemented",
-   "status": "not-performed"
+   "status": "killed"
   },
   {
-   "killer": null,
+   "killer": "test_auto_commitment.CommittedBehaviour.test_item_overlay_uses_persistent_known_ground",
    "name": "mutation_route_from_raw_grid_under_item",
-   "reason": "named killer test_item_overlay_uses_persistent_known_ground not implemented",
-   "status": "not-performed"
+   "status": "killed"
   },
   {
-   "killer": null,
+   "killer": "test_auto_pickup.PickupPolicyWiring.test_pickup_choice_criteria_object_key_index_and_n_frozen",
    "name": "mutation_sort_or_drop_choice_member",
-   "reason": "named killer test_pickup_choice_criteria_object_key_index_and_n_frozen not implemented",
-   "status": "not-performed"
+   "status": "killed"
   },
   {
    "killer": null,

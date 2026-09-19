@@ -403,6 +403,19 @@ class DirectiveSchemaV2(unittest.TestCase):
         book.activate(v2, 2, "1")
         self.assertEqual(book.events[-1]["directive"]["schema_version"], 2)
 
+    def test_served_generation_does_not_reassert_destination(self):
+        # a served/failed generation expires and is not reasserted each tick
+        book = DSEV.DirectiveBook()
+        dset, _ = DSEV.validate_directive_set(
+            {"schema_version": 2, "goals": ["collect_items"], "target": [5, 5],
+             "ttl": 5})
+        book.activate(dset, 1, "1", instance=1)
+        self.assertTrue(book.has_active)
+        book.expire("served")
+        self.assertFalse(book.has_active)
+        st = DSEV.PreconditionState()
+        self.assertFalse(book.view(2, "1", st, instance=1).active)
+
     def test_v2_target_legality_matrix(self):
         cases = [
             (["collect_items"], [5, 5], True),

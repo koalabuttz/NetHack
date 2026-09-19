@@ -139,24 +139,54 @@ MUTATIONS = (
         "killer": ("test_auto_pickup.PickupEvidenceAndIntent."
                    "test_food_appearance_alone_never_asserts_safe_food"),
     },
+    {
+        "name": "mutation_apply_antibacktrack_to_committed_target",
+        "file": "tools/agent/policy.py",
+        "old": ("        if step is not None:\n"
+                "            payload = self._dest_payload(\"continue\", held)"),
+        "new": ("        if step is not None and not self._is_reverse(\n"
+                "                step, hero, self.recovery.previous_distinct):\n"
+                "            payload = self._dest_payload(\"continue\", held)"),
+        "killer": ("test_auto_commitment.CommittedBehaviour."
+                   "test_committed_reverse_survives_same_family_margin"),
+    },
+    {
+        "name": "mutation_reactivate_failed_directive_each_tick",
+        "file": "tools/agent/directives.py",
+        "old": ("    def expire(self, reason: str, tick: Optional[int] = None,\n"
+                "               level: Optional[str] = None) -> None:\n"
+                "        if self._active is not None:"),
+        "new": ("    def expire(self, reason: str, tick: Optional[int] = None,\n"
+                "               level: Optional[str] = None) -> None:\n"
+                "        if False and self._active is not None:"),
+        "killer": ("test_auto_providers.DirectiveSchemaV2."
+                   "test_served_generation_does_not_reassert_destination"),
+    },
+    {
+        "name": "mutation_route_from_raw_grid_under_item",
+        "file": "tools/agent/policy.py",
+        "old": ("        if persistent is not None and hasattr(persistent, "
+                "\"ter\"):\n            return persistent"),
+        "new": ("        if False and persistent is not None "
+                "and hasattr(persistent, \"ter\"):\n            return persistent"),
+        "killer": ("test_auto_commitment.CommittedBehaviour."
+                   "test_item_overlay_uses_persistent_known_ground"),
+    },
+    {
+        "name": "mutation_sort_or_drop_choice_member",
+        "file": "tools/agent/policy.py",
+        "old": ("        if alt is None:\n            return base\n"
+                "        return tuple(base) + (alt,)"),
+        "new": ("        if alt is None:\n            return base\n"
+                "        return tuple(base)"),
+        "killer": ("test_auto_pickup.PickupPolicyWiring."
+                   "test_pickup_choice_criteria_object_key_index_and_n_frozen"),
+    },
 )
 
 #: The plan's remaining named mutations, whose killer tests are not yet
 #: implemented in this checkout.  Recorded honestly as not-performed.
 NOT_PERFORMED = (
-    {"name": "mutation_apply_antibacktrack_to_committed_target",
-     "reason": "named killer test_committed_reverse_survives_same_family_"
-               "margin not implemented"},
-    {"name": "mutation_reactivate_failed_directive_each_tick",
-     "reason": "named killer tests test_served_generation_does_not_reassert_"
-               "destination / test_identical_new_generation_does_not_reset_"
-               "failure_budget not implemented"},
-    {"name": "mutation_route_from_raw_grid_under_item",
-     "reason": "named killer test_item_overlay_uses_persistent_known_ground "
-               "not implemented"},
-    {"name": "mutation_sort_or_drop_choice_member",
-     "reason": "named killer test_pickup_choice_criteria_object_key_index_and_"
-               "n_frozen not implemented"},
     {"name": "mutation_rerender_historical_strategy_turn",
      "reason": "named killer test_strategy_historical_bytes_not_rerendered_"
                "after_commitment_change not implemented"},
