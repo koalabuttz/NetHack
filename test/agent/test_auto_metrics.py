@@ -299,5 +299,25 @@ class ValidationReport(unittest.TestCase):
         self.assertIn("note", report["live_claims"])
 
 
+class PresentationV3Metadata(unittest.TestCase):
+    """AC13: the `/3` presentation version is metadata only."""
+
+    def test_presentation_v3_recorded_only_in_allowlisted_metadata(self):
+        from tools.agent import presentation, providers
+        self.assertEqual(presentation.PRESENTATION_VERSION, "jev-presentation/3")
+        self.assertEqual(providers.JEV_PRESENTATION_VERSION,
+                         presentation.PRESENTATION_VERSION)
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "fixtures", "jev_golden_request.json")
+        with open(path) as fh:
+            golden = json.load(fh)
+        self.assertEqual(golden["capture"]["presentation_version"],
+                         "jev-presentation/3")
+        self.assertIs(golden["capture"]["dirty"], False)
+        # the version is allowlisted metadata, never a wire field
+        self.assertNotIn("jev-presentation/3",
+                         json.dumps(golden["request_body"]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

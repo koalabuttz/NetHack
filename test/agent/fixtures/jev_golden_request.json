@@ -1,10 +1,10 @@
 {
  "capture": {
   "adapter_version": "jev-choice/2",
-  "commit": "e2902f263aa7d9533461a400cf2761dec0ea085f",
+  "commit": "7761274b1d9c3dcb5b926980230e49189aea866c",
   "dirty": false,
   "endpoint_path": "/systemone",
-  "presentation_version": "jev-presentation/2"
+  "presentation_version": "jev-presentation/3"
  },
  "description": "New semantic-wire golden request (AC.2). Deterministic fixture: one command need with three retained candidates (navigate-north / navigate-east / search-in-place). The exact raw serialized request bytes are pinned by sha256.",
  "expected": {
@@ -55,6 +55,7 @@
    }
   },
   "state": {
+   "commitment": null,
    "directives": [],
    "game": "NetHack",
    "hero": [
@@ -100,6 +101,7 @@
     "prompt": ""
    },
    "objective": "Survive, explore safely, and descend when prepared.",
+   "role": null,
    "room": {
     "contents": [],
     "contents_omitted": 0,
@@ -118,7 +120,7 @@
    }
   }
  },
- "request_body_sha256": "6da85477c25b549056f486641e0a42521d3e4c039d91f89ac429a1c37ff80af9",
+ "request_body_sha256": "82a6c84b2d43422f80ad32a9a4319ba1ce8bbab30633980bcbdb8c02aa56e113",
  "response": {
   "answers": {
    "action": {
