@@ -1,6 +1,22 @@
 {
  "commits": [
   {
+   "hash": "fb7987c5c3a7a97fb6fc5eb8ad249061e1d2ab11",
+   "subject": "agent: live/evaluator parity and supersede"
+  },
+  {
+   "hash": "90db062c7792e277525d1b55caa68e5d779969ff",
+   "subject": "agent: regenerate goldens for populated context"
+  },
+  {
+   "hash": "61feec3f86ef2ba5cc5d840bedeff6fa69bb38cb",
+   "subject": "agent: populate role and commitment context"
+  },
+  {
+   "hash": "04cb2263f2ac66e8f36c2a8e073f8cc170401a07",
+   "subject": "agent: extend mutation checks to 10 of 11"
+  },
+  {
    "hash": "7bfa476d6ce8090e6dbc06a9e8e268feb8b71fed",
    "subject": "agent: persistent terrain routing (AC12)"
   },
@@ -15,22 +31,6 @@
   {
    "hash": "7761274b1d9c3dcb5b926980230e49189aea866c",
    "subject": "agent: fix golden capture helper"
-  },
-  {
-   "hash": "90435687c57c07107b961c747e27851005d156a3",
-   "subject": "agent: golden request capture helper"
-  },
-  {
-   "hash": "ae4f008289510dd9cf2ebdfee8d78672df8ac219",
-   "subject": "agent: presentation /3 commitment context"
-  },
-  {
-   "hash": "20f37548c4f2e65127eb6b9c222a7dbf5dae34c6",
-   "subject": "agent: wire pickup intent into policy"
-  },
-  {
-   "hash": "a752ff1306c89b426aecba3f0952f0786dca3469",
-   "subject": "agent: mutation checks and validation report (phase 4)"
   }
  ],
  "gates": {
@@ -112,10 +112,9 @@
    "status": "killed"
   },
   {
-   "killer": null,
+   "killer": "test_auto_providers.StrategyHistoryFrozen.test_strategy_historical_bytes_not_rerendered_after_commitment_change",
    "name": "mutation_rerender_historical_strategy_turn",
-   "reason": "named killer test_strategy_historical_bytes_not_rerendered_after_commitment_change not implemented",
-   "status": "not-performed"
+   "status": "killed"
   }
  ],
  "pickup_shape_disposition": {

@@ -68,14 +68,12 @@ MUTATIONS = (
     {
         "name": "mutation_drop_held_target_each_tick",
         "file": "tools/agent/policy.py",
-        "old": ("        held = self.targets.held()\n"
-                "        if held is not None and self.targets.holds("
-                "self.instance_id, terrain,\n"
-                "                                                   hero):"),
-        "new": ("        held = self.targets.held()\n"
-                "        if False and held is not None "
-                "and self.targets.holds(self.instance_id, terrain,\n"
-                "                                                   hero):"),
+        "old": ("        if held is not None and not superseded \\\n"
+                "                and self.targets.holds(self.instance_id, "
+                "terrain, hero):"),
+        "new": ("        if False and held is not None and not superseded \\\n"
+                "                and self.targets.holds(self.instance_id, "
+                "terrain, hero):"),
         "killer": ("test_auto_commitment.PrepareAndReconcile."
                    "test_destination_survives_alternate_score_and_visit_"
                    "changes"),
@@ -182,15 +180,24 @@ MUTATIONS = (
         "killer": ("test_auto_pickup.PickupPolicyWiring."
                    "test_pickup_choice_criteria_object_key_index_and_n_frozen"),
     },
+    {
+        "name": "mutation_rerender_historical_strategy_turn",
+        "file": "tools/agent/providers.py",
+        "old": ("    messages = _messages_for(retained, user_text)\n"
+                "    fits = _payload_bytes(config, messages) <= ceiling"),
+        "new": ("    messages = _messages_for(\n"
+                "        [StrategyExchange(user=user_text, assistant=\"\")],\n"
+                "        user_text)\n"
+                "    fits = _payload_bytes(config, messages) <= ceiling"),
+        "killer": ("test_auto_providers.StrategyHistoryFrozen."
+                   "test_strategy_historical_bytes_not_rerendered_after_"
+                   "commitment_change"),
+    },
 )
 
-#: The plan's remaining named mutations, whose killer tests are not yet
-#: implemented in this checkout.  Recorded honestly as not-performed.
-NOT_PERFORMED = (
-    {"name": "mutation_rerender_historical_strategy_turn",
-     "reason": "named killer test_strategy_historical_bytes_not_rerendered_"
-               "after_commitment_change not implemented"},
-)
+#: The plan's remaining named mutations whose killer tests are not
+#: implemented in this checkout.  Empty: all eleven are demonstrated.
+NOT_PERFORMED = ()
 
 
 def run_mutation(m):

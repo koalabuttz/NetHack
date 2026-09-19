@@ -444,6 +444,48 @@ class DirectiveSchemaV2(unittest.TestCase):
                 self.assertEqual(dset.to_dict()["schema_version"], 2)
 
 
+class StrategyHistoryFrozen(unittest.TestCase):
+    """AC14: frozen historical strategy turns are never re-rendered."""
+
+    @staticmethod
+    def _rc(message):
+        """(role, content) for a message in either dict or pair form."""
+        if isinstance(message, dict):
+            return message.get("role"), message.get("content")
+        return message[0], message[1]
+
+    def test_strategy_historical_bytes_not_rerendered_after_commitment_change(
+            self):
+        from tools.agent import providers
+        cfg = providers.ProviderConfig(strategy="deepseek",
+                                       deepseek_model="deepseek-chat")
+        conv = providers.StrategyConversation(max_pairs=4)
+
+        def _ctx(tick, msg):
+            return providers.StrategyContext(
+                episode=1, tick=tick, role="Valkyrie", summary={},
+                boundaries=["b2"], map_text="", status_text="HP 12/20  Dlvl:1",
+                recent_messages=[msg], inventory=["a food ration"],
+                history=[], remaining_budget=7, level="1", directives=[])
+
+        p1 = providers.prepare_strategy_request(
+            cfg, _ctx(4, "You see here a food ration."), conversation=conv)
+        conv.install(p1.retained, providers.StrategyExchange(
+            user=p1.user_text, assistant='{"schema_version": 2}'))
+        frozen = tuple(ex.user for ex in conv.snapshot())
+        # a later turn with changed state re-renders only the current tail
+        p2 = providers.prepare_strategy_request(
+            cfg, _ctx(9, "The kitten mews."), conversation=conv)
+        # the committed conversation is untouched, and the historical user
+        # bytes are carried verbatim rather than re-rendered from the new state
+        self.assertEqual(tuple(ex.user for ex in conv.snapshot()), frozen)
+        users = [c for r, c in (self._rc(m) for m in p2.messages)
+                 if r == "user"]
+        self.assertIn(p1.user_text, users)
+        self.assertEqual(users[-1], p2.user_text)
+        self.assertNotEqual(p1.user_text, p2.user_text)
+
+
 class PresentationCommitmentContext(unittest.TestCase):
     """AC13: the /3 state carries the configured role and the commitment."""
 

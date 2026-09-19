@@ -476,6 +476,51 @@ class CommittedBehaviour(unittest.TestCase):
         self.assertEqual(new.purpose, navigation.COMMIT_COLLECT_ITEMS)
         self.assertEqual(new.source, navigation.SRC_DIRECTIVE)
 
+    def test_one_dijkstra_replans_route_not_destination(self):
+        cells = {(x, 10): FLOOR for x in range(1, 8)}
+        mem = nav_test.mem_with(cells, (1, 10))
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_EXPLORE_FRONTIER,
+                                pos=(6, 10), family=navigation.TFAM_FRONTIER)
+        first = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.assertEqual(first.direction, (1, 0))
+        # a discovered change re-plans the route around it...
+        mem.grid[(2, 10)] = WALL
+        mem.grid[(1, 11)] = FLOOR
+        mem.grid[(2, 11)] = FLOOR
+        mem.grid[(3, 11)] = FLOOR
+        second = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        # ... but the committed destination is unchanged
+        self.assertEqual(self.ref.targets.held().pos, (6, 10))
+        self.assertNotEqual(second.direction, first.direction)
+
+    def test_destination_survives_frontier_reclassification_en_route(self):
+        cells = {(x, 10): FLOOR for x in range(1, 7)}
+        mem = nav_test.mem_with(cells, (1, 10))
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_EXPLORE_FRONTIER,
+                                pos=(4, 10), family=navigation.TFAM_FRONTIER)
+        # the waypoint ceases to border unknown space while en route
+        mem.grid[(4, 9)] = WALL
+        mem.grid[(4, 11)] = WALL
+        cand = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        # discovery itself must not cancel the committed progress
+        self.assertEqual(self.ref.targets.held().pos, (4, 10))
+        self.assertEqual(cand.family, "frontier")
+
+    def test_no_targets_reuses_bounded_forced_search_accounting(self):
+        # a lone known floor cell has no reachable target: the fallback is the
+        # bounded ordinary search, and it is not reset by repetition
+        mem = nav_test.mem_with({(1, 10): FLOOR}, (1, 10))
+        cand = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.assertEqual(cand.semantic_label, "search-secret")
+        site = (1, 10)
+        for _ in range(6):
+            self.ref.recovery.note_search_completed(site)
+        again = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        # the exhausted budget is reused: no further ordinary search
+        self.assertNotEqual(again.semantic_label, "search-secret")
+
     def test_item_overlay_uses_persistent_known_ground(self):
         import types
         # the runner-owned persistent terrain classifies the ground beneath an
