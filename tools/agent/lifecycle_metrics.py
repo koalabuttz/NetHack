@@ -82,15 +82,39 @@ class LifecycleRecorder(object):
         self.sink = sink
         self.cap = int(cap)
         self.events: List[Dict[str, Any]] = []
+        # Totals for the emitted cursor: ``recorded`` counts every event ever
+        # recorded, ``emitted`` those already handed to a sink.  A sink that is
+        # active during the episode emits incrementally, so the end-of-episode
+        # drain (:meth:`drain_pending`) has nothing left to re-emit and a
+        # >cap event stream is never truncated in the artifact.
+        self.recorded = 0
+        self.emitted = 0
 
     def record(self, kind: str, outcome: str, **fields: Any) -> None:
         ev = {"schema": SCHEMA_VERSION, "kind": kind, "outcome": outcome}
         ev.update(fields)
         self.events.append(ev)
+        self.recorded += 1
         if len(self.events) > self.cap:
             del self.events[:len(self.events) - self.cap]
         if self.sink is not None:
             self.sink(dict(ev))
+            self.emitted = self.recorded
+
+    def drain_pending(self) -> List[Dict[str, Any]]:
+        """The events not yet handed to a sink, marking them emitted.
+
+        Used by an end-of-episode drain when no incremental sink was active;
+        with an active sink there is nothing pending and `[]` is returned, so
+        the retained window is never replayed into the artifact (no
+        duplicates).
+        """
+        pending = self.recorded - self.emitted
+        if pending <= 0:
+            return []
+        out = [dict(e) for e in self.events[-pending:]]
+        self.emitted = self.recorded
+        return out
 
     def summarize(self) -> Dict[str, Any]:
         return summarize(self.events)

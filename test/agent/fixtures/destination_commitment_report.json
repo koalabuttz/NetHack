@@ -1,9 +1,13 @@
 {
  "commit_range": {
   "base": "56c0c45a0739b29a3173b08b343d5fc786a56712",
-  "head": "fb4ae178479c1b98a3d62f5a85ae5d360da4f722"
+  "head": "26787feea7de47ab4d3843b99e3a5725befbb439"
  },
  "commits": [
+  {
+   "hash": "26787feea7de47ab4d3843b99e3a5725befbb439",
+   "subject": "agent: repair-safe pickup attempt identity"
+  },
   {
    "hash": "fb4ae178479c1b98a3d62f5a85ae5d360da4f722",
    "subject": "agent: regenerate report at final head"
@@ -31,10 +35,6 @@
   {
    "hash": "d0b65d1daa2b00abb9c4b600a263d8d7e7b097c8",
    "subject": "agent: lifecycle metrics and report fields (4)"
-  },
-  {
-   "hash": "52fa81ae83ffe46a440dc0c84ec130bcb6ef3469",
-   "subject": "agent: strategy context subcontent (5)"
   }
  ],
  "gates": {
@@ -195,5 +195,5 @@
   ]
  },
  "schema_version": 1,
- "suite_count": 1023
+ "suite_count": 1024
 }

@@ -188,6 +188,11 @@ class ScriptedReflex(object):
         # accepted decision's send), so a delivery repair that resends the
         # frozen action cannot consume a second attempt (plan 3.3).
         self.pickup_attempt_identity = None
+        # Offer/first-action dedup sets (plan 5): an offer is recorded once per
+        # evidence token at its first real dispatch, and a directive
+        # first-action once per generation.
+        self._pickup_offered = set()
+        self._directive_first_action = set()
         # True when an active collect destination already sits under the hero,
         # so the acquired action is the pickup initiation (plan 1.5/3.3).
         self.on_square_collect = False
@@ -495,6 +500,14 @@ class ScriptedReflex(object):
             "init_inventory": init_sig,
         }
         self.pickup_attempt_identity = identity
+        # The offer is recorded once per evidence token at the first *real
+        # dispatch* -- never during pure candidate preparation, which may
+        # discard or re-prepare the same offer many times (plan 3.3/5).
+        if ev.token not in self._pickup_offered:
+            self._pickup_offered.add(ev.token)
+            self.lifecycle.record(lifecycle_metrics.KIND_PICKUP,
+                                  lifecycle_metrics.PICKUP_OFFERED,
+                                  token=ev.token, purpose=mode)
         self.lifecycle.record(lifecycle_metrics.KIND_PICKUP,
                               lifecycle_metrics.PICKUP_ATTEMPTED,
                               token=ev.token, purpose=mode)
@@ -587,6 +600,13 @@ class ScriptedReflex(object):
                         pos=pos, family=family, source=source,
                         generation=int(generation), tick=tick,
                         phase=navigation.PHASE_INTERACTING)
+                    serial = self.targets.held().serial
+                    self.lifecycle.record(
+                        lifecycle_metrics.KIND_DESTINATION,
+                        lifecycle_metrics.DEST_ACQUIRED, serial=serial,
+                        purpose=purpose, source=source,
+                        generation=int(generation), reason=reason)
+                    self._record_directive_resolved(source, generation, reason)
                     return
                 # the observation that justified acquisition already satisfied
                 # it: record reached instead of installing (plan 1.4)
@@ -610,6 +630,7 @@ class ScriptedReflex(object):
                 else lifecycle_metrics.DEST_ACQUIRED,
                 serial=serial, purpose=purpose, source=source,
                 generation=int(generation), reason=reason)
+            self._record_directive_resolved(source, generation, reason)
             return
         cur = self.targets.held()
         if cur is None or cur.serial != int(expected):
@@ -624,13 +645,22 @@ class ScriptedReflex(object):
             self._note_serviced(mem, pos)
             self.targets.retire("reached")
             if cur.source == navigation.SRC_DIRECTIVE:
-                self._settle_directive("reached", cur.generation, reason)
+                self._settle_directive("reached", cur.generation, reason,
+                                       serial=cur.serial)
             return
         # continue / interact
         self.targets.note_nav_attempt()
         self.lifecycle.record(lifecycle_metrics.KIND_DESTINATION,
                               lifecycle_metrics.DEST_ACTION,
                               serial=cur.serial, purpose=cur.purpose)
+        if cur.source == navigation.SRC_DIRECTIVE \
+                and cur.generation not in self._directive_first_action:
+            # the first reconciled destination action of this generation
+            self._directive_first_action.add(cur.generation)
+            self.lifecycle.record(lifecycle_metrics.KIND_DIRECTIVE,
+                                  lifecycle_metrics.DIR_FIRST_ACTION,
+                                  generation=int(cur.generation),
+                                  serial=cur.serial)
         if hero is not None:
             self.targets.note_progress(tuple(hero), tick)
             # A continuation chosen while a pickup was offered declines that
@@ -656,7 +686,8 @@ class ScriptedReflex(object):
                                     signature=sig)
                 if cur.source == navigation.SRC_DIRECTIVE:
                     self._settle_directive("failed", cur.generation,
-                                           "door-ineffective")
+                                           "door-ineffective",
+                                           serial=cur.serial)
                 return
         if self.targets.stalled():
             held = self.targets.held()
@@ -667,7 +698,7 @@ class ScriptedReflex(object):
                         self._terrain(mem), held.pos))
                 if held.source == navigation.SRC_DIRECTIVE:
                     self._settle_directive("failed", held.generation,
-                                           "stalled")
+                                           "stalled", serial=held.serial)
 
     def _commit_destination_failure(self, payload, tick, mem) -> None:
         """Settle an unresolved explicit destination (plan 1.5).
@@ -682,13 +713,16 @@ class ScriptedReflex(object):
         (_tag, reason, generation) = payload
         held = self.targets.held()
         if held is not None:
+            self._record_directive_resolved(held.source, held.generation,
+                                            reason, resolved=False)
             self.targets.retire(
                 "unreachable" if reason == "unreachable"
                 else "directive-unresolved", pos=held.pos,
                 signature=navigation.local_evidence_signature(
                     self._terrain(mem), held.pos))
             if held.source == navigation.SRC_DIRECTIVE:
-                self._settle_directive("failed", held.generation, reason)
+                self._settle_directive("failed", held.generation, reason,
+                                       serial=held.serial)
         else:
             self._settle_directive("failed", generation, reason)
 
@@ -1178,20 +1212,38 @@ class ScriptedReflex(object):
                           % self.last_unresolved, "dest-unresolved",
                           effect_payload=payload)
 
-    def _settle_directive(self, outcome, generation, reason) -> None:
-        """Queue a directive-owned destination settlement (plan 1.5)."""
+    def _record_directive_resolved(self, source, generation, reason,
+                                   resolved=True) -> None:
+        """Record a directive destination's resolution outcome (plan 5).
+
+        Emitted at the reconcile fold where the resolved destination is
+        committed (or its failure settled) -- the destination's actual
+        resolution boundary; a proposal that is never sent/reconciled is not a
+        resolution.
+        """
+        if source != navigation.SRC_DIRECTIVE:
+            return
+        self.lifecycle.record(
+            lifecycle_metrics.KIND_DIRECTIVE, lifecycle_metrics.DIR_RESOLVED,
+            generation=int(generation), resolved=bool(resolved), reason=reason)
+
+    def _settle_directive(self, outcome, generation, reason, serial=None) -> None:
+        """Queue a directive-owned destination settlement (plan 1.5).
+
+        *serial* is the destination serial captured **before** the caller
+        retired the commitment, so a terminal event always names the
+        destination it terminated.
+        """
         self.directive_settlement = (outcome, int(generation), str(reason))
         self.lifecycle.record(
             lifecycle_metrics.KIND_DIRECTIVE,
             lifecycle_metrics.DIR_TERMINAL, generation=int(generation),
             outcome_detail=outcome, reason=reason)
-        held = self.targets.held()
         self.lifecycle.record(
             lifecycle_metrics.KIND_DESTINATION,
             lifecycle_metrics.DEST_REACHED if outcome == "reached"
             else lifecycle_metrics.DEST_FAILED,
-            serial=(held.serial if held is not None else None),
-            reason=reason)
+            serial=serial, reason=reason)
 
     @staticmethod
     def _dest_payload(op, held, target=None, purpose=None, source=None,
@@ -1282,9 +1334,6 @@ class ScriptedReflex(object):
                    int(self.directives.generation), str(ev.appearance),
                    mem.inventory_signature())
         reason = "pick up the items here (%s)" % mode
-        self.lifecycle.record(lifecycle_metrics.KIND_PICKUP,
-                              lifecycle_metrics.PICKUP_OFFERED,
-                              token=ev.token, purpose=mode)
         return self._cand({"key": KEY.KEY_PICKUP}, "pick-up", "pickup", score,
                           reason, "pickup", effect_payload=payload)
 
@@ -1588,7 +1637,7 @@ class ScriptedReflex(object):
                     self._terrain(mem), held.pos))
             if held.source == navigation.SRC_DIRECTIVE:
                 self._settle_directive("failed", held.generation,
-                                       "locked-door")
+                                       "locked-door", serial=held.serial)
 
     def _fold_pickup_outcome(self, mem) -> None:
         """Classify one reconciled pickup attempt into an outcome (plan 3.3).
@@ -1659,13 +1708,15 @@ class ScriptedReflex(object):
                 self._note_serviced(mem, held.pos)
             else:
                 self.targets.note_serviced(held.pos, ())
+            serial = held.serial
             self.targets.retire("collected")
             self._settle_directive("reached", held.generation,
-                                   "pickup-success")
+                                   "pickup-success", serial=serial)
         else:
+            serial = held.serial
             self.targets.retire("pickup-" + outcome)
             self._settle_directive("failed", held.generation,
-                                   "pickup-" + outcome)
+                                   "pickup-" + outcome, serial=serial)
 
     def begin_instance(self, iid) -> None:
         """Start a fresh level-instance scope (plan 4.1 rule 6).
@@ -1688,6 +1739,8 @@ class ScriptedReflex(object):
         self.pickup_generation = 0
         self.pickup_pending = None
         self.pickup_attempt_identity = None
+        self._pickup_offered = set()
+        self._directive_first_action = set()
         self.directive_settlement = None
         self._cycled = False
         self.stuck = 0

@@ -453,6 +453,40 @@ class LifecycleRecording(unittest.TestCase):
             self.assertEqual(summary["pickup_attempts"], 1)
             self.assertEqual(summary["pickup_outcomes"]["no-items"], 1)
 
+    def test_over_cap_lifecycle_stream_persists_completely(self):
+        # an episode emitting more events than the retained window must still
+        # persist every one of them in the sidecar (incremental sink, no
+        # truncation, no duplicates)
+        import glob
+        from tools.agent import events, lifecycle_metrics, policy, recording
+        from tools.agent.providers import ProviderConfig
+        ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+        total = ref.lifecycle.EVENT_CAP + 100
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = recording.EpisodeRecorder(tmp, 1)
+            ref.lifecycle.sink = lambda ev: rec.record_event(
+                events.lifecycle_event(ev))          # the real sidecar writer
+            for _ in range(total):
+                ref.lifecycle.record(lifecycle_metrics.KIND_DESTINATION,
+                                     lifecycle_metrics.DEST_ACTION, serial=1)
+            # the incremental sink emitted everything: nothing is replayed
+            self.assertEqual(ref.lifecycle.drain_pending(), [])
+            rec.finalize({})
+            paths = glob.glob(os.path.join(tmp, "*.events.jsonl"))
+            self.assertTrue(paths, "no events sidecar was written")
+            with open(paths[0]) as fh:
+                lines = [json.loads(ln) for ln in fh if ln.strip()]
+        persisted = [ln for ln in lines if ln.get("record") == "lifecycle"]
+        # every emitted event survived into the artifact, even past the cap
+        self.assertEqual(len(persisted), total)
+        # the in-memory window is bounded...
+        self.assertEqual(len(ref.lifecycle.events), ref.lifecycle.EVENT_CAP)
+        # ... but the metrics derive from the complete persisted stream
+        summary = lifecycle_metrics.summarize(
+            lifecycle_metrics.load_events(persisted))
+        self.assertTrue(summary["available"])
+        self.assertEqual(summary["destination_switch_rate"], 0.0)
+
     def test_legacy_sidecar_without_lifecycle_events_reads_unavailable(self):
         from tools.agent import lifecycle_metrics
         with tempfile.TemporaryDirectory() as tmp:

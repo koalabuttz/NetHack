@@ -645,6 +645,14 @@ class _EpisodeRunner(object):
         self.req = Request()
         self.mem = EpisodeMemory()
         self.reflex = ScriptedReflex(controller.config)
+        # Incremental lifecycle persistence (plan section 5): each destination/
+        # pickup/directive event is written into the events sidecar as it is
+        # recorded, so a long episode is never truncated to the recorder's
+        # retained window.  A non-scripted reflex (an injected test double)
+        # has no recorder and simply is not wired.
+        _lifecycle = getattr(self.reflex, "lifecycle", None)
+        if _lifecycle is not None:
+            _lifecycle.sink = self._lifecycle_sink
         self.reflex.max_ticks = controller.config.max_ticks
         self.reflex_provider = controller._new_reflex_provider(self.reflex)
         self.strategy_provider = controller._new_strategy_provider()
@@ -1100,6 +1108,10 @@ class _EpisodeRunner(object):
         # suppresses, and a nested sink call returns immediately.
         self._note_recorder_health()
 
+    def _lifecycle_sink(self, ev) -> None:
+        """Incremental lifecycle persistence into the event sidecar (§5)."""
+        self.rec.record_event(lifecycle_event(ev))
+
     def _flush_events(self):
         """Finalise any open lifecycle records and persist directive events.
 
@@ -1114,11 +1126,13 @@ class _EpisodeRunner(object):
         for ev in self.book.events:
             self.rec.record_event(directive_event(ev))
         # The destination/pickup lifecycle stream is persisted additively in
-        # the same event sidecar (plan section 5), so a produced artifact can
-        # feed the lifecycle metrics.
-        for ev in getattr(getattr(self.reflex, "lifecycle", None), "events",
-                          ()):
-            self.rec.record_event(lifecycle_event(ev))
+        # the same event sidecar (plan section 5).  With the incremental sink
+        # active this drains nothing (no duplicates); without one it replays
+        # only the events never emitted.
+        lifecycle = getattr(self.reflex, "lifecycle", None)
+        if lifecycle is not None:
+            for ev in lifecycle.drain_pending():
+                self.rec.record_event(lifecycle_event(ev))
         self._note_recorder_health()
 
     def _emit(self, kind, obj, need_key=None, write_deadline=None):
@@ -2063,7 +2077,33 @@ class _EpisodeRunner(object):
             return
         self.book.activate(dset, self.tick, level,
                            instance=current_instance)
+        self._record_directive_eligible()
         self.boundary_queue.finish(True)
+
+    def _record_directive_eligible(self) -> None:
+        """Record that an explicit-destination directive became eligible (§5).
+
+        Emitted at the command boundary where the advice activates, so the
+        override-execution metric has a real *eligible* input stream rather
+        than test-only occurrences.  Modifier-only advice (no positional goal,
+        no target) is not a destination and is not recorded as eligible.
+        """
+        from . import directives as directives_mod
+        from . import lifecycle_metrics as lm
+        lifecycle = getattr(self.reflex, "lifecycle", None)
+        if lifecycle is None:
+            return
+        dset = self.book.active(self.tick, self.mem.status.dlvl,
+                                self._precondition_state(),
+                                instance=self.instance.current())
+        if dset is None:
+            return
+        goals = tuple(getattr(dset, "goals", ()) or ())
+        if getattr(dset, "target", None) is None and not any(
+                g in directives_mod.POSITIONAL_GOALS for g in goals):
+            return                          # modifier-only advice: no destination
+        lifecycle.record(lm.KIND_DIRECTIVE, lm.DIR_ELIGIBLE,
+                         generation=self.book.generation)
 
     def _remaining_budget(self):
         spendable = self.ledger.strategy_cap - self.ledger.postmortem_reserve

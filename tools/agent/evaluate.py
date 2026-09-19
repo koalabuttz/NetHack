@@ -451,6 +451,10 @@ class ReplayPass(object):
         self.book = DirectiveBook()
 
         self.reflex = ScriptedReflex(config)
+        # Incremental lifecycle persistence (plan section 5), exactly as in the
+        # live controller: each event is appended to the evaluator's event
+        # records as it is recorded.
+        self.reflex.lifecycle.sink = self._lifecycle_sink
         self.reflex.max_ticks = config.max_ticks
         self.provider = self._build_reflex(provider_name)
         self.strategy = self._build_strategy(strategy_name)
@@ -1066,7 +1070,32 @@ class ReplayPass(object):
             self.boundary_queue.finish(False, "stale-instance")
             return
         self.book.activate(dset, self.tick, level, instance=current_instance)
+        self._record_directive_eligible()
         self.boundary_queue.finish(True)
+
+    def _lifecycle_sink(self, ev) -> None:
+        """Incremental lifecycle persistence into the event records (§5)."""
+        self.event_records.append(lifecycle_event(ev))
+
+    def _record_directive_eligible(self) -> None:
+        """Record an explicit-destination directive's eligibility (§5).
+
+        Mirrors the live controller: emitted at the command boundary where the
+        advice activates, and only for destination-bearing advice.
+        """
+        from . import directives as directives_mod
+        from . import lifecycle_metrics as lm
+        dset = self.book.active(self.tick, self.mem.status.dlvl,
+                                self._precondition_state(),
+                                instance=self.instance.current())
+        if dset is None:
+            return
+        goals = tuple(getattr(dset, "goals", ()) or ())
+        if getattr(dset, "target", None) is None and not any(
+                g in directives_mod.POSITIONAL_GOALS for g in goals):
+            return
+        self.reflex.lifecycle.record(lm.KIND_DIRECTIVE, lm.DIR_ELIGIBLE,
+                                     generation=self.book.generation)
 
     # -- decision --------------------------------------------------------
     def _decide_pending(self) -> None:
@@ -1268,9 +1297,9 @@ class ReplayPass(object):
             self.event_records.append(directive_event(ev))
         # The destination/pickup lifecycle stream is persisted additively in
         # the same event sidecar (plan section 5), in the evaluator exactly as
-        # in the live controller.
-        for ev in getattr(getattr(self.reflex, "lifecycle", None), "events",
-                          ()):
+        # in the live controller.  With the incremental sink active this drains
+        # nothing (no duplicates).
+        for ev in self.reflex.lifecycle.drain_pending():
             self.event_records.append(lifecycle_event(ev))
         if self._pending is not None and not self._pending.decided:
             self.need_unanswered += 1
