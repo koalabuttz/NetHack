@@ -73,13 +73,13 @@ def main():
         sent["questions"]["action"]["criteria"].keys())
     golden["instructions"] = sent["questions"]["action"]["instructions"]
     golden["legend"] = sent["state"]["legend"]
-    capture = golden.setdefault("capture", {})
-    capture["presentation_version"] = providers.JEV_PRESENTATION_VERSION
-    capture["adapter_version"] = getattr(providers, "JEV_ADAPTER_VERSION",
-                                         capture.get("adapter_version"))
-    capture["commit"] = commit
-    capture["dirty"] = dirty
-    capture["endpoint_path"] = path
+    capture_meta = golden.setdefault("capture", {})
+    capture_meta["presentation_version"] = providers.JEV_PRESENTATION_VERSION
+    capture_meta["adapter_version"] = getattr(
+        providers, "JEV_ADAPTER_VERSION", capture_meta.get("adapter_version"))
+    capture_meta["commit"] = commit
+    capture_meta["dirty"] = dirty
+    capture_meta["endpoint_path"] = path
     with open(GOLDEN, "w") as fh:
         json.dump(golden, fh, indent=1, sort_keys=True)
     print("wrote %s (commit %s, dirty=%s)" % (GOLDEN, commit[:12], dirty))
