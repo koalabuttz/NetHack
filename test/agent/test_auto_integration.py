@@ -556,6 +556,111 @@ class ForcedSearchBinding(WireHarness):
 
 # ---------------------------------------------------------------- MEDIUM 5
 
+class DirectiveActivationParity(unittest.TestCase):
+    """AC7/AC15: the same canned advice steers the same command in both tiers.
+
+    Live activates pending advice before ``_decide`` builds its view; the
+    evaluator activates before it builds its directive view.  Driving both with
+    the *same* canned v2 set must therefore leave the same post-activation
+    view in force at the command boundary (the shared ordering, plan 2.2).
+    """
+
+    def _live(self):
+        r = _runner()
+        r.book = directives.DirectiveBook()
+        r.boundary_queue = types.SimpleNamespace(
+            events=[],
+            finish=lambda ok, reason=None: r.boundary_queue.events.append(
+                (ok, reason)))
+        r.tick = 5
+        r.instance.begin_playable()
+        r.mem.status.dlvl = "1"
+        return r
+
+    def _replay(self):
+        from tools.agent import evaluate
+        cfg = ProviderConfig(reflex="scripted", strategy="off")
+        rp = evaluate.ReplayPass([], cfg, "scripted", "off")
+        rp.tick = 5
+        rp.mem.status.dlvl = "1"
+        return rp
+
+    def _activate_live(self, r, dset):
+        r._pending_directives = dset
+        r._pending_directives_level = "1"
+        r._pending_directives_instance = None       # instance check skipped
+        r._activate_pending_directives({"kind": "command", "id": 7})
+
+    def _activate_evaluator(self, rp, dset):
+        rp._strategy_pending = dset
+        rp._strategy_level = "1"
+        rp._strategy_instance = None
+        rp._activate_directives({"kind": "command", "id": 7})
+
+    def _assert_same_command_view(self, book, *, target=None, goal=None):
+        view = book.view(6, "1", directives.PreconditionState())
+        self.assertTrue(view.active)
+        if target is not None:
+            self.assertEqual(tuple(view.target), tuple(target))
+        if goal is not None:
+            self.assertTrue(view.wants(goal))
+
+    def test_pending_collect_items_steers_same_command_live_and_evaluator(self):
+        dset, why = directives.validate_directive_set(
+            {"schema_version": 2, "goals": ["collect_items"], "target": [5, 5],
+             "ttl": 50})
+        self.assertEqual(why, "")
+        live = self._live()
+        self._activate_live(live, dset)
+        replay = self._replay()
+        self._activate_evaluator(replay, dset)
+        for book in (live.book, replay.book):
+            self._assert_same_command_view(book, target=(5, 5),
+                                           goal="collect_items")
+
+    def test_pending_flee_to_upstairs_steers_same_command_live_and_evaluator(
+            self):
+        dset, why = directives.validate_directive_set(
+            {"schema_version": 2, "goals": ["flee_to_upstairs"], "ttl": 50})
+        self.assertEqual(why, "")
+        live = self._live()
+        self._activate_live(live, dset)
+        replay = self._replay()
+        self._activate_evaluator(replay, dset)
+        for book in (live.book, replay.book):
+            self._assert_same_command_view(book, goal="flee_to_upstairs")
+
+    def test_modifier_only_legacy_advice_parity_live_and_evaluator(self):
+        dset, why = directives.validate_directive_set(
+            {"schema_version": 1, "goals": ["survive"], "ttl": 50})
+        self.assertEqual(why, "")
+        live = self._live()
+        self._activate_live(live, dset)
+        replay = self._replay()
+        self._activate_evaluator(replay, dset)
+        for book in (live.book, replay.book):
+            self._assert_same_command_view(book, goal="survive")
+
+    def test_evaluator_rejects_source_instance_mismatch_before_activation(
+            self):
+        dset, _ = directives.validate_directive_set(
+            {"schema_version": 2, "goals": ["collect_items"], "target": [5, 5],
+             "ttl": 50})
+        rp = self._replay()
+        rp.instance.begin_playable()                # instance 1
+        rp.mem.begin_instance(2)
+        rp.instance.observe((instances.S_OUTCOME,), True)
+        self.assertEqual(rp.instance.current(), 2)
+        rp._strategy_pending = dset
+        rp._strategy_level = "1"
+        rp._strategy_instance = 1                   # dispatched for instance 1
+        rp._activate_directives({"kind": "command", "id": 7})
+        # zero activation and the stale advice consumed before any effect
+        self.assertFalse(rp.book.has_active)
+        self.assertEqual(rp.book.generation, 0)
+        self.assertIsNone(rp._strategy_pending)
+
+
 class DirectiveSourceInstance(unittest.TestCase):
     """Pending advice is scoped to its source level instance (plan 4.4)."""
 

@@ -459,6 +459,22 @@ class CommittedBehaviour(unittest.TestCase):
         self.assertEqual(chosen.family, "emergency")
         # the destination pipeline is suspended: no replacement is committed
         self.assertEqual(self.ref.targets.held(), old)
+        # the following eligible command resolves the newly active directive
+        # destination and compare-and-applies it
+        mem.status.hp = 20
+        view = DirectiveView(DirectiveSet(
+            schema_version=2, goals=("collect_items",), target=(6, 10)), 1)
+        cand = self.ref.prepare(
+            nav_test.ctx(mem, directives=[view])).table.scripted()
+        self.assertEqual(cand.effect_payload[1], "acquire")
+        self.ref.commit_effect(cand.proposed_effect, cand.semantic_label, 2,
+                               mem, observed_kind="moved",
+                               payload=cand.effect_payload)
+        new = self.ref.targets.held()
+        self.assertIsNotNone(new)
+        self.assertEqual(new.pos, (6, 10))
+        self.assertEqual(new.purpose, navigation.COMMIT_COLLECT_ITEMS)
+        self.assertEqual(new.source, navigation.SRC_DIRECTIVE)
 
     def test_item_overlay_uses_persistent_known_ground(self):
         import types

@@ -792,8 +792,14 @@ class ScriptedReflex(object):
         plan = navigation.plan(terrain, hero, mem.visits, None,
                                self._check_deadline)
         held = self.targets.held()
-        if held is not None and self.targets.holds(self.instance_id, terrain,
-                                                   hero):
+        # A newly activated explicit destination replaces the old one at the
+        # next genuine command decision (plan 1.5); the superseded default
+        # commitment is not routed.
+        superseded = (held is not None
+                      and held.generation != self.directives.generation
+                      and self._directive_bears_destination())
+        if held is not None and not superseded \
+                and self.targets.holds(self.instance_id, terrain, hero):
             routed = self._route_committed(held, terrain, hero, plan)
             if routed is not None:
                 return self._with_pickup((routed,), mem, hero)
@@ -834,6 +840,12 @@ class ScriptedReflex(object):
         targets = plan.targets
         directive_pos = (self.directives.target
                          if self.directives.active else None)
+        directive_purpose = None
+        if directive_pos is not None:
+            if self.directives.wants_collect():
+                directive_purpose = navigation.COMMIT_COLLECT_ITEMS
+            elif self.directives.wants_flee_upstairs():
+                directive_purpose = navigation.COMMIT_FLEE_UPSTAIRS
         if directive_pos is not None:
             pool = [t for t in targets
                     if tuple(t.pos) == tuple(directive_pos)]
@@ -870,7 +882,12 @@ class ScriptedReflex(object):
                                    getattr(context, "rejected", None))
         cands = []
         for target, family, key, score, step, extra in kept:
-            payload = self._dest_payload("acquire", None, target=target)
+            payload = self._dest_payload(
+                "acquire", None, target=target, purpose=directive_purpose,
+                source=(navigation.SRC_DIRECTIVE
+                        if directive_pos is not None
+                        else navigation.SRC_DEFAULT),
+                generation=self.directives.generation)
             cands.append(self._cand(
                 {"key": key}, "navigate", family, score,
                 "%s: %s" % (self._nav_reason(extra), target.reason), "navigate",
@@ -879,7 +896,8 @@ class ScriptedReflex(object):
         return cands
 
     @staticmethod
-    def _dest_payload(op, held, target=None):
+    def _dest_payload(op, held, target=None, purpose=None, source=None,
+                      generation=None):
         """The frozen destination effect payload (plan 1.4).
 
         Binds the operation (``acquire``/``continue``/``arrive``), the level
@@ -895,12 +913,25 @@ class ScriptedReflex(object):
                                             held.serial)
         else:
             iid = 0
-            purpose = navigation._PURPOSE_BY_FAMILY.get(
+            purpose = purpose or navigation._PURPOSE_BY_FAMILY.get(
                 target.family, navigation.COMMIT_EXPLORE_FRONTIER)
             pos, family = tuple(target.pos), target.family
-            source, generation, expected = ("default", 0, -1)
+            source = source or navigation.SRC_DEFAULT
+            generation = 0 if generation is None else int(generation)
+            expected = -1
         return ("dest", op, int(iid), purpose, int(pos[0]), int(pos[1]),
                 family, source, int(generation), int(expected))
+
+    def _directive_bears_destination(self) -> bool:
+        """True when the active advice names or selects a destination (1.5)."""
+        if not self.directives.active:
+            return False
+        if self.directives.target is not None:
+            return True
+        return bool(self.directives.wants_collect()
+                    or self.directives.wants_flee_upstairs()
+                    or self.directives.prefers_stairs()
+                    or self.directives.destination_selecting())
 
     def _with_pickup(self, base, mem, hero):
         """Append the opportunistic pickup alternative at a supported site.
