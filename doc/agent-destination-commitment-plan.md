@@ -1,6 +1,8 @@
-# Destination commitment and situational pickup (Revision 2 — DRAFT, pending plan review)
+# Destination commitment and situational pickup (Revision 3 — DRAFT, pending plan review)
 
 > **Round-1 plan-review provenance.** Review verdict: **REVISE — 5 High, 4 Medium, 2 Low, all addressed** in this revision. Changes: (1) pickup stays command-only with conservative local menu filtering (§1.3, §3.3, AC11); (2) explicit reconciliation state machine (§1.4); (3) honest shop/single-item-autoselect guarantee (§3.3, §3.5, AC11, Risks); (4) evaluator directive-scoping parity (§2.2, Phase 2); (5) full AC→named-test map plus native pickup-shape test infrastructure (§6 Phase 0/3, §7, §8); (6) corrected `directives_applied` semantics (Verified facts, §5); (7) evidence-epoch stability (§3.2); (8) command-only v2 application rule (§1.5, §2.2); (9) replace-not-branch core policy functions (§1.3, Phase 1, Implementation Summary); (10) v2 target-legality matrix (§2.1); (11) contract-migration checklist (§6). Sections not named here are retained verbatim from Revision 1.
+
+> **Round-2 plan-review provenance.** Review verdict: **REVISE — 2 High, 3 Medium, 2 Low, all addressed** in this revision. Changes: (1) one common pending-directive activation ordering — **service/settle strategy → activate eligible pending advice → build the directive view → prepare/select the action**, with emergency-singleton precedence preserved inside policy — adopted for live and evaluator alike, so a newly activated v2 destination affects the same command decision in both (§2.2, Phase 2, AC7, AC15); (2) completed AC→named-test map for the previously untested core clauses of AC2, AC4, AC8, AC11, and AC14 (§7, §8); (3) `explore_frontier`/`search_dead_ends` renamed **destination-selecting goals** and the target-rule sentence corrected so only `collect_items`/`flee_to_upstairs`/`descend_known_stairs` carry or resolve coordinates (§2.1); (4) explicit post-implementation diff-review loop added (§9); (5) concrete native pickup probe infrastructure named and AC17's pass condition restated as the native target passing (§6 Phase 0/3, AC17, AC18, Risks); (6) `AUTOSELECT_SINGLE` residual reframed as one object *entry/stack* at its full quantity (`src/pickup.c:1012-1015,1072-1076`), not one unit (§3.3, §3.5, AC11, Phase 0, Risks); (7) stale `directives_applied` phrasing corrected to applied boundary EIDs, with no directive-set activation counts inferred from that field (§2.2, Risks, Verified facts); (8) contract-migration stair-test entry corrected for default-vs-explicit-stair semantics (§6). Sections not named here are retained verbatim from Revision 2.
 
 Design produced by `architect:architect-destination`. Follow-up to `doc/agent-jev-gate-nav-plan.md` (anti-oscillation/room awareness, live) and `doc/agent-jev-presentation-plan.md`. Operator direction: "Make it destination commitment. Default being frontier/door, but if DeepSeek thinks we 'need to pick up those items' or 'flee to upstairs' then we'll be directed that way. Deciding if something should be picked up should depend on the current situation and build."
 
@@ -38,7 +40,7 @@ Paths and line numbers below refer to the inspected checkout, not the older plan
 - `tools/agent/directives.py:188-223,251-259,292-339`: DirectiveBook owns instance/level/TTL/precondition applicability, increments generation at activation, and supports a pure display peek. TTL equality is still eligible (`age > ttl` expires).
 - `tools/agent/providers.py:805-821`: the static DeepSeek prompt explicitly lists v1 and all nine goals. `:861-897` fixes snapshot order and ends with remaining budget. `:902-951` freezes historical user/assistant pairs.
 - `tools/agent/controller.py:1947-1950,2000-2032`: validated advice becomes pending, then activates if dispatch level/instance still match. Despite the method's command-boundary wording, the current activation gate accepts command, key, and direction needs. New destination intent must not hijack a pending prompt continuation.
-- `tools/agent/controller.py:1056-1057,2030-2032`: `directives_applied` is the number of boundary EIDs settled as applied (`tools/agent/events.py:472-479,505-512`; one DirectiveBook activation can settle several EIDs); it is neither a count of directive-set activations nor of steered reflex decisions. The supplied 16 activations versus 17 calls does not establish frequent validation rejection or expiry. A postmortem call, failure, cancellation, or stale response could account for the difference; no campaign artifacts were inspected to identify which.
+- `tools/agent/controller.py:1056-1057,2030-2032`: `directives_applied` is the number of boundary EIDs settled as applied (`tools/agent/events.py:472-479,505-512`; one DirectiveBook activation can settle several EIDs); it is neither a count of directive-set activations nor of steered reflex decisions. The supplied 17 calls versus 16 applied boundary EIDs does not establish frequent validation rejection or expiry. A postmortem call, failure, cancellation, or stale response could account for the difference; no campaign artifacts were inspected to identify which.
 - `tools/agent/controller.py:2040-2069`: strategy receives configured role, cached inventory, recent messages, map, HP/hunger/XL, active directives, and boundary history. This builder does not explicitly add current condition facts or inventory-age facts to status.
 - **Pickup correction:** inspection of `tools/agent/policy.py` found no `pick-up` or `KEY_PICKUP` candidate generation. Presentation supports the key and generic/exact-bound pickup text (`tools/agent/presentation.py:118,262,556-560`), and the wire key exists (`tools/agent/protocol.py:62`). The earlier claim of a current scripted pickup singleton is not true of this checkout. Pickup is new policy behavior here.
 - `tools/agent/policy.py:429-483`: current menu handling recognizes eating and a limited generic menu set; unrecognized menus cancel. Pickup needs an explicit intent/menu lifecycle.
@@ -137,7 +139,7 @@ No named target strings, executable content, item ids, inventory letters, raw me
 
 Continue accepting schema v1 with exactly the original nine-goal vocabulary and existing semantics. Missing `schema_version` remains legacy v1, avoiding silent reinterpretation of old artifacts. Serialize the actual accepted version in `to_dict`; do not normalize old records to v2. New DeepSeek requests require explicit v2. Reject booleans/floats masquerading as schema versions as well as malformed coordinates, unknown fields/goals, duplicates, and wire-like fields.
 
-For v2, define positional goals as `collect_items`, `flee_to_upstairs`, `explore_frontier`, `search_dead_ends`, and `descend_known_stairs`. Permit at most one positional goal in a set, so the single shared target is unambiguous; survival/food/recovery/inventory modifiers may coexist. Ordered goals still convey strategy priority, but hard emergency handling cannot be demoted. Keep v1 multi-goal validation unchanged for compatibility.
+For v2, define positional goals as `collect_items`, `flee_to_upstairs`, `explore_frontier`, `search_dead_ends`, and `descend_known_stairs`. Among these, `explore_frontier` and `search_dead_ends` are **destination-selecting goals** — they select their destination locally during resolution and are not coordinate-bearing — whereas `collect_items`, `flee_to_upstairs`, and `descend_known_stairs` carry or resolve explicit coordinates. Permit at most one positional goal in a set, so the single shared target is unambiguous; survival/food/recovery/inventory modifiers may coexist. Ordered goals still convey strategy priority, but hard emergency handling cannot be demoted. Keep v1 multi-goal validation unchanged for compatibility.
 
 **V2 target-legality matrix** — one parameterized validator case per row, `test_v2_target_legality_matrix`:
 
@@ -146,12 +148,12 @@ For v2, define positional goals as `collect_items`, `flee_to_upstairs`, `explore
 | v1 (all goals) | unchanged | v1 validation and semantics are untouched. |
 | `collect_items` | required | A non-null target is mandatory; reject a null target. |
 | `flee_to_upstairs` | null or target | Null resolves the nearest reachable observed upstairs deterministically; a supplied target must resolve to known upstairs locally. |
-| `explore_frontier` | null only | A target is not accepted; reject a non-null target. |
-| `search_dead_ends` | null only | A target is not accepted; reject a non-null target. |
+| `explore_frontier` | null only | A destination-selecting goal (selects its destination locally during resolution; not coordinate-bearing); reject a non-null target. |
+| `search_dead_ends` | null only | A destination-selecting goal (selects its destination locally during resolution; not coordinate-bearing); reject a non-null target. |
 | `descend_known_stairs` | optional | Null selects stairs by existing priority; a supplied target must resolve to a known stairs square. |
 | no positional goal | must be null | Reject a non-null target when no positional goal is present. |
 
-At command resolution, reject/defer semantically unsupported targets with a structured reason rather than treating coordinate validation as evidence validation. Collection requires observed item evidence; retreat requires known upstairs; exploration targets require legal known geometry or an observed closed door. If no explicit destination is present, retain current goal modifiers. A new modifier-only set does not churn a default commitment; replacing a directive-owned target with advice that no longer authorizes it releases it.
+At command resolution, reject/defer semantically unsupported targets with a structured reason rather than treating coordinate validation as evidence validation. Collection requires observed item evidence; retreat requires known upstairs; destination-selecting goals resolve locally against legal known geometry or an observed closed door; only `collect_items`/`flee_to_upstairs`/`descend_known_stairs` carry or resolve explicit coordinates. If no explicit destination is present, retain current goal modifiers. A new modifier-only set does not churn a default commitment; replacing a directive-owned target with advice that no longer authorizes it releases it.
 
 ### 2.2 End-to-end path
 
@@ -159,13 +161,15 @@ Update together:
 
 - `directives.py`: version-specific closed validators, exact new goals, immutable view accessors and unchanged DirectiveBook applicability authority.
 - `providers.py`: static v2 schema prompt, destination semantics, role/inventory/need-aware pickup guidance, unknown BUC/safety warnings; ordinary provider validation continues to be the only gateway.
-- `controller.py` and `evaluate.py`: matching frozen contexts; command-only destination resolution after non-command continuations; directive generation and completion/failure lifecycle parity.
+- `controller.py` and `evaluate.py`: matching frozen contexts; command-only destination resolution after non-command continuations; directive generation and completion/failure lifecycle parity; one shared command-boundary activation ordering (service/settle → activate → view → prepare/select).
 - `presentation.py`: new closed goal-summary entries and route-purpose descriptions, no raw explanation-as-instructions.
 - recording/evaluation readers: accept both versions and preserve historical version fields; missing new telemetry means unavailable, not zero.
 
 **Evaluator directive-scoping parity (explicit Phase 2 substep with call sites).** Capture `_strategy_instance` at dispatch; reject a source-instance mismatch before activation; call `book.activate(..., instance=current_instance)`; and pass the same instance to every `book.view`/`peek_view`. Live already scopes this way (`tools/agent/controller.py:1947-1950,2000-2032,2056-2057,2653-2656`); the evaluator currently does not (`tools/agent/evaluate.py:909-925,967-980,988-1018`). This keeps destination lifecycle events and active-view expiry identical between live and replay.
 
-Do not increase strategy call frequency or budgets as part of this feature. The supplied 17 calls/16 activations suggests measurement of **steering** is missing, not that more calls are necessarily needed. Retain existing scheduling and report validated, activated, destination-resolved, first action sent, reached/failed/expired as separate events.
+**Common pending-directive activation ordering (explicit Phase 2 substep, both call sites).** Live and evaluator must apply pending destination advice in the *same* order at a command boundary: **service/settle strategy → activate eligible pending advice at the command boundary → build the directive view → prepare/select the action**, with emergency-singleton precedence preserved inside policy. Today the two disagree. Live calls `_decide()` and builds the reflex/Jev proposal *before* `_activate_pending_directives()` (`tools/agent/controller.py:2633-2654`), and `_decide` builds its context from the pre-activation `book.view` (`tools/agent/controller.py:2771-2818`); the evaluator does the reverse — services strategy, activates pending directives, and *then* builds the view/context and proposes (`tools/agent/evaluate.py:1013-1029`). The consequence is that a newly returned v2 destination can steer the activation-turn action in the evaluator but cannot in live, contradicting AC7 and AC15. Fix live so `_activate_pending_directives()` runs *before* `_decide()`'s context build, so `_decide` sees post-activation views; keep the evaluator's existing order but give it the instance guards and the v2 destination command gate (§1.5 "One application rule"). After this change, a newly activated v2 destination affects the same command decision in live and evaluator alike.
+
+Do not increase strategy call frequency or budgets as part of this feature. The supplied 17 calls / 16 applied boundary EIDs suggests measurement of **steering** is missing, not that more calls are necessarily needed. Do not infer directive-set activation counts from that field anywhere. Retain existing scheduling and report validated, activated, destination-resolved, first action sent, reached/failed/expired as separate events.
 
 ### 2.3 Context and cache invariants
 
@@ -204,7 +208,7 @@ Implement a real `pickup` intent using existing frozen-effect machinery:
 1. At an eligible location, locally construct `KEY_PICKUP` with a frozen location/evidence token and acquisition purpose. A collection directive makes this the terminal singleton after safety checks; opportunistic pickup competes only with committed-route continuation.
 2. Follow only the actual need/prompt. Never send comma as a direction response. Consume/reject stale menu generations as existing candidates do.
 3. Jev is command-only and never chooses menu rows. At a command decision on a supported item site the offered Choice is exactly the `pick-up` action and the committed-route continuation; that command-need choice is consistent with the existing presentation boundary and adds no `menu`-need provider path. The pickup intent then locally filters the resulting menu: it selects a **uniquely authorized exact row** — exact recognized food for urgent hunger, or a single bound row for a targeted `collect_items` — and **cancels** a broad or ambiguous pile rather than model-choosing among row candidates. A directive authorizes the inspection attempt, not indiscriminate acquisition of an entire stack. Repeated bounded single-row acquisitions may collect several useful items.
-4. Preserve uncertainty and decline unsupported yes/no prompts, unknown pickup menus, rows explicitly marked unpaid, or capacity/burden prompts; do not add purchase/theft or burden overrides. Where a command automatically acquires a single item without a menu, record that inherent uncertainty rather than claim preselection prevented it (see §3.5).
+4. Preserve uncertainty and decline unsupported yes/no prompts, unknown pickup menus, rows explicitly marked unpaid, or capacity/burden prompts; do not add purchase/theft or burden overrides. Where a command automatically acquires a single object entry/stack at its full quantity without a menu, record that inherent uncertainty rather than claim preselection prevented it (see §3.5).
 5. Treat an observed success message, relevant inventory change, or fresh no-items evidence as outcomes. Sending comma or losing a glyph beneath the hero is not proof of collection.
 
 **Decision (deferred non-goal):** a Jev menu-choice path — extending presentation and providers to `menu` needs with multi-candidate preparation so Jev could pick among explicit rows — is deliberately **not** implemented here. Jev remains command-only. Any such path would require its own design and operator-approval phase; this plan neither assumes nor enables it.
@@ -225,15 +229,15 @@ Use three independent controls:
 
 Do not permanently mark a looted square unwalkable. Routes may legitimately cross it. What is prohibited is treating stale loot or an already-serviced frontier as a recurring destination, not using necessary transit floor.
 
-### 3.5 Shop and single-item acquisition guarantee
+### 3.5 Shop and single-object-entry acquisition guarantee
 
 The guarantee is deliberately narrow and honest rather than a general fail-closed claim:
 
 - the pickup intent never selects a menu row explicitly marked **unpaid** and never initiates a purchase;
 - later purchase or encumbrance (burden/capacity) prompts are declined;
-- **direct single-item acquisition under `AUTOSELECT_SINGLE` (`src/pickup.c:759-788`) is an acknowledged residual uncertainty.** With the pinned profile (`test/agent/gen_profile.py:427`), a lone item on the hero's square can be auto-selected with no menu, and no public shop/ownership evidence exists before the command is sent. The agent cannot inspect a menu that is never presented, so it cannot guarantee declining an unpaid single item on that path.
+- **direct single-object-entry acquisition under `AUTOSELECT_SINGLE` (`src/pickup.c:759-788`) is an acknowledged residual uncertainty.** With the pinned profile (`test/agent/gen_profile.py:427`), a lone object entry/stack on the hero's square can be auto-selected at its **full quantity** with no menu (`src/pickup.c:1012-1015,1072-1076` sets the selected count to `last->quan`), and no public shop/ownership evidence exists before the command is sent. The agent cannot inspect a menu that is never presented, so it cannot guarantee declining an unpaid object entry/stack on that path.
 
-The residual risk is bounded to a single item per command on a supported site, is recorded as `unknown`/unproven evidence rather than a success claim, and is carried in Risks (§10).
+The residual risk is bounded to a single object entry/stack (at its full quantity) per command on a supported site, is recorded as `unknown`/unproven evidence rather than a success claim, and is carried in Risks (§10).
 
 ## 4. Failure containment and fallback
 
@@ -270,10 +274,10 @@ Do not reinterpret the old `directives_applied` counter (it counts applied bound
 
 ### Phase 0 — Native pickup-shape test infrastructure
 
-Stand up deterministic native pickup scenarios through the existing agent-port test surface **before** any pickup behavior depends on them. Reference the menu mechanics in `win/agent/winagent.c:2463-2525` and the `dopickup` flows in `src/pickup.c:759-788`. Cover at least:
+Build the concrete engine-side probe described here **before** any pickup behavior depends on it. `make -C test/agent check` is engine-free — it runs the Python suites and cannot compile `win/agent/winagent.c` or `src/pickup.c`. Native probes are separate opt-in targets that require built workers (`test/agent/Makefile:117-197`), and the `winagent.c` built-ins cannot drive `dopickup` directly. Add an engine-side pickup probe — a new `AGENT_TEST` pickup case in the worker test surface, or a dedicated native driver target `make -C test/agent native-pickup` — that constructs deterministic wizmode/test levels and drives the real `dopickup`. Reference the menu mechanics in `win/agent/winagent.c:2463-2525` and the `dopickup` flows in `src/pickup.c:759-788`. Cover at least:
 
 - no object present;
-- one object with `AUTOSELECT_SINGLE` auto-selection (no menu);
+- one object entry/stack with `AUTOSELECT_SINGLE` auto-selection (no menu), asserting the **full stack quantity** (`src/pickup.c:1012-1015,1072-1076` sets the selected count to `last->quan`), not one unit;
 - multi-row `PICK_ANY` menu with title, mode, and row set;
 - cancellation;
 - success with the resulting inventory delta;
@@ -281,7 +285,7 @@ Stand up deterministic native pickup scenarios through the existing agent-port t
 - capacity/burden prompt;
 - stale menu generation.
 
-If a shape cannot be produced deterministically for any reason, flag it in Risks and make an operator-gated manual probe mandatory for that shape; row-model tests alone must not claim protocol-shape verification. AC17/AC18 cover this infrastructure itself.
+AC17's pass condition is **the native target passing**, not a Python row-model test. Keep the pure Python row-model tests separate (they check the row model, not protocol shape). If a native shape proves infeasible to produce deterministically, name that shape explicitly as one that may fall to AC18 operator-gated manual validation, flag it in Risks, and make that manual probe mandatory for the shape; row-model tests alone must not claim protocol-shape verification. AC17/AC18 cover this infrastructure itself.
 
 ### Phase 1 — Contract fixtures and navigation foundation
 
@@ -291,17 +295,17 @@ Exit: deterministic commitment, door completion, negative-target suppression, an
 
 ### Phase 2 — Directive v2 and live/replay parity
 
-Implement dual-version validator and prompt schema, semantic target resolver, command-only destination application, generation served/failed guards, TTL/instance invalidation, and upstairs arrival semantics. Update presentation goal summaries and evaluator/recording version handling. Add context evidence inside the existing cache block order. Add the evaluator directive-scoping-parity substep (§2.2): capture `_strategy_instance` at dispatch, reject a source-instance mismatch before activation, and thread the instance through `book.activate`/`book.view`/`peek_view`.
+Implement dual-version validator and prompt schema, semantic target resolver, command-only destination application, generation served/failed guards, TTL/instance invalidation, and upstairs arrival semantics. Update presentation goal summaries and evaluator/recording version handling. Add context evidence inside the existing cache block order. Add the evaluator directive-scoping-parity substep (§2.2): capture `_strategy_instance` at dispatch, reject a source-instance mismatch before activation, and thread the instance through `book.activate`/`book.view`/`peek_view`. Also implement the shared pending-directive activation ordering (§2.2): in live, move `_activate_pending_directives()` ahead of `_decide()`'s context build so `_decide` sees post-activation views (`tools/agent/controller.py:2633-2654,2771-2818`); the evaluator already activates before building its view/context (`tools/agent/evaluate.py:1013-1029`) but must gain the instance guards and the v2 destination command gate. Preserve emergency-singleton precedence inside policy in both.
 
-Exit: old v1 fixtures round-trip; targeted directives replace held destinations; stale/expired advice cannot create effects; live/replay tests agree.
+Exit: old v1 fixtures round-trip; targeted directives replace held destinations; stale/expired advice cannot create effects; a newly activated v2 destination steers the same command decision in live and evaluator; live/replay tests agree.
 
 ### Phase 3 — Pickup intent, contextual choice, and Jev command-only wiring
 
-Implement floor evidence binding, narrow urgent-food fallback, strategy arrival inspection, the command-need pickup-versus-continuation Choice, local exact-row selection with conservative pile cancellation, bounded outcomes, and the narrow shop/single-item guarantee (§3.5). Add Jev role/freshness/commitment context and bump presentation version to `/3` in existing allowlisted metadata only. Jev remains command-only; no `menu`-need provider path is added.
+Implement floor evidence binding, narrow urgent-food fallback, strategy arrival inspection, the command-need pickup-versus-continuation Choice, local exact-row selection with conservative pile cancellation, bounded outcomes, and the narrow shop/single-object-entry guarantee (§3.5). Add Jev role/freshness/commitment context and bump presentation version to `/3` in existing allowlisted metadata only. Jev remains command-only; no `menu`-need provider path is added.
 
-Run the Phase 0 native pickup-shape scenarios against this behavior. If any shape is not deterministically producible, the operator-gated manual probe for that shape becomes mandatory and row-model tests must not claim protocol-shape verification.
+Run the Phase 0 native pickup-shape scenarios (`make -C test/agent native-pickup` or the equivalent `AGENT_TEST` pickup case) against this behavior; AC17 passes only when the native target itself passes. If a shape is not deterministically producible, the operator-gated manual probe for that shape becomes mandatory (AC18) and row-model tests must not claim protocol-shape verification.
 
-Exit: no menu blind-confirm, no glyph-to-safety inference, no repeated stale pickup loops, no Jev menu-row choice path, and retained Choice identity/order invariants hold; native pickup-shape scenarios (or the mandatory manual probe) are recorded.
+Exit: no menu blind-confirm, no glyph-to-safety inference, no repeated stale pickup loops, no Jev menu-row choice path, and retained Choice identity/order invariants hold; the native pickup target passes (AC17) or the mandatory operator-gated manual probe is recorded for any explicitly named infeasible shape (AC18).
 
 ### Phase 4 — Metrics, regression, and controlled validation
 
@@ -313,7 +317,7 @@ Perform deterministic scripted and fake-provider integration episodes, then an o
 
 Name each existing test/fixture whose committed contract changes, with old vs new expectation. Implementers add any further entry discovered during implementation, each with old/new expectation:
 
-- `test/agent/test_auto_navigation.py::test_farther_reachable_stair_is_chosen_when_nearer_is_isolated` (`test_auto_navigation.py:202-214`): **old** asserts the *stair family* winner when a nearer stair is isolated; **new** asserts the committed destination's identity and route — the chosen representative may differ once destination commitment, not per-tick argmax, drives selection.
+- `test/agent/test_auto_navigation.py::test_farther_reachable_stair_is_chosen_when_nearer_is_isolated` (`test_auto_navigation.py:202-214`): **old** asserts that an unreachable nearer stair is excluded and the farther reachable stair wins under stair-first scoring; **new** preserves the unreachable-target exclusion while default destination selection prefers a reachable door/frontier before stair unless explicit stair advice or the descent fallback applies; keep a dedicated reachable-farther-stair test under explicit-stair/fallback semantics rather than as a default-selection expectation.
 - Replay fixtures assuming one candidate per frontier direction (`test/agent/test_auto_replay.py:630-634`): **old** one navigation candidate per frontier direction; **new** a single committed-destination continuation candidate (plus the permitted pickup alternative), with updated expected candidate counts and identity.
 - Presentation version metadata: **old** `jev-presentation/2`; **new** `/3`, recorded only in allowlisted metadata (guarded by `test_presentation_v3_recorded_only_in_allowlisted_metadata`).
 
@@ -331,7 +335,7 @@ AC5. Door commitment persists through approach and completes only on observed te
 
 AC6. Preparing, rendering, rejecting, failing to send, or not selecting a candidate cannot acquire a target, spend a pickup attempt, or commit progress. Reconciliation commits exactly once.
 
-AC7. Valid v2 `collect_items` and `flee_to_upstairs` directives structurally override default commitment at a genuine command boundary. Mandatory continuations and emergency singletons remain higher priority.
+AC7. Valid v2 `collect_items` and `flee_to_upstairs` directives structurally override default commitment at a genuine command boundary, and a newly activated v2 destination affects the same command decision in live and evaluator alike (one shared ordering: service/settle strategy → activate eligible pending advice → build the directive view → prepare/select the action, with emergency-singleton precedence preserved inside policy). Mandatory continuations and emergency singletons remain higher priority.
 
 AC8. Directive eligibility remains instance/level/TTL/precondition governed. Served or failed generations do not reassert each tick; repeats cannot reset identical failure evidence. Fleeing reaches known upstairs without automatically ascending or exiting.
 
@@ -339,7 +343,7 @@ AC9. v1 recordings/directives retain their accepted shape and semantics; v1 reje
 
 AC10. Pickup judgment has role, hunger/HP/conditions, cached inventory freshness, and displayed evidence available. Glyphs never imply BUC/safe food/upgrades; adjacent ambiguous items do not become reflex detours.
 
-AC11. Pickup initiation, menu/yes-no continuation, no-item/refusal, success, and cancellation are correctly distinguished; attempts are bounded by evidence and instance. Jev is never offered individual pickup-menu rows: at a command decision the Choice is only `pick-up` versus route continuation, and the pickup intent selects a uniquely authorized exact row and cancels broad/ambiguous piles rather than model-choosing. The intent never selects a row explicitly marked unpaid and declines later purchase/encumbrance prompts; direct single-item `AUTOSELECT_SINGLE` acquisition is recorded as an acknowledged residual uncertainty, not a prevented case. Gold fixtures either collect once or continue without recurring destination/pickup loops.
+AC11. Pickup initiation, menu/yes-no continuation, no-item/refusal, success, and cancellation are correctly distinguished; attempts are bounded by evidence and instance. Jev is never offered individual pickup-menu rows: at a command decision the Choice is only `pick-up` versus route continuation, and the pickup intent selects a uniquely authorized exact row and cancels broad/ambiguous piles rather than model-choosing. The intent never selects a row explicitly marked unpaid and declines later purchase/encumbrance prompts; direct single-object-entry/stack `AUTOSELECT_SINGLE` acquisition is recorded as an acknowledged residual uncertainty, not a prevented case. Gold fixtures either collect once or continue without recurring destination/pickup loops.
 
 AC12. Item-overlay paths use persistent known terrain; unknown terrain under a glyph remains unknown. Canonical appearance markers and immediate-destination clauses retain their evidence precedence.
 
@@ -347,13 +351,13 @@ AC13. Choice criteria remain an insertion-ordered object with exactly one key/in
 
 AC14. DeepSeek block order, final budget line, frozen historical bytes, reservation, history settlement, and cancellation invariants remain intact.
 
-AC15. Live/evaluator behavior and lifecycle event definitions agree. Report distinguishes directive activation from steering and pickup attempt from outcome; missing old fields are not manufactured zeros.
+AC15. Live/evaluator behavior and lifecycle event definitions agree, including that a newly activated v2 destination affects the same command decision in live and evaluator alike (§2.2 shared activation ordering). Report distinguishes directive activation from steering and pickup attempt from outcome; missing old fields are not manufactured zeros.
 
 AC16. All existing auto suites pass or have individually justified expectation updates; named new regression and mutation checks pass. Live claims are accompanied by a validation report, not inferred from unit/replay success.
 
-AC17. Native pickup-shape scenarios run deterministically through the agent-port test surface (§6 Phase 0) for all eight listed shapes: no object; single-object `AUTOSELECT_SINGLE`; multi-row `PICK_ANY` (title/mode/rows); cancellation; success with inventory delta; unpaid/shop annotation; capacity/burden prompt; stale menu generation.
+AC17. Native pickup-shape scenarios run deterministically through the engine-side pickup probe (§6 Phase 0 — the new `AGENT_TEST` pickup case or the `make -C test/agent native-pickup` target), and **AC17's pass condition is that native target passing**, not a Python row-model test. It covers all eight listed shapes: no object; single-object-entry `AUTOSELECT_SINGLE` (asserting full stack quantity); multi-row `PICK_ANY` (title/mode/rows); cancellation; success with inventory delta; unpaid/shop annotation; capacity/burden prompt; stale menu generation. Pure Python row-model tests remain separate.
 
-AC18. Where a native shape cannot be produced deterministically, the plan requires a mandatory operator-gated manual probe for that shape and the validation report records which shapes are native versus manual; row-model-only tests must not claim protocol-shape verification.
+AC18. Where a native shape cannot be produced deterministically (the native target proves infeasible), the plan names that shape explicitly and requires a mandatory operator-gated manual probe for it; the validation report records which shapes are native versus manual, and row-model-only tests must not claim protocol-shape verification.
 
 ## 8. Named-test strategy
 
@@ -389,6 +393,9 @@ The following are proposed exact test names, not claims that tests already exist
 - `test_menu_prompt_frames_do_not_reset_attempt_budget`
 - `test_inventory_refresh_does_not_reset_attempt_budget`
 - `test_departure_return_without_new_evidence_keeps_negative`
+- `test_explicit_stair_directive_selects_stair_destination`
+- `test_on_stair_descent_singleton_unaffected_by_commitment`
+- `test_hard_blockage_retires_and_suppresses_destination`
 
 ### Reconciliation (`test_auto_commitment.py`, live + evaluator)
 
@@ -424,6 +431,12 @@ The following are proposed exact test names, not claims that tests already exist
 - `test_evaluator_rejects_same_level_instance_change_before_activation`
 - `test_evaluator_active_view_expires_after_instance_change`
 - `test_destination_lifecycle_events_parity_live_evaluator`
+- `test_pending_collect_items_steers_same_command_live_and_evaluator`
+- `test_pending_flee_to_upstairs_steers_same_command_live_and_evaluator`
+- `test_modifier_only_legacy_advice_parity_live_and_evaluator`
+- `test_level_change_expires_destination`
+- `test_ttl_expiry_releases_destination`
+- `test_precondition_failure_releases_destination`
 
 ### Pickup (`test_auto_pickup.py`)
 
@@ -440,17 +453,23 @@ The following are proposed exact test names, not claims that tests already exist
 - `test_pickup_menu_selects_unique_authorized_row`
 - `test_broad_ambiguous_pile_is_cancelled_not_model_chosen`
 - `test_unpaid_rows_and_capacity_prompts_are_declined`
-- `test_single_item_autoselect_is_acknowledged_uncertainty`
+- `test_single_object_entry_autoselect_is_acknowledged_uncertainty`
 - `test_pickup_attempt_limit_counts_reconciled_initiations_only`
 - `test_no_items_negative_survives_repeated_directive`
 - `test_declined_pickup_not_reoffered_for_unchanged_evidence`
 - `test_new_item_evidence_reopens_bounded_attempts`
 - `test_gold_site_collect_or_decline_never_recreates_pacing_loop`
+- `test_pickup_initiation_recorded_distinct_from_outcome`
+- `test_yes_no_refusal_is_decline_not_failure`
+- `test_no_items_evidence_terminates_target`
+- `test_confirmed_pickup_success_records_inventory_delta`
+- `test_deliberate_cancellation_terminates_site`
 
-### Native pickup-shape infrastructure (`test_auto_pickup.py`, Phase 0)
+### Native pickup-shape infrastructure (engine-side probe, Phase 0)
 
-- `test_native_pickup_shapes_are_deterministic` (parameterized over: no object, single-object `AUTOSELECT_SINGLE`, multi-row `PICK_ANY` title/mode/rows, cancellation, success with inventory delta, unpaid/shop annotation, capacity/burden prompt, stale menu generation)
-- `test_pickup_protocol_shape_requires_native_or_manual_probe`
+- `make -C test/agent native-pickup` (or the equivalent `AGENT_TEST` pickup case) — the native target whose passing is AC17's pass condition: one case per shape, asserting real `dopickup` behavior and full stack quantity for `AUTOSELECT_SINGLE`.
+- `test_pickup_row_model_shapes_are_self_consistent` (pure Python row-model test in `test_auto_pickup.py`; checks the row model only and never claims protocol-shape verification).
+- `test_pickup_protocol_shape_requires_native_or_manual_probe` (guards that shape verification cites the native target or an operator-gated manual probe).
 
 ### Presentation/metrics (existing `test_auto_jev_presentation.py`, `test_auto_metrics.py`, `test_auto_gate_nav_pin.py`)
 
@@ -486,22 +505,22 @@ Each acceptance criterion's named tests; a mutation that regresses an AC must fa
 | AC | Named tests |
 |---|---|
 | AC1 | `test_destination_survives_alternate_score_and_visit_changes`, `test_destination_survives_frontier_reclassification_en_route`, `test_one_dijkstra_replans_route_not_destination` |
-| AC2 | `test_default_commits_door_or_frontier_before_stair`, `test_unvisited_fallback_after_serviced_frontiers`, `test_no_targets_reuses_bounded_forced_search_accounting` |
+| AC2 | `test_default_commits_door_or_frontier_before_stair`, `test_unvisited_fallback_after_serviced_frontiers`, `test_no_targets_reuses_bounded_forced_search_accounting`, `test_explicit_stair_directive_selects_stair_destination`, `test_on_stair_descent_singleton_unaffected_by_commitment` |
 | AC3 | `test_committed_reverse_survives_same_family_margin`, `test_uncommitted_reverse_preserves_strict_40_boundary`, `test_rejected_alternative_cannot_suppress_required_reverse` |
-| AC4 | `test_cycle_invalidates_and_suppresses_same_destination`, `test_long_route_stall_budget_bounds_nonperiodic_loop`, `test_instance_change_clears_commitment_and_negatives` |
+| AC4 | `test_cycle_invalidates_and_suppresses_same_destination`, `test_long_route_stall_budget_bounds_nonperiodic_loop`, `test_instance_change_clears_commitment_and_negatives`, `test_hard_blockage_retires_and_suppresses_destination` |
 | AC5 | `test_door_commitment_survives_approach_and_open_prompt`, `test_locked_door_fails_once_and_next_target_progresses`, `test_ineffective_door_attempts_are_bounded`, `test_door_no_time_outcome_folds_once`, `test_stale_continuation_after_cycle_invalidation_does_not_resurrect` |
 | AC6 | `test_prepare_and_unselected_candidate_do_not_commit_destination`, `test_write_failure_and_local_rejection_do_not_commit_destination`, `test_reconciled_destination_effect_commits_exactly_once`, `test_same_key_different_destination_has_distinct_effect_identity`, `test_one_hop_acquisition_records_reached_without_installation` |
-| AC7 | `test_collect_directive_replaces_default_destination`, `test_flee_resolves_nearest_reachable_known_upstairs`, `test_pending_key_does_not_apply_new_destination`, `test_menu_or_yn_need_does_not_consume_pending_destination`, `test_emergency_singleton_precedes_destination_application` |
-| AC8 | `test_flee_arrival_does_not_ascend_or_exit_dungeon`, `test_directive_expiry_releases_owned_destination`, `test_served_generation_does_not_reassert_destination`, `test_identical_new_generation_does_not_reset_failure_budget`, `test_stale_instance_directive_never_creates_destination_effect`, `test_evaluator_rejects_same_level_instance_change_before_activation`, `test_evaluator_active_view_expires_after_instance_change` |
+| AC7 | `test_collect_directive_replaces_default_destination`, `test_flee_resolves_nearest_reachable_known_upstairs`, `test_pending_key_does_not_apply_new_destination`, `test_menu_or_yn_need_does_not_consume_pending_destination`, `test_emergency_singleton_precedes_destination_application`, `test_pending_collect_items_steers_same_command_live_and_evaluator`, `test_pending_flee_to_upstairs_steers_same_command_live_and_evaluator`, `test_modifier_only_legacy_advice_parity_live_and_evaluator` |
+| AC8 | `test_flee_arrival_does_not_ascend_or_exit_dungeon`, `test_directive_expiry_releases_owned_destination`, `test_served_generation_does_not_reassert_destination`, `test_identical_new_generation_does_not_reset_failure_budget`, `test_stale_instance_directive_never_creates_destination_effect`, `test_evaluator_rejects_same_level_instance_change_before_activation`, `test_evaluator_active_view_expires_after_instance_change`, `test_level_change_expires_destination`, `test_ttl_expiry_releases_destination`, `test_precondition_failure_releases_destination` (TTL equality remains eligible per DirectiveBook semantics) |
 | AC9 | `test_v1_directive_roundtrip_preserves_version_and_defaults`, `test_v1_rejects_v2_destination_goals`, `test_v2_requires_collect_coordinate_and_unambiguous_positional_goal`, `test_v2_rejects_wire_fields_bool_version_and_invalid_coordinates`, `test_v2_target_legality_matrix`, `test_strategy_prompt_v2_and_summary_goal_maps_match_validator` |
 | AC10 | `test_hungry_exact_ration_allows_narrow_pickup_fallback`, `test_food_appearance_alone_never_asserts_safe_food`, `test_role_inventory_and_conditions_reach_pickup_judgment`, `test_adjacent_ambiguous_item_does_not_redirect_default_route`, `test_old_floor_message_cannot_bind_after_movement` |
-| AC11 | `test_pickup_menu_selects_only_bound_authorized_row`, `test_pickup_menu_selects_unique_authorized_row`, `test_broad_ambiguous_pile_is_cancelled_not_model_chosen`, `test_unpaid_rows_and_capacity_prompts_are_declined`, `test_single_item_autoselect_is_acknowledged_uncertainty`, `test_pickup_attempt_limit_counts_reconciled_initiations_only`, `test_no_items_negative_survives_repeated_directive`, `test_declined_pickup_not_reoffered_for_unchanged_evidence`, `test_new_item_evidence_reopens_bounded_attempts`, `test_gold_site_collect_or_decline_never_recreates_pacing_loop`, `test_stationary_frames_do_not_reset_attempt_budget`, `test_menu_prompt_frames_do_not_reset_attempt_budget`, `test_inventory_refresh_does_not_reset_attempt_budget`, `test_departure_return_without_new_evidence_keeps_negative` |
+| AC11 | `test_pickup_menu_selects_only_bound_authorized_row`, `test_pickup_menu_selects_unique_authorized_row`, `test_broad_ambiguous_pile_is_cancelled_not_model_chosen`, `test_unpaid_rows_and_capacity_prompts_are_declined`, `test_single_object_entry_autoselect_is_acknowledged_uncertainty`, `test_pickup_attempt_limit_counts_reconciled_initiations_only`, `test_no_items_negative_survives_repeated_directive`, `test_declined_pickup_not_reoffered_for_unchanged_evidence`, `test_new_item_evidence_reopens_bounded_attempts`, `test_gold_site_collect_or_decline_never_recreates_pacing_loop`, `test_stationary_frames_do_not_reset_attempt_budget`, `test_menu_prompt_frames_do_not_reset_attempt_budget`, `test_inventory_refresh_does_not_reset_attempt_budget`, `test_departure_return_without_new_evidence_keeps_negative`, `test_pickup_initiation_recorded_distinct_from_outcome`, `test_yes_no_refusal_is_decline_not_failure`, `test_no_items_evidence_terminates_target`, `test_confirmed_pickup_success_records_inventory_delta`, `test_deliberate_cancellation_terminates_site` |
 | AC12 | `test_item_overlay_uses_persistent_known_ground`, `test_item_on_unknown_ground_does_not_authorize_route`, `test_room_markers_and_destination_clause_precedence_unchanged` |
 | AC13 | `test_pickup_choice_criteria_object_key_index_and_n_frozen`, `test_destination_and_pickup_presentation_never_mutate_retained_table`, `test_presentation_v3_recorded_only_in_allowlisted_metadata` |
-| AC14 | `test_strategy_render_order_and_final_budget_line_unchanged`, `test_strategy_historical_bytes_not_rerendered_after_commitment_change`, `test_strategy_context_item_coordinates_conditions_and_inventory_age`, `test_legacy_recording_without_commitment_fields_remains_readable` |
-| AC15 | `test_live_replay_destination_and_pickup_effect_parity`, `test_reconciliation_parity_live_and_evaluator`, `test_destination_lifecycle_events_parity_live_evaluator`, `test_activation_and_override_execution_metrics_are_distinct`, `test_pickup_attempt_and_confirmed_outcome_metrics_are_distinct`, `test_legacy_missing_commitment_metrics_report_unavailable` |
+| AC14 | `test_strategy_render_order_and_final_budget_line_unchanged`, `test_strategy_historical_bytes_not_rerendered_after_commitment_change`, `test_strategy_context_item_coordinates_conditions_and_inventory_age`, `test_legacy_recording_without_commitment_fields_remains_readable`, plus the existing `test_auto_providers.py` invariants `test_a_cache_price_never_lowers_a_reservation`, `test_history_reflects_only_successful_settlement`, `test_cancellation_adds_no_history` (destination-context variants added if needed) |
+| AC15 | `test_live_replay_destination_and_pickup_effect_parity`, `test_reconciliation_parity_live_and_evaluator`, `test_destination_lifecycle_events_parity_live_evaluator`, `test_pending_collect_items_steers_same_command_live_and_evaluator`, `test_pending_flee_to_upstairs_steers_same_command_live_and_evaluator`, `test_modifier_only_legacy_advice_parity_live_and_evaluator`, `test_activation_and_override_execution_metrics_are_distinct`, `test_pickup_attempt_and_confirmed_outcome_metrics_are_distinct`, `test_legacy_missing_commitment_metrics_report_unavailable` |
 | AC16 | `test_legacy_recording_without_commitment_fields_remains_readable`, `test_presentation_v3_recorded_only_in_allowlisted_metadata`, the full auto-suite gate, and the §8 mutation checks |
-| AC17 | `test_native_pickup_shapes_are_deterministic` |
+| AC17 | the native target `make -C test/agent native-pickup` (or the equivalent `AGENT_TEST` pickup case) — passing that target is the pass condition; pure Python row-model coverage is `test_pickup_row_model_shapes_are_self_consistent` |
 | AC18 | `test_pickup_protocol_shape_requires_native_or_manual_probe` |
 
 ## 9. Review and documentation strategy
@@ -513,6 +532,8 @@ Review in three passes:
 1. Navigation/lifecycle: deterministic acquisition, distinct door endpoint/approach, serviced-frontier reset rules, legal routes, atomic effect ownership, and recovery budgets.
 2. Trust/contracts: v1/v2 compatibility, stale directives, prompt continuation safety, player-visible evidence, no explanation execution, pickup menu binding, frozen Choice identity, cache invariants.
 3. Operational evidence: full suite results, mutation results, bounded integration fixtures, and operator-approved live report. Compare failures as well as averages; explain expected Jev consultation-rate changes.
+
+**Post-implementation review loop (required).** After all automatable tests and mutation checks pass, dispatch the prescribed reviewer against the actual diff and AC1–AC18; fix or explicitly rebut every finding; rerun the affected tests; and repeat after any Critical/Important finding until none remain or an operator decision is required. This is the same loop prescribed in `doc/agent-jev-gate-nav-plan.md` §10.
 
 Validation report should list commit/config identifiers, suite counts and exact changed tests, named mutation results, provider/network use, matched campaign conditions, commitment terminal reasons, pickup uncertainty, and outstanding descent behavior. Do not install/rebuild the engine for this agent-only change without a separate need; avoid the destructive install path warned about in AGENTS.md.
 
@@ -526,9 +547,9 @@ Validation report should list commit/config identifiers, suite counts and exact 
 - **Pickup is larger than a key binding:** menu/yes-no outcomes, hero overlays, autopickup, shops, stale messages, and capacity must be tested. Conservative cancellation may forgo useful loot; prefer that to indiscriminate acquisition.
 - **Build awareness is model judgment, not a complete optimizer:** role and observed equipment inform advice; no hidden item valuation, BUC inference, or class-specific equip engine.
 - **Retreat means arrival, not ascent:** chosen explicitly to avoid unapproved transitions/dungeon exit. Reaching upstairs does not guarantee survival; emergency handling remains authoritative. Automatic ascent requires separate operator approval/design.
-- **Metric interpretation:** 16 activations/17 calls is not 16 steered ticks. Diagnose real advice usefulness with new lifecycle measures before changing strategy frequency.
-- **Single-item autoselect residual uncertainty:** with the pinned profile (`test/agent/gen_profile.py:427`), a lone item on the hero's square can be acquired through `AUTOSELECT_SINGLE` (`src/pickup.c:759-788`) with no menu and no pre-command public shop/ownership evidence; the agent cannot inspect a menu that is never presented, so it cannot guarantee declining an unpaid single item on that path. The guarantee is narrowed to "never select a row explicitly marked unpaid; decline later purchase/encumbrance prompts" (§3.5), and the residual is recorded as unproven evidence, not a success claim.
-- **Native pickup-shape determinism:** the Phase 0 scenarios are the intended protocol-shape evidence. If a shape cannot be produced deterministically through the agent-port surface, an operator-gated manual probe becomes mandatory for that shape, and row-model tests alone must not claim protocol-shape verification (§6, AC18).
+- **Metric interpretation:** 16 applied boundary EIDs / 17 calls is not 16 steered ticks. The applied-boundary-EID field is not a directive-set activation count; diagnose real advice usefulness with new lifecycle measures before changing strategy frequency.
+- **Single-object-entry autoselect residual uncertainty:** with the pinned profile (`test/agent/gen_profile.py:427`), a lone object entry/stack on the hero's square can be acquired at its full quantity through `AUTOSELECT_SINGLE` (`src/pickup.c:759-788,1012-1015,1072-1076`) with no menu and no pre-command public shop/ownership evidence; the agent cannot inspect a menu that is never presented, so it cannot guarantee declining an unpaid object entry/stack on that path. The guarantee is narrowed to "never select a row explicitly marked unpaid; decline later purchase/encumbrance prompts" (§3.5), and the residual is recorded as unproven evidence, not a success claim.
+- **Native pickup-shape determinism:** the Phase 0 engine-side probe (new `AGENT_TEST` pickup case or `make -C test/agent native-pickup`) is the intended protocol-shape evidence, and AC17's pass condition is that native target passing. If a shape cannot be produced deterministically, name it explicitly, make an operator-gated manual probe mandatory for it, and do not let row-model tests alone claim protocol-shape verification (§6, AC17, AC18).
 - **Rollback:** retain backward readers and separate commits by phase. If live performance regresses, revert policy behavior while retaining schema/recording readers so generated artifacts remain readable. No new runtime feature-flag matrix is required merely for rollout; any temporary comparison flag should be narrowly scoped and documented rather than permanent duplicate policy.
 
 ## Non-goals
