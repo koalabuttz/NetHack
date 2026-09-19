@@ -1,9 +1,13 @@
 {
  "commit_range": {
   "base": "56c0c45a0739b29a3173b08b343d5fc786a56712",
-  "head": "6c85539c264408c234348043cc13a12768e24332"
+  "head": "e801e038d361533c5e82778982214f5148ae8ff2"
  },
  "commits": [
+  {
+   "hash": "e801e038d361533c5e82778982214f5148ae8ff2",
+   "subject": "agent: acquire on-square collect at pickup send"
+  },
   {
    "hash": "6c85539c264408c234348043cc13a12768e24332",
    "subject": "agent: regenerate report at final head"
@@ -31,10 +35,6 @@
   {
    "hash": "f214fd9a75c5d4caff5b61f68fcf77d6fac1b9fb",
    "subject": "agent: persist lifecycle events live and evaluator"
-  },
-  {
-   "hash": "001d02ea2df06f16bfee3bc4dff2ea03972f3c9c",
-   "subject": "agent: metric denominator and report staleness (2b,3)"
   }
  ],
  "gates": {
