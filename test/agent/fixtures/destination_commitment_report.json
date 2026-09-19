@@ -1,9 +1,13 @@
 {
  "commit_range": {
   "base": "56c0c45a0739b29a3173b08b343d5fc786a56712",
-  "head": "1b0a5b1d8cfaeec82f0a054a56cfd8218ff05c08"
+  "head": "5cccee7453db65e03e0a773b6f5dedb1aee5c70c"
  },
  "commits": [
+  {
+   "hash": "5cccee7453db65e03e0a773b6f5dedb1aee5c70c",
+   "subject": "agent: evaluator cancels rejected pickup freeze"
+  },
   {
    "hash": "1b0a5b1d8cfaeec82f0a054a56cfd8218ff05c08",
    "subject": "agent: regenerate report at final head"
@@ -31,10 +35,6 @@
   {
    "hash": "183247ea8c96b9d8e9d28f029ca20bad1bf31568",
    "subject": "agent: persist lifecycle stream to the sidecar"
-  },
-  {
-   "hash": "9a2b6d24a9022a2134b38059ecb1dab6c07527bb",
-   "subject": "agent: regenerate report at final head"
   }
  ],
  "gates": {
