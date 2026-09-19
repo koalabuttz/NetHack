@@ -1186,7 +1186,8 @@ class ReplayPass(object):
                     tuple(getattr(cand, "effect_payload", ())))
                 if cand.proposed_effect == "pickup":
                     # Freeze the pickup attempt at the send boundary (1.5/3.3)
-                    self.reflex.arm_pickup(self._pending_effect[2])
+                    self.reflex.arm_pickup(self._pending_effect[2],
+                                           tick=self.tick)
         elif matched and getattr(cand, "proposed_effect", ""):
             self._pending_effect = (
                 cand.proposed_effect, cand.semantic_label,

@@ -2803,7 +2803,8 @@ class _EpisodeRunner(object):
                 original = (repair.get("ordinal") if repair is not None
                             else ordinal)
                 self.reflex.arm_pickup(self._attempt_payload,
-                                       identity=("pickup", original))
+                                       identity=("pickup", original),
+                                       tick=self.tick)
             self.tick += 1
         else:
             # A non-command send freezes its proposed effect (and any payload)

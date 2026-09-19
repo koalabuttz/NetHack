@@ -1,9 +1,13 @@
 {
  "commit_range": {
   "base": "56c0c45a0739b29a3173b08b343d5fc786a56712",
-  "head": "718138b195571740b33190a3faff70e43abc593c"
+  "head": "6c85539c264408c234348043cc13a12768e24332"
  },
  "commits": [
+  {
+   "hash": "6c85539c264408c234348043cc13a12768e24332",
+   "subject": "agent: regenerate report at final head"
+  },
   {
    "hash": "718138b195571740b33190a3faff70e43abc593c",
    "subject": "agent: incremental lifecycle sidecar and events"
@@ -31,10 +35,6 @@
   {
    "hash": "001d02ea2df06f16bfee3bc4dff2ea03972f3c9c",
    "subject": "agent: metric denominator and report staleness (2b,3)"
-  },
-  {
-   "hash": "d8d819493b6dd8b54b387ef6f8efa8c44bef28ef",
-   "subject": "agent: collect arrival and send-time pickup freeze"
   }
  ],
  "gates": {
@@ -195,5 +195,5 @@
   ]
  },
  "schema_version": 1,
- "suite_count": 1024
+ "suite_count": 1029
 }

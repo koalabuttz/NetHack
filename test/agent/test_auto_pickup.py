@@ -619,5 +619,135 @@ class PickupRowModel(unittest.TestCase):
             "Do you want your possessions identified? [ynq]"))
 
 
+class OnSquareCollectionLifecycle(unittest.TestCase):
+    """Round-4: an on-square collect acquires at its pickup dispatch.
+
+    The first on-square pickup send *atomically* establishes the
+    directive-owned interacting commitment, emits exactly one acquisition, one
+    resolved generation and one first action, and its terminal outcome retires
+    that same serial and settles the directive generation.
+    """
+
+    def setUp(self):
+        self.ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+
+    def _view(self):
+        return DirectiveView(DirectiveSet(
+            schema_version=2, goals=("collect_items",), target=(1, 10)), 1)
+
+    def _mem(self):
+        mem = nav_test.mem_with({(x, 10): FLOOR for x in range(1, 8)}, (1, 10))
+        self.ref.floor.observe_item(self.ref.instance_id, (1, 10),
+                                    "coin appearance")
+        mem.inventory.refresh([{"text": "a dagger"}], 1, 100)  # pre-send base
+        return mem
+
+    def _cand(self, mem, view):
+        cand = self.ref.prepare(
+            nav_test.ctx(mem, directives=[view])).table.scripted()
+        self.assertEqual(cand.semantic_label, "pick-up")
+        return cand
+
+    def _events(self, kind, outcome):
+        return [e for e in self.ref.lifecycle.events
+                if e["kind"] == kind and e["outcome"] == outcome]
+
+    def _arm(self, cand):
+        return self.ref.arm_pickup(cand.effect_payload,
+                                   identity=("pickup", 1), tick=3)
+
+    def _assert_no_reassertion(self, mem, view):
+        # the settled generation is expired at the book, exactly as the
+        # controller does; the next prepare is plain navigation, not a
+        # destfail/search reassertion
+        from tools.agent import directives as DSMOD
+        book = DSMOD.DirectiveBook()
+        dset, _ = DSMOD.validate_directive_set(
+            {"schema_version": 2, "goals": ["collect_items"],
+             "target": [1, 10], "ttl": 50})
+        book.activate(dset, 1, "1")
+        outcome, _gen, reason = self.ref.directive_settlement
+        book.expire("destination-%s: %s" % (outcome, reason), 2, "1")
+        self.assertFalse(book.has_active)
+        cand = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.assertNotEqual(cand.semantic_label, "unresolved-destination")
+
+    def _drive(self, *, message=None, delta=None):
+        mem = self._mem()
+        view = self._view()
+        cand = self._cand(mem, view)
+        self.assertIsNotNone(cand.effect_payload[9])       # the acquire spec
+        self._arm(cand)
+        # the acquisition is installed at the same send boundary
+        self.assertEqual(len(self._events("destination", "acquired")), 1)
+        held = self.ref.targets.held()
+        self.assertIsNotNone(held)
+        self.assertEqual(held.purpose, navigation.COMMIT_COLLECT_ITEMS)
+        self.assertEqual(held.phase, navigation.PHASE_INTERACTING)
+        self.assertEqual(held.source, navigation.SRC_DIRECTIVE)
+        self.assertEqual(len(self._events("directive", "resolved")), 1)
+        serial = held.serial
+        if delta is not None:
+            mem.inventory.refresh(delta, 2, 101)
+        if message:
+            mem.messages.append(message)
+        self.ref.note_observation(mem)
+        return mem, view, serial
+
+    def test_on_square_success_acquires_resolves_and_settles_the_same_serial(
+            self):
+        mem, view, serial = self._drive(
+            delta=[{"text": "a dagger"}, {"text": "some gold pieces"}])
+        self.assertEqual(len(self._events("directive", "first-action")), 1)
+        self.assertEqual(len(self._events("destination", "reached")), 1)
+        self.assertEqual(self._events("destination", "reached")[0]["serial"],
+                         serial)                       # the same serial
+        self.assertEqual(len(self._events("directive", "terminal")), 1)
+        self.assertIsNone(self.ref.targets.held())
+        self.assertEqual(self.ref.directive_settlement[0], "reached")
+        self._assert_no_reassertion(mem, view)
+
+    def test_on_square_no_items_terminates_the_same_serial(self):
+        mem, view, serial = self._drive(
+            message="There is nothing here to pick up.")
+        self.assertEqual(len(self._events("directive", "first-action")), 1)
+        self.assertEqual(len(self._events("destination", "failed")), 1)
+        self.assertEqual(self._events("destination", "failed")[0]["serial"],
+                         serial)
+        self.assertIsNone(self.ref.targets.held())
+        self.assertEqual(self.ref.directive_settlement[0], "failed")
+        self._assert_no_reassertion(mem, view)
+
+    def test_on_square_refusal_terminates_the_same_serial(self):
+        mem, view, serial = self._drive(message="That item is unpaid.")
+        self.assertEqual(len(self._events("destination", "failed")), 1)
+        self.assertEqual(self._events("destination", "failed")[0]["serial"],
+                         serial)
+        self.assertIsNone(self.ref.targets.held())
+        self.assertEqual(self.ref.directive_settlement[0], "failed")
+        self._assert_no_reassertion(mem, view)
+
+    def test_prepare_and_unselected_candidate_install_no_acquisition(self):
+        mem = self._mem()
+        view = self._view()
+        self._cand(mem, view)                       # prepared, never armed
+        self.assertIsNone(self.ref.targets.held())
+        self.assertEqual(self._events("destination", "acquired"), [])
+        self.assertEqual(self._events("directive", "resolved"), [])
+        self.assertIsNone(self.ref.directive_settlement)
+
+    def test_failed_write_and_unselected_pickup_install_no_acquisition(self):
+        # a failed write never reaches arm_pickup; an unselected candidate never
+        # reaches it either, so neither mutates the commitment (plan 1.4/3.3)
+        mem = self._mem()
+        view = self._view()
+        cand = self._cand(mem, view)
+        self.assertIsNotNone(cand.effect_payload[9])
+        # no arm == no send (a write failure or an unselected member)
+        self.assertIsNone(self.ref.targets.held())
+        self.assertEqual(self._events("destination", "acquired"), [])
+        self.assertIsNone(self.ref.directive_settlement)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -456,7 +456,7 @@ class ScriptedReflex(object):
                                              pickup.OUTCOME_REFUSED)
                 self._settle_pickup_target(pickup.OUTCOME_REFUSED, mem)
 
-    def arm_pickup(self, payload, identity=None) -> bool:
+    def arm_pickup(self, payload, identity=None, tick=0) -> bool:
         """Freeze a pickup attempt at the *send* boundary (plan 1.5/3.3).
 
         The evidence identity, purpose, generation and the **pre-send**
@@ -515,7 +515,40 @@ class ScriptedReflex(object):
         self.pickup_purpose = mode
         self.pickup_evidence = ev
         self.pickup_init_inventory = init_sig
+        # An on-square collection's first dispatch atomically acquires its
+        # directive-owned interacting commitment here, at the send boundary.
+        if len(payload) > 9 and payload[9]:
+            self._acquire_on_square(payload[9], pos, tick)
         return True
+
+    def _acquire_on_square(self, spec, pos, tick) -> None:
+        """Acquire the directive-owned interacting commitment for an on-square
+        collection (plan 1.5/3.3).
+
+        Idempotent per (generation, coordinate): emits ``DEST_ACQUIRED`` and
+        ``DIR_RESOLVED`` exactly once for that acquisition, so the eventual
+        pickup outcome settles the same serial rather than leaving the
+        directive active.
+        """
+        purpose, family, source, generation = spec[:4]
+        held = self.targets.held()
+        if (held is not None and held.source == navigation.SRC_DIRECTIVE
+                and held.generation == int(generation)
+                and tuple(held.pos) == tuple(pos)):
+            return                          # already acquired
+        self.targets.commit(instance_id=self.instance_id, purpose=purpose,
+                            pos=tuple(pos), family=family, source=source,
+                            generation=int(generation), tick=int(tick),
+                            phase=navigation.PHASE_INTERACTING)
+        serial = self.targets.held().serial
+        self.lifecycle.record(lifecycle_metrics.KIND_DESTINATION,
+                              lifecycle_metrics.DEST_ACQUIRED, serial=serial,
+                              purpose=purpose, source=source,
+                              generation=int(generation),
+                              reason="on-square collection")
+        self._record_directive_resolved(source, generation,
+                                        "collect the items here",
+                                        resolved=True)
 
     def cancel_pickup(self) -> None:
         """Cancel a pending pickup freeze on a terminal non-repair invalid.
@@ -1329,10 +1362,21 @@ class ScriptedReflex(object):
             mode, score = "urgent", 900
         else:
             mode, score = "opportunistic", -1
+        onsquare = None
+        if self.on_square_collect and mode == "collect":
+            # The first on-square pickup dispatch is *also* the destination
+            # acquisition: the frozen pickup payload carries the acquisition
+            # identity so arm_pickup can install the directive-owned
+            # interacting commitment at the same sent/reconciled boundary
+            # (plan 1.5/3.3), without any mutation during preparation.
+            onsquare = (navigation.COMMIT_COLLECT_ITEMS,
+                        navigation.TFAM_UNVISITED,
+                        navigation.SRC_DIRECTIVE,
+                        int(self.directives.generation))
         payload = ("pickup", mode, int(ev.instance), int(ev.pos[0]),
                    int(ev.pos[1]), int(ev.source_epoch),
                    int(self.directives.generation), str(ev.appearance),
-                   mem.inventory_signature())
+                   mem.inventory_signature(), onsquare)
         reason = "pick up the items here (%s)" % mode
         return self._cand({"key": KEY.KEY_PICKUP}, "pick-up", "pickup", score,
                           reason, "pickup", effect_payload=payload)
@@ -1653,6 +1697,17 @@ class ScriptedReflex(object):
         attempt = self.pickup_pending
         if attempt is None:
             return
+        held = self.targets.held()
+        if (held is not None and held.source == navigation.SRC_DIRECTIVE
+                and held.purpose == navigation.COMMIT_COLLECT_ITEMS
+                and held.generation not in self._directive_first_action):
+            # the reconciled pickup action is this generation's first
+            # destination action (plan 5)
+            self._directive_first_action.add(held.generation)
+            self.lifecycle.record(lifecycle_metrics.KIND_DIRECTIVE,
+                                  lifecycle_metrics.DIR_FIRST_ACTION,
+                                  generation=int(held.generation),
+                                  serial=held.serial)
         ev = attempt.get("evidence")
         init_sig = attempt.get("init_inventory")
         joined = " ".join(t.lower() for t in mem.recent_messages(6))
