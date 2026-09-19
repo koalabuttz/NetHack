@@ -23,6 +23,182 @@ for _p in (_ROOT, _HERE):
         sys.path.insert(0, _p)
 
 import pickup_shapes  # noqa: E402
+from tools.agent import pickup  # noqa: E402
+
+
+class PickupEvidenceAndIntent(unittest.TestCase):
+    """AC10/AC11: the floor evidence ledger, trust rules and menu model."""
+
+    def test_hungry_exact_ration_allows_narrow_pickup_fallback(self):
+        self.assertTrue(pickup.urgent_food_fallback(
+            hungry=True, usable_cached_food=False,
+            exact_ration_name="food ration"))
+        self.assertFalse(pickup.urgent_food_fallback(
+            hungry=False, usable_cached_food=False,
+            exact_ration_name="food ration"))
+        self.assertFalse(pickup.urgent_food_fallback(
+            hungry=True, usable_cached_food=True,
+            exact_ration_name="food ration"))
+        self.assertFalse(pickup.urgent_food_fallback(
+            hungry=True, usable_cached_food=False, exact_ration_name=""))
+
+    def test_food_appearance_alone_never_asserts_safe_food(self):
+        led = pickup.FloorLedger()
+        ev = led.observe_item(1, (5, 5), "food")
+        self.assertTrue(pickup.appearance_authorizes_inspection(ev))
+        self.assertFalse(pickup.appearance_proves_safety(ev))
+        self.assertIn("no safety guarantee",
+                      pickup.RECOGNIZED_FOOD_WORDING.lower())
+
+    def test_hero_overlay_retains_last_seen_evidence_without_claiming_presence(
+            self):
+        led = pickup.FloorLedger()
+        ev = led.observe_item(1, (5, 5), "food")
+        retained = led.retain_on_arrival(1, (5, 5))
+        self.assertTrue(retained.last_seen)
+        # the source epoch is unchanged by the move onto the item
+        self.assertEqual(retained.source_epoch, ev.source_epoch)
+        self.assertEqual(retained.token, ev.token)
+
+    def test_stationary_frames_do_not_reset_attempt_budget(self):
+        led = pickup.FloorLedger()
+        ev = led.observe_item(1, (5, 5), "food")
+        led.note_initiation(ev)
+        again = led.observe_item(1, (5, 5), "food")     # same appearance
+        self.assertEqual(again.source_epoch, ev.source_epoch)
+        self.assertEqual(led.attempts(again), 1)
+
+    def test_inventory_refresh_does_not_reset_attempt_budget(self):
+        led = pickup.FloorLedger()
+        ev = led.observe_item(1, (5, 5), "food")
+        led.note_initiation(ev)
+        led.note_initiation(ev)
+        self.assertFalse(led.budget_available(ev))
+        # an inventory refresh / global map revision is not a floor observation
+        self.assertEqual(led.attempts(ev), pickup.MAX_PICKUP_ATTEMPTS)
+
+    def test_pickup_attempt_limit_counts_reconciled_initiations_only(self):
+        led = pickup.FloorLedger()
+        ev = led.observe_item(1, (5, 5), "food")
+        self.assertTrue(led.budget_available(ev))
+        led.note_initiation(ev)
+        self.assertTrue(led.budget_available(ev))
+        led.note_initiation(ev)
+        self.assertFalse(led.budget_available(ev))
+        self.assertEqual(led.attempts(ev), pickup.MAX_PICKUP_ATTEMPTS)
+
+    def test_new_item_evidence_reopens_bounded_attempts(self):
+        led = pickup.FloorLedger()
+        ev = led.observe_item(1, (5, 5), "food")
+        led.note_initiation(ev)
+        led.note_initiation(ev)
+        self.assertFalse(led.budget_available(ev))
+        fresh = led.observe_item(1, (5, 5), "food ration")   # material change
+        self.assertNotEqual(fresh.source_epoch, ev.source_epoch)
+        self.assertTrue(led.budget_available(fresh))
+
+    def test_declined_pickup_not_reoffered_for_unchanged_evidence(self):
+        led = pickup.FloorLedger()
+        ev = led.observe_item(1, (5, 5), "gold")
+        self.assertFalse(led.declined(ev))
+        led.note_declined(ev)
+        self.assertTrue(led.declined(ev))
+        again = led.observe_item(1, (5, 5), "gold")
+        self.assertTrue(led.declined(again))
+
+    def test_no_items_negative_survives_repeated_directive(self):
+        led = pickup.FloorLedger()
+        led.note_negative(1, (5, 5), pickup.OUTCOME_NO_ITEMS)
+        self.assertEqual(led.negative(1, (5, 5)), pickup.OUTCOME_NO_ITEMS)
+        # a repeated directive does not clear the negative
+        self.assertEqual(led.negative(1, (5, 5)), pickup.OUTCOME_NO_ITEMS)
+
+    def test_current_arrival_message_binds_item_to_location(self):
+        led = pickup.FloorLedger()
+        led.observe_item(1, (5, 5), "food")
+        ev = led.bind_ration_name(1, (5, 5), "food ration", (5, 5))
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev.ration_name, "food ration")
+
+    def test_old_floor_message_cannot_bind_after_movement(self):
+        led = pickup.FloorLedger()
+        led.observe_item(1, (5, 5), "food")
+        # the hero has moved away, so a recent message cannot bind here
+        ev = led.bind_ration_name(1, (5, 5), "food ration", (6, 5))
+        self.assertIsNone(ev)
+
+    def test_pickup_menu_selects_unique_authorized_row(self):
+        rows = pickup.parse_rows([
+            {"r": 1, "text": "a dagger", "selectable": True},
+            {"r": 2, "text": "2 food rations", "selectable": True},
+        ])
+        kind, row, _why = pickup.menu_decision(rows, urgent_food=True)
+        self.assertEqual(kind, "select")
+        self.assertEqual(row.index, 2)
+
+    def test_pickup_menu_selects_only_bound_authorized_row(self):
+        rows = pickup.parse_rows([
+            {"r": 1, "text": "a dagger", "selectable": True},
+            {"r": 2, "text": "some gold pieces", "selectable": True},
+        ])
+        kind, row, _why = pickup.menu_decision(rows, bound_row_index=1)
+        self.assertEqual(kind, "select")
+        self.assertEqual(row.index, 1)
+
+    def test_broad_ambiguous_pile_is_cancelled_not_model_chosen(self):
+        rows = pickup.parse_rows([
+            {"r": 1, "text": "food ration", "selectable": True},
+            {"r": 2, "text": "cram ration", "selectable": True},
+        ])
+        kind, row, why = pickup.menu_decision(rows, urgent_food=True)
+        self.assertEqual(kind, "cancel")
+        self.assertIsNone(row)
+        self.assertIn("ambiguous", why)
+
+    def test_unpaid_rows_and_capacity_prompts_are_declined(self):
+        rows = pickup.parse_rows([
+            {"r": 1, "text": "food ration (unpaid)", "selectable": True},
+        ])
+        kind, row, _why = pickup.menu_decision(rows, urgent_food=True)
+        self.assertEqual(kind, "cancel")
+        self.assertIsNone(row)
+        self.assertTrue(pickup.is_unpaid_row(rows[0]))
+        self.assertTrue(pickup.is_capacity_prompt(
+            "Your backpack is getting hard to carry, continue? [yn]"))
+        self.assertFalse(pickup.is_capacity_prompt("Really quit? [yn]"))
+
+    def test_yes_no_refusal_is_decline_not_failure(self):
+        # a refused acquisition is a decline-class outcome, never a success
+        self.assertNotEqual(pickup.OUTCOME_REFUSED, pickup.OUTCOME_SUCCESS)
+        self.assertTrue(pickup.terminates_target(pickup.OUTCOME_REFUSED))
+        self.assertFalse(pickup.terminates_target(pickup.OUTCOME_UNKNOWN))
+
+    def test_no_items_evidence_terminates_target(self):
+        self.assertTrue(pickup.terminates_target(pickup.OUTCOME_NO_ITEMS))
+
+    def test_deliberate_cancellation_terminates_site(self):
+        self.assertTrue(pickup.terminates_target(pickup.OUTCOME_CANCELED))
+
+    def test_confirmed_pickup_success_records_inventory_delta(self):
+        # success is terminal and distinct from the unproven autoselect path
+        self.assertTrue(pickup.terminates_target(pickup.OUTCOME_SUCCESS))
+        residual = pickup.single_entry_autoselect_uncertainty()
+        self.assertFalse(residual["claimed"])
+        self.assertEqual(residual["evidence"], pickup.OUTCOME_UNKNOWN)
+
+    def test_pickup_initiation_recorded_distinct_from_outcome(self):
+        # initiation counting is separate from the outcome vocabulary
+        led = pickup.FloorLedger()
+        ev = led.observe_item(1, (5, 5), "food")
+        led.note_initiation(ev)
+        self.assertEqual(led.attempts(ev), 1)
+        self.assertIsNone(led.negative(1, (5, 5)))
+
+    def test_single_object_entry_autoselect_is_acknowledged_uncertainty(self):
+        residual = pickup.single_entry_autoselect_uncertainty()
+        self.assertEqual(residual["path"], "autoselect-single")
+        self.assertFalse(residual["menu_observed"])
+        self.assertFalse(residual["claimed"])
 
 
 class PickupShapeVocabulary(unittest.TestCase):
