@@ -102,12 +102,21 @@ def summarize(events: Optional[Iterable[dict]]) -> Dict[str, Any]:
         key = str(e.get("reason") or DEST_EXPIRED)
         reasons[key] = reasons.get(key, 0) + 1
 
-    activated = [e for e in direc if e.get("outcome") == DIR_ELIGIBLE]
+    activated = {e.get("generation") for e in direc
+                 if e.get("outcome") == DIR_ELIGIBLE}
     executed = {e.get("generation") for e in direc
                 if e.get("outcome") == DIR_FIRST_ACTION}
     resolved = {e.get("generation") for e in direc
                 if e.get("outcome") == DIR_RESOLVED}
-    unresolved = sorted(g for g in resolved if g not in executed)
+    # The plan defines override execution over **eligible resolved**
+    # generations: a generation that was eligible but never resolved must not
+    # inflate the denominator, and eligible generations that never executed
+    # (failed resolution or expired before action) are listed separately.
+    eligible_resolved = activated & resolved
+    executed_eligible = executed & eligible_resolved
+    unresolved_or_expired = sorted(activated - executed)
+    override_rate = (len(executed_eligible) / float(len(eligible_resolved))
+                     if eligible_resolved else None)
 
     picked: Dict[str, int] = {}
     for e in pick:
@@ -130,11 +139,10 @@ def summarize(events: Optional[Iterable[dict]]) -> Dict[str, Any]:
         "destination_switch_rate": (len(switches) / float(len(actions))
                                     if actions else None),
         "directive_activations": len(activated) if direc else None,
-        "directive_executions": (len(executed) if direc else None),
-        "directive_override_execution_rate": (
-            len(executed) / float(len(activated)) if activated else None),
+        "directive_executions": len(executed_eligible) if direc else None,
+        "directive_override_execution_rate": override_rate,
         "directive_unresolved_or_expired_before_action": (
-            unresolved if direc else None),
+            unresolved_or_expired if direc else None),
         "target_reach_rate": (len([e for e in terminal
                                    if e.get("outcome") == DEST_REACHED])
                               / float(len(acquired)) if acquired else None),

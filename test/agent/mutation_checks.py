@@ -22,6 +22,7 @@ import json
 import os
 import subprocess
 import sys
+import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -233,6 +234,34 @@ def _git(*args):
         return ""
 
 
+def _suite_count():
+    """The *actual* number of discovered auto tests, never a constant.
+
+    Discovery imports the suites but runs nothing, so the count always tracks
+    the real suite; a discovery failure reports ``None`` ("unavailable") rather
+    than a stale constant.
+    """
+    try:
+        loader = unittest.TestLoader()
+        suite = loader.discover(os.path.join(ROOT, "test", "agent"),
+                                pattern="test_auto*.py")
+        return suite.countTestCases()
+    except Exception:                        # noqa: BLE001
+        return None
+
+
+def _commit_range():
+    """The implementation range: the first phase commit's parent .. HEAD."""
+    head = _git("rev-parse", "HEAD")
+    base = head
+    for line in reversed(_git("log", "--format=%H %s").splitlines()):
+        sha, _, subject = line.partition(" ")
+        if subject.startswith("agent: native pickup-shape probe"):
+            base = _git("rev-parse", "%s^" % sha) or sha
+            break
+    return {"base": base, "head": head}
+
+
 def _lifecycle_summary():
     """The lifecycle metric summary recorded in the validation report.
 
@@ -258,9 +287,8 @@ def build_report(*, gates=None, mutations=None):
         "generated_from": {"repository": "nethack",
                            "scope": "agent destination commitment + pickup"},
         "commits": commits,
-        "commit_range": {"base": commits[-1]["hash"] if commits else "",
-                         "head": _git("rev-parse", "HEAD")},
-        "suite_count": 1009,
+        "commit_range": _commit_range(),
+        "suite_count": _suite_count(),
         "lifecycle_metrics": _lifecycle_summary(),
         "gates": gates if gates is not None else dict(DEFAULT_GATES),
         "named_mutations": mutations,

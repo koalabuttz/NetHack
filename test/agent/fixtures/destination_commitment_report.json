@@ -1,9 +1,13 @@
 {
  "commit_range": {
-  "base": "d3a38006cac05c33468077e751e42a285ed550e8",
-  "head": "d0b65d1daa2b00abb9c4b600a263d8d7e7b097c8"
+  "base": "56c0c45a0739b29a3173b08b343d5fc786a56712",
+  "head": "d8d819493b6dd8b54b387ef6f8efa8c44bef28ef"
  },
  "commits": [
+  {
+   "hash": "d8d819493b6dd8b54b387ef6f8efa8c44bef28ef",
+   "subject": "agent: collect arrival and send-time pickup freeze"
+  },
   {
    "hash": "d0b65d1daa2b00abb9c4b600a263d8d7e7b097c8",
    "subject": "agent: lifecycle metrics and report fields (4)"
@@ -31,10 +35,6 @@
   {
    "hash": "ef67b0f6330f04aca1f1a5b157248328eafdf752",
    "subject": "agent: delivery-repair activation test"
-  },
-  {
-   "hash": "d3a38006cac05c33468077e751e42a285ed550e8",
-   "subject": "agent: AC1/AC2 tests and final mutation"
   }
  ],
  "gates": {
@@ -195,5 +195,5 @@
   ]
  },
  "schema_version": 1,
- "suite_count": 1009
+ "suite_count": 1016
 }

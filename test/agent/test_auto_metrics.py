@@ -311,6 +311,33 @@ class LifecycleMetrics(unittest.TestCase):
         self.assertNotEqual(s["pickup_attempts"],
                             s["pickup_outcomes"][LM.PICKUP_SUCCEEDED])
 
+    def test_override_execution_rate_uses_eligible_resolved_denominator(self):
+        from tools.agent import lifecycle_metrics as LM
+        rec = LM.LifecycleRecorder()
+        # generation 1 is eligible but never resolves
+        rec.record(LM.KIND_DIRECTIVE, LM.DIR_ELIGIBLE, generation=1)
+        # generation 2 is eligible, resolves and executes
+        rec.record(LM.KIND_DIRECTIVE, LM.DIR_ELIGIBLE, generation=2)
+        rec.record(LM.KIND_DIRECTIVE, LM.DIR_RESOLVED, generation=2)
+        rec.record(LM.KIND_DIRECTIVE, LM.DIR_FIRST_ACTION, generation=2)
+        s = rec.summarize()
+        self.assertEqual(s["directive_activations"], 2)
+        # the denominator is the eligible *resolved* set, not all eligible
+        self.assertEqual(s["directive_override_execution_rate"], 1.0)
+        self.assertEqual(s["directive_executions"], 1)
+        # the eligible-never-resolved generation is listed separately
+        self.assertEqual(s["directive_unresolved_or_expired_before_action"],
+                         [1])
+        # an expired-before-action generation is listed too
+        rec.record(LM.KIND_DIRECTIVE, LM.DIR_ELIGIBLE, generation=3)
+        rec.record(LM.KIND_DIRECTIVE, LM.DIR_RESOLVED, generation=3)
+        rec.record(LM.KIND_DIRECTIVE, LM.DIR_TERMINAL, generation=3,
+                   reason="expired")
+        s2 = rec.summarize()
+        self.assertEqual(s2["directive_override_execution_rate"], 0.5)
+        self.assertEqual(s2["directive_unresolved_or_expired_before_action"],
+                         [1, 3])
+
     def test_legacy_missing_commitment_metrics_report_unavailable(self):
         from tools.agent import lifecycle_metrics as LM
         s = LM.summarize([])
