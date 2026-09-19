@@ -1,9 +1,13 @@
 {
  "commit_range": {
   "base": "56c0c45a0739b29a3173b08b343d5fc786a56712",
-  "head": "26787feea7de47ab4d3843b99e3a5725befbb439"
+  "head": "718138b195571740b33190a3faff70e43abc593c"
  },
  "commits": [
+  {
+   "hash": "718138b195571740b33190a3faff70e43abc593c",
+   "subject": "agent: incremental lifecycle sidecar and events"
+  },
   {
    "hash": "26787feea7de47ab4d3843b99e3a5725befbb439",
    "subject": "agent: repair-safe pickup attempt identity"
@@ -31,10 +35,6 @@
   {
    "hash": "d8d819493b6dd8b54b387ef6f8efa8c44bef28ef",
    "subject": "agent: collect arrival and send-time pickup freeze"
-  },
-  {
-   "hash": "d0b65d1daa2b00abb9c4b600a263d8d7e7b097c8",
-   "subject": "agent: lifecycle metrics and report fields (4)"
   }
  ],
  "gates": {
