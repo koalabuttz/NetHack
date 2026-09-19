@@ -763,6 +763,13 @@ class _EpisodeRunner(object):
         # never resurrect an older action the engine already rejected.
         self._applied_token = None
         self._applied_seq = 0
+        # The controller-owned *authoritative* table identity of the accepted
+        # Jev decision, captured at arbitration acceptance alongside the token.
+        # A delivery repair is honoured only while its frozen table id/version
+        # still match this identity, so an ``invalid(incomplete)`` resend can
+        # never resurrect a decision from a superseded table.
+        self._applied_table_id = ""
+        self._applied_table_version = None
         self._last_send_ordinal = None
         self._last_jev_send = None
         self._repair_send = None
@@ -1732,8 +1739,8 @@ class _EpisodeRunner(object):
             # Jev record that still describes the *latest successfully sent
             # answer* is eligible: the sent ordinal must match, so a stale
             # record left over from an earlier, already-rejected decision is
-            # never resendable (the deeper table/rejection-version check lives
-            # in ``_resend_repair``).
+            # never resendable (the deeper table-identity and
+            # rejection-version checks live in ``_resend_repair``).
             record = getattr(self, "_last_jev_send", None)
             if (record is not None
                     and record.get("ordinal") == self._last_send_ordinal):
@@ -2584,17 +2591,23 @@ class _EpisodeRunner(object):
         consulting Jev again, so it carries the original applied-decision
         token (whose charge is idempotent).  The repair is honoured only while
         it still describes the very send it came from -- the need id/key, the
-        sent ordinal and the frozen table/rejection identity must all be
-        unchanged.  On any mismatch the resend fails closed to the scripted
-        action and charges nothing, rather than resurrecting an older action
-        (possibly one the engine already rejected) as if it were the same
-        decision.
+        sent ordinal, and the frozen table/rejection identity must all be
+        unchanged.  The table identity is compared against the controller-owned
+        *authoritative* identity of the accepted decision (captured at
+        arbitration acceptance): both the table id and the table version must
+        match, so a repair whose table was superseded fails closed.  On any
+        mismatch the resend falls closed to the scripted action and charges
+        nothing, rather than resurrecting an older action (possibly one the
+        engine already rejected) as if it were the same decision.
         """
         same_need = (need is not None
                      and need.get("id") == repair.get("need_id")
                      and self.pending_key == repair.get("need_key"))
         same_send = repair.get("ordinal") == self._last_send_ordinal
-        same_table = (repair.get("table_version") is not None
+        same_table = (repair.get("table_id") == self._applied_table_id
+                      and repair.get("table_version") is not None
+                      and repair.get("table_version")
+                      == self._applied_table_version
                       and repair.get("rejection_version")
                       == self._rejection_for(self.pending_key).version)
         if same_need and same_send and same_table:
@@ -2772,6 +2785,8 @@ class _EpisodeRunner(object):
         decision's acceptance.
         """
         self._applied_token = None
+        self._applied_table_id = ""
+        self._applied_table_version = None
         if self.force_fallback:
             self.ledger.reflex_fallback += 1
             return (self._safe_fallback(need), "controller",
@@ -2959,6 +2974,12 @@ class _EpisodeRunner(object):
         # delivery-repair resend so the decision is counted exactly once.
         self._applied_seq += 1
         self._applied_token = (self.result.index, self._applied_seq)
+        # Capture the *authoritative* table identity of this accepted decision
+        # alongside the token.  ``validate_raw_choice`` already proved the raw
+        # choice's id/version equal this exact prepared table's, so the frozen
+        # prepared identity is authoritative for the whole repair lifecycle.
+        self._applied_table_id = prepared.table.table_id
+        self._applied_table_version = prepared.table.table_version
         accepted_reason = ("jev choice: %s" % outcome.reason
                            if outcome.reason else "jev choice")
         return (candidates.candidate_to_wire(outcome.candidate), "jev",

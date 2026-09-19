@@ -1136,6 +1136,43 @@ class JevAppliedCap(WireHarness):
         self.assertEqual(r.ledger.reflex_applied, 1)
         self.assertEqual(r.ledger.reflex_paid_dispatched, 1)
 
+    def test_incomplete_repair_fails_closed_when_table_identity_stale(self):
+        # the frozen repair record is honoured only while its table identity
+        # still matches the controller-owned *authoritative* identity of the
+        # accepted decision: both the recorded table id AND the recorded table
+        # version are compared, not merely stored.  Changing either the
+        # authoritative id or the authoritative version between the send and
+        # the repair makes the record stale, so the resend falls closed to the
+        # scripted action with no token -- the already charged applied count
+        # stays put rather than the frozen Jev action being resurrected.
+        for attr, mutate in (("_applied_table_id", lambda v: v + "-stale"),
+                             ("_applied_table_version", lambda v: v + 1)):
+            fake = _ChoiceJev(usage={"prompt_tokens": 1000})
+            r, rec, _ = self._runner(fake, cap=1)
+            self._answer(r)
+            self.assertEqual(r.ledger.reflex_applied, 1)
+            # the repair record and the authoritative identity agree on send
+            self.assertEqual(r._last_jev_send["table_id"], r._applied_table_id)
+            self.assertEqual(r._last_jev_send["table_version"],
+                             r._applied_table_version)
+            authoritative = getattr(r, attr)
+            self.assertNotIn(authoritative, (None, ""))
+            setattr(r, attr, mutate(authoritative))
+            r._on_invalid({"code": "incomplete"})
+            self.assertIsNotNone(r._repair_send)
+            # the resend helper refuses the mismatched-table record
+            _sel, provider, reason, _lat, _usage, low, token = \
+                r._resend_repair(r.pending_need, r._repair_send)
+            self.assertEqual(provider, "scripted")
+            self.assertIsNone(token)
+            self.assertTrue(low)
+            self.assertIn("stale", reason)
+            self._answer(r)
+            rec.finalize({})
+            self.assertEqual(fake.decides, 1)
+            self.assertEqual(r.ledger.reflex_applied, 1)
+            self.assertEqual(r.ledger.reflex_paid_dispatched, 1)
+
     def test_reflex_rejected_counts_only_defined_answer_rejections(self):
         # one arbitration rejection + one pre-dispatch skip + one timeout +
         # one cap-reached fallback: rejected is 1 (the arbitration rejection),
