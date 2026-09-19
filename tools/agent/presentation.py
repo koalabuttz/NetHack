@@ -1158,7 +1158,8 @@ def _commitment_payload(context) -> Optional[Dict[str, Any]]:
     return {"purpose": _text(dest.get("purpose")),
             "pos": pos_out,
             "phase": _text(dest.get("phase")),
-            "source": _text(dest.get("source"))}
+            "source": _text(dest.get("source")),
+            "generation": _int_or_none(dest.get("generation"))}
 
 
 def render_state(context) -> Dict[str, Any]:

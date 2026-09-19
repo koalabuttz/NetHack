@@ -271,6 +271,11 @@ class ReflexContext(object):
     deadline: float = 0.0
     rejected: Any = None
     prepared: Any = None
+    # The configured role and the active destination commitment (plan §2.3 /
+    # §3.1), rendered into the Jev state as ``role``/``commitment``.  Both are
+    # optional, so a direct caller that supplies neither renders ``null``.
+    role: str = ""
+    destination: Any = None
 
 
 @dataclass

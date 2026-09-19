@@ -2838,8 +2838,28 @@ class _EpisodeRunner(object):
             # so the presentation can describe a pending eat/quit rather than
             # repeating boilerplate.
             intent=getattr(self.reflex, "intent", "") or "",
+            role=self.c.config.role or "",
+            destination=self._destination_record(),
             directives=[view] if view.active else [],
             deadline=reflex_dl or 0.0, rejected=rs)
+
+    def _destination_record(self):
+        """The active destination commitment for the presentation (plan §2.3).
+
+        Returns ``None`` when no destination is held, else the commitment's
+        purpose, semantic target, phase, source and originating directive
+        generation -- untrusted game-state data for the model to reason about,
+        never an instruction.
+        """
+        store = getattr(self.reflex, "targets", None)
+        commitment = store.held() if store is not None else None
+        if commitment is None:
+            return None
+        return {"purpose": commitment.purpose,
+                "pos": [int(commitment.pos[0]), int(commitment.pos[1])],
+                "phase": commitment.phase,
+                "source": commitment.source,
+                "generation": int(commitment.generation)}
 
     def _decide_scripted(self, ctx, reflex_dl, t0):
         """The always-available tier, bounded by the reflex deadline.

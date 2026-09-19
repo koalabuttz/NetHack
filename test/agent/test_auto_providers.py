@@ -444,6 +444,49 @@ class DirectiveSchemaV2(unittest.TestCase):
                 self.assertEqual(dset.to_dict()["schema_version"], 2)
 
 
+class PresentationCommitmentContext(unittest.TestCase):
+    """AC13: the /3 state carries the configured role and the commitment."""
+
+    def test_render_state_carries_role_and_commitment(self):
+        from tools.agent import presentation
+        ctx = wire_ctx()
+        state = presentation.render_state(ctx)
+        self.assertEqual(state["role"], "Valkyrie")
+        self.assertIsNotNone(state["commitment"])
+        self.assertEqual(state["commitment"]["purpose"], "explore-frontier")
+        self.assertEqual(state["commitment"]["pos"], [6, 5])
+        self.assertEqual(state["commitment"]["phase"], "travelling")
+        self.assertEqual(state["commitment"]["source"], "default")
+        self.assertEqual(state["commitment"]["generation"], 0)
+        # with no held destination the commitment is null, never manufactured
+        ctx.destination = None
+        self.assertIsNone(presentation.render_state(ctx)["commitment"])
+
+    def test_destination_record_reflects_the_held_commitment(self):
+        # the controller's record mirrors the reflex commitment exactly
+        import types
+        from tools.agent import navigation
+        owner = None
+        for name in dir(controller):
+            obj = getattr(controller, name)
+            if isinstance(obj, type) and hasattr(obj, "_destination_record"):
+                owner = obj
+                break
+        self.assertIsNotNone(owner, "no controller class exposes the record")
+        store = navigation.CommitmentStore()
+        store.commit(instance_id=1, purpose=navigation.COMMIT_COLLECT_ITEMS,
+                     pos=(12, 4), family=navigation.TFAM_FRONTIER,
+                     source=navigation.SRC_DIRECTIVE, generation=7)
+        rec = owner._destination_record(
+            types.SimpleNamespace(reflex=types.SimpleNamespace(targets=store)))
+        self.assertEqual(rec, {"purpose": "collect-items", "pos": [12, 4],
+                               "phase": "travelling", "source": "directive",
+                               "generation": 7})
+        empty = types.SimpleNamespace(
+            reflex=types.SimpleNamespace(targets=navigation.CommitmentStore()))
+        self.assertIsNone(owner._destination_record(empty))
+
+
 class StrategyPromptSchemaV2(unittest.TestCase):
     def test_strategy_prompt_v2_and_summary_goal_maps_match_validator(self):
         from tools.agent import presentation, providers
@@ -1762,7 +1805,11 @@ def wire_ctx(need=None, tick=3):
     ctx = ReflexContext(
         episode=1, tick=tick, need=need,
         need_key=protocol.NeedKey(1, 1, need.get("id")), snapshot=snap,
-        pages=[], memory=mem, terrain=terrain, deadline=0.0)
+        pages=[], memory=mem, terrain=terrain, deadline=0.0,
+        role="Valkyrie",
+        destination={"purpose": "explore-frontier", "pos": [6, 5],
+                     "phase": "travelling", "source": "default",
+                     "generation": 0})
     cands = [
         candidates.make_candidate({"key": 107}, "navigate", "frontier",
                                   (0, -1), 0, 500, [("b", 500)],
