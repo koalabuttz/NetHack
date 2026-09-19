@@ -43,14 +43,20 @@ approved vocabulary.
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from . import protocol, state
-from .instances import (T_CLOSED_DOOR, T_CORRIDOR, T_DOORWAY, T_FLOOR,
-                        T_OPEN_DOOR, T_STAIRS_DOWN, T_STAIRS_UP)
+from . import instances, protocol, state
+from .instances import (T_ALTAR, T_BOULDER, T_CLOSED_DOOR, T_CORRIDOR,
+                        T_DOORWAY, T_FLOOR, T_FOUNTAIN, T_LAVA, T_OPEN_DOOR,
+                        T_STAIRS_DOWN, T_STAIRS_UP, T_TRAP, T_TREE, T_UNKNOWN,
+                        T_WATER)
 
 #: Bumped whenever the rendered keys, criteria or state payload change meaning,
 #: so an artifact can name the presentation that produced it.  Recorded in
 #: allowlisted metadata only -- never as a wire field.
-PRESENTATION_VERSION = "jev-presentation/1"
+#:
+#: ``/2`` adds the room-awareness enrichment (plan §5): original item/creature/
+#: unclassified foreground markers, a corrected fixed legend and the ``room``
+#: state field with its destination-appearance clause.
+PRESENTATION_VERSION = "jev-presentation/2"
 
 # -- refusal codes ---------------------------------------------------------
 
@@ -462,7 +468,10 @@ def _walk_text(candidate, compass: str, context) -> Tuple[str, str]:
     Only a *confirmed* ``T_CLOSED_DOOR`` adjacent cell takes the blocking-door
     branch: a remembered doorway or open door is not a closed door and never
     acquires a "closed / may block movement" claim.  Those use their approved
-    remembered-terrain phrases instead.
+    remembered-terrain phrases instead.  When a current known terrain class at
+    the destination contradicts the remembered class, the stale remembered
+    phrase (floor *or* door) is omitted rather than presented as fact, and the
+    current-class clause carries the displacement instead.
     """
     purpose = purpose_of(candidate.reason)
     hero = _hero(context)
@@ -471,14 +480,16 @@ def _walk_text(candidate, compass: str, context) -> Tuple[str, str]:
     step = DIR_BY_NAME[compass]
     dest = (hero[0] + step[0], hero[1] + step[1])
     klass = terrain_class(context, dest)
-    occupant = OCCUPANT_CLAUSE if currently_occupied(context, dest, hero) \
-        else ""
-    if klass == T_CLOSED_DOOR:
-        return (_join(DOOR_TOWARD_TEMPLATE % compass, occupant, purpose), "")
-    phrase = TERRAIN_PHRASES.get(klass) if klass is not None else None
+    clause = destination_appearance_clause(candidate, "command", context)
+    current = _current_terrain_at(context, dest)
+    stale = (current is not None and klass is not None and current != klass)
+    if klass == T_CLOSED_DOOR and not stale:
+        return (_join(DOOR_TOWARD_TEMPLATE % compass, clause, purpose), "")
+    phrase = (TERRAIN_PHRASES.get(klass)
+              if (klass is not None and not stale) else None)
     if phrase is None:
-        return (_join("Walk %s." % compass, occupant, purpose), "")
-    return (_join("Walk %s onto %s." % (compass, phrase), occupant, purpose),
+        return (_join("Walk %s." % compass, clause, purpose), "")
+    return (_join("Walk %s onto %s." % (compass, phrase), clause, purpose),
             "")
 
 
@@ -553,6 +564,8 @@ def _command_text(candidate, stem: str, context) -> Tuple[str, str]:
         compass = movement_of(candidate)
         if compass is not None:
             return (_join("Move %s as a recovery step." % compass,
+                          destination_appearance_clause(candidate, "command",
+                                                        context),
                           LOOP_BREAKER_CLAUSE if loop_breaker else ""), "")
         return (_join(SEARCH_TEMPLATE,
                       LOOP_BREAKER_CLAUSE if loop_breaker else ""), "")
@@ -560,12 +573,16 @@ def _command_text(candidate, stem: str, context) -> Tuple[str, str]:
         compass = movement_of(candidate)
         if compass is not None:
             return (_join("Move %s as a recovery step." % compass,
+                          destination_appearance_clause(candidate, "command",
+                                                        context),
                           LOOP_BREAKER_CLAUSE if loop_breaker else ""), "")
         return (LOOP_BREAKER_CLAUSE, "")
     if stem == "escape":
         compass = movement_of(candidate)
         if compass is not None:
-            return ("Move %s, %s" % (compass, WITHDRAW_CLAUSE.lower()), "")
+            return (_join("Move %s, %s" % (compass, WITHDRAW_CLAUSE.lower()),
+                          destination_appearance_clause(candidate, "command",
+                                                        context)), "")
         return (WITHDRAW_CLAUSE, "")
     if label == "forced-search" or stem == "forced-search":
         return (FORCED_SEARCH_TEMPLATE, "")
@@ -646,24 +663,57 @@ GAME = "NetHack"
 OBJECTIVE = "Survive, explore safely, and descend when prepared."
 
 #: The fixed, fully inlined glyph legend.  Keys and values are verbatim and
-#: snapshot-tested, and every glyph the map renderer can emit is covered.
+#: snapshot-tested; every glyph the map renderer can emit is covered.  The map
+#: carries **no color**, so no entry claims a color distinction; ``*``/``&``/``?``
+#: are the closed current-screen foreground markers.
 LEGEND = {
     " ": "unknown or unobserved",
-    ".": "floor or doorway",
-    "#": "corridor or tree; color distinguishes",
-    "-": "wall or open door",
-    "|": "wall or open door",
-    "+": "closed door or wall; color distinguishes",
-    ">": "stairs down",
-    "<": "stairs up",
-    "@": "your hero (from state.hero)",
-    "*": "a creature; species unknown",
-    "^": "trap",
-    "}": "water or lava; color distinguishes",
-    "0": "boulder",
-    "{": "fountain",
-    "_": "altar",
+    ".": "classified floor",
+    "#": "classified corridor or tree",
+    "-": "classified open door; orientation omitted",
+    "|": "classified wall or bars; orientation omitted",
+    "+": "classified closed door or doorway of unknown state",
+    ">": "classified stairs down",
+    "<": "classified stairs up",
+    "@": "your confirmed hero",
+    "*": ("creature appearance shown on the current screen; disposition "
+          "unknown"),
+    "&": "item appearance shown on the current screen; see room.contents",
+    "?": "unclassified nonblank display shown on the current screen",
+    "^": "classified trap",
+    "}": "classified water or lava",
+    "0": "classified boulder",
+    "{": "classified fountain",
+    "_": "classified altar",
 }
+
+#: The exact fixed room-scope sentence (plan §5.5).
+ROOM_SCOPE = ("Current screen within map bounds, not a segmented room. Screen "
+              "appearances may be remembered by the game; contents are not "
+              "exhaustive. Terrain may be remembered. Openings are landmarks, "
+              "not verified exits or routes.")
+
+#: The room list caps (plan §5.5).
+CONTENTS_LIMIT = 16
+OPENINGS_LIMIT = 12
+
+#: The classes eligible for ``room.openings`` (corridor/door/stair landmarks).
+OPENING_CLASSES = (T_CORRIDOR, T_DOORWAY, T_OPEN_DOOR, T_CLOSED_DOOR,
+                   T_STAIRS_UP, T_STAIRS_DOWN)
+
+#: Door/stair landmarks precede plain corridor ones in the openings list.
+_OPENING_PRIORITY = {T_DOORWAY: 0, T_OPEN_DOOR: 0, T_CLOSED_DOOR: 0,
+                     T_STAIRS_UP: 0, T_STAIRS_DOWN: 0, T_CORRIDOR: 1}
+
+#: The current classified features that ``room.contents`` records (plan §5.5).
+CONTENTS_FEATURES = (T_TREE, T_WATER, T_LAVA, T_TRAP, T_BOULDER, T_FOUNTAIN,
+                     T_ALTAR)
+
+#: The eight compass names by sign-based direction from the hero (north is
+#: decreasing y).
+COMPASS_NAMES = {(0, 1): "south", (0, -1): "north", (1, 0): "east",
+                 (-1, 0): "west", (1, 1): "southeast", (1, -1): "northeast",
+                 (-1, 1): "southwest", (-1, -1): "northwest"}
 
 #: Deterministic summaries for the nine strategy goals, in the fixed priority
 #: order the directive vocabulary already has.
@@ -824,6 +874,264 @@ def _intent_payload(context) -> Optional[str]:
     return intent
 
 
+# -- room awareness (plan section 5) ---------------------------------------
+
+def _cell_tuple(entry):
+    """``(glyph, color, style, other)`` from one snapshot map cell."""
+    if not entry:
+        return None
+    return (entry[0],
+            entry[1] if len(entry) > 1 else "",
+            entry[2] if len(entry) > 2 else "",
+            entry[3] if len(entry) > 3 else "")
+
+
+def _appearance_of(entry, pos, hero):
+    cell = _cell_tuple(entry)
+    if cell is None or not cell[0]:
+        return None
+    return instances.display_appearance(cell[0], cell[1], cell[2], cell[3],
+                                        pos, hero)
+
+
+def _chebyshev(a, b):
+    return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
+
+
+def _direction_name(hero, pos):
+    """The sign-based compass name from *hero* to *pos* (§5.5).
+
+    ``here`` when equal, ``None`` with no hero.  North is decreasing y.
+    """
+    if hero is None:
+        return None
+    d = (pos[0] - hero[0], pos[1] - hero[1])
+    if d == (0, 0):
+        return "here"
+    def _sign(v):
+        return 0 if v == 0 else (1 if v > 0 else -1)
+    return COMPASS_NAMES.get((_sign(d[0]), _sign(d[1])))
+
+
+def _shown_of(entry, pos, hero):
+    """The ``shown`` label for one coordinate (plan §5.5)."""
+    app = _appearance_of(entry, pos, hero)
+    if app is None or app.kind == instances.APP_BLANK:
+        return "none"
+    if app.kind == instances.APP_HERO:
+        return "hero"
+    if app.kind == instances.APP_CREATURE:
+        return "creature"
+    if app.kind == instances.APP_ITEM:
+        return "item"
+    if app.kind == instances.APP_UNCLASSIFIED:
+        return "unclassified"
+    return "none"        # a classified feature is not a foreground appearance
+
+
+def _room_contents(context, mem, bounds):
+    """The bounded ``room.contents`` list, or ``None`` when unavailable.
+
+    Source: only the current ``snapshot.map``, within the returned map
+    rectangle.  One record per non-hero position that shows a creature or item
+    appearance, an unclassified nonblank display, or a current classified
+    feature in :data:`CONTENTS_FEATURES`.
+    """
+    snap = getattr(context, "snapshot", None)
+    cells = state._current_map(snap)
+    if cells is None or bounds is None:
+        return None
+    hero = getattr(mem, "hero", None)
+    hero_pos = tuple(hero) if hero is not None else None
+    x_min, x_max, y_min, y_max = bounds
+    records = []
+    for pos, entry in cells.items():
+        pos = tuple(pos)
+        if not (x_min <= pos[0] <= x_max and y_min <= pos[1] <= y_max):
+            continue
+        if hero_pos is not None and pos == hero_pos:
+            continue
+        app = _appearance_of(entry, pos, hero_pos)
+        if app is None or app.kind == instances.APP_BLANK:
+            continue
+        if app.kind == instances.APP_CREATURE:
+            kind, category = "creature", "creature"
+        elif app.kind == instances.APP_ITEM:
+            kind, category = "item", app.category
+        elif app.kind == instances.APP_UNCLASSIFIED:
+            kind, category = "unclassified", app.category
+        elif app.kind == instances.APP_FEATURE \
+                and app.terrain in CONTENTS_FEATURES:
+            kind, category = "feature", app.terrain
+        else:
+            continue
+        records.append((pos, {"at": [pos[0], pos[1]], "kind": kind,
+                              "category": category}))
+    return records
+
+
+def _room_openings(context, mem, bounds):
+    """The bounded ``room.openings`` list, or ``None`` when unavailable.
+
+    Source: the current display tuple classified with
+    :func:`instances.classify_cell` when an available current snapshot supplies
+    one, else the remembered class through ``TerrainMemory.ter``.  A current
+    known class controls the record; a currently shown wall suppresses a stale
+    remembered door, and a current item/creature over remembered stairs keeps
+    ``source="memory"`` (the foreground appearance is not the terrain).
+    """
+    snap = getattr(context, "snapshot", None)
+    cells = state._current_map(snap)
+    terrain = getattr(context, "terrain", None)
+    has_terrain = terrain is not None and hasattr(terrain, "ter")
+    if cells is None and not has_terrain:
+        return None
+    if bounds is None:
+        return None
+    hero = getattr(mem, "hero", None)
+    hero_pos = tuple(hero) if hero is not None else None
+    x_min, x_max, y_min, y_max = bounds
+    records = []
+    for x in range(x_min, x_max + 1):
+        for y in range(y_min, y_max + 1):
+            pos = (x, y)
+            entry = cells.get(pos) if cells else None
+            current = None
+            if entry:
+                cell = _cell_tuple(entry)
+                if cell and cell[0]:
+                    current = instances.classify_cell(cell[0], cell[1], cell[2],
+                                                      cell[3])
+            remembered = terrain.ter(pos) if has_terrain else T_UNKNOWN
+            if current is not None and current.terrain != T_UNKNOWN:
+                if current.terrain not in OPENING_CLASSES:
+                    continue
+                klass, source = current.terrain, "screen"
+            elif remembered in OPENING_CLASSES:
+                klass, source = remembered, "memory"
+            else:
+                continue
+            shown = _shown_of(entry, pos, hero_pos) if cells is not None \
+                else None
+            records.append((pos, {"at": [x, y],
+                                  "direction": _direction_name(hero_pos, pos),
+                                  "terrain": klass, "source": source,
+                                  "shown": shown}))
+    return records
+
+
+def _order_and_cap(records, hero, limit, priority=None):
+    """Deterministic ordering + cap; returns ``(kept, omitted)``."""
+    hero_pos = tuple(hero) if hero is not None else None
+
+    def key(item):
+        pos, record = item
+        rank = 0 if priority is None else priority.get(record.get("terrain"), 0)
+        if hero_pos is not None:
+            return (rank, _chebyshev(hero_pos, pos), pos[1], pos[0])
+        return (rank, 0, pos[1], pos[0])
+
+    ordered = sorted(records, key=key)
+    return ordered[:limit], max(0, len(ordered) - limit)
+
+
+def room_payload(context, mem, bounds):
+    """The required ``room`` state object (plan §5.5).
+
+    Pure and read-only.  Each list is ``null`` when its required source is
+    unavailable (and its omitted count is then ``null``); ``[]`` with count 0
+    means the available source contains no matching records, not that the room
+    is empty.
+    """
+    contents = _room_contents(context, mem, bounds)
+    openings = _room_openings(context, mem, bounds)
+    hero = getattr(mem, "hero", None)
+    if contents is None:
+        contents_list, contents_omitted = None, None
+    else:
+        kept, omitted = _order_and_cap(contents, hero, CONTENTS_LIMIT)
+        contents_list = [rec for _pos, rec in kept]
+        contents_omitted = omitted
+    if openings is None:
+        openings_list, openings_omitted = None, None
+    else:
+        kept, omitted = _order_and_cap(openings, hero, OPENINGS_LIMIT,
+                                       _OPENING_PRIORITY)
+        openings_list = [rec for _pos, rec in kept]
+        openings_omitted = omitted
+    return {"scope": ROOM_SCOPE,
+            "contents": contents_list,
+            "contents_omitted": contents_omitted,
+            "openings": openings_list,
+            "openings_omitted": openings_omitted}
+
+
+# -- destination appearance clause (plan section 5.6) ----------------------
+
+ITEM_CLAUSE = "An item with %s is shown on that square."
+UNCLASSIFIED_CLAUSE = "An unclassified display is shown on that square."
+FEATURE_CLAUSE = "The current screen classifies that square as %s."
+
+
+def destination_appearance_clause(candidate, need_kind: str, context) -> str:
+    """At most one appearance clause for a *command-need movement action*.
+
+    Returns an empty string for a non-command need, a non-movement action, an
+    unavailable current snapshot, an absent destination, or no applicable
+    appearance -- so direction/key answers stay neutral and nonmovement
+    recovery/search never acquires a destination claim.  The clause describes
+    the actual adjacent destination encoded by the frozen candidate's own
+    direction, never a route target or a capped-list entry.
+    """
+    if need_kind != "command":
+        return ""
+    if movement_of(candidate) is None:
+        return ""
+    hero = _hero(context)
+    if hero is None:
+        return ""
+    compass = movement_of(candidate)
+    step = DIR_BY_NAME.get(compass)
+    if step is None:
+        return ""
+    dest = (hero[0] + step[0], hero[1] + step[1])
+    snap = getattr(context, "snapshot", None)
+    cells = state._current_map(snap)
+    if cells is None:
+        return ""
+    entry = cells.get(dest)
+    if not entry:
+        return ""
+    app = _appearance_of(entry, dest, hero)
+    if app is None or app.kind == instances.APP_BLANK:
+        return ""
+    if app.kind == instances.APP_CREATURE:
+        return OCCUPANT_CLAUSE
+    if app.kind == instances.APP_ITEM:
+        return ITEM_CLAUSE % app.category
+    if app.kind == instances.APP_UNCLASSIFIED:
+        return UNCLASSIFIED_CLAUSE
+    if app.kind == instances.APP_FEATURE:
+        return FEATURE_CLAUSE % app.terrain
+    return ""
+
+
+def _current_terrain_at(context, dest):
+    """The current classified terrain at *dest*, or ``None`` when unknown."""
+    snap = getattr(context, "snapshot", None)
+    cells = state._current_map(snap)
+    if not cells:
+        return None
+    entry = cells.get(dest)
+    cell = _cell_tuple(entry)
+    if cell is None or not cell[0]:
+        return None
+    classified = instances.classify_cell(cell[0], cell[1], cell[2], cell[3])
+    if classified.terrain == T_UNKNOWN:
+        return None
+    return classified.terrain
+
+
 def render_state(context) -> Dict[str, Any]:
     """The compact remembered-state payload sent with every request.
 
@@ -837,6 +1145,15 @@ def render_state(context) -> Dict[str, Any]:
     st = getattr(mem, "status", None)
     need = context.need or {}
     hero = getattr(mem, "hero", None)
+    # The map is rendered once; the room lists reuse the *same* rectangle so a
+    # later crop or cap can never disagree with what the map shows.
+    game_map = _map_payload(context, mem)
+    if game_map is None:
+        bounds = None
+    else:
+        bounds = (game_map["x_min"], game_map["x_max"],
+                  game_map["y_min"], game_map["y_max"])
+    room = _room_payload_safe(context, mem, bounds)
     return {
         "game": GAME,
         "objective": OBJECTIVE,
@@ -856,9 +1173,19 @@ def render_state(context) -> Dict[str, Any]:
         "messages": _messages_payload(mem),
         "need": {"kind": _text(need.get("kind")),
                  "prompt": _text(need.get("prompt"))},
-        "map": _map_payload(context, mem),
+        "map": game_map,
+        "room": room,
         "stairs": _stairs_payload(mem),
     }
+
+
+def _room_payload_safe(context, mem, bounds):
+    """``room`` with the required shape even if a helper degrades."""
+    try:
+        return room_payload(context, mem, bounds)
+    except Exception:                           # noqa: BLE001
+        return {"scope": ROOM_SCOPE, "contents": None, "contents_omitted": None,
+                "openings": None, "openings_omitted": None}
 
 
 # -- build result ----------------------------------------------------------

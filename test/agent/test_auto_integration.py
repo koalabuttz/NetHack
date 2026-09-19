@@ -791,6 +791,74 @@ class JevPresentationIsolation(WireHarness):
         self.assertEqual(providers._render_strategy_prompt(self._ctx()),
                          rendered)
 
+    def test_room_enrichment_does_not_change_deepseek_payload_or_history(self):
+        from tools.agent import presentation, providers
+        from test_auto_jev_presentation import room_ctx
+        # rendering the *enriched* Jev state changes nothing on the DeepSeek
+        # side: its renderer and frozen request payload are untouched
+        enriched = presentation.render_state(room_ctx())
+        self.assertIn("room", enriched)
+        rendered = providers._render_strategy_prompt(self._ctx())
+        self.assertEqual(hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
+                         self.PROMPT_SHA256)
+        cfg = providers.ProviderConfig(strategy="deepseek",
+                                       deepseek_model="deepseek-chat")
+        prepared = providers.prepare_strategy_request(cfg, self._ctx())
+        body = json.dumps(prepared.payload(), separators=(",", ":"))
+        self.assertEqual(
+            hashlib.sha256(body.encode("utf-8")).hexdigest(),
+            "9dc0e7c032da118f5bd5e00a531f73553b32797190bb2cfb551756abef566792")
+
+    def test_room_enrichment_leaves_relative_acceptance_and_applied_cap_unchanged(
+            self):
+        from tools.agent import arbitration, presentation
+        from test_auto_jev_presentation import ROOM_HERO, move_cand, room_ctx
+        # the offered option count and their order are the same with and
+        # without the enriched snapshot, so N (and the relative gate) is
+        # untouched by the enrichment
+        cands = [move_cand(protocol.KEY_L, "navigate", (1, 0)),
+                 move_cand(protocol.KEY_H, "navigate", (-1, 0))]
+        table = candidates.build_table(protocol.NeedKey(1, 1, 1), 1, cands)
+        rich, refusal = presentation.present("command", table.ordered_candidates,
+                                             room_ctx())
+        bare, refusal2 = presentation.present(
+            "command", table.ordered_candidates,
+            room_ctx(terrain={}, snapshot=[(ROOM_HERO, ("@", "white"))]))
+        self.assertEqual(refusal, "")
+        self.assertEqual(refusal2, "")
+        self.assertEqual(len(rich.keys), len(bare.keys))
+        self.assertEqual(list(rich.key_index.values()),
+                         list(bare.key_index.values()))
+        # the *relative* gate decision is identical over the same table
+        def outcome(prob):
+            raw = arbitration.RawChoice(
+                table_id=table.table_id, need_key=tuple(table.need_key),
+                table_version=table.table_version, index=0,
+                selected_probability=prob)
+            return arbitration.validate_raw_choice(
+                table, raw, arbitration.RejectionSet()).accepted
+        self.assertEqual(outcome(0.80), outcome(0.80))
+        self.assertTrue(outcome(0.80))          # > 1.5/2
+        self.assertFalse(outcome(0.70))         # <= 1.5/2
+
+    def test_room_enrichment_uses_same_frozen_snapshot_for_map_and_criteria(
+            self):
+        from tools.agent import presentation
+        from test_auto_jev_presentation import ROOM_HERO, move_cand, room_ctx
+        snap = [(ROOM_HERO, ("@", "white", 0, "none")),
+                ((ROOM_HERO[0] + 1, ROOM_HERO[1]), ("%", "yellow", 0, "none"))]
+        ctx = room_ctx(terrain={(ROOM_HERO[0] + 1, ROOM_HERO[1]):
+                                instances.T_FLOOR},
+                       snapshot=snap)
+        # the map marks the destination as an item appearance ...
+        text = presentation.render_state(ctx)["map"]["text"]
+        self.assertIn("&", text)
+        # ... and the criterion for the move onto it names the same category
+        criterion, refusal = presentation.render_criterion(
+            move_cand(protocol.KEY_L, "navigate", (1, 0)), "command", ctx)
+        self.assertEqual(refusal, "")
+        self.assertIn("item with food appearance", criterion)
+
 
 # -------------------------------------------- applied-decision cap (phase 2)
 

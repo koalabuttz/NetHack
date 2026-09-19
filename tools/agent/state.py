@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
-from . import protocol
+from . import instances, protocol
 from .events import Boundary, BoundaryDetector, HUNGER_STAGES
 from .instances import (T_ALTAR, T_BARS, T_BOULDER, T_CLOSED_DOOR,
                         T_CORRIDOR, T_DOORWAY, T_FLOOR, T_FOUNTAIN, T_LAVA,
@@ -280,8 +280,31 @@ TERRAIN_GLYPHS = {
 #: renders as, whatever its raw glyph.  Raw monster glyphs are never emitted.
 OCCUPANT_MARKER = "*"
 
+#: The canonical marker for a currently observed *item appearance* (any of the
+#: closed item-appearance symbols), so a raw gem ``*`` can never be confused
+#: with a creature and a raw demon ``&`` can never be read as an item.
+ITEM_MARKER = "&"
+
+#: The canonical marker for an unclassified nonblank current display symbol.
+UNCLASSIFIED_MARKER = "?"
+
 #: The confirmed hero's own marker (final precedence).
 HERO_MARKER = "@"
+
+
+def _current_map(snapshot):
+    """The current snapshot's map dict, or ``None`` when unavailable.
+
+    The exact availability predicate of plan §5.1: the map is a usable source
+    iff ``snapshot`` is not ``None`` and ``snapshot.map`` is a dict.  The empty
+    dict ``{}`` is *known empty*; a missing or non-dict ``map`` is
+    *unavailable*.  The existing ``getattr(..., "map", None) or {}`` collapse
+    (which merges absent with known-empty) is deliberately not inherited.
+    """
+    if snapshot is None:
+        return None
+    cells = getattr(snapshot, "map", None)
+    return cells if isinstance(cells, dict) else None
 
 
 def bounded_map(terrain,
@@ -291,18 +314,21 @@ def bounded_map(terrain,
                 stairs_up=()) -> Optional[dict]:
     """The bounded remembered-map crop for the presentation payload.
 
-    Read-only, pure and deterministic.  The glyph of a cell comes from the
-    *persistent classified* ``terrain`` (``instances.TerrainMemory``), so
-    remembered ground survives under a current occupant; dynamic occupancy
-    comes **only** from the current ``snapshot``, with every observed non-hero
-    creature rendered as the single canonical :data:`OCCUPANT_MARKER`, and
-    the confirmed hero cell rendered as :data:`HERO_MARKER` with final
-    precedence.  ``EpisodeMemory.grid`` is never a glyph source (its raw cells
-    are overwritten by occupants), and a stale remembered monster is never
-    drawn as current.
+    Read-only, pure and deterministic.  Cell precedence (plan §5.4):
 
-    The crop is the union of the nonblank rendered glyphs, the confirmed hero
-    and the remembered stairs, expanded by one blank margin and clamped to the
+    1. the *persistent classified* ``terrain`` glyph (so remembered ground
+       survives under a current occupant), plus the remembered-stair fallback;
+    2. current snapshot *known classified terrain*, rendered via
+       :data:`TERRAIN_GLYPHS` (never the verbatim raw terrain glyph/color);
+    3. current foreground appearance: a creature becomes
+       :data:`OCCUPANT_MARKER`, an item appearance :data:`ITEM_MARKER`, and an
+       unclassified nonblank display :data:`UNCLASSIFIED_MARKER`;
+    4. the confirmed hero cell, always final.
+
+    ``EpisodeMemory.grid`` is never a glyph source, and a stale remembered
+    monster or object is never drawn as current.  The crop bounds are computed
+    from **all** resulting nonblank cells (so an item in a previously unknown
+    area expands the crop), expanded by one blank margin and clamped to the
     protocol rectangle.  With no evidence at all the result is ``None``.
     """
     glyphs: Dict[Tuple[int, int], str] = {}
@@ -316,13 +342,29 @@ def bounded_map(terrain,
     for pos in stairs_up:
         glyphs.setdefault(tuple(pos), "<")
     hero_pos = tuple(hero) if hero is not None else None
-    cells = getattr(snapshot, "map", None) or {}
-    for pos, cell in cells.items():
-        glyph = cell[0] if cell else ""
-        if not glyph or pos == hero_pos:
-            continue
-        if monster_cell(glyph, hero_pos, pos):
-            glyphs[pos] = OCCUPANT_MARKER
+    cells = _current_map(snapshot)
+    if cells:
+        for pos, cell in cells.items():
+            if not cell:
+                continue
+            glyph = cell[0]
+            color = cell[1] if len(cell) > 1 else ""
+            style = cell[2] if len(cell) > 2 else ""
+            other = cell[3] if len(cell) > 3 else ""
+            app = instances.display_appearance(glyph, color, style, other,
+                                               pos, hero_pos)
+            if app.kind in (instances.APP_BLANK, instances.APP_HERO):
+                continue
+            if app.kind == instances.APP_CREATURE:
+                glyphs[pos] = OCCUPANT_MARKER
+            elif app.kind == instances.APP_ITEM:
+                glyphs[pos] = ITEM_MARKER
+            elif app.kind == instances.APP_UNCLASSIFIED:
+                glyphs[pos] = UNCLASSIFIED_MARKER
+            elif app.kind == instances.APP_FEATURE:
+                glyph = TERRAIN_GLYPHS.get(app.terrain, " ")
+                if glyph != " ":
+                    glyphs[pos] = glyph
     if hero_pos is not None:
         glyphs[hero_pos] = HERO_MARKER
     evidence = [pos for pos, glyph in glyphs.items() if glyph != " "]

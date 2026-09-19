@@ -108,11 +108,74 @@ evaluation" below.
 ### Reflex confidence
 
 `--confidence-threshold C` (default 0.8)
-    the minimum confidence for a *paid* reflex answer to be accepted; a
-    paid answer below it falls back to scripted play.  Valid range `0..1`.
-    It applies to the calibrated paid reflex confidence only -- the scripted
-    heuristic score is never compared to it, so an ordinary scripted decision
-    is not treated as uncertain.
+    the minimum confidence for a *paid* reflex answer to be accepted **in
+    absolute mode only**; a paid answer below it falls back to scripted play.
+    Valid range `0..1`.  It applies to the calibrated paid reflex confidence
+    only -- the scripted heuristic score is never compared to it, so an
+    ordinary scripted decision is not treated as uncertain.  Changing it alone
+    no longer tunes the default Jev acceptance rule (see below).
+
+`--jev-confidence-mode {relative,absolute}` (default `relative`)
+    the Jev acceptance policy.  `relative` accepts on **concentration**: the
+    selected option's *own validated probability* must strictly exceed
+    `--jev-relative-factor / N`, where `N` is the number of retained offered
+    options.  The service's separate `confidence` scalar is never consulted in
+    this mode, and a missing or malformed selected probability fails closed.
+    `absolute` is the explicit rollback to the legacy flat
+    `--confidence-threshold` comparison.  The two modes are never combined.
+
+`--jev-relative-factor K` (default 1.5)
+    the relative multiplier, strictly between 1 and 2.  Above 1 so acceptance
+    requires a genuinely non-uniform distribution; below 2 so a two-option
+    choice stays attainable (`p > 1.5/2 = 0.75`).  Thresholds: `N=2: >0.75`,
+    `N=3: >0.5`, `N=4: >0.375`, `N=5: >0.3`, `N=6: >0.25`.  An exactly
+    uniform distribution still abstains, and the comparison is strict
+    (`p > k/N`, never `>=`).  Concentration is **not permission**: every
+    identity, membership, rejection and eligibility gate still applies, and a
+    passing concentration test never bypasses safety.
+
+`--reflex-call-cap N` (default 0 = disabled)
+    the **applied-decision** limit for the paid Jev reflex: at most `N`
+    accepted Jev proposals may be **completely sent** (locally valid, not
+    replaced by a fallback or a forced-search override, and written to the
+    wire).  Rejected, skipped, abstained, timed-out or failed-send
+    consultations do **not** spend the applied allowance, but they still cost
+    money -- there is deliberately no rejection-attempt cap.  The reservation
+    diagnostic `reflex.paid_dispatched` (consultations *reserved*) is retained
+    for compatibility and may exceed the applied count; the applied count is
+    reported as `reflex.applied` in the ledger and the episode/campaign
+    summaries.  A delivery repair (`invalid` with `incomplete`) resends the
+    frozen validated action without re-consulting Jev and is charged once.
+
+**Anti-oscillation navigation.**  The scripted reflex owns a movement-history
+state machine over *confirmed* observations only (a proposal, a rejected
+candidate or a failed write never advances it): the current cell, the last
+distinct previous cell, a deduplicated trailing window and an active-cycle
+flag.  Ordinary navigation applies a bounded **same-family** preference against
+an immediate reversal -- a reversing target is suppressed only when a
+comparable non-reversing target exists in the same family within a strict
+`40`-point margin (the `+30` directive contribution participates), rejected
+alternatives are ignored, and a dead end whose only exit is backtracking keeps
+it.  A detected period-2/period-3 cycle independently enters a safe recovery
+step over edge-legal neighbours (door/corner legality respected), preferring a
+non-reversing exit; when no legal movement exists it uses the existing bounded
+search-fallback/forced-search nomination machinery.  Emergency disengagement
+is untouched and may reverse.
+
+**Room awareness.**  The Jev `state` payload carries a `room` object
+(`scope`, `contents`, `contents_omitted`, `openings`, `openings_omitted`) and
+an enriched map whose foreground markers are canonical: `*` creature
+appearance, `&` item appearance, `?` unclassified display, `@` the confirmed
+hero (final precedence).  Raw glyphs never leak; the fixed `legend` covers
+every emittable glyph and the map carries no colour.  `room.contents` (cap 16)
+lists current-screen creature/item/unclassified appearances and classified
+features nearest-first; `room.openings` (cap 12) lists corridor/door/stair
+landmarks with an exact `source` of `screen` or `memory` and makes **no**
+reachability or visibility claim.  Movement criteria add at most one
+destination-appearance clause from the *actual adjacent* square.  All helpers
+are pure: rendering mutates no terrain, occupancy, memory or snapshot, and
+missing evidence degrades rather than refusing the request.  The presentation
+version is bumped to `jev-presentation/2`.
 
 ### Strategy budget
 
@@ -510,12 +573,35 @@ only by a manual documentation review at each TypeSafe release.
 probability.  It measures **concentration, not correctness**, and it is
 **not permission to act**: several legitimately acceptable navigation
 alternatives can spread probability, so an honest multi-alternative table
-looks low-confidence.  The existing global confidence threshold is preserved
-unchanged, and the safety and eligibility gates remain authoritative
+looks low-confidence.  The safety and eligibility gates remain authoritative
 independently of it.  Any threshold change or bypass is an operator decision
 backed by measured data.  Distribution-shape measurement across
 multi-alternative navigation tables is a **live-only, operator-gated** metric
 and is never fabricated offline.
+
+Since the approved follow-up (`doc/agent-jev-gate-nav-plan.md`, revision 4)
+the *default* acceptance rule is **peakedness-relative**: the selected
+option's own validated probability must strictly exceed
+`--jev-relative-factor / N` (default `1.5/N`), and the service `confidence`
+scalar is no longer consulted in that mode.  The legacy flat
+`--confidence-threshold` gate is preserved as the explicit `--jev-confidence-mode
+absolute` rollback.  This is a policy heuristic, not a calibrated risk
+probability, and it changes only *which* legitimate choice is taken -- never
+whether a choice is safe.  See "Reflex confidence" above for the exact
+boundaries and the applied-decision cap.
+
+### Alternating-motion measurement
+
+`longest_loop_span` and `loop_spans_ge_2` measure runs of identical
+`(hero, displayed time)` frames -- **stationary** duplicates only.  They do
+not measure movement alternation, so they cannot prove the anti-oscillation
+fix succeeded or failed.  The validation report therefore derives a separate,
+report-local alternating-move figure from the confirmed hero positions
+(consecutive duplicates removed, then consecutive `A-B-A`/`B-A-B`
+confirmations), scoped to the level instance; `test/agent/test_auto_metrics.py`
+computes it without any production metrics-schema migration.  Decisions that
+merely *offer* a reversal are not counted: only a committed, confirmed move
+advances the movement history.
 
 ### Offline measurement
 

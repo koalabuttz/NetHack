@@ -928,5 +928,405 @@ class TestJevConfidence(unittest.TestCase):
         self.assertNotIn('"distribution"', report)
 
 
+# ------------------------------------------------------------------ AC.5
+
+def move_cand(code, label, step, family="frontier", **kw):
+    """A movement-key candidate bound to an explicit compass step."""
+    from tools.agent import candidates as C
+    return C.make_candidate({"key": code}, label, family=family, direction=step,
+                            direction_rank=kw.pop("direction_rank", 0),
+                            score=kw.pop("score", 500),
+                            reason=kw.pop("reason",
+                                          "navigate: observation frontier"),
+                            proposed_effect=kw.pop("proposed_effect",
+                                                   "navigate"), **kw)
+
+
+def room_of(context):
+    return presentation.render_state(context)["room"]
+
+
+def map_of(context):
+    return presentation.render_state(context)["map"]
+
+
+ROOM_HERO = (10, 10)
+ROOM_TERRAIN = {(9, 10): instances.T_FLOOR,
+                (11, 10): instances.T_STAIRS_DOWN,
+                (13, 10): instances.T_CORRIDOR,
+                (16, 10): instances.T_CORRIDOR,
+                (12, 11): instances.T_CLOSED_DOOR}
+ROOM_SNAPSHOT = [((9, 10), (".", "gray", 0, "none")),
+                 ((10, 10), ("@", "white", 0, "none")),
+                 ((11, 10), ("%", "yellow", 0, "none")),
+                 ((12, 10), ("a", "white", 0, "none")),
+                 ((13, 10), ("#", "gray", 0, "none")),
+                 ((14, 10), ("+", "brown", 0, "none")),
+                 ((15, 10), ("{", "gray", 0, "none")),
+                 ((12, 11), ("|", "gray", 0, "none"))]
+
+
+def room_ctx(hero=ROOM_HERO, terrain=None, snapshot=None, need=COMMAND,
+             memory=None):
+    return context_of(need, hero=hero,
+                      terrain=ROOM_TERRAIN if terrain is None else terrain,
+                      snapshot=ROOM_SNAPSHOT if snapshot is None
+                      else snapshot,
+                      memory=memory)
+
+
+class TestJevRoomAwareness(unittest.TestCase):
+    """Room-awareness enrichment of the Jev state payload and criteria (§5)."""
+
+    # -- legend / map -----------------------------------------------------
+
+    def test_fixed_legend_covers_every_emittable_glyph(self):
+        emittable = set(state.TERRAIN_GLYPHS.values())
+        emittable |= {state.OCCUPANT_MARKER, state.ITEM_MARKER,
+                      state.UNCLASSIFIED_MARKER, state.HERO_MARKER}
+        emittable.discard(" ")
+        for glyph in sorted(emittable):
+            self.assertIn(glyph, presentation.LEGEND, glyph)
+        # every legend key is an emittable glyph (a closed legend)
+        self.assertEqual(set(presentation.LEGEND) - {" "}, emittable)
+        # the legend is emitted in the declared insertion order
+        self.assertEqual(list(presentation.LEGEND), list(presentation.LEGEND))
+        rendered = map_of(room_ctx())["text"]
+        for line in rendered.split("\n"):
+            body = line[3:]      # drop the fixed "%2d " row-number prefix
+            for ch in body:
+                self.assertIn(ch, presentation.LEGEND)
+
+    def test_confirmed_hero_wins_and_nonhero_at_is_creature(self):
+        snap = [((10, 10), ("@", "white", 0, "none")),
+                ((11, 10), ("@", "white", 0, "none"))]
+        ctx = room_ctx(terrain={}, snapshot=snap)
+        text = map_of(ctx)["text"]
+        row = [ln for ln in text.split("\n") if ln.startswith("10 ")][0]
+        body = row.split(" ", 1)[1]
+        # hero at x=10 is '@', the human at x=11 is the creature marker
+        self.assertEqual(body[10 - 9], "@")
+        self.assertEqual(body[11 - 9], "*")
+        room = room_of(ctx)
+        kinds = {(r["at"][0], r["kind"]) for r in room["contents"]}
+        self.assertIn((11, "creature"), kinds)
+
+    def test_current_items_overlay_remembered_floor_and_stairs(self):
+        room = room_of(room_ctx())
+        cats = {(r["at"][0], r["kind"], r["category"]) for r in room["contents"]}
+        # the food appearance is an item over remembered floor/stairs
+        self.assertIn((11, "item", "food appearance"), cats)
+        self.assertIn((12, "creature", "creature"), cats)
+        self.assertIn((15, "unclassified", "unclassified display"), cats)
+
+    def test_stale_item_and_creature_absent_from_snapshot_not_overlaid(self):
+        # remembered terrain, but a snapshot without the item/creature: only
+        # the remembered terrain is drawn, and no contents record appears
+        terrain = {(11, 10): instances.T_FLOOR, (12, 10): instances.T_FLOOR}
+        ctx = room_ctx(terrain=terrain, snapshot=[((10, 10), ("@", "white"))])
+        text = map_of(ctx)["text"]
+        self.assertNotIn("&", text)
+        self.assertNotIn("*", text)
+        self.assertEqual(room_of(ctx)["contents"], [])
+
+    def test_current_features_and_unknown_display_expand_map_bounds(self):
+        # a feature/unknown far to the east expands the crop before any cap
+        snap = [((10, 10), ("@", "white", 0, "none")),
+                ((30, 10), ("}", "blue", 0, "none"))]
+        ctx = room_ctx(terrain={}, snapshot=snap)
+        game_map = map_of(ctx)
+        self.assertLessEqual(game_map["x_min"], 10)
+        self.assertGreaterEqual(game_map["x_max"], 30)
+
+    def test_remembered_bars_render_in_map_without_structured_record(self):
+        terrain = {(12, 10): instances.T_BARS}
+        snap = [((10, 10), ("@", "white", 0, "none"))]
+        ctx = room_ctx(terrain=terrain, snapshot=snap)
+        text = map_of(ctx)["text"]
+        self.assertIn("|", text)          # legend-covered underlay
+        room = room_of(ctx)
+        self.assertEqual(room["contents"], [])
+        # bars are deliberately excluded from both structured lists
+        for rec in room["openings"]:
+            self.assertNotEqual(rec["terrain"], instances.T_BARS)
+
+    # -- contents ---------------------------------------------------------
+
+    def test_contents_nearest_first_cap_and_exact_omitted_count(self):
+        # 20 identical food appearances east of the hero: capped at 16
+        snap = [((10, 10), ("@", "white", 0, "none"))]
+        for i in range(20):
+            snap.append(((11 + i, 10), ("%", "yellow", 0, "none")))
+        ctx = room_ctx(terrain={}, snapshot=snap)
+        room = room_of(ctx)
+        self.assertEqual(len(room["contents"]), 16)
+        self.assertEqual(room["contents_omitted"], 20 - 16)
+        xs = [r["at"][0] for r in room["contents"]]
+        self.assertEqual(xs, sorted(xs))          # nearest first
+
+    def test_contents_row_major_without_hero(self):
+        snap = [((12, 10), ("%", "yellow", 0, "none")),
+                ((11, 12), ("!", "white", 0, "none")),
+                ((11, 10), ("%", "yellow", 0, "none"))]
+        ctx = room_ctx(hero=None, terrain={}, snapshot=snap)
+        room = room_of(ctx)
+        ats = [tuple(r["at"]) for r in room["contents"]]
+        self.assertEqual(ats, [(11, 10), (12, 10), (11, 12)])   # (y, x)
+
+    def test_room_null_empty_and_unavailable_sources(self):
+        # (a) an unavailable snapshot with no remembered openings: contents is
+        # null, but openings is an available-but-empty list
+        ctx = room_ctx(terrain={}, snapshot=[])
+        ctx.snapshot = None
+        room = room_of(ctx)
+        self.assertIsNone(room["contents"])
+        self.assertIsNone(room["contents_omitted"])
+        self.assertEqual(room["openings"], [])
+        self.assertEqual(room["openings_omitted"], 0)
+        # (b) no evidence at all (no snapshot, no hero, no terrain): the map is
+        # unavailable, so *both* lists are null
+        ctx0 = room_ctx(hero=None, terrain={}, snapshot=[])
+        ctx0.snapshot = None
+        room0 = room_of(ctx0)
+        self.assertIsNone(room0["contents"])
+        self.assertIsNone(room0["openings"])
+        self.assertIsNone(room0["contents_omitted"])
+        self.assertIsNone(room0["openings_omitted"])
+        # (c) a known-empty map is available: empty lists with 0 omitted
+        empty = protocol.Snapshot()
+        empty.map = {}
+        ctx2 = room_ctx(terrain={})
+        ctx2.snapshot = empty
+        room2 = room_of(ctx2)
+        self.assertEqual(room2["contents"], [])
+        self.assertEqual(room2["contents_omitted"], 0)
+        # (d) a malformed (non-dict) map is unavailable, never known-empty
+        bad = protocol.Snapshot()
+        bad.map = ["not", "a", "dict"]
+        ctx3 = room_ctx(terrain={})
+        ctx3.snapshot = bad
+        room3 = room_of(ctx3)
+        self.assertIsNone(room3["contents"])
+        self.assertIsNone(room3["contents_omitted"])
+
+    # -- openings ---------------------------------------------------------
+
+    def test_openings_screen_memory_sources_and_current_wall_override(self):
+        room = room_of(room_ctx())
+        by_at = {tuple(r["at"]): r for r in room["openings"]}
+        # a current wall at (12,11) suppresses the stale remembered door
+        self.assertNotIn((12, 11), by_at)
+        # an item over remembered stairs keeps source=memory, shown=item
+        self.assertEqual(by_at[(11, 10)]["source"], "memory")
+        self.assertEqual(by_at[(11, 10)]["terrain"],
+                         instances.T_STAIRS_DOWN)
+        self.assertEqual(by_at[(11, 10)]["shown"], "item")
+        # current corridor/door classifications are screen-sourced
+        self.assertEqual(by_at[(13, 10)]["source"], "screen")
+        self.assertEqual(by_at[(14, 10)]["terrain"], instances.T_CLOSED_DOOR)
+
+    def test_remote_doors_stairs_precede_corridor_landmarks(self):
+        room = room_of(room_ctx())
+        terrains = [r["terrain"] for r in room["openings"]]
+        corridor = terrains.index(instances.T_CORRIDOR)
+        for i, t in enumerate(terrains):
+            if t != instances.T_CORRIDOR:
+                self.assertLess(i, corridor)
+
+    def test_openings_eight_compass_directions_here_and_unknown_hero(self):
+        hero = (10, 10)
+        offsets = {(0, -1): "north", (1, -1): "northeast", (1, 0): "east",
+                   (1, 1): "southeast", (0, 1): "south", (-1, 1): "southwest",
+                   (-1, 0): "west", (-1, -1): "northwest"}
+        for step, name in offsets.items():
+            pos = (hero[0] + step[0], hero[1] + step[1])
+            snap = [(hero, ("@", "white", 0, "none")),
+                    (pos, ("#", "gray", 0, "none"))]
+            ctx = room_ctx(hero=hero, terrain={}, snapshot=snap)
+            room = room_of(ctx)
+            self.assertEqual(room["openings"][0]["direction"], name, step)
+        # with no hero, direction is null (not a guess)
+        snap = [((25, 12), ("#", "gray", 0, "none"))]
+        ctx = room_ctx(hero=None, terrain={}, snapshot=snap)
+        self.assertIsNone(room_of(ctx)["openings"][0]["direction"])
+
+    def test_openings_cap_and_no_accessibility_claim(self):
+        snap = [((10, 10), ("@", "white", 0, "none"))]
+        for i in range(20):
+            snap.append(((11 + i, 12), ("#", "gray", 0, "none")))
+        room = room_of(room_ctx(terrain={}, snapshot=snap))
+        self.assertEqual(len(room["openings"]), 12)
+        self.assertEqual(room["openings_omitted"], 20 - 12)
+        # the records make no reachability/visibility claim (the fixed `scope`
+        # wording explicitly denies them, and the records add none)
+        blob = json.dumps(room["openings"]).lower()
+        for word in ("reachable", "passable", "verified exit", "line of "
+                     "sight", "clear", "no monster"):
+            self.assertNotIn(word, blob)
+
+    # -- purity / frozen contracts ---------------------------------------
+
+    def test_renderer_is_pure_and_repeatable(self):
+        ctx = room_ctx()
+        before = (dict(ctx.terrain.terrain), dict(ctx.terrain.occupancy),
+                  ctx.terrain.map_revision, ctx.terrain.occupancy_generation,
+                  dict(ctx.snapshot.map), ctx.memory.hero)
+        first = presentation.render_state(ctx)
+        second = presentation.render_state(ctx)
+        self.assertEqual(first, second)
+        self.assertEqual((dict(ctx.terrain.terrain), dict(ctx.terrain.occupancy),
+                          ctx.terrain.map_revision,
+                          ctx.terrain.occupancy_generation,
+                          dict(ctx.snapshot.map), ctx.memory.hero), before)
+
+    def test_criteria_keys_order_indices_and_option_count_unchanged(self):
+        cands = [move_cand(KEY.KEY_L, "navigate", (1, 0)),
+                 move_cand(KEY.KEY_H, "navigate", (-1, 0)),
+                 cand(KEY.KEY_SEARCH, "search")]
+        table = table_of(cands)
+        ctx = room_ctx(need=COMMAND)
+        frozen, refusal = presentation.present("command", table.ordered_candidates,
+                                               ctx)
+        self.assertEqual(refusal, "")
+        self.assertEqual(len(frozen.keys), len(table.ordered_candidates))
+        self.assertEqual(list(frozen.criteria),
+                         list(frozen.keys))
+        self.assertEqual(sorted(frozen.key_index.values()),
+                         list(range(len(frozen.keys))))
+
+    def test_maximum_lists_and_crop_have_bounded_serialized_size(self):
+        snap = [((10, 10), ("@", "white", 0, "none"))]
+        for i in range(40):
+            snap.append(((11 + (i % 20), 10 + (i // 20)),
+                         ("%", "yellow", 0, "none")))
+        for i in range(40):
+            snap.append(((11 + (i % 20), 14 + (i // 20)),
+                         ("#", "gray", 0, "none")))
+        ctx = room_ctx(terrain={}, snapshot=snap)
+        state_obj = presentation.render_state(ctx)
+        self.assertLessEqual(len(state_obj["room"]["contents"]), 16)
+        self.assertLessEqual(len(state_obj["room"]["openings"]), 12)
+        blob = json.dumps(state_obj).encode("utf-8")
+        # structurally bounded: the whole state payload stays well under 64 KiB
+        self.assertLess(len(blob), 65536)
+
+    # -- destination criteria --------------------------------------------
+
+    def test_destination_appearance_not_route_target_or_capped_list(self):
+        # the clause describes the *actual adjacent* destination, not a route
+        # target far away nor the head of a capped contents list
+        snap = [((10, 10), ("@", "white", 0, "none")),
+                ((11, 10), ("%", "yellow", 0, "none")),
+                ((20, 15), ("!", "white", 0, "none"))]
+        ctx = room_ctx(terrain={(11, 10): instances.T_FLOOR}, snapshot=snap)
+        text, refusal = presentation.render_criterion(
+            move_cand(KEY.KEY_L, "navigate", (1, 0)), "command", ctx)
+        self.assertEqual(refusal, "")
+        self.assertIn("An item with food appearance is shown on that square.",
+                      text)
+        self.assertNotIn("potion", text)
+
+    def test_food_appearance_never_named_ration_or_safe(self):
+        snap = [((10, 10), ("@", "white", 0, "none")),
+                ((11, 10), ("%", "yellow", 0, "none"))]
+        ctx = room_ctx(terrain={(11, 10): instances.T_FLOOR}, snapshot=snap)
+        text, _ = presentation.render_criterion(
+            move_cand(KEY.KEY_L, "navigate", (1, 0)), "command", ctx)
+        self.assertIn("food appearance", text)
+        for word in ("ration", "safe", "edible", "corpse", "BUC"):
+            self.assertNotIn(word, text)
+
+    def test_direction_answer_has_no_walking_or_destination_claim(self):
+        snap = [((10, 10), ("@", "white", 0, "none")),
+                ((11, 10), ("%", "yellow", 0, "none"))]
+        ctx = room_ctx(need=DIRECTION, terrain={}, snapshot=snap)
+        cands = [move_cand(KEY.KEY_L, "navigate", (1, 0))]
+        frozen, refusal = presentation.present("direction", cands, ctx)
+        self.assertEqual(refusal, "")
+        for text in frozen.criteria.values():
+            self.assertNotIn("Walk", text)
+            self.assertNotIn("shown on that square", text)
+
+    def test_conflicting_current_terrain_omits_stale_criterion_phrase(self):
+        # memory says floor, but the current screen shows a wall there
+        snap = [((10, 10), ("@", "white", 0, "none")),
+                ((11, 10), ("|", "gray", 0, "none"))]
+        ctx = room_ctx(terrain={(11, 10): instances.T_FLOOR}, snapshot=snap)
+        text, _ = presentation.render_criterion(
+            move_cand(KEY.KEY_L, "navigate", (1, 0)), "command", ctx)
+        self.assertNotIn("remembered room floor", text)
+        self.assertIn("classifies that square as wall", text)
+
+    def test_cycle_recovery_movement_gets_destination_appearance(self):
+        snap = [((10, 10), ("@", "white", 0, "none")),
+                ((11, 10), ("%", "yellow", 0, "none"))]
+        ctx = room_ctx(terrain={(11, 10): instances.T_FLOOR}, snapshot=snap)
+        for label in ("recovery-step", "random-move", "unblock"):
+            text, refusal = presentation.render_criterion(
+                move_cand(KEY.KEY_L, label, (1, 0)), "command", ctx)
+            self.assertEqual(refusal, "", label)
+            self.assertIn("food appearance", text, label)
+
+    def test_emergency_escape_movement_gets_destination_appearance(self):
+        snap = [((10, 10), ("@", "white", 0, "none")),
+                ((11, 10), ("a", "white", 0, "none"))]
+        ctx = room_ctx(terrain={}, snapshot=snap)
+        text, refusal = presentation.render_criterion(
+            move_cand(KEY.KEY_L, "escape", (1, 0)), "command", ctx)
+        self.assertEqual(refusal, "")
+        self.assertIn("A creature is shown on that square", text)
+
+    def test_search_wait_and_nonmovement_recovery_omit_destination_appearance(
+            self):
+        snap = [((10, 10), ("@", "white", 0, "none")),
+                ((11, 10), ("%", "yellow", 0, "none"))]
+        ctx = room_ctx(terrain={}, snapshot=snap)
+        cases = [
+            (cand(KEY.KEY_SEARCH, "search-in-place"), "command"),
+            (cand(KEY.KEY_SEARCH, "search"), "command"),
+            (cand(KEY.KEY_WAIT, "unblock"), "command"),
+            (cand(KEY.KEY_EAT, "eat-food"), "command"),
+        ]
+        for candidate, kind in cases:
+            text, refusal = presentation.render_criterion(candidate, kind, ctx)
+            self.assertEqual(refusal, "", candidate.semantic_label)
+            self.assertNotIn("shown on that square", text)
+            self.assertNotIn("classifies that square", text)
+        # a non-command need never carries the clause either
+        self.assertEqual(
+            presentation.destination_appearance_clause(
+                move_cand(KEY.KEY_L, "navigate", (1, 0)), "direction", ctx),
+            "")
+
+    def test_full_room_state_snapshot(self):
+        room = room_of(room_ctx())
+        self.assertEqual(room, {
+            "scope": presentation.ROOM_SCOPE,
+            "contents": [
+                {"at": [11, 10], "kind": "item",
+                 "category": "food appearance"},
+                {"at": [12, 10], "kind": "creature", "category": "creature"},
+                {"at": [15, 10], "kind": "unclassified",
+                 "category": "unclassified display"},
+            ],
+            "contents_omitted": 0,
+            "openings": [
+                {"at": [11, 10], "direction": "east",
+                 "terrain": instances.T_STAIRS_DOWN, "source": "memory",
+                 "shown": "item"},
+                {"at": [14, 10], "direction": "east",
+                 "terrain": instances.T_CLOSED_DOOR, "source": "screen",
+                 "shown": "none"},
+                {"at": [13, 10], "direction": "east",
+                 "terrain": instances.T_CORRIDOR, "source": "screen",
+                 "shown": "none"},
+                {"at": [16, 10], "direction": "east",
+                 "terrain": instances.T_CORRIDOR, "source": "memory",
+                 "shown": "none"},
+            ],
+            "openings_omitted": 0,
+        })
+
+
 if __name__ == "__main__":
     unittest.main()

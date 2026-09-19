@@ -900,5 +900,70 @@ class TestJevContext(WireHarness):
         runner.pending_need = {"kind": "command", "id": 1}
         return runner, rec
 
+class DisplayAppearance(unittest.TestCase):
+    """The pure display-appearance classifier (plan section 5.3)."""
+
+    def test_display_appearance_item_classes_are_closed_and_pinned(self):
+        expected = {
+            ")": "weapon appearance", "[": "armor appearance",
+            "=": "ring appearance", '"': "amulet appearance",
+            "(": "tool appearance", "%": "food appearance",
+            "!": "potion appearance", "?": "scroll appearance",
+            "/": "wand appearance", "$": "coin appearance",
+            "*": "gem or rock appearance", "0": "iron ball appearance",
+        }
+        self.assertEqual(I.ITEM_APPEARANCES, expected)
+        for glyph, category in expected.items():
+            app = I.display_appearance(glyph, "gray")
+            self.assertEqual(app.kind, I.APP_ITEM, glyph)
+            self.assertEqual(app.category, category, glyph)
+        # the table is closed: a glyph outside it is never an item
+        for glyph in ("{", "^", "X", "~", "@"):
+            self.assertNotIn(glyph, I.ITEM_APPEARANCES)
+        # blank and absent cells are not contents
+        self.assertEqual(I.display_appearance(" ", "gray").kind, I.APP_BLANK)
+        self.assertEqual(I.display_appearance("", "").kind, I.APP_BLANK)
+
+    def test_display_appearance_gem_demon_scroll_mimic_armor_collisions(self):
+        # a raw gem '*' must be an item, never a creature
+        self.assertEqual(I.display_appearance("*", "green").kind, I.APP_ITEM)
+        # a raw demon '&' must be a creature, never an item
+        self.assertEqual(I.display_appearance("&", "red").kind, I.APP_CREATURE)
+        # a raw scroll '?' is an item, not the unclassified marker
+        self.assertEqual(I.display_appearance("?", "white").kind, I.APP_ITEM)
+        # a raw mimic ']' is a creature; a raw armor '[' is an item
+        self.assertEqual(I.display_appearance("]", "brown").kind, I.APP_CREATURE)
+        self.assertEqual(I.display_appearance("[", "gray").kind, I.APP_ITEM)
+
+    def test_display_appearance_reuses_color_aware_terrain_classifier(self):
+        # brown '-' is an open door, gray '-' a wall: the appearance helper
+        # delegates to the existing colour-aware classifier
+        self.assertEqual(I.display_appearance("-", "brown").terrain,
+                         I.T_OPEN_DOOR)
+        self.assertEqual(I.display_appearance("-", "gray").terrain, I.T_WALL)
+        self.assertEqual(I.display_appearance("+", "brown").terrain,
+                         I.T_CLOSED_DOOR)
+        self.assertEqual(I.display_appearance("_", "gray").terrain, I.T_ALTAR)
+        # a gray '{' is not a proved fountain, so it is unclassified
+        self.assertEqual(I.display_appearance("{", "gray").kind,
+                         I.APP_UNCLASSIFIED)
+
+    def test_display_appearance_does_not_change_walkability_or_memory(self):
+        # calling the helper changes no classification, walkability or memory
+        cells = {(3, 3): (".", "gray", 0, "none"),
+                 (4, 3): ("+", "brown", 0, "none")}
+        before = I.classify_cell(".", "gray")
+        tm = I.TerrainMemory()
+        tm.merge(cells)
+        snapshot = dict(tm.terrain), dict(tm.occupancy), tm.map_revision
+        I.display_appearance("%", "yellow")
+        I.display_appearance("&", "red")
+        self.assertEqual(I.classify_cell(".", "gray"), before)
+        self.assertEqual(tm.walkable((3, 3)), True)
+        self.assertEqual(tm.walkable((4, 3)), False)
+        self.assertEqual((dict(tm.terrain), dict(tm.occupancy),
+                          tm.map_revision), snapshot)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

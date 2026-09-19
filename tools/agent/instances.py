@@ -56,6 +56,81 @@ OCC_NONE = "none"
 OCC_MONSTER = "monster"
 OCC_HERO_OR_HUMAN = "hero-or-human"
 
+# -- display-appearance interpretation (plan section 5.3) ------------------
+#
+# A *display-symbol interpretation*, not a second terrain classifier: it maps
+# a current snapshot's ``(glyph, color, style, other)`` to a closed
+# presentation category, delegating terrain/occupant meaning to the existing
+# :func:`classify_cell`.  It changes no walkability, ``Cell`` safety or memory
+# semantics and never feeds policy eligibility.  It is pinned to the shipped
+# symbol profile (``include/defsym.h``); an unknown or custom symbol maps to
+# ``unclassified`` rather than a guessed object category.
+
+APP_HERO = "hero"
+APP_CREATURE = "creature"
+APP_ITEM = "item"
+APP_FEATURE = "feature"
+APP_UNCLASSIFIED = "unclassified"
+APP_BLANK = "blank"
+
+#: The closed item-appearance table.  ``*`` is gem/rock appearance and ``0`` is
+#: the iron ball (``include/defsym.h``); both are delivered here only when no
+#: earlier precedence step consumed the glyph.
+ITEM_APPEARANCES = {
+    ")": "weapon appearance",
+    "[": "armor appearance",
+    "=": "ring appearance",
+    '"': "amulet appearance",
+    "(": "tool appearance",
+    "%": "food appearance",
+    "!": "potion appearance",
+    "?": "scroll appearance",
+    "/": "wand appearance",
+    "$": "coin appearance",
+    "*": "gem or rock appearance",
+    "0": "iron ball appearance",
+}
+
+
+@dataclass(frozen=True)
+class Appearance(object):
+    """One closed display-appearance category for a current snapshot cell.
+
+    ``kind`` is one of ``hero``/``creature``/``item``/``feature``/
+    ``unclassified``/``blank``; ``category`` is the exact §5.3 wording (an item
+    category, the ``creature`` marker, the terrain class string for a feature,
+    or ``unclassified display``).  ``terrain`` carries the classified terrain
+    class where one is known.
+    """
+
+    kind: str
+    category: str = ""
+    terrain: str = T_UNKNOWN
+
+
+def display_appearance(glyph: str, color: str = "", style: str = "",
+                       other: str = "", pos=None, hero=None) -> Appearance:
+    """Interpret one current snapshot cell as a closed appearance category.
+
+    Precedence (plan §5.3): the confirmed hero coordinate; the existing monster
+    classification (including an ``@`` off the hero square); the existing
+    classified terrain; the closed item-appearance table; otherwise
+    ``unclassified``.  Hero identity comes only from the confirmed coordinate,
+    never from scanning for a first ``@``.
+    """
+    if not glyph or glyph == " ":
+        return Appearance(APP_BLANK)
+    if hero is not None and pos is not None and tuple(pos) == tuple(hero):
+        return Appearance(APP_HERO, "hero")
+    cell = classify_cell(glyph, color, style, other)
+    if cell.occupant != OCC_NONE:
+        return Appearance(APP_CREATURE, "creature", cell.terrain)
+    if cell.terrain != T_UNKNOWN:
+        return Appearance(APP_FEATURE, cell.terrain, cell.terrain)
+    if glyph in ITEM_APPEARANCES:
+        return Appearance(APP_ITEM, ITEM_APPEARANCES[glyph])
+    return Appearance(APP_UNCLASSIFIED, "unclassified display")
+
 
 def is_monster_glyph(glyph: str) -> bool:
     """True for a public monster-class glyph (letters or punctuation)."""

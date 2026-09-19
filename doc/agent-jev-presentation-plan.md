@@ -313,6 +313,22 @@ After implementation: reviewer subagent against this plan with AC.1–12 as the 
 - **D1 (resolved, bounded)** Criteria wire shape: JSON object, retained-order serialization — evidence in §2. The contract snapshot catches local serializer drift only; upstream official-contract changes are caught by the §13 manual docs check, not by the snapshot.
 - **D2 (decided)** No synthetic `other`/fallback option in Choice tables: the retained set is the complete candidate set; a synthetic option has no retained index. Coverage = refusal codes + existing scripted fallback (`controller.py:2747-2801`).
 - **D3 (operator-owned, deferred)** Confidence-threshold semantics: existing global gate preserved; changes require measured data and explicit operator approval.
+
+> **Follow-up (2026-09, superseded in part).** The approved follow-up
+> `doc/agent-jev-gate-nav-plan.md` (revision 4) records the operator's decision
+> to supersede this plan's D3 scope restriction on the *default* acceptance
+> rule: acceptance is now peakedness-relative (`p > 1.5/N` on the selected
+> option's own validated probability, `--jev-confidence-mode relative`), with
+> the flat `--confidence-threshold` gate retained as the explicit `absolute`
+> rollback.  It also adds an applied-decision cap and anti-oscillation
+> navigation in `policy.py` (so this plan's "no `policy.py` changes" non-goal
+> is historical, not current), and amends the Jev state payload and movement
+> criterion text with room-awareness enrichment (`jev-presentation/2`).
+> Everything else here -- concentration-not-permission semantics, the
+> identity/membership/rejection/eligibility gates, the request-envelope and
+> retained-candidate/key contract, and the DeepSeek renderer/history/cache
+> invariants -- still holds.  Old invariant statements in this plan are
+> historical where the follow-up explicitly supersedes them.
 - **D4 (limitation, recorded)** Replay cannot exercise live Jev (offline always falls back, networked replay rejected): offline metrics are synthetic-labeled; tokens/latency/cost/distributions/survival are live-only and operator-gated. Byte counts are never converted to tokens.
 - **Risk: token budget.** The 32,000-token Jev context window is documented; full map + 40 inventory rows are not guaranteed to fit. Phase D measures bytes offline; live token measurement is manual. Blank-margin cropping is lossless; radius cropping/message truncation/inventory-cap changes are separate decisions.
 - **Risk: scope.** Wording improvements do not let Jev choose food over exploration when policy never offers both; candidate-policy expansion remains a separate design.
