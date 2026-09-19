@@ -373,6 +373,66 @@ class LifecycleMetrics(unittest.TestCase):
         self.assertEqual(s["destination_switch_rate"], 0.0)
 
 
+class LifecycleRecording(unittest.TestCase):
+    """AC15: the live controller and the evaluator persist the same events."""
+
+    def _drivers(self):
+        import test_auto_navigation as nav
+        from tools.agent import controller, evaluate, policy
+        from tools.agent.providers import ProviderConfig
+        live = object.__new__(controller._EpisodeRunner)
+        live.reflex = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+        rp = evaluate.ReplayPass([], ProviderConfig(reflex="scripted",
+                                                    strategy="off"),
+                                 "scripted", "off")
+        out = []
+        for ref in (live.reflex, rp.reflex):
+            mem = nav.mem_with({(x, 10): nav.FLOOR for x in range(1, 8)},
+                               (1, 10))
+            out.append((ref, mem, nav))
+        return out
+
+    def test_live_and_evaluator_persist_destination_lifecycle_events(self):
+        for ref, mem, nav in self._drivers():
+            cand = ref.prepare(nav.ctx(mem)).table.scripted()
+            self.assertEqual(cand.effect_payload[1], "acquire")
+            ref.commit_effect(cand.proposed_effect, cand.semantic_label, 1,
+                              mem, observed_kind="moved",
+                              payload=cand.effect_payload)
+            cont = ref._dest_payload("continue", ref.targets.held())
+            ref.commit_effect("navigate", "navigate", 2, mem,
+                              observed_kind="moved", payload=cont)
+            dest = [e["outcome"] for e in ref.lifecycle.events
+                    if e["kind"] == "destination"]
+            self.assertEqual(dest[:2], ["acquired", "action"])
+            # additive and schema-versioned
+            self.assertTrue(all("schema" in e for e in ref.lifecycle.events))
+            summary = ref.lifecycle.summarize()
+            self.assertTrue(summary["available"])
+            self.assertIsNotNone(summary["commitment_length_median"])
+
+    def test_live_and_evaluator_persist_pickup_lifecycle_events(self):
+        from tools.agent.directives import DirectiveSet, DirectiveView
+        for ref, mem, nav in self._drivers():
+            ref.floor.observe_item(ref.instance_id, (1, 10), "coin appearance")
+            dset = DirectiveSet(schema_version=2, goals=("collect_items",),
+                                target=(1, 10))
+            table = ref.prepare(nav.ctx(mem, directives=[
+                DirectiveView(dset, 1)])).table
+            cand = table.scripted()
+            self.assertEqual(cand.semantic_label, "pick-up")
+            ref.arm_pickup(cand.effect_payload)      # the send boundary
+            mem.messages.append("There is nothing here to pick up.")
+            ref.note_observation(mem)                # the result
+            events = [(e["kind"], e["outcome"]) for e in ref.lifecycle.events]
+            self.assertIn(("pickup", "offered"), events)
+            self.assertIn(("pickup", "attempted"), events)
+            self.assertIn(("pickup", "no-items"), events)
+            summary = ref.lifecycle.summarize()
+            self.assertEqual(summary["pickup_attempts"], 1)
+            self.assertEqual(summary["pickup_outcomes"]["no-items"], 1)
+
+
 class ValidationReport(unittest.TestCase):
     """AC16/AC18: the validation report carries every required field."""
 

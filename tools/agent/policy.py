@@ -35,8 +35,8 @@ import random
 import time
 from typing import Dict, List, Optional, Tuple
 
-from . import (candidates, forced_search, instances, navigation, pickup,
-               protocol, recovery, state)
+from . import (candidates, forced_search, instances, lifecycle_metrics,
+               navigation, pickup, protocol, recovery, state)
 from .arbitration import select_retained
 from .directives import DirectiveView
 from .providers import ReflexContext, ReflexResult, ReflexTimeout
@@ -187,6 +187,10 @@ class ScriptedReflex(object):
         # True when an active collect destination already sits under the hero,
         # so the acquired action is the pickup initiation (plan 1.5/3.3).
         self.on_square_collect = False
+        # The additive, schema-versioned lifecycle event stream (plan section
+        # 5): recorded at the reconcile folds, so the live controller and the
+        # evaluator -- which both drive this reflex -- persist the same events.
+        self.lifecycle = lifecycle_metrics.LifecycleRecorder()
         self._cycled = False
         # The last prepared table and retained candidate, exposed for the
         # controller-owned SentAttempt lifecycle (set in decide()).
@@ -475,6 +479,9 @@ class ScriptedReflex(object):
                            else int(self.directives.generation)),
             "init_inventory": init_sig,
         }
+        self.lifecycle.record(lifecycle_metrics.KIND_PICKUP,
+                              lifecycle_metrics.PICKUP_ATTEMPTED,
+                              token=ev.token, purpose=mode)
         self.intent = "pickup"
         self.pickup_purpose = mode
         self.pickup_evidence = ev
@@ -559,10 +566,18 @@ class ScriptedReflex(object):
             if (cur is not None and cur.pos == pos
                     and cur.purpose == purpose and cur.instance_id == iid):
                 return                      # idempotent: already committed
+            replaced = cur is not None
             self.targets.commit(instance_id=iid or self.instance_id,
                                 purpose=purpose, pos=pos, family=family,
                                 source=source, generation=int(generation),
                                 tick=tick)
+            serial = self.targets.held().serial
+            self.lifecycle.record(
+                lifecycle_metrics.KIND_DESTINATION,
+                lifecycle_metrics.DEST_REPLACED if replaced
+                else lifecycle_metrics.DEST_ACQUIRED,
+                serial=serial, purpose=purpose, source=source,
+                generation=int(generation), reason=reason)
             return
         cur = self.targets.held()
         if cur is None or cur.serial != int(expected):
@@ -581,6 +596,9 @@ class ScriptedReflex(object):
             return
         # continue / interact
         self.targets.note_nav_attempt()
+        self.lifecycle.record(lifecycle_metrics.KIND_DESTINATION,
+                              lifecycle_metrics.DEST_ACTION,
+                              serial=cur.serial, purpose=cur.purpose)
         if hero is not None:
             self.targets.note_progress(tuple(hero), tick)
             # A continuation chosen while a pickup was offered declines that
@@ -1131,6 +1149,17 @@ class ScriptedReflex(object):
     def _settle_directive(self, outcome, generation, reason) -> None:
         """Queue a directive-owned destination settlement (plan 1.5)."""
         self.directive_settlement = (outcome, int(generation), str(reason))
+        self.lifecycle.record(
+            lifecycle_metrics.KIND_DIRECTIVE,
+            lifecycle_metrics.DIR_TERMINAL, generation=int(generation),
+            outcome_detail=outcome, reason=reason)
+        held = self.targets.held()
+        self.lifecycle.record(
+            lifecycle_metrics.KIND_DESTINATION,
+            lifecycle_metrics.DEST_REACHED if outcome == "reached"
+            else lifecycle_metrics.DEST_FAILED,
+            serial=(held.serial if held is not None else None),
+            reason=reason)
 
     @staticmethod
     def _dest_payload(op, held, target=None, purpose=None, source=None,
@@ -1221,6 +1250,9 @@ class ScriptedReflex(object):
                    int(self.directives.generation), str(ev.appearance),
                    mem.inventory_signature())
         reason = "pick up the items here (%s)" % mode
+        self.lifecycle.record(lifecycle_metrics.KIND_PICKUP,
+                              lifecycle_metrics.PICKUP_OFFERED,
+                              token=ev.token, purpose=mode)
         return self._cand({"key": KEY.KEY_PICKUP}, "pick-up", "pickup", score,
                           reason, "pickup", effect_payload=payload)
 
@@ -1572,6 +1604,10 @@ class ScriptedReflex(object):
         self.pickup_init_inventory = None
         self.pickup_pending = None
         hero = mem.hero
+        self.lifecycle.record(
+            lifecycle_metrics.KIND_PICKUP,
+            _PICKUP_EVENT_OUTCOME.get(outcome, lifecycle_metrics.PICKUP_UNKNOWN),
+            token=(ev.token if ev is not None else None), outcome_detail=outcome)
         if ev is not None:
             self.floor.note_outcome(ev, outcome)
             if hero is not None:
@@ -1891,6 +1927,17 @@ def _manhattan(a, b):
 # adjustment never crosses a family boundary (gaps are >= 100, adjustment is
 # capped at 40), so a nearer stair cannot be suppressed indefinitely by a
 # distant frontier.
+#: The lifecycle outcome recorded for each pickup outcome (plan section 5).
+_PICKUP_EVENT_OUTCOME = {
+    pickup.OUTCOME_SUCCESS: lifecycle_metrics.PICKUP_SUCCEEDED,
+    pickup.OUTCOME_NO_ITEMS: lifecycle_metrics.PICKUP_NO_ITEMS,
+    pickup.OUTCOME_REFUSED: lifecycle_metrics.PICKUP_REFUSED,
+    pickup.OUTCOME_CANCELED: lifecycle_metrics.PICKUP_CANCELED,
+    pickup.OUTCOME_DECLINED: lifecycle_metrics.PICKUP_DECLINED,
+    pickup.OUTCOME_EXHAUSTED: lifecycle_metrics.PICKUP_UNKNOWN,
+    pickup.OUTCOME_UNKNOWN: lifecycle_metrics.PICKUP_UNKNOWN,
+}
+
 _NAV_FAMILY = {navigation.TFAM_STAIR: "stair",
                navigation.TFAM_DOOR: "door",
                navigation.TFAM_FRONTIER: "frontier",

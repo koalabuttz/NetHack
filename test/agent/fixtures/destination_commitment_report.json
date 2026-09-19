@@ -1,9 +1,13 @@
 {
  "commit_range": {
   "base": "56c0c45a0739b29a3173b08b343d5fc786a56712",
-  "head": "d8d819493b6dd8b54b387ef6f8efa8c44bef28ef"
+  "head": "001d02ea2df06f16bfee3bc4dff2ea03972f3c9c"
  },
  "commits": [
+  {
+   "hash": "001d02ea2df06f16bfee3bc4dff2ea03972f3c9c",
+   "subject": "agent: metric denominator and report staleness (2b,3)"
+  },
   {
    "hash": "d8d819493b6dd8b54b387ef6f8efa8c44bef28ef",
    "subject": "agent: collect arrival and send-time pickup freeze"
@@ -31,10 +35,6 @@
   {
    "hash": "67cdedb09fd43bc00eba14649f701e6f2c4de44e",
    "subject": "agent: semantic v2 destination resolution"
-  },
-  {
-   "hash": "ef67b0f6330f04aca1f1a5b157248328eafdf752",
-   "subject": "agent: delivery-repair activation test"
   }
  ],
  "gates": {
@@ -195,5 +195,5 @@
   ]
  },
  "schema_version": 1,
- "suite_count": 1016
+ "suite_count": 1018
 }
