@@ -462,6 +462,9 @@ class CommittedBehaviour(unittest.TestCase):
         # the following eligible command resolves the newly active directive
         # destination and compare-and-applies it
         mem.status.hp = 20
+        # a collect_items destination resolves only against item evidence
+        self.ref.floor.observe_item(self.ref.instance_id, (6, 10),
+                                    "coin appearance")
         view = DirectiveView(DirectiveSet(
             schema_version=2, goals=("collect_items",), target=(6, 10)), 1)
         cand = self.ref.prepare(
@@ -547,14 +550,128 @@ class CommittedBehaviour(unittest.TestCase):
         self.assertNotIn((2, 10), plan.dist)
 
     def test_flee_arrival_does_not_ascend_or_exit_dungeon(self):
-        mem = nav_test.mem_with({(x, 10): FLOOR for x in range(1, 5)},
-                                (3, 10))
-        mem.grid[(3, 10)] = ("<", "white", 0, "none")   # hero on up stairs
+        mem = nav_test.mem_with({(x, 10): FLOOR for x in range(1, 6)}, (1, 10))
+        mem.grid[(4, 10)] = ("<", "white", 0, "none")
+        mem.stairs_up.add((4, 10))
         view = DirectiveView(DirectiveSet(
             schema_version=2, goals=("flee_to_upstairs",)), 1)
-        table = self.ref.prepare(nav_test.ctx(mem, directives=[view])).table
-        for cand in table.ordered_candidates:
-            self.assertNotEqual(cand.action.to_wire(), {"key": ord("<")})
+        cand = self.ref.prepare(
+            nav_test.ctx(mem, directives=[view])).table.scripted()
+        # the known upstairs square was actually resolved and selected ...
+        self.assertEqual(cand.effect_payload[1], "acquire")
+        self.assertEqual(cand.effect_payload[3], "flee-upstairs")
+        self.assertEqual(tuple(cand.effect_payload[4:6]), (4, 10))
+        # ... and arriving there serves the generation, without ascending
+        arrived = nav_test.mem_with({(x, 10): FLOOR for x in range(1, 6)},
+                                    (4, 10))
+        arrived.grid[(4, 10)] = ("<", "white", 0, "none")
+        arrived.stairs_up.add((4, 10))
+        self.ref.commit_effect(cand.proposed_effect, cand.semantic_label, 2,
+                               arrived, observed_kind="moved",
+                               payload=cand.effect_payload)
+        self.assertIsNone(self.ref.targets.held())
+        self.assertEqual(self.ref.directive_settlement[0], "reached")
+        for c in self.ref.prepare(
+                nav_test.ctx(arrived, directives=[view])).table.ordered_candidates:
+            self.assertNotEqual(c.action.to_wire(), {"key": ord("<")})
+
+    def test_targetless_flee_chooses_nearest_reachable_upstairs(self):
+        mem = nav_test.mem_with({(x, 10): FLOOR for x in range(1, 9)}, (1, 10))
+        for pos in ((3, 10), (7, 10)):
+            mem.grid[pos] = ("<", "white", 0, "none")
+            mem.stairs_up.add(pos)
+        view = DirectiveView(DirectiveSet(
+            schema_version=2, goals=("flee_to_upstairs",)), 1)
+        cand = self.ref.prepare(
+            nav_test.ctx(mem, directives=[view])).table.scripted()
+        self.assertEqual(cand.effect_payload[3], "flee-upstairs")
+        self.assertEqual(tuple(cand.effect_payload[4:6]), (3, 10))
+
+    def test_supplied_non_upstairs_flee_coordinate_is_rejected(self):
+        mem = nav_test.mem_with({(x, 10): FLOOR for x in range(1, 9)}, (1, 10))
+        mem.grid[(7, 10)] = ("<", "white", 0, "none")
+        mem.stairs_up.add((7, 10))
+        view = DirectiveView(DirectiveSet(
+            schema_version=2, goals=("flee_to_upstairs",), target=(4, 10)), 1)
+        cand = self.ref.prepare(
+            nav_test.ctx(mem, directives=[view])).table.scripted()
+        # a structured rejection: no wrong-terrain target is ever routed
+        self.assertEqual(cand.proposed_effect, "dest-unresolved")
+        self.assertEqual(cand.semantic_label, "unresolved-destination")
+        self.ref.commit_effect(cand.proposed_effect, cand.semantic_label, 2,
+                               mem, observed_kind="no-time",
+                               payload=cand.effect_payload)
+        outcome, _gen, reason = self.ref.directive_settlement
+        self.assertEqual(outcome, "failed")
+        self.assertIn("not an observed upstairs", reason)
+
+    def test_collect_resolves_on_visited_non_frontier_item_floor(self):
+        cells = {(x, 10): FLOOR for x in range(1, 8)}
+        for x in range(1, 8):                 # no cell borders unknown space
+            cells[(x, 9)] = WALL
+            cells[(x, 11)] = WALL
+        mem = nav_test.mem_with(cells, (1, 10))
+        mem.visits[(5, 10)] = 3               # visited, non-frontier floor
+        self.ref.floor.observe_item(self.ref.instance_id, (5, 10),
+                                    "coin appearance")
+        view = DirectiveView(DirectiveSet(
+            schema_version=2, goals=("collect_items",), target=(5, 10)), 1)
+        cand = self.ref.prepare(
+            nav_test.ctx(mem, directives=[view])).table.scripted()
+        self.assertEqual(cand.effect_payload[3], "collect-items")
+        self.assertEqual(tuple(cand.effect_payload[4:6]), (5, 10))
+
+    def test_collect_without_item_evidence_is_a_structured_failure(self):
+        mem = nav_test.mem_with({(x, 10): FLOOR for x in range(1, 8)}, (1, 10))
+        view = DirectiveView(DirectiveSet(
+            schema_version=2, goals=("collect_items",), target=(5, 10)), 1)
+        cand = self.ref.prepare(
+            nav_test.ctx(mem, directives=[view])).table.scripted()
+        # no default exploration masquerading as steering
+        self.assertEqual(cand.semantic_label, "unresolved-destination")
+        self.assertNotEqual(cand.family, "frontier")
+        self.assertIn("no floor item evidence", cand.effect_payload[1])
+
+    def test_no_reassertion_after_production_completion_or_failure(self):
+        mem = nav_test.mem_with({(x, 10): FLOOR for x in range(1, 8)}, (1, 10))
+        self.ref.floor.observe_item(self.ref.instance_id, (5, 10),
+                                    "coin appearance")
+        view = DirectiveView(DirectiveSet(
+            schema_version=2, goals=("collect_items",), target=(5, 10)), 1)
+        cand = self.ref.prepare(
+            nav_test.ctx(mem, directives=[view])).table.scripted()
+        self.ref.commit_effect(cand.proposed_effect, cand.semantic_label, 1,
+                               mem, observed_kind="moved",
+                               payload=cand.effect_payload)
+        held = self.ref.targets.held()
+        self.assertEqual(held.source, navigation.SRC_DIRECTIVE)
+        # arriving serves the generation: the destination is retired and the
+        # settlement is queued for the book (no reassertion next tick)
+        arrived = nav_test.mem_with({(x, 10): FLOOR for x in range(1, 8)},
+                                    (5, 10))
+        arrived.visits[(5, 10)] = 1
+        cont = policy.ScriptedReflex._dest_payload("continue", held)
+        self.ref.commit_effect("navigate", "navigate", 2, arrived,
+                               observed_kind="moved", payload=cont)
+        self.assertIsNone(self.ref.targets.held())
+        self.assertEqual(self.ref.directive_settlement[0], "reached")
+        # applying that settlement at the book expires the generation
+        from tools.agent import directives as DSMOD
+        book = DSMOD.DirectiveBook()
+        dset, _ = DSMOD.validate_directive_set(
+            {"schema_version": 2, "goals": ["collect_items"],
+             "target": [5, 10], "ttl": 50})
+        book.activate(dset, 1, "1")
+        outcome, _gen, reason = self.ref.directive_settlement
+        book.expire("destination-%s: %s" % (outcome, reason), 2, "1")
+        self.assertFalse(book.has_active)
+        # an unresolved failure settles identically
+        self.ref.directive_settlement = None
+        fail = self.ref._unresolved_destination_candidate()
+        self.ref.commit_effect(fail.proposed_effect, fail.semantic_label, 3,
+                               mem, observed_kind="no-time",
+                               payload=fail.effect_payload)
+        self.assertEqual(self.ref.directive_settlement[0], "failed")
 
 
 if __name__ == "__main__":

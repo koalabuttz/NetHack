@@ -604,19 +604,44 @@ class DirectiveActivationParity(unittest.TestCase):
             self.assertEqual(tuple(view.target), tuple(target))
         if goal is not None:
             self.assertTrue(view.wants(goal))
+        return view
+
+    def _reflex_effect_of(self, view, *, evidence=(), upstairs=()):
+        """The reflex's selected destination *effect* under *view* (plan 1.4).
+
+        Drives the real scripted reflex so the assertion is on the chosen
+        candidate's frozen effect (operation, purpose, coordinate), not merely
+        on active-view state.
+        """
+        import test_auto_navigation as nav
+        from tools.agent import policy
+        mem = nav.mem_with({(x, 10): nav.FLOOR for x in range(1, 8)}, (1, 10))
+        for pos in upstairs:
+            mem.stairs_up.add(tuple(pos))
+        ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+        for pos in evidence:
+            ref.floor.observe_item(ref.instance_id, tuple(pos),
+                                   "coin appearance")
+        table = ref.prepare(nav.ctx(mem, directives=[view])).table
+        return table.scripted()
 
     def test_pending_collect_items_steers_same_command_live_and_evaluator(self):
         dset, why = directives.validate_directive_set(
-            {"schema_version": 2, "goals": ["collect_items"], "target": [5, 5],
-             "ttl": 50})
+            {"schema_version": 2, "goals": ["collect_items"],
+             "target": [5, 10], "ttl": 50})
         self.assertEqual(why, "")
         live = self._live()
         self._activate_live(live, dset)
         replay = self._replay()
         self._activate_evaluator(replay, dset)
         for book in (live.book, replay.book):
-            self._assert_same_command_view(book, target=(5, 5),
-                                           goal="collect_items")
+            view = self._assert_same_command_view(book, target=(5, 10),
+                                                  goal="collect_items")
+            cand = self._reflex_effect_of(view, evidence=[(5, 10)])
+            # the *same* command decision selects the same destination effect
+            self.assertEqual(cand.effect_payload[1], "acquire")
+            self.assertEqual(cand.effect_payload[3], "collect-items")
+            self.assertEqual(tuple(cand.effect_payload[4:6]), (5, 10))
 
     def test_pending_flee_to_upstairs_steers_same_command_live_and_evaluator(
             self):
@@ -628,7 +653,12 @@ class DirectiveActivationParity(unittest.TestCase):
         replay = self._replay()
         self._activate_evaluator(replay, dset)
         for book in (live.book, replay.book):
-            self._assert_same_command_view(book, goal="flee_to_upstairs")
+            view = self._assert_same_command_view(book,
+                                                  goal="flee_to_upstairs")
+            cand = self._reflex_effect_of(view, upstairs=[(6, 10)])
+            self.assertEqual(cand.effect_payload[1], "acquire")
+            self.assertEqual(cand.effect_payload[3], "flee-upstairs")
+            self.assertEqual(tuple(cand.effect_payload[4:6]), (6, 10))
 
     def test_modifier_only_legacy_advice_parity_live_and_evaluator(self):
         dset, why = directives.validate_directive_set(

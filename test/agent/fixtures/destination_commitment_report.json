@@ -1,6 +1,10 @@
 {
  "commits": [
   {
+   "hash": "ef67b0f6330f04aca1f1a5b157248328eafdf752",
+   "subject": "agent: delivery-repair activation test"
+  },
+  {
    "hash": "d3a38006cac05c33468077e751e42a285ed550e8",
    "subject": "agent: AC1/AC2 tests and final mutation"
   },
@@ -27,10 +31,6 @@
   {
    "hash": "b76b42b78e35ee0adb30f489a9c4c4ae47d06403",
    "subject": "agent: named lifecycle and pickup tests"
-  },
-  {
-   "hash": "3293782b2ae1ff8064f7a49683394937cd9568bf",
-   "subject": "agent: presentation /3 golden and test"
   }
  ],
  "gates": {

@@ -1373,6 +1373,7 @@ class _EpisodeRunner(object):
                 self._attempt_effect, self._attempt_label, self.tick,
                 self.mem, observed_kind=self._attempt_kind,
                 payload=self._attempt_payload)
+            self._settle_directive_destination()
         self._attempt_effect = None
         self._attempt_label = ""
         self._attempt_payload = ()
@@ -1804,6 +1805,22 @@ class _EpisodeRunner(object):
             self._pending_directives = None
 
     # -- boundary detection ----------------------------------------------
+    def _settle_directive_destination(self) -> None:
+        """Settle a directive-owned destination at the reconcile boundary.
+
+        The reflex queues ``(outcome, generation, reason)`` when a
+        directive-owned destination is reached, fails or cannot be resolved;
+        the book is expired here so a served/failed generation is not
+        reasserted every tick (plan 1.5 "directive"/"Flee upstairs").
+        """
+        settlement = getattr(self.reflex, "directive_settlement", None)
+        if settlement is None:
+            return
+        self.reflex.directive_settlement = None
+        outcome, _generation, reason = settlement
+        self.book.expire("destination-%s: %s" % (outcome, reason), self.tick,
+                         self.mem.status.dlvl)
+
     def _detect_boundaries(self):
         """Fold one applied snapshot into the boundary machinery."""
         st = self.mem.status

@@ -166,6 +166,13 @@ class ScriptedReflex(object):
         # The instance-scoped floor-item evidence ledger (plan section 3):
         # source-epoch tokens, bounded attempts, declines and negatives.
         self.floor = pickup.FloorLedger()
+        # The most recent unresolved explicit-destination reason (reflex-local
+        # policy bookkeeping, set during preparation, never gameplay memory).
+        self.last_unresolved = ""
+        # The directive-owned destination settlement the controller applies at
+        # its reconcile boundary (plan 1.5 "directive"): a
+        # ``(outcome, generation, reason)`` tuple or ``None``.
+        self.directive_settlement = None
         self._cycled = False
         # The last prepared table and retained candidate, exposed for the
         # controller-owned SentAttempt lifecycle (set in decide()).
@@ -349,6 +356,9 @@ class ScriptedReflex(object):
         if tags and all(t in self._NONCOMMAND_EFFECTS for t in tags):
             self._commit_noncommand(tags, payload, mem)
             return
+        if payload and payload[0] == "destfail":
+            self._commit_destination_failure(payload, tick, mem)
+            return
         if payload and payload[0] == "pickup":
             self._commit_pickup(payload, tick, mem)
             return
@@ -444,8 +454,13 @@ class ScriptedReflex(object):
         """
         if not payload or payload[0] != "dest":
             return
-        (_tag, op, iid, purpose, x, y, family, source, generation,
-         expected) = payload
+        if len(payload) >= 11:
+            (_tag, op, iid, purpose, x, y, family, source, generation,
+             expected, reason) = payload
+        else:
+            (_tag, op, iid, purpose, x, y, family, source, generation,
+             expected) = payload
+            reason = ""
         pos = (int(x), int(y))
         hero = mem.hero
         if op == "acquire":
@@ -453,6 +468,8 @@ class ScriptedReflex(object):
                 # the observation that justified acquisition already satisfied
                 # it: record reached instead of installing (plan 1.4)
                 self.targets.note_serviced(pos, ())
+                if source == navigation.SRC_DIRECTIVE:
+                    self._settle_directive("reached", generation, reason)
                 return
             cur = self.targets.held()
             if (cur is not None and cur.pos == pos
@@ -469,6 +486,8 @@ class ScriptedReflex(object):
         if op == "arrive" or (hero is not None and tuple(hero) == pos):
             self.targets.note_serviced(pos, ())
             self.targets.retire("reached")
+            if cur.source == navigation.SRC_DIRECTIVE:
+                self._settle_directive("reached", cur.generation, reason)
             return
         # continue / interact
         self.targets.note_nav_attempt()
@@ -492,9 +511,30 @@ class ScriptedReflex(object):
                 return
             if self.targets.door_attempts_exhausted:
                 self.targets.retire("door-ineffective")
+                if cur.source == navigation.SRC_DIRECTIVE:
+                    self._settle_directive("failed", cur.generation,
+                                           "door-ineffective")
                 return
         if self.targets.stalled():
             self.targets.retire("stalled")
+            if cur.source == navigation.SRC_DIRECTIVE:
+                self._settle_directive("failed", cur.generation, "stalled")
+
+    def _commit_destination_failure(self, payload, tick, mem) -> None:
+        """Settle an unresolved explicit destination (plan 1.5).
+
+        The failure is a fold: the directive-owned destination is retired and
+        suppressed under its evidence, and the settlement is queued for the
+        controller's ``DirectiveBook.expire`` so the same generation is not
+        reasserted every tick.
+        """
+        if not payload or payload[0] != "destfail":
+            return
+        (_tag, reason, generation) = payload
+        held = self.targets.held()
+        if held is not None and held.source == navigation.SRC_DIRECTIVE:
+            self.targets.retire("directive-unresolved")
+        self._settle_directive("failed", generation, reason)
 
     @staticmethod
     def _refresh_payload(payload):
@@ -807,6 +847,10 @@ class ScriptedReflex(object):
                                              prefer_stairs, explore_first)
         if cands:
             return self._with_pickup(tuple(cands), mem, hero)
+        if self.last_unresolved:
+            # An unresolved explicit destination is a structured failure: it is
+            # never silently replaced by default exploration (plan 1.5).
+            return (self._unresolved_destination_candidate(),)
         if mem.searches_since_progress < 3 \
                 and self._allows_search(mem, hero) \
                 and not self._cycled:
@@ -836,19 +880,31 @@ class ScriptedReflex(object):
 
     def _acquisition_candidates(self, context, mem, hero, plan, prefer_stairs,
                                 explore_first):
-        """The default/directive destination pool, scored (plan 1.2)."""
+        """The default/directive destination pool, scored (plan 1.2).
+
+        An explicit, coordinate-bearing v2 destination is resolved by the
+        dedicated semantic resolver *before* any acquisition: it is never
+        re-resolved against generic exploration enumeration, and an unresolved
+        explicit destination yields no candidates (the caller emits a
+        structured failure instead of silently exploring).
+        """
         targets = plan.targets
-        directive_pos = (self.directives.target
-                         if self.directives.active else None)
         directive_purpose = None
-        if directive_pos is not None:
-            if self.directives.wants_collect():
-                directive_purpose = navigation.COMMIT_COLLECT_ITEMS
-            elif self.directives.wants_flee_upstairs():
-                directive_purpose = navigation.COMMIT_FLEE_UPSTAIRS
-        if directive_pos is not None:
+        self.last_unresolved = ""
+        if self._directive_bears_destination() \
+                and (self.directives.wants_collect()
+                     or self.directives.wants_flee_upstairs()):
+            target, directive_purpose, reason = \
+                self._resolve_semantic_destination(context, mem, hero, plan)
+            if target is None:
+                self.last_unresolved = reason
+                return []
+            pool = [target]
+        elif self.directives.target is not None:
+            # a coordinate-bearing goal we do not resolve semantically
+            # (e.g. descend_known_stairs) keeps its exact-coordinate pool
             pool = [t for t in targets
-                    if tuple(t.pos) == tuple(directive_pos)]
+                    if tuple(t.pos) == tuple(self.directives.target)]
         else:
             def ok(t):
                 return (not self.targets.serviced(t.pos)
@@ -881,13 +937,17 @@ class ScriptedReflex(object):
         kept = self._antibacktrack(scored, hero,
                                    getattr(context, "rejected", None))
         cands = []
+        directive_pool = (directive_purpose is not None
+                          or (self.directives.active
+                              and self.directives.target is not None))
         for target, family, key, score, step, extra in kept:
             payload = self._dest_payload(
                 "acquire", None, target=target, purpose=directive_purpose,
                 source=(navigation.SRC_DIRECTIVE
-                        if directive_pos is not None
+                        if directive_pool
                         else navigation.SRC_DEFAULT),
-                generation=self.directives.generation)
+                generation=self.directives.generation,
+                reason=target.reason)
             cands.append(self._cand(
                 {"key": key}, "navigate", family, score,
                 "%s: %s" % (self._nav_reason(extra), target.reason), "navigate",
@@ -895,11 +955,54 @@ class ScriptedReflex(object):
                 effect_payload=payload))
         return cands
 
+    def _resolve_semantic_destination(self, context, mem, hero, plan):
+        """Resolve a coordinate-bearing v2 destination goal (plan 2.1, item 1).
+
+        Returns ``(Target|None, purpose|None, reason)``.  ``target`` is ``None``
+        for a structured failure; the caller then emits a frozen failure
+        operation instead of falling through to default exploration.
+        """
+        terrain = self._terrain(mem, context)
+        target = self.directives.target
+        if self.directives.wants_flee_upstairs():
+            known = set(mem.stairs_up)
+            t, why = navigation.resolve_semantic_destination(
+                terrain, hero, plan.dist, plan.first,
+                purpose=navigation.COMMIT_FLEE_UPSTAIRS, target=target,
+                upstairs=known)
+            return t, navigation.COMMIT_FLEE_UPSTAIRS, why
+        if self.directives.wants_collect():
+            t, why = navigation.resolve_semantic_destination(
+                terrain, hero, plan.dist, plan.first,
+                purpose=navigation.COMMIT_COLLECT_ITEMS, target=target,
+                evidence_positions=self.floor.evidence_positions())
+            return t, navigation.COMMIT_COLLECT_ITEMS, why
+        return None, None, "no coordinate-bearing destination goal"
+
+    def _unresolved_destination_candidate(self):
+        """A frozen structured failure for an unresolved explicit destination.
+
+        The directive-owned destination is neither routed nor replaced by
+        default exploration: the turn is held with a search-in-place while the
+        failure effect retires/suppresses the destination and settles its
+        generation at the reconcile boundary (plan 1.5).
+        """
+        payload = ("destfail", self.last_unresolved,
+                   int(self.directives.generation))
+        return self._cand({"key": KEY.KEY_SEARCH}, "unresolved-destination",
+                          "recovery", 0,
+                          "explicit destination unresolved: %s"
+                          % self.last_unresolved, "dest-unresolved",
+                          effect_payload=payload)
+
+    def _settle_directive(self, outcome, generation, reason) -> None:
+        """Queue a directive-owned destination settlement (plan 1.5)."""
+        self.directive_settlement = (outcome, int(generation), str(reason))
+
     @staticmethod
     def _dest_payload(op, held, target=None, purpose=None, source=None,
-                      generation=None):
+                      generation=None, reason=None):
         """The frozen destination effect payload (plan 1.4).
-
         Binds the operation (``acquire``/``continue``/``arrive``), the level
         instance, the semantic destination coordinate and family, the source
         and originating generation, and -- for a continuation -- the expected
@@ -920,7 +1023,8 @@ class ScriptedReflex(object):
             generation = 0 if generation is None else int(generation)
             expected = -1
         return ("dest", op, int(iid), purpose, int(pos[0]), int(pos[1]),
-                family, source, int(generation), int(expected))
+                family, source, int(generation), int(expected),
+                str(reason or ""))
 
     def _directive_bears_destination(self) -> bool:
         """True when the active advice names or selects a destination (1.5)."""

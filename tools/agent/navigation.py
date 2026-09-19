@@ -646,6 +646,67 @@ def route_held_destination(c: Commitment, terrain: "TerrainMemory",
     return None, None, "no route to the destination"
 
 
+def _target_at(pos: Tuple[int, int], dist: Dict[Tuple[int, int], int],
+               first: Dict[Tuple[int, int], Tuple[int, int]], family: str,
+               reason: str) -> Target:
+    """A reachable target record at *pos* (the caller proved reachability)."""
+    return Target(tuple(pos), family, first[pos], dist[pos], reason)
+
+
+def resolve_semantic_destination(
+        terrain: "TerrainMemory", hero: Tuple[int, int],
+        dist: Dict[Tuple[int, int], int],
+        first: Dict[Tuple[int, int], Tuple[int, int]], *,
+        purpose: str,
+        target: Optional[Tuple[int, int]] = None,
+        upstairs: Sequence[Tuple[int, int]] = (),
+        evidence_positions: Sequence[Tuple[int, int]] = ()
+) -> Tuple[Optional[Target], str]:
+    """Resolve a coordinate-bearing v2 goal to a legal, *observed* target.
+
+    Returns ``(Target, "")`` on success and ``(None, reason)`` on a structured
+    failure -- an explicit destination is never silently re-resolved against
+    generic exploration enumeration (plan 2.1/1.5).  ``flee_to_upstairs``
+    accepts only an observed upstairs square (a supplied coordinate that is not
+    known upstairs is rejected), and a null target deterministically selects
+    the nearest *reachable* observed upstairs.  ``collect_items`` resolves only
+    against a matching current floor-evidence token with a reachable route, so
+    a visited non-frontier floor square without item evidence is not a target.
+    """
+    hero = tuple(hero)
+    if purpose == COMMIT_FLEE_UPSTAIRS:
+        known = {tuple(p) for p in upstairs} | set(terrain.stairs_up())
+        if target is not None:
+            t = tuple(target)
+            if t not in known:
+                return None, "flee target is not an observed upstairs"
+            if t == hero:
+                return None, "already on the flee target"
+            if t not in dist:
+                return None, "flee target is not reachable"
+            return _target_at(t, dist, first, TFAM_STAIR,
+                              "reachable known up stairs"), ""
+        reachable = sorted((p for p in known if p in dist and p != hero),
+                           key=lambda p: (dist[p], p))
+        if not reachable:
+            return None, "no reachable observed upstairs"
+        return _target_at(reachable[0], dist, first, TFAM_STAIR,
+                          "nearest reachable known up stairs"), ""
+    if purpose == COMMIT_COLLECT_ITEMS:
+        if target is None:
+            return None, "collect_items requires a target"
+        t = tuple(target)
+        if t not in {tuple(p) for p in evidence_positions}:
+            return None, "no floor item evidence at the target"
+        if t == hero:
+            return None, "already at the collection site"
+        if t not in dist:
+            return None, "the collection site is not reachable"
+        return _target_at(t, dist, first, TFAM_UNVISITED,
+                          "collect the observed items here"), ""
+    return None, "no coordinate-bearing destination goal"
+
+
 __all__ = [
     "DIRECTIONS", "DIR_RANK", "BASE_STEP", "VISIT_PENALTY", "FAILED_PENALTY",
     "TFAM_STAIR", "TFAM_DOOR", "TFAM_FRONTIER", "TFAM_UNVISITED",
@@ -657,4 +718,5 @@ __all__ = [
     "DOOR_INTERACT_MAX", "STALL_MAX", "STALL_TOTAL_MIN", "STALL_TOTAL_FACTOR",
     "STALL_TOTAL_SLACK", "Commitment", "CommitmentStore", "commitment_for",
     "resolve_destination", "route_held_destination",
+    "resolve_semantic_destination",
 ]

@@ -139,6 +139,10 @@ class FloorLedger(object):
     def evidence(self, pos: Tuple[int, int]) -> Optional[FloorEvidence]:
         return self._groups.get(tuple(pos))
 
+    def evidence_positions(self) -> Tuple[Tuple[int, int], ...]:
+        """Every position with current floor evidence (deterministic order)."""
+        return tuple(sorted(self._groups))
+
     # -- attempts --------------------------------------------------------
     def attempts(self, ev: FloorEvidence) -> int:
         return self._attempts.get(ev.token, 0)
