@@ -2,7 +2,7 @@
  "per_request": [
   {
    "bytes_legacy": 1461,
-   "bytes_new": 3320,
+   "bytes_new": 3318,
    "canned_usage": {
     "input_tokens": 312,
     "output_tokens": 48,
@@ -38,7 +38,7 @@
   },
   {
    "bytes_legacy": 1443,
-   "bytes_new": 3248,
+   "bytes_new": 3246,
    "canned_usage": {
     "input_tokens": 312,
     "output_tokens": 48,
@@ -93,7 +93,7 @@
   },
   {
    "bytes_legacy": 897,
-   "bytes_new": 3691,
+   "bytes_new": 3689,
    "canned_usage": {
     "input_tokens": 312,
     "output_tokens": 48,
@@ -110,7 +110,7 @@
   },
   {
    "bytes_legacy": 1329,
-   "bytes_new": 4129,
+   "bytes_new": 4127,
    "canned_usage": {
     "input_tokens": 312,
     "output_tokens": 48,
@@ -127,7 +127,7 @@
   },
   {
    "bytes_legacy": 1443,
-   "bytes_new": 4244,
+   "bytes_new": 4242,
    "canned_usage": {
     "input_tokens": 312,
     "output_tokens": 48,
@@ -144,7 +144,7 @@
   },
   {
    "bytes_legacy": 1733,
-   "bytes_new": 4689,
+   "bytes_new": 4687,
    "canned_usage": {
     "input_tokens": 312,
     "output_tokens": 48,
@@ -161,7 +161,7 @@
   },
   {
    "bytes_legacy": 1443,
-   "bytes_new": 4244,
+   "bytes_new": 4242,
    "canned_usage": {
     "input_tokens": 288,
     "output_tokens": 40,
@@ -204,6 +204,6 @@
    "unsupported-need": 1
   },
   "total_bytes_legacy": 9749,
-  "total_bytes_new": 27565
+  "total_bytes_new": 27551
  }
 }

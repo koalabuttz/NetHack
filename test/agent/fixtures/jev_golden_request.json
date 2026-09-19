@@ -1,7 +1,7 @@
 {
  "capture": {
   "adapter_version": "jev-choice/2",
-  "commit": "7761274b1d9c3dcb5b926980230e49189aea866c",
+  "commit": "61feec3f86ef2ba5cc5d840bedeff6fa69bb38cb",
   "dirty": false,
   "endpoint_path": "/systemone",
   "presentation_version": "jev-presentation/3"
@@ -55,7 +55,16 @@
    }
   },
   "state": {
-   "commitment": null,
+   "commitment": {
+    "generation": 0,
+    "phase": "travelling",
+    "pos": [
+     6,
+     5
+    ],
+    "purpose": "explore-frontier",
+    "source": "default"
+   },
    "directives": [],
    "game": "NetHack",
    "hero": [
@@ -101,7 +110,7 @@
     "prompt": ""
    },
    "objective": "Survive, explore safely, and descend when prepared.",
-   "role": null,
+   "role": "Valkyrie",
    "room": {
     "contents": [],
     "contents_omitted": 0,
@@ -120,7 +129,7 @@
    }
   }
  },
- "request_body_sha256": "82a6c84b2d43422f80ad32a9a4319ba1ce8bbab30633980bcbdb8c02aa56e113",
+ "request_body_sha256": "ee31a27f1385dcd661c47f5630f04c6ac4bba22f3f1821d3636bfa18275c0760",
  "response": {
   "answers": {
    "action": {
