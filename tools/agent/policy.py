@@ -788,7 +788,7 @@ class ScriptedReflex(object):
         if hero in mem.stairs_down and not explore_first:
             return (self._cand({"key": ord(">")}, "descend", "descend", 900,
                                "descend the known stairs", "descend"),)
-        terrain = self._terrain(mem)
+        terrain = self._terrain(mem, context)
         plan = navigation.plan(terrain, hero, mem.visits, None,
                                self._check_deadline)
         held = self.targets.held()
@@ -1268,8 +1268,19 @@ class ScriptedReflex(object):
             return False
         return self.recovery.allows_search(site)
 
-    def _terrain(self, mem):
-        """Build one classified terrain view from remembered raw cells."""
+    def _terrain(self, mem, context=None):
+        """The classified terrain used for routing (plan 1.1, AC12).
+
+        Prefers the runner-owned **persistent classified terrain** carried on
+        the reflex context, so known ground survives beneath a current
+        item/creature overlay -- ``EpisodeMemory.grid`` is overwritten by the
+        overlay, so rebuilding from it would lose the ground under a glyph.  A
+        direct unit caller without that reference keeps a conservative rebuild
+        from the remembered raw cells.
+        """
+        persistent = getattr(context, "terrain", None)
+        if persistent is not None and hasattr(persistent, "ter"):
+            return persistent
         terrain = navigation.TerrainMemory()
         terrain.merge(mem.grid)
         return terrain

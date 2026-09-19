@@ -460,6 +460,31 @@ class CommittedBehaviour(unittest.TestCase):
         # the destination pipeline is suspended: no replacement is committed
         self.assertEqual(self.ref.targets.held(), old)
 
+    def test_item_overlay_uses_persistent_known_ground(self):
+        import types
+        # the runner-owned persistent terrain classifies the ground beneath an
+        # item overlay, so routing uses it instead of mem.grid (which the
+        # overlay overwrote with the item glyph)
+        persistent = navigation.TerrainMemory()
+        persistent.merge({(2, 10): FLOOR})
+        mem = nav_test.mem_with(
+            {(1, 10): FLOOR, (2, 10): ("%", "brown", 0, "none")}, (1, 10))
+        terrain = self.ref._terrain(
+            mem, types.SimpleNamespace(memory=mem, terrain=persistent))
+        self.assertTrue(terrain.walkable((2, 10)))
+
+    def test_item_on_unknown_ground_does_not_authorize_route(self):
+        import types
+        persistent = navigation.TerrainMemory()          # (2, 10) unknown
+        mem = nav_test.mem_with(
+            {(1, 10): FLOOR, (2, 10): ("%", "brown", 0, "none")}, (1, 10))
+        terrain = self.ref._terrain(
+            mem, types.SimpleNamespace(memory=mem, terrain=persistent))
+        # unknown ground under a glyph stays unknown and is never a route
+        self.assertFalse(terrain.walkable((2, 10)))
+        plan = navigation.plan(terrain, (1, 10))
+        self.assertNotIn((2, 10), plan.dist)
+
     def test_flee_arrival_does_not_ascend_or_exit_dungeon(self):
         mem = nav_test.mem_with({(x, 10): FLOOR for x in range(1, 5)},
                                 (3, 10))
