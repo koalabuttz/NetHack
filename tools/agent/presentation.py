@@ -56,7 +56,12 @@ from .instances import (T_ALTAR, T_BOULDER, T_CLOSED_DOOR, T_CORRIDOR,
 #: ``/2`` adds the room-awareness enrichment (plan §5): original item/creature/
 #: unclassified foreground markers, a corrected fixed legend and the ``room``
 #: state field with its destination-appearance clause.
-PRESENTATION_VERSION = "jev-presentation/2"
+#:
+#: ``/3`` adds the destination-commitment and build-aware pickup context
+#: (destination-commitment plan §2.3/§3.1): the configured ``role`` and the
+#: active ``commitment`` destination summary in the state payload.  Recorded in
+#: allowlisted metadata only -- never as a wire field.
+PRESENTATION_VERSION = "jev-presentation/3"
 
 # -- refusal codes ---------------------------------------------------------
 
@@ -1135,6 +1140,27 @@ def _current_terrain_at(context, dest):
     return classified.terrain
 
 
+def _commitment_payload(context) -> Optional[Dict[str, Any]]:
+    """The active destination commitment summary, or ``None`` (plan §2.3).
+
+    Populated only from a controller-supplied ``destination`` record; every
+    field is null-safe, and an unavailable commitment is reported as ``null``
+    rather than manufactured.
+    """
+    dest = getattr(context, "destination", None)
+    if not isinstance(dest, dict):
+        return None
+    pos = dest.get("pos")
+    if isinstance(pos, (list, tuple)) and len(pos) == 2:
+        pos_out = [int(pos[0]), int(pos[1])]
+    else:
+        pos_out = None
+    return {"purpose": _text(dest.get("purpose")),
+            "pos": pos_out,
+            "phase": _text(dest.get("phase")),
+            "source": _text(dest.get("source"))}
+
+
 def render_state(context) -> Dict[str, Any]:
     """The compact remembered-state payload sent with every request.
 
@@ -1170,6 +1196,8 @@ def render_state(context) -> Dict[str, Any]:
             "conditions": _conditions(getattr(context, "snapshot", None)),
         },
         "hero": [int(hero[0]), int(hero[1])] if hero is not None else None,
+        "role": _text(getattr(context, "role", None)),
+        "commitment": _commitment_payload(context),
         "inventory": _inventory_payload(mem, st),
         "directives": _directive_summaries(context),
         "intent": _intent_payload(context),
