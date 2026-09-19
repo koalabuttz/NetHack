@@ -1,6 +1,14 @@
 {
  "commits": [
   {
+   "hash": "5ef9028b86990f1a99a1e8a0abb26983d1cc28a2",
+   "subject": "agent: tighten replay agreement threshold"
+  },
+  {
+   "hash": "03d220b3e7f49b3dee44421bf1335edcea623ff4",
+   "subject": "agent: local evidence signatures and door caps"
+  },
+  {
    "hash": "e2587e70c51d8d074107985435ecbae259332da7",
    "subject": "agent: pickup outcome lifecycle end-to-end"
   },
@@ -23,14 +31,6 @@
   {
    "hash": "90db062c7792e277525d1b55caa68e5d779969ff",
    "subject": "agent: regenerate goldens for populated context"
-  },
-  {
-   "hash": "61feec3f86ef2ba5cc5d840bedeff6fa69bb38cb",
-   "subject": "agent: populate role and commitment context"
-  },
-  {
-   "hash": "04cb2263f2ac66e8f36c2a8e073f8cc170401a07",
-   "subject": "agent: extend mutation checks to 10 of 11"
   }
  ],
  "gates": {

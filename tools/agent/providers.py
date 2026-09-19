@@ -341,6 +341,13 @@ class StrategyContext(object):
     # response received).
     role: str = ""
     directives: List[Any] = field(default_factory=list)
+    # Bounded deterministic subcontent (plan 2.3) rendered *inside* the
+    # existing snapshot blocks: cached-inventory freshness, the visible
+    # condition names, and player-visible item/target/commitment evidence.
+    inventory_age_text: str = "unknown"
+    conditions: List[str] = field(default_factory=list)
+    item_evidence: List[Any] = field(default_factory=list)
+    commitment: Any = None
     # An immutable frozen request, when the harness prepared one.  A context
     # without it is prepared as a fresh zero-history request, so direct
     # provider calls keep their existing signature and semantics.
@@ -874,6 +881,22 @@ def _summary_json(summary) -> str:
     return json.dumps(summary, sort_keys=True)
 
 
+def _strategy_evidence_lines(ctx) -> list:
+    """Bounded item/commitment evidence lines (plan 2.3).
+
+    Player-visible evidence only: observed item coordinates/appearances and
+    the active destination commitment.  Deterministic and capped so the block
+    stays bounded.
+    """
+    out = []
+    for item in list(getattr(ctx, "item_evidence", ()) or ())[:40]:
+        out.append("  item evidence: " + json.dumps(list(item)))
+    commit = getattr(ctx, "commitment", None)
+    out.append("current commitment: "
+               + (json.dumps(commit, sort_keys=True) if commit else "none"))
+    return out
+
+
 def _render_strategy_prompt(ctx: StrategyContext) -> str:
     """Render one complete bounded current-state snapshot.
 
@@ -895,6 +918,8 @@ def _render_strategy_prompt(ctx: StrategyContext) -> str:
     lines.append("inventory:")
     for r in ctx.inventory[:40]:
         lines.append("  - " + str(r))
+    lines.append("inventory freshness: "
+                 + (getattr(ctx, "inventory_age_text", "") or "unknown"))
     if not postmortem:
         lines.append("boundary history:")
         for rec in list(ctx.history)[-16:]:
@@ -906,8 +931,12 @@ def _render_strategy_prompt(ctx: StrategyContext) -> str:
         lines.append("  - " + str(m))
     lines.append("map:")
     lines.append(ctx.map_text or "")
+    lines.extend(_strategy_evidence_lines(ctx))
     lines.append("displayed level: " + str(ctx.level or ""))
     lines.append("status: " + str(ctx.status_text or ""))
+    conds = [str(c) for c in (getattr(ctx, "conditions", None) or ())]
+    lines.append("visible conditions: "
+                 + (", ".join(conds) if conds else "none"))
     lines.append("tick: %d" % ctx.tick)
     lines.append("remaining strategy calls: %d" % ctx.remaining_budget)
     return "\n".join(lines)

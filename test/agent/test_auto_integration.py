@@ -937,7 +937,7 @@ class JevPresentationIsolation(WireHarness):
     #: frozen context below.  Pinned so any drift in the strategy rendering --
     #: a field reorder, a renamed line or a stray Jev field -- fails here.
     PROMPT_SHA256 = (
-        "6d9219dce073b328dc4554afde2baea41222ae95376951c1509a27b7e7e462a5")
+        "dacb308b8e01cef26e755a8ffbb5127efa38c2587a3913907b6115fad295534d")
 
     def _ctx(self):
         from tools.agent.providers import StrategyContext
@@ -981,7 +981,7 @@ class JevPresentationIsolation(WireHarness):
         # unchanged.
         self.assertEqual(
             hashlib.sha256(body.encode("utf-8")).hexdigest(),
-            "d98fc9d0230800b8749c216d73eb404f6c77e4a172574b5aea3451199f8c9088")
+            "8e822a801e71a6a1f9af6bcd9eb7ce2be77177f167f41955411e43a594910fe0")
         # rendering the same context twice is byte-identical (render-once)
         self.assertEqual(providers._render_strategy_prompt(self._ctx()),
                          rendered)
@@ -1005,7 +1005,7 @@ class JevPresentationIsolation(WireHarness):
         # unchanged.
         self.assertEqual(
             hashlib.sha256(body.encode("utf-8")).hexdigest(),
-            "d98fc9d0230800b8749c216d73eb404f6c77e4a172574b5aea3451199f8c9088")
+            "8e822a801e71a6a1f9af6bcd9eb7ce2be77177f167f41955411e43a594910fe0")
 
     def test_room_enrichment_leaves_relative_acceptance_and_applied_cap_unchanged(
             self):

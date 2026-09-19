@@ -486,6 +486,64 @@ class StrategyHistoryFrozen(unittest.TestCase):
         self.assertNotEqual(p1.user_text, p2.user_text)
 
 
+class StrategyContextSubcontent(unittest.TestCase):
+    """AC14 (plan 2.3): bounded subcontent inside the existing blocks."""
+
+    def _ctx(self, **kw):
+        from tools.agent import providers
+        base = dict(episode=1, tick=4, role="Valkyrie", summary={},
+                    boundaries=["b2"], map_text="", status_text="HP 12/20",
+                    recent_messages=["m"], inventory=["a food ration"],
+                    history=[], remaining_budget=7, level="1", directives=[])
+        base.update(kw)
+        return providers.StrategyContext(**base)
+
+    def test_strategy_context_item_coordinates_conditions_and_inventory_age(
+            self):
+        from tools.agent import providers
+        ctx = self._ctx(inventory_age_text="7 ticks ago",
+                        conditions=["Hungry", "Confused"],
+                        item_evidence=[[6, 5, "coin appearance", 2]],
+                        commitment={"purpose": "collect-items", "pos": [6, 5],
+                                    "phase": "travelling",
+                                    "source": "directive", "generation": 3})
+        rendered = providers._render_strategy_prompt(ctx)
+        self.assertIn("inventory freshness: 7 ticks ago", rendered)
+        self.assertIn("visible conditions: Hungry, Confused", rendered)
+        self.assertIn('item evidence: [6, 5, "coin appearance", 2]', rendered)
+        self.assertIn('"purpose": "collect-items"', rendered)
+        # block order and the final budget line are preserved
+        lines = rendered.split("\n")
+        self.assertTrue(lines[0].startswith("GAME STATE (untrusted data):"))
+        self.assertTrue(lines[-1].startswith("remaining strategy calls: "))
+        # defaults are explicit, never absent
+        plain = providers._render_strategy_prompt(self._ctx())
+        self.assertIn("inventory freshness: unknown", plain)
+        self.assertIn("visible conditions: none", plain)
+        self.assertIn("current commitment: none", plain)
+
+    def test_live_and_evaluator_builders_populate_the_subcontent(self):
+        import types
+        from tools.agent import evaluate
+        rp = evaluate.ReplayPass([], ProviderConfig(reflex="scripted",
+                                                    strategy="off"),
+                                 "scripted", "off")
+        rp.tick = 9
+        rp.mem.inventory.refresh([{"text": "a dagger"}], 3, 100)
+        rp.snap.cond = [{"text": "Hungry"}]
+        rp.reflex.floor.observe_item(rp.reflex.instance_id, (6, 5),
+                                     "coin appearance")
+        rp.reflex.targets.commit(instance_id=0, purpose="collect-items",
+                                 pos=(6, 5), family="frontier",
+                                 source="directive", generation=3)
+        built = rp._build_strategy_context(types.SimpleNamespace(eids=[]))
+        self.assertEqual(built.inventory_age_text, "6 ticks ago")
+        self.assertEqual(list(built.conditions), ["Hungry"])
+        self.assertEqual(list(built.item_evidence[0]),
+                         [6, 5, "coin appearance", 1])
+        self.assertEqual(built.commitment["purpose"], "collect-items")
+
+
 class PresentationCommitmentContext(unittest.TestCase):
     """AC13: the /3 state carries the configured role and the commitment."""
 

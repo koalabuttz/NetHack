@@ -2090,7 +2090,44 @@ class _EpisodeRunner(object):
             history=list(self._boundary_history),
             remaining_budget=self._remaining_budget(), level=st.dlvl,
             role=self.c.config.role,
-            directives=[view.dset] if view.active else [])
+            directives=[view.dset] if view.active else [],
+            inventory_age_text=self._inventory_age_text(),
+            conditions=self._visible_conditions(),
+            item_evidence=self._strategy_item_evidence(),
+            commitment=self._destination_record())
+
+    def _inventory_age_text(self) -> str:
+        """The cached-inventory freshness (plan 2.3), or ``unknown``."""
+        inv = getattr(self.mem, "inventory", None)
+        seen = getattr(inv, "seen_tick", None)
+        if seen is None:
+            return "unknown (never read)"
+        return "%d ticks ago" % max(0, self.tick - int(seen))
+
+    def _visible_conditions(self):
+        """The displayed condition names from the current snapshot."""
+        out = []
+        for entry in getattr(self.snap, "cond", ()) or ():
+            text = ""
+            if isinstance(entry, dict):
+                text = (entry.get("text") or "").strip()
+            if text:
+                out.append(text)
+        return out
+
+    def _strategy_item_evidence(self):
+        """Player-visible floor item evidence (plan 2.3)."""
+        reflex = getattr(self, "reflex", None)
+        floor = getattr(reflex, "floor", None)
+        if floor is None:
+            return []
+        out = []
+        for pos in floor.evidence_positions()[:40]:
+            ev = floor.evidence(pos)
+            if ev is not None:
+                out.append([int(ev.pos[0]), int(ev.pos[1]),
+                            str(ev.appearance), int(ev.source_epoch)])
+        return out
 
     def _precondition_state(self):
         st = self.mem.status
