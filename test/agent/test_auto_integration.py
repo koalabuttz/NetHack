@@ -1234,6 +1234,34 @@ class JevAppliedCap(WireHarness):
         self.assertEqual(r.ledger.reflex_paid_dispatched, 1)
         self.assertEqual(r.ledger.prompt_tokens, 1000)
 
+    def test_incomplete_delivery_repair_does_not_activate_or_consume_pending(
+            self):
+        # a delivery-repair (incomplete-retry) pass must neither activate nor
+        # consume pending destination advice: it stays preserved until the next
+        # fresh command decision, where it activates normally (plan 2.2)
+        fake = _ChoiceJev(usage={"prompt_tokens": 1000})
+        r, rec, _ = self._runner(fake, cap=1)
+        self._answer(r)                       # the fresh decision and its send
+        dset, why = directives.validate_directive_set(
+            {"schema_version": 2, "goals": ["collect_items"], "target": [5, 5],
+             "ttl": 50})
+        self.assertEqual(why, "")
+        # the strategy has since returned this advice, still pending
+        r._pending_directives = dset
+        r._pending_directives_level = r.mem.status.dlvl
+        r._pending_directives_instance = None
+        r._on_invalid({"code": "incomplete"})
+        self.assertIsNotNone(r._repair_send)
+        self._answer(r)                       # the delivery-repair pass
+        # the repair left the pending advice untouched and never activated it
+        self.assertIs(r._pending_directives, dset)
+        self.assertFalse(r.book.has_active)
+        rec.finalize({})
+        # the next genuine command decision activates it normally
+        r._activate_pending_directives({"kind": "command", "id": 9})
+        self.assertTrue(r.book.has_active)
+        self.assertIsNone(r._pending_directives)
+
     def test_jev_applied_send_later_native_invalid_is_not_refunded(self):
         fake = _ChoiceJev()
         r, rec, _ = self._runner(fake, cap=1)

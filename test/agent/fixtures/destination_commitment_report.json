@@ -1,6 +1,10 @@
 {
  "commits": [
   {
+   "hash": "d3a38006cac05c33468077e751e42a285ed550e8",
+   "subject": "agent: AC1/AC2 tests and final mutation"
+  },
+  {
    "hash": "fb7987c5c3a7a97fb6fc5eb8ad249061e1d2ab11",
    "subject": "agent: live/evaluator parity and supersede"
   },
@@ -27,10 +31,6 @@
   {
    "hash": "3293782b2ae1ff8064f7a49683394937cd9568bf",
    "subject": "agent: presentation /3 golden and test"
-  },
-  {
-   "hash": "7761274b1d9c3dcb5b926980230e49189aea866c",
-   "subject": "agent: fix golden capture helper"
   }
  ],
  "gates": {
