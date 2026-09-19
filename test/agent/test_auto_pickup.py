@@ -23,7 +23,142 @@ for _p in (_ROOT, _HERE):
         sys.path.insert(0, _p)
 
 import pickup_shapes  # noqa: E402
-from tools.agent import pickup  # noqa: E402
+from tools.agent import pickup, policy, presentation  # noqa: E402
+from tools.agent.directives import DirectiveSet, DirectiveView  # noqa: E402
+from tools.agent.providers import ProviderConfig  # noqa: E402
+
+import test_auto_navigation as nav_test  # noqa: E402
+
+FLOOR = nav_test.FLOOR
+
+
+class PickupPolicyWiring(unittest.TestCase):
+    """AC11/AC13: the policy pickup intent over a supported item site."""
+
+    def setUp(self):
+        self.ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+
+    def _mem(self, hero=(1, 10)):
+        cells = {(x, 10): FLOOR for x in range(1, 8)}
+        return nav_test.mem_with(cells, hero)
+
+    def _labels(self, table):
+        return [c.semantic_label for c in table.ordered_candidates]
+
+    def _observe(self, mem, appearance="% food appearance"):
+        return self.ref.floor.observe_item(self.ref.instance_id, mem.hero,
+                                           appearance)
+
+    def test_opportunistic_pickup_preserves_exploration_destination(self):
+        mem = self._mem()
+        self._observe(mem)
+        table = self.ref.prepare(nav_test.ctx(mem)).table
+        labels = self._labels(table)
+        self.assertIn("navigate", labels)
+        self.assertIn("pick-up", labels)
+        # the committed-route continuation stays the scripted argmax
+        self.assertEqual(table.scripted().semantic_label, "navigate")
+
+    def test_retreat_suppresses_opportunistic_pickup(self):
+        mem = self._mem()
+        self._observe(mem)
+        view = DirectiveView(DirectiveSet(
+            schema_version=2, goals=("flee_to_upstairs",)), 1)
+        table = self.ref.prepare(
+            nav_test.ctx(mem, directives=[view])).table
+        self.assertNotIn("pick-up", self._labels(table))
+
+    def test_adjacent_ambiguous_item_does_not_redirect_default_route(self):
+        mem = self._mem(hero=(3, 10))
+        # an item appearance adjacent to (not under) the hero is context only
+        mem.grid[(3, 9)] = ("%", "brown", 0, "none")
+        table = self.ref.prepare(nav_test.ctx(mem)).table
+        self.assertNotIn("pick-up", self._labels(table))
+        self.assertEqual(table.scripted().semantic_label, "navigate")
+
+    def test_hungry_exact_ration_promotes_pickup_above_route(self):
+        mem = self._mem()
+        self._observe(mem)
+        self.ref.floor.bind_ration_name(self.ref.instance_id, mem.hero,
+                                        "food ration", mem.hero)
+        mem.status.hunger = "Hungry"
+        # the scheduled-eat path is on cooldown, so navigation is reached and
+        # the narrow urgent-food rule authorizes the reflex pickup
+        self.ref.last_eat_tick = 1000
+        table = self.ref.prepare(nav_test.ctx(mem)).table
+        self.assertEqual(table.scripted().semantic_label, "pick-up")
+
+    def test_declined_token_not_reoffered(self):
+        mem = self._mem()
+        ev = self._observe(mem)
+        self.ref.floor.note_declined(ev)
+        table = self.ref.prepare(nav_test.ctx(mem)).table
+        self.assertNotIn("pick-up", self._labels(table))
+
+    def test_bounded_attempts_suppress_pickup_offer(self):
+        mem = self._mem()
+        ev = self._observe(mem)
+        self.ref.floor.note_initiation(ev)
+        self.ref.floor.note_initiation(ev)
+        table = self.ref.prepare(nav_test.ctx(mem)).table
+        self.assertNotIn("pick-up", self._labels(table))
+
+    def test_commit_pickup_counts_reconciled_initiation(self):
+        mem = self._mem()
+        ev = self._observe(mem)
+        payload = ("pickup", "opportunistic", ev.instance, ev.pos[0],
+                   ev.pos[1], ev.source_epoch)
+        self.ref.commit_effect("pickup", "pick-up", 1, mem,
+                               observed_kind="moved", payload=payload)
+        self.assertEqual(self.ref.floor.attempts(ev), 1)
+        self.assertEqual(self.ref.intent, "pickup")
+
+    def test_stale_pickup_token_is_dropped(self):
+        mem = self._mem()
+        ev = self._observe(mem)
+        payload = ("pickup", "opportunistic", ev.instance, ev.pos[0],
+                   ev.pos[1], ev.source_epoch + 99)
+        self.ref.commit_effect("pickup", "pick-up", 1, mem,
+                               observed_kind="moved", payload=payload)
+        self.assertEqual(self.ref.floor.attempts(ev), 0)
+        self.assertEqual(self.ref.intent, "")
+
+    def test_continuation_over_offer_declines_the_token(self):
+        mem = self._mem()
+        self._observe(mem)
+        # acquire the destination, then send one continuation over the offered
+        # pickup: that continuation declines the token (plan 3.3)
+        first = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.ref.commit_effect(first.proposed_effect, first.semantic_label, 1,
+                               mem, observed_kind="moved",
+                               payload=first.effect_payload)
+        self.assertIsNotNone(self.ref.targets.held())
+        cont = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.assertEqual(cont.effect_payload[1], "continue")
+        self.ref.commit_effect(cont.proposed_effect, cont.semantic_label, 2,
+                               mem, observed_kind="moved",
+                               payload=cont.effect_payload)
+        ev = self.ref.floor.evidence(mem.hero)
+        self.assertTrue(self.ref.floor.declined(ev))
+        table = self.ref.prepare(nav_test.ctx(mem)).table
+        self.assertNotIn("pick-up", self._labels(table))
+
+    def test_pickup_choice_criteria_object_key_index_and_n_frozen(self):
+        mem = self._mem()
+        self._observe(mem)
+        table = self.ref.prepare(nav_test.ctx(mem)).table
+        n = len(table.ordered_candidates)
+        pres, refusal = presentation.present(
+            "command", table.ordered_candidates, nav_test.ctx(mem))
+        self.assertEqual(refusal, "")
+        # the criteria object is insertion-ordered, one key per retained member
+        self.assertEqual(len(pres.keys), n)
+        self.assertEqual(list(pres.criteria), list(pres.keys))
+        self.assertEqual(sorted(pres.key_index.values()), list(range(n)))
+        # presentation neither adds, drops nor reorders: the pick-up member is
+        # present with a stable key
+        self.assertIn("pick-up", pres.criteria)
+        self.assertEqual(pres.keys[-1], "pick-up")
 
 
 class PickupEvidenceAndIntent(unittest.TestCase):

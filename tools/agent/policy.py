@@ -35,7 +35,8 @@ import random
 import time
 from typing import Dict, List, Optional, Tuple
 
-from . import candidates, forced_search, navigation, protocol, recovery, state
+from . import (candidates, forced_search, instances, navigation, pickup,
+               protocol, recovery, state)
 from .arbitration import select_retained
 from .directives import DirectiveView
 from .providers import ReflexContext, ReflexResult, ReflexTimeout
@@ -162,6 +163,9 @@ class ScriptedReflex(object):
         # persistent committed destination plus its serviced/failed ledgers.
         # Mutated only at a reconcile/effect boundary, never during prepare.
         self.targets = navigation.CommitmentStore()
+        # The instance-scoped floor-item evidence ledger (plan section 3):
+        # source-epoch tokens, bounded attempts, declines and negatives.
+        self.floor = pickup.FloorLedger()
         self._cycled = False
         # The last prepared table and retained candidate, exposed for the
         # controller-owned SentAttempt lifecycle (set in decide()).
@@ -316,7 +320,8 @@ class ScriptedReflex(object):
     #: The non-command effect tags :meth:`commit_effect` applies from the
     #: frozen proposal rather than during preparation (plan 3.1).
     _NONCOMMAND_EFFECTS = ("selection-done", "eat-menu", "eat-forced-menu",
-                           "refresh-inventory-menu")
+                           "refresh-inventory-menu", "pickup-menu",
+                           "pickup-menu-cancel")
 
     def commit_effect(self, effect, semantic_label, tick, mem,
                       observed_kind="", payload=()) -> None:
@@ -343,6 +348,9 @@ class ScriptedReflex(object):
         tags = tuple(t for t in effect.split("+") if t)
         if tags and all(t in self._NONCOMMAND_EFFECTS for t in tags):
             self._commit_noncommand(tags, payload, mem)
+            return
+        if payload and payload[0] == "pickup":
+            self._commit_pickup(payload, tick, mem)
             return
         if payload and payload[0] == "dest":
             self._commit_destination(payload, tick, mem)
@@ -393,6 +401,36 @@ class ScriptedReflex(object):
             elif tag == "refresh-inventory-menu":
                 rows, seen_tick, game_time = self._refresh_payload(payload)
                 mem.inventory.refresh(rows, seen_tick, game_time)
+            elif tag == "pickup-menu":
+                self.intent = ""
+            elif tag == "pickup-menu-cancel":
+                # a deliberate cancellation terminates the site's acquisition
+                self.intent = ""
+                if mem.hero is not None:
+                    self.floor.note_negative(self.instance_id, mem.hero,
+                                             pickup.OUTCOME_CANCELED)
+
+    def _commit_pickup(self, payload, tick, mem) -> None:
+        """Commit one selected, sent and reconciled pickup initiation (3.3).
+
+        Applies only against the unchanged evidence token: a stale token, an
+        already-declined token, an existing negative or an exhausted budget
+        drops the effect.  The initiation is counted here, at the reconcile
+        boundary, so preparation and selection spend no attempt.
+        """
+        if not payload or payload[0] != "pickup":
+            return
+        (_tag, mode, iid, x, y, epoch) = payload
+        pos = (int(x), int(y))
+        ev = self.floor.evidence(pos)
+        if ev is None or ev.source_epoch != int(epoch):
+            return                      # stale evidence token
+        if self.floor.declined(ev) or self.floor.negative(ev.instance, pos):
+            return
+        if not self.floor.budget_available(ev):
+            return
+        self.floor.note_initiation(ev)
+        self.intent = "pickup"
 
     def _commit_destination(self, payload, tick, mem) -> None:
         """Apply one frozen destination effect (compare-and-apply, plan 1.4).
@@ -436,6 +474,15 @@ class ScriptedReflex(object):
         self.targets.note_nav_attempt()
         if hero is not None:
             self.targets.note_progress(tuple(hero), tick)
+            # A continuation chosen while a pickup was offered declines that
+            # evidence token for the current visit, so it is not re-offered
+            # every tick (plan 3.3).
+            ev = self.floor.evidence(hero)
+            if (ev is not None and not self.floor.declined(ev)
+                    and not self.floor.negative(self.instance_id, hero)
+                    and not self.directives.wants_flee_upstairs()
+                    and self.floor.budget_available(ev)):
+                self.floor.note_declined(ev)
         if cur.purpose == navigation.COMMIT_OPEN_DOOR:
             if hero is not None and recovery.chebyshev(hero, pos) <= 1:
                 self.targets.note_interact_attempt()
@@ -496,6 +543,25 @@ class ScriptedReflex(object):
         refresh = self._inventory_refresh(context, context.pages, title)
         tags = [] if refresh is None else ["refresh-inventory-menu"]
         payload = refresh or ()
+
+        if self.intent == "pickup":
+            # The pickup intent locally filters the real menu: a uniquely
+            # authorized exact row (urgent food) or a single bound row
+            # (collect_items), else a conservative cancellation -- never a
+            # model-chosen row (plan 3.3).
+            mem = context.memory
+            hero = mem.hero
+            ev = self.floor.evidence(hero) if hero is not None else None
+            urgent = bool(ev and pickup.urgent_food_fallback(
+                hungry=self._hungry(mem.status),
+                usable_cached_food=bool(mem.inventory.food_rows()),
+                exact_ration_name=ev.ration_name))
+            decision, row, why = pickup.menu_decision(
+                pickup.parse_rows(context.pages), urgent_food=urgent)
+            if decision == "select" and row is not None:
+                return ({"menu": need.get("menu"), "commit": [[row.index, -1]]},
+                        why, "pickup-menu", ())
+            return {"cancel": True}, why, "pickup-menu-cancel", ()
 
         if self.intent == "eat":
             # the eat-intent transition is a frozen effect, not a mutation
@@ -566,6 +632,9 @@ class ScriptedReflex(object):
 
         if "shall i pick" in low:
             return {"yn": KEY.KEY_N}, "decline auto-pick", "prompt", ()
+        if pickup.is_capacity_prompt(prompt):
+            # a capacity/burden question is always declined (plan 3.5)
+            return {"yn": KEY.KEY_N}, "decline capacity prompt", "prompt", ()
         if "really quit" in low or "quit without saving" in low:
             return {"yn": KEY.KEY_Y}, "confirm quit", "prompt", ()
         if "save" in low and "really" in low:
@@ -727,11 +796,11 @@ class ScriptedReflex(object):
                                                    hero):
             routed = self._route_committed(held, terrain, hero, plan)
             if routed is not None:
-                return (routed,)
+                return self._with_pickup((routed,), mem, hero)
         cands = self._acquisition_candidates(context, mem, hero, plan,
                                              prefer_stairs, explore_first)
         if cands:
-            return tuple(cands)
+            return self._with_pickup(tuple(cands), mem, hero)
         if mem.searches_since_progress < 3 \
                 and self._allows_search(mem, hero) \
                 and not self._cycled:
@@ -832,6 +901,56 @@ class ScriptedReflex(object):
             source, generation, expected = ("default", 0, -1)
         return ("dest", op, int(iid), purpose, int(pos[0]), int(pos[1]),
                 family, source, int(generation), int(expected))
+
+    def _with_pickup(self, base, mem, hero):
+        """Append the opportunistic pickup alternative at a supported site.
+
+        The held-route continuation (or the acquisition set) is never dropped
+        or reordered: the pickup candidate is only appended, so the Choice
+        criterion order and N are decided entirely here (plan 3.3).
+        """
+        alt = self._pickup_alternative(mem, hero)
+        if alt is None:
+            return base
+        return tuple(base) + (alt,)
+
+    def _pickup_alternative(self, mem, hero):
+        """The priority-bound pickup candidate, or ``None`` (plan 3.1/3.3).
+
+        Offered only when the hero stands on a supported item site (a floor
+        evidence token exists) with budget remaining and no negative.  An
+        explicit ``flee_to_upstairs`` suppresses opportunistic pickup
+        entirely.  The score keeps the scripted fallback on the committed
+        route unless an explicit ``collect_items`` directive or the narrow
+        urgent-food rule authorizes a reflex pickup; Jev may still choose
+        ``pick-up`` over the continuation among the offered criteria.
+        """
+        if hero is None:
+            return None
+        if self.directives.wants_flee_upstairs():
+            return None
+        instance = self.instance_id
+        ev = self.floor.evidence(hero)
+        if ev is None or self.floor.declined(ev) \
+                or self.floor.negative(instance, hero) \
+                or not self.floor.budget_available(ev):
+            return None
+        collect = self.directives.wants_collect() and (
+            self.directives.target is None
+            or tuple(self.directives.target) == tuple(hero))
+        urgent = pickup.urgent_food_fallback(
+            hungry=self._hungry(mem.status),
+            usable_cached_food=bool(mem.inventory.food_rows()),
+            exact_ration_name=ev.ration_name)
+        if collect or urgent:
+            mode, score = "urgent", 900
+        else:
+            mode, score = "opportunistic", -1
+        payload = ("pickup", mode, int(ev.instance), int(ev.pos[0]),
+                   int(ev.pos[1]), int(ev.source_epoch))
+        reason = "pick up the items here (%s)" % mode
+        return self._cand({"key": KEY.KEY_PICKUP}, "pick-up", "pickup", score,
+                          reason, "pickup", effect_payload=payload)
 
     # The bounded same-family margin: a reversal is kept only when it scores
     # strictly more than 40 above the best non-reversing alternative in its
@@ -1045,6 +1164,7 @@ class ScriptedReflex(object):
             # existing edge-legal recovery singleton runs, so a stale
             # destination cannot re-drive the loop (plan 1.5 "Cycle").
             self.targets.invalidate_cycle()
+        self._fold_floor(mem)
         instance = getattr(mem, "instance", None)
         if instance is None:
             instance = self.instance_id
@@ -1054,6 +1174,36 @@ class ScriptedReflex(object):
                 self.food.note_inventory_negative(mem.inventory_signature())
             elif kind == recovery.FOOD_NEG_LOCATION and hero is not None:
                 self.food.note_location_negative(instance or 0, hero, 0)
+
+    def _fold_floor(self, mem) -> None:
+        """Fold one committed observation into the floor-item ledger (3.2).
+
+        A displayed item appearance at a non-hero cell creates (or materially
+        refreshes) a source-epoch token.  When the confirmed hero stands on a
+        square whose ledger record already exists, that record is retained as
+        *last-seen* evidence with its **unchanged** epoch -- the hero overlay
+        hides the glyph but must not fabricate a new token (and so must not
+        reset the bounded attempt budget).
+        """
+        instance = getattr(mem, "instance", None)
+        if instance is None:
+            instance = self.instance_id
+        hero = mem.hero
+        for pos, cell in mem.grid.items():
+            if not cell:
+                continue
+            ch = cell[0]
+            if not ch or ch in (" ", "@"):
+                continue
+            color = cell[1] if len(cell) > 1 else ""
+            style = cell[2] if len(cell) > 2 else ""
+            other = cell[3] if len(cell) > 3 else ""
+            app = instances.display_appearance(ch, color, style, other, pos,
+                                               hero)
+            if app.kind == instances.APP_ITEM:
+                self.floor.observe_item(instance, pos, app.category)
+        if hero is not None and self.floor.evidence(hero) is not None:
+            self.floor.retain_on_arrival(instance, hero)
 
     def begin_instance(self, iid) -> None:
         """Start a fresh level-instance scope (plan 4.1 rule 6).
@@ -1069,6 +1219,7 @@ class ScriptedReflex(object):
         # A fresh level-instance scope clears the commitment and the scoped
         # serviced/failed ledgers (plan 1.5 "Level instance change").
         self.targets.reset()
+        self.floor.reset()
         self._cycled = False
         self.stuck = 0
         self.last_hero = None
