@@ -237,6 +237,14 @@ class PrepareAndReconcile(unittest.TestCase):
         routed = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
         self.assertEqual(self.ref.targets.held().pos, committed)
         self.assertEqual(routed.family, "frontier")
+        # a held destination is routed as a SINGLE committed continuation, not
+        # re-elected from the pool (the held branch is the only thing that can
+        # produce a one-candidate navigation table here)
+        prepared2 = self.ref.prepare(nav_test.ctx(mem))
+        self.assertEqual(len(prepared2.table.ordered_candidates), 1)
+        cont = prepared2.table.scripted()
+        self.assertTrue(cont.effect_payload)
+        self.assertEqual(cont.effect_payload[1], "continue")
 
     def test_one_hop_acquisition_records_reached_without_installation(self):
         # the destination the observation already satisfies is serviced, not

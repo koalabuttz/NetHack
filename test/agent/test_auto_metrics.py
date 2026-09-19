@@ -268,5 +268,36 @@ class ControlledAlternationFixtures(unittest.TestCase):
         self.assertEqual(alternating_moves(stationary), (0, 0, 1))
 
 
+class ValidationReport(unittest.TestCase):
+    """AC16/AC18: the validation report carries every required field."""
+
+    def test_validation_report_contains_required_fields(self):
+        import mutation_checks
+        import pickup_shapes
+        self.assertTrue(os.path.exists(mutation_checks.REPORT_PATH),
+                        mutation_checks.REPORT_PATH)
+        with open(mutation_checks.REPORT_PATH) as fh:
+            report = json.load(fh)
+        for field in mutation_checks.REQUIRED_FIELDS:
+            self.assertIn(field, report)
+        # commit/config identifiers
+        self.assertTrue(report["commits"])
+        for c in report["commits"]:
+            self.assertTrue(c.get("hash") and c.get("subject"))
+        # suite and named-mutation results
+        self.assertTrue(report["gates"])
+        names = {m["name"] for m in report["named_mutations"]}
+        for m in list(mutation_checks.MUTATIONS) \
+                + list(mutation_checks.NOT_PERFORMED):
+            self.assertIn(m["name"], names)
+        # the native-vs-manual pickup-shape disposition is exhaustive
+        disp = report["pickup_shape_disposition"]
+        pickup_shapes.validate_partition(disp["native_passed"],
+                                         disp["manual_required"])
+        # live claims are explicitly labeled, never inferred
+        self.assertFalse(report["live_claims"]["measured"])
+        self.assertIn("note", report["live_claims"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
