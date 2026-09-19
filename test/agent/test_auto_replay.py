@@ -1591,5 +1591,41 @@ class TestJevOfflineMetrics(unittest.TestCase):
         self.assertIn("bytes", lowered)
 
 
+class AdditiveJevReasonCompatibility(unittest.TestCase):
+    """AC.7: additive Jev reason strings keep the sidecar schema stable."""
+
+    def test_additive_jev_reasons_preserve_decision_sidecar_loading(self):
+        # The decision-sidecar *schema* is unchanged: the new Jev reason text
+        # (the relative-concentration note and the anti-backtrack qualifier)
+        # is an additive string value, so old and new records load identically.
+        old = {"schema": 1, "proposal": {"key": 108}, "selected": {"key": 108},
+               "provider": "jev", "reason": "jev choice", "boundaries": [],
+               "directives": [], "usage": {}}
+        new = dict(old, reason=("jev choice: relative concentration "
+                                "p=0.550 N=3 k=1.500"))
+        nav = dict(old, provider="scripted",
+                   reason=("navigate (avoiding an immediate backtrack): "
+                           "observation frontier"))
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ep-1.decisions.jsonl")
+            with open(path, "w") as fh:
+                for rec in (old, new, nav):
+                    fh.write(json.dumps(rec) + "\n")
+            loaded = evaluate.load_decisions(path)
+        self.assertEqual(len(loaded), 3)
+        # every key and value round-trips; only the reason text grew
+        self.assertEqual([r["selected"] for r in loaded],
+                         [{"key": 108}] * 3)
+        self.assertEqual([r["provider"] for r in loaded],
+                         ["jev", "jev", "scripted"])
+        self.assertEqual(loaded[0]["reason"], "jev choice")
+        self.assertIn("relative concentration", loaded[1]["reason"])
+        self.assertIn("avoiding an immediate backtrack", loaded[2]["reason"])
+        # the recognized-purpose mapping still resolves the qualified reason
+        from tools.agent import presentation
+        self.assertEqual(presentation.purpose_of(nav["reason"]),
+                         presentation.PURPOSES["observation frontier"])
+
+
 if __name__ == "__main__":
     unittest.main()

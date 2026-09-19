@@ -1115,6 +1115,26 @@ class JevAppliedCap(WireHarness):
         self.assertIsNone(r2.ledger.reserve_reflex_paid())
 
 
+    def test_episode_and_campaign_summary_report_reflex_applied_and_consulted_counts(
+            self):
+        # the per-episode and campaign summaries report both the applied count
+        # (bounded by the applied cap) and the consulted/reserved diagnostic
+        r = controller.EpisodeResult(index=1)
+        r.budget = {"usage": {"prompt_tokens": 10},
+                    "reflex": {"applied": 2, "paid_dispatched": 5,
+                               "successful": 2, "fallback": 3, "timeout": 1,
+                               "invalid": 0, "low_confidence": 0}}
+        ep = controller._episode_summary(r)
+        self.assertEqual(ep["reflex"]["applied"], 2)
+        self.assertEqual(ep["reflex"]["paid_dispatched"], 5)
+        summary = controller.campaign_summary([r], ProviderConfig(), 1.0)
+        self.assertEqual(summary["totals"]["reflex"]["applied"], 2)
+        self.assertEqual(summary["totals"]["reflex"]["paid_dispatched"], 5)
+        # applied never exceeds the applied cap even when consultations do
+        self.assertLessEqual(summary["totals"]["reflex"]["applied"],
+                             summary["totals"]["reflex"]["paid_dispatched"])
+
+
 class SummaryCompatibility(unittest.TestCase):
     """AC.7: additive ``reflex.applied`` reporting keeps old consumers working."""
 
