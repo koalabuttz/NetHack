@@ -25,7 +25,7 @@ cycle.
 """
 
 import heapq
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, FrozenSet, Optional, Sequence, Tuple
 
 from .instances import (OCC_NONE, T_CLOSED_DOOR, T_DOORWAY, T_OPEN_DOOR,
@@ -488,7 +488,8 @@ class CommitmentStore(object):
                evidence_token: tuple = (), tick: int = 0,
                approach: Optional[Tuple[int, int]] = None,
                expected_serial: Optional[int] = None,
-               hops: Optional[int] = None) -> bool:
+               hops: Optional[int] = None,
+               phase: str = PHASE_TRAVELLING) -> bool:
         """Install a new commitment (compare-and-apply).
 
         ``expected_serial`` implements the compare-and-apply contract: when it
@@ -506,7 +507,8 @@ class CommitmentStore(object):
             purpose=purpose, pos=tuple(pos), family=family,
             approach=None if approach is None else tuple(approach),
             source=source, generation=int(generation),
-            evidence_token=tuple(evidence_token), acquisition_tick=int(tick))
+            evidence_token=tuple(evidence_token), acquisition_tick=int(tick),
+            phase=phase)
         self.stall_attempts = 0
         self.interact_attempts = 0
         self.total_attempts = 0
@@ -519,6 +521,19 @@ class CommitmentStore(object):
     def set_stall_cap(self, hops: int) -> None:
         self.stall_cap = max(STALL_TOTAL_MIN,
                              STALL_TOTAL_FACTOR * int(hops) + STALL_TOTAL_SLACK)
+
+    def set_phase(self, phase: str) -> None:
+        """Transition the active commitment's phase, keeping every identity.
+
+        The serial, evidence token, purpose and originating generation are
+        preserved, so an arrival that begins an interaction is not a new
+        commitment and its later terminal outcome settles the same target.
+        """
+        cur = self.current
+        if cur is None or cur.phase == phase:
+            return
+        self.current = replace(cur, phase=phase)
+        self.events.append({"event": "phase", "phase": phase, "pos": cur.pos})
 
     def note_nav_attempt(self) -> None:
         self.total_attempts += 1
@@ -745,7 +760,11 @@ def resolve_semantic_destination(
         if t not in {tuple(p) for p in evidence_positions}:
             return None, "no floor item evidence at the target"
         if t == hero:
-            return None, "already at the collection site"
+            # the target is already under the hero: this is not a failure, it
+            # is the on-square collection case -- the caller emits the pickup
+            # action rather than a movement step (plan 1.5/3.3)
+            return Target(t, TFAM_UNVISITED, (0, 0), 0,
+                          "collect the items here"), ""
         if t not in dist:
             return None, "the collection site is not reachable"
         return _target_at(t, dist, first, TFAM_UNVISITED,

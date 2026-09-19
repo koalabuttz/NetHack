@@ -180,6 +180,13 @@ class ScriptedReflex(object):
         self.pickup_evidence = None
         self.pickup_init_inventory = None
         self.pickup_generation = 0
+        # The frozen in-flight pickup attempt (plan 1.5/3.3), installed at the
+        # *send* boundary so the observation that reports the result is folded
+        # against a pre-send baseline rather than a post-result one.
+        self.pickup_pending = None
+        # True when an active collect destination already sits under the hero,
+        # so the acquired action is the pickup initiation (plan 1.5/3.3).
+        self.on_square_collect = False
         self._cycled = False
         # The last prepared table and retained candidate, exposed for the
         # controller-owned SentAttempt lifecycle (set in decide()).
@@ -430,18 +437,20 @@ class ScriptedReflex(object):
                 # a declined capacity/burden prompt is a terminal refusal
                 self.intent = ""
                 self.pickup_purpose = ""
+                self.pickup_pending = None
                 if mem.hero is not None:
                     self.floor.note_negative(self.instance_id, mem.hero,
                                              pickup.OUTCOME_REFUSED)
                 self._settle_pickup_target(pickup.OUTCOME_REFUSED, mem)
 
-    def _commit_pickup(self, payload, tick, mem) -> None:
-        """Commit one selected, sent and reconciled pickup initiation (3.3).
+    def arm_pickup(self, payload) -> None:
+        """Freeze a pickup attempt at the *send* boundary (plan 1.5/3.3).
 
-        Applies only against the unchanged evidence token: a stale token, an
-        already-declined token, an existing negative or an exhausted budget
-        drops the effect.  The initiation is counted here, at the reconcile
-        boundary, so preparation and selection spend no attempt.
+        The evidence identity, purpose, generation and the **pre-send**
+        inventory signature are captured here, before the observation that
+        reports the result, so that observation is classified against a true
+        pre-send baseline on its own reconciliation boundary.  The bounded
+        initiation is counted here, and only here, for a sent attempt.
         """
         if not payload or payload[0] != "pickup":
             return
@@ -454,13 +463,58 @@ class ScriptedReflex(object):
             return
         if not self.floor.budget_available(ev):
             return
+        init_sig = payload[8] if len(payload) > 8 else None
+        if init_sig is not None:
+            init_sig = tuple(init_sig) if not isinstance(init_sig, tuple) \
+                else init_sig
         self.floor.note_initiation(ev)
+        self.pickup_pending = {
+            "evidence": ev,
+            "purpose": mode,
+            "generation": (int(payload[6]) if len(payload) > 6
+                           else int(self.directives.generation)),
+            "init_inventory": init_sig,
+        }
         self.intent = "pickup"
         self.pickup_purpose = mode
         self.pickup_evidence = ev
-        self.pickup_init_inventory = mem.inventory_signature()
-        self.pickup_generation = (int(payload[6]) if len(payload) > 6
-                                  else int(self.directives.generation))
+        self.pickup_init_inventory = init_sig
+
+    def _commit_pickup(self, payload, tick, mem) -> None:
+        """Commit one selected, sent and reconciled pickup initiation (3.3).
+
+        Applies only against the unchanged evidence token: a stale token, an
+        already-declined token, an existing negative or an exhausted budget
+        drops the effect.  The initiation is counted here, at the reconcile
+        boundary, so preparation and selection spend no attempt.
+        """
+        if not payload or payload[0] != "pickup":
+            return
+        if self.pickup_pending is not None:
+            return                      # already frozen at the send boundary
+        (_tag, mode, iid, x, y, epoch) = payload[:6]
+        pos = (int(x), int(y))
+        ev = self.floor.evidence(pos)
+        if ev is None or ev.source_epoch != int(epoch):
+            return                      # stale evidence token
+        if self.floor.declined(ev) or self.floor.negative(ev.instance, pos):
+            return
+        if not self.floor.budget_available(ev):
+            return
+        self.floor.note_initiation(ev)
+        init_sig = payload[8] if len(payload) > 8 else None
+        self.pickup_pending = {
+            "evidence": ev, "purpose": mode,
+            "generation": (int(payload[6]) if len(payload) > 6
+                           else int(self.directives.generation)),
+            "init_inventory": (None if init_sig is None else tuple(init_sig)),
+        }
+        self.intent = "pickup"
+        self.pickup_purpose = mode
+        self.pickup_evidence = ev
+        self.pickup_init_inventory = (None if init_sig is None
+                                      else tuple(init_sig))
+        self.pickup_generation = self.pickup_pending["generation"]
 
     def _commit_destination(self, payload, tick, mem) -> None:
         """Apply one frozen destination effect (compare-and-apply, plan 1.4).
@@ -485,6 +539,16 @@ class ScriptedReflex(object):
         hero = mem.hero
         if op == "acquire":
             if hero is not None and tuple(hero) == pos:
+                if purpose == navigation.COMMIT_COLLECT_ITEMS:
+                    # the collection site is already under the hero: install
+                    # the commitment in its interacting phase rather than
+                    # servicing it, so the pickup outcome settles it (1.5/3.3)
+                    self.targets.commit(
+                        instance_id=iid or self.instance_id, purpose=purpose,
+                        pos=pos, family=family, source=source,
+                        generation=int(generation), tick=tick,
+                        phase=navigation.PHASE_INTERACTING)
+                    return
                 # the observation that justified acquisition already satisfied
                 # it: record reached instead of installing (plan 1.4)
                 self._note_serviced(mem, pos)
@@ -504,6 +568,12 @@ class ScriptedReflex(object):
         if cur is None or cur.serial != int(expected):
             return                          # stale continuation: drop it
         if op == "arrive" or (hero is not None and tuple(hero) == pos):
+            if cur.purpose == navigation.COMMIT_COLLECT_ITEMS:
+                # Arrival at a collection site *begins* the pickup phase: the
+                # target is not settled here -- only a pickup terminal outcome
+                # settles it and its directive generation (plan 1.5/3.3).
+                self.targets.set_phase(navigation.PHASE_INTERACTING)
+                return
             self._note_serviced(mem, pos)
             self.targets.retire("reached")
             if cur.source == navigation.SRC_DIRECTIVE:
@@ -894,6 +964,14 @@ class ScriptedReflex(object):
                                              prefer_stairs, explore_first)
         if cands:
             return self._with_pickup(tuple(cands), mem, hero)
+        if self.on_square_collect:
+            # an active collect destination already under the hero: the
+            # command decision is the pickup initiation (plan 1.5/3.3)
+            alt = self._pickup_alternative(mem, hero)
+            if alt is not None:
+                return (alt,)
+            self.last_unresolved = "collection site under the hero"
+            return (self._unresolved_destination_candidate(),)
         if self.last_unresolved:
             # An unresolved explicit destination is a structured failure: it is
             # never silently replaced by default exploration (plan 1.5).
@@ -939,6 +1017,7 @@ class ScriptedReflex(object):
         terrain = self._terrain(mem, context)
         directive_purpose = None
         self.last_unresolved = ""
+        self.on_square_collect = False
         if self._directive_bears_destination() \
                 and (self.directives.wants_collect()
                      or self.directives.wants_flee_upstairs()):
@@ -946,6 +1025,11 @@ class ScriptedReflex(object):
                 self._resolve_semantic_destination(context, mem, hero, plan)
             if target is None:
                 self.last_unresolved = reason
+                return []
+            if tuple(target.pos) == tuple(hero):
+                # the collection site is under the hero: the acquired action is
+                # the pickup initiation, not a movement step
+                self.on_square_collect = True
                 return []
             pool = [target]
         elif self.directives.target is not None:
@@ -1134,7 +1218,8 @@ class ScriptedReflex(object):
             mode, score = "opportunistic", -1
         payload = ("pickup", mode, int(ev.instance), int(ev.pos[0]),
                    int(ev.pos[1]), int(ev.source_epoch),
-                   int(self.directives.generation), str(ev.appearance))
+                   int(self.directives.generation), str(ev.appearance),
+                   mem.inventory_signature())
         reason = "pick up the items here (%s)" % mode
         return self._cand({"key": KEY.KEY_PICKUP}, "pick-up", "pickup", score,
                           reason, "pickup", effect_payload=payload)
@@ -1444,19 +1529,23 @@ class ScriptedReflex(object):
     def _fold_pickup_outcome(self, mem) -> None:
         """Classify one reconciled pickup attempt into an outcome (plan 3.3).
 
-        Player-visible evidence only: an inventory delta is success; the
-        explicit "nothing here to pick up" line is no-items; an unpaid /
-        refusal line is refused; anything else is unknown.  A terminal outcome
-        updates the floor ledger, clears the pickup intent and settles the
-        directive-owned collection target.
+        The attempt was frozen at the *send* boundary, so this observation --
+        the one that reports the result -- is classified against the pre-send
+        inventory baseline and the frozen evidence token.  An ``unknown``
+        classification consumes the bounded attempt but **preserves** the
+        interaction phase and the collection target until a terminal outcome
+        or exhaustion; only a terminal outcome settles the target and its
+        directive generation.
         """
-        if self.intent != "pickup":
+        attempt = self.pickup_pending
+        if attempt is None:
             return
-        ev = self.pickup_evidence
+        ev = attempt.get("evidence")
+        init_sig = attempt.get("init_inventory")
         joined = " ".join(t.lower() for t in mem.recent_messages(6))
         sig = mem.inventory_signature()
-        if (sig is not None and self.pickup_init_inventory is not None
-                and sig != self.pickup_init_inventory):
+        if (sig is not None and init_sig is not None
+                and tuple(sig) != tuple(init_sig)):
             outcome = pickup.OUTCOME_SUCCESS
         elif "nothing here to pick up" in joined:
             outcome = pickup.OUTCOME_NO_ITEMS
@@ -1466,17 +1555,29 @@ class ScriptedReflex(object):
             outcome = pickup.OUTCOME_REFUSED
         else:
             outcome = pickup.OUTCOME_UNKNOWN
-        terminal = pickup.terminates_target(outcome)
+        if not pickup.terminates_target(outcome):
+            # unknown: the attempt is spent but the interaction phase and the
+            # collection target survive until a terminal outcome/exhaustion
+            if ev is not None:
+                self.floor.note_outcome(ev, outcome)
+            if ev is not None and not self.floor.budget_available(ev):
+                self._finish_pickup(pickup.OUTCOME_EXHAUSTED, mem, ev)
+            return
+        self._finish_pickup(outcome, mem, ev)
+
+    def _finish_pickup(self, outcome, mem, ev) -> None:
+        """Apply a terminal pickup outcome and settle the collection target."""
         self.intent = ""
         self.pickup_purpose = ""
         self.pickup_init_inventory = None
+        self.pickup_pending = None
         hero = mem.hero
         if ev is not None:
             self.floor.note_outcome(ev, outcome)
-            if terminal and hero is not None:
-                self.floor.note_negative(self.instance_id, tuple(hero), outcome)
-        if terminal:
-            self._settle_pickup_target(outcome, mem)
+            if hero is not None:
+                self.floor.note_negative(self.instance_id, tuple(hero),
+                                         outcome)
+        self._settle_pickup_target(outcome, mem)
 
     def _settle_pickup_target(self, outcome: str, mem=None) -> None:
         """Settle a directive-owned collection target after an outcome (3.3)."""
@@ -1516,6 +1617,7 @@ class ScriptedReflex(object):
         self.pickup_evidence = None
         self.pickup_init_inventory = None
         self.pickup_generation = 0
+        self.pickup_pending = None
         self.directive_settlement = None
         self._cycled = False
         self.stuck = 0

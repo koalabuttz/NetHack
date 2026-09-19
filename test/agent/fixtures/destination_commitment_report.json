@@ -1,9 +1,13 @@
 {
  "commit_range": {
-  "base": "fb7987c5c3a7a97fb6fc5eb8ad249061e1d2ab11",
-  "head": "52fa81ae83ffe46a440dc0c84ec130bcb6ef3469"
+  "base": "d3a38006cac05c33468077e751e42a285ed550e8",
+  "head": "d0b65d1daa2b00abb9c4b600a263d8d7e7b097c8"
  },
  "commits": [
+  {
+   "hash": "d0b65d1daa2b00abb9c4b600a263d8d7e7b097c8",
+   "subject": "agent: lifecycle metrics and report fields (4)"
+  },
   {
    "hash": "52fa81ae83ffe46a440dc0c84ec130bcb6ef3469",
    "subject": "agent: strategy context subcontent (5)"
@@ -31,10 +35,6 @@
   {
    "hash": "d3a38006cac05c33468077e751e42a285ed550e8",
    "subject": "agent: AC1/AC2 tests and final mutation"
-  },
-  {
-   "hash": "fb7987c5c3a7a97fb6fc5eb8ad249061e1d2ab11",
-   "subject": "agent: live/evaluator parity and supersede"
   }
  ],
  "gates": {

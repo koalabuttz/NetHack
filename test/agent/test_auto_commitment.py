@@ -693,16 +693,24 @@ class CommittedBehaviour(unittest.TestCase):
                                payload=cand.effect_payload)
         held = self.ref.targets.held()
         self.assertEqual(held.source, navigation.SRC_DIRECTIVE)
-        # arriving serves the generation: the destination is retired and the
-        # settlement is queued for the book (no reassertion next tick)
+        # arriving at the collection site begins the interacting phase ...
         arrived = nav_test.mem_with({(x, 10): FLOOR for x in range(1, 8)},
                                     (5, 10))
         arrived.visits[(5, 10)] = 1
         cont = policy.ScriptedReflex._dest_payload("continue", held)
         self.ref.commit_effect("navigate", "navigate", 2, arrived,
                                observed_kind="moved", payload=cont)
+        self.assertIsNotNone(self.ref.targets.held())
+        # ... and only a pickup terminal outcome settles it and serves the
+        # generation (no reassertion next tick)
+        self.ref.pickup_pending = {
+            "evidence": self.ref.floor.evidence(arrived.hero),
+            "purpose": "collect", "generation": held.generation,
+            "init_inventory": ()}
+        arrived.messages.append("There is nothing here to pick up.")
+        self.ref.note_observation(arrived)
         self.assertIsNone(self.ref.targets.held())
-        self.assertEqual(self.ref.directive_settlement[0], "reached")
+        self.assertEqual(self.ref.directive_settlement[0], "failed")
         # applying that settlement at the book expires the generation
         from tools.agent import directives as DSMOD
         book = DSMOD.DirectiveBook()

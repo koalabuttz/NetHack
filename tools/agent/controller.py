@@ -2742,6 +2742,10 @@ class _EpisodeRunner(object):
             # Only a successful complete send arms the single SentAttempt
             # (plan 3.4 step 5); a failed write raised above and armed none.
             self._arm_attempt(ordinal, selected)
+            if self._attempt_effect == "pickup":
+                # Freeze the pickup attempt at the send boundary (plan 1.5/3.3)
+                # so its result is classified against a pre-send baseline.
+                self.reflex.arm_pickup(self._attempt_payload)
             self.tick += 1
         else:
             # A non-command send freezes its proposed effect (and any payload)

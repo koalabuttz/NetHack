@@ -162,84 +162,145 @@ class PickupPolicyWiring(unittest.TestCase):
         self.assertEqual([c.candidate_id for c in table.ordered_candidates],
                          before_ids)
 
-    def test_no_items_evidence_terminates_target(self):
-        # issue a real pickup command, then fold the engine's no-items line
+    def _collect_site(self, appearance="coin appearance"):
+        """A mem with item evidence under the hero and an interacting target."""
         mem = self._mem()
-        ev = self._observe(mem)
-        self.ref.targets.commit(instance_id=self.ref.instance_id,
-                                purpose=navigation.COMMIT_COLLECT_ITEMS,
-                                pos=tuple(mem.hero),
-                                family=navigation.TFAM_FRONTIER,
-                                source=navigation.SRC_DIRECTIVE)
-        payload = ("pickup", "collect", ev.instance, ev.pos[0], ev.pos[1],
-                   ev.source_epoch, 0, ev.appearance)
-        self.ref.commit_effect("pickup", "pick-up", 1, mem,
-                               observed_kind="no-time", payload=payload)
+        ev = self.ref.floor.observe_item(self.ref.instance_id, mem.hero,
+                                         appearance)
+        view = DirectiveView(DirectiveSet(
+            schema_version=2, goals=("collect_items",), target=mem.hero), 1)
+        self.ref.targets.commit(
+            instance_id=self.ref.instance_id,
+            purpose=navigation.COMMIT_COLLECT_ITEMS, pos=tuple(mem.hero),
+            family=navigation.TFAM_FRONTIER,
+            source=navigation.SRC_DIRECTIVE,
+            phase=navigation.PHASE_INTERACTING)
+        return mem, ev, view
+
+    def _pickup_candidate(self, mem, view):
+        """The production pickup candidate for the given collect advice."""
+        table = self.ref.prepare(nav_test.ctx(mem, directives=[view])).table
+        cand = table.scripted()
+        self.assertEqual(cand.semantic_label, "pick-up")
+        return cand
+
+    def test_on_square_collect_advice_produces_pickup_action(self):
+        mem = self._mem()
+        self.ref.floor.observe_item(self.ref.instance_id, (1, 10),
+                                    "coin appearance")
+        view = DirectiveView(DirectiveSet(
+            schema_version=2, goals=("collect_items",), target=(1, 10)), 1)
+        cand = self.ref.prepare(
+            nav_test.ctx(mem, directives=[view])).table.scripted()
+        # the on-square collect target yields the pickup action, not a failure
+        self.assertEqual(cand.semantic_label, "pick-up")
+        self.assertEqual(cand.action.to_wire(), {"key": ord(",")})
+        self.assertEqual(cand.effect_payload[0], "pickup")
+        self.assertEqual(cand.effect_payload[1], "collect")
+        self.assertEqual(tuple(cand.effect_payload[3:5]), (1, 10))
+
+    def test_collection_arrival_begins_pickup_phase_not_settlement(self):
+        mem = nav_test.mem_with({(x, 10): FLOOR for x in range(1, 8)},
+                                (1, 10))
+        self.ref.floor.observe_item(self.ref.instance_id, (4, 10),
+                                    "coin appearance")
+        view = DirectiveView(DirectiveSet(
+            schema_version=2, goals=("collect_items",), target=(4, 10)), 1)
+        cand = self.ref.prepare(
+            nav_test.ctx(mem, directives=[view])).table.scripted()
+        self.ref.commit_effect(cand.proposed_effect, cand.semantic_label, 1,
+                               mem, observed_kind="moved",
+                               payload=cand.effect_payload)
+        held = self.ref.targets.held()
+        self.assertEqual(held.purpose, navigation.COMMIT_COLLECT_ITEMS)
+        # arrival at the site: the target is NOT settled; the phase turns
+        arrived = nav_test.mem_with({(x, 10): FLOOR for x in range(1, 8)},
+                                    (4, 10))
+        self.ref.directive_settlement = None
+        cont = policy.ScriptedReflex._dest_payload("continue", held)
+        self.ref.commit_effect("navigate", "navigate", 2, arrived,
+                               observed_kind="moved", payload=cont)
+        self.assertIsNotNone(self.ref.targets.held())
+        self.assertEqual(self.ref.targets.held().phase,
+                         navigation.PHASE_INTERACTING)
+        self.assertIsNone(self.ref.directive_settlement)
+        # the on-square collect now offers the pickup initiation ...
+        self.ref.floor.observe_item(self.ref.instance_id, (4, 10),
+                                    "coin appearance")
+        cand2 = self._pickup_candidate(arrived, view)
+        self.ref.arm_pickup(cand2.effect_payload)       # the send boundary
+        # ... and only the pickup outcome settles it and its generation
+        arrived.messages.append("There is nothing here to pick up.")
+        self.ref.note_observation(arrived)
+        self.assertIsNone(self.ref.targets.held())
+        self.assertEqual(self.ref.directive_settlement[0], "failed")
+
+    def test_direct_no_items_terminates_target(self):
+        mem, ev, view = self._collect_site()
+        cand = self._pickup_candidate(mem, view)
+        self.ref.arm_pickup(cand.effect_payload)        # the send boundary
         self.assertEqual(self.ref.intent, "pickup")
         self.assertEqual(self.ref.pickup_purpose, "collect")
         self.ref.directive_settlement = None
-        # the reconciled observation carries the no-items evidence
         mem.messages.append("There is nothing here to pick up.")
-        self.ref.note_observation(mem)
+        self.ref.note_observation(mem)                  # the result
         self.assertEqual(self.ref.intent, "")
+        self.assertIsNone(self.ref.pickup_pending)
         self.assertEqual(self.ref.floor.outcome(ev), pickup.OUTCOME_NO_ITEMS)
         self.assertEqual(self.ref.floor.negative(self.ref.instance_id,
                                                  mem.hero),
                          pickup.OUTCOME_NO_ITEMS)
-        self.assertIsNone(self.ref.targets.held())          # settled
+        self.assertIsNone(self.ref.targets.held())
         self.assertEqual(self.ref.directive_settlement[0], "failed")
-        # ... and the site is not re-offered
-        table = self.ref.prepare(nav_test.ctx(mem)).table
-        self.assertNotIn("pick-up", self._labels(table))
+        labels = [c.semantic_label for c in self.ref.prepare(
+            nav_test.ctx(mem, directives=[view])).table.ordered_candidates]
+        self.assertNotIn("pick-up", labels)             # no reoffer
 
-    def test_confirmed_pickup_success_records_inventory_delta(self):
-        mem = self._mem()
-        ev = self._observe(mem)
-        self.ref.targets.commit(instance_id=self.ref.instance_id,
-                                purpose=navigation.COMMIT_COLLECT_ITEMS,
-                                pos=tuple(mem.hero),
-                                family=navigation.TFAM_FRONTIER,
-                                source=navigation.SRC_DIRECTIVE)
-        mem.inventory.refresh([{"text": "a dagger"}], 1, 100)
-        payload = ("pickup", "collect", ev.instance, ev.pos[0], ev.pos[1],
-                   ev.source_epoch, 0, ev.appearance)
-        self.ref.commit_effect("pickup", "pick-up", 1, mem,
-                               observed_kind="moved", payload=payload)
-        init_sig = self.ref.pickup_init_inventory
-        # the reconciled observation shows an inventory delta (the acquisition)
-        mem.inventory.refresh([{"text": "a dagger"},
-                               {"text": "some gold pieces"}], 2, 101)
-        self.ref.directive_settlement = None
-        self.ref.note_observation(mem)
-        self.assertEqual(self.ref.intent, "")
-        self.assertNotEqual(mem.inventory_signature(), init_sig)
-        self.assertEqual(self.ref.floor.outcome(ev), pickup.OUTCOME_SUCCESS)
-        self.assertEqual(self.ref.directive_settlement[0], "reached")
-
-    def test_yes_no_refusal_is_decline_not_failure(self):
-        mem = self._mem()
-        ev = self._observe(mem)
-        payload = ("pickup", "collect", ev.instance, ev.pos[0], ev.pos[1],
-                   ev.source_epoch, 0, ev.appearance)
-        self.ref.commit_effect("pickup", "pick-up", 1, mem,
-                               observed_kind="no-time", payload=payload)
+    def test_capacity_refusal_settles_the_target(self):
+        mem, _ev, view = self._collect_site()
+        cand = self._pickup_candidate(mem, view)
+        self.ref.arm_pickup(cand.effect_payload)
         ctx = nav_test.ctx(mem)
         ctx.need = {"kind": "yn",
                     "prompt": "Your backpack is getting hard to carry, "
                               "continue? [yn]"}
         action, _reason, effect, _payload = self.ref._noncommand(ctx, "yn")
-        # the capacity/burden prompt is declined with a terminal refusal
         self.assertEqual(action, {"yn": ord("n")})
         self.assertEqual(effect, "pickup-refuse")
         self.ref.directive_settlement = None
         self.ref.commit_effect(effect, "prompt", 2, mem,
                                observed_kind="prompt-opened", payload=())
         self.assertEqual(self.ref.intent, "")
+        self.assertIsNone(self.ref.pickup_pending)
         self.assertEqual(self.ref.floor.negative(self.ref.instance_id,
                                                  mem.hero),
                          pickup.OUTCOME_REFUSED)
-        self.assertNotEqual(self.ref.floor.outcome(ev) or "",
-                            pickup.OUTCOME_SUCCESS)
+        self.assertIsNone(self.ref.targets.held())
+        self.assertEqual(self.ref.directive_settlement[0], "failed")
+
+    def test_autoselect_unknown_then_inventory_confirmed_success(self):
+        mem, ev, view = self._collect_site()
+        mem.inventory.refresh([{"text": "a dagger"}], 1, 100)
+        cand = self._pickup_candidate(mem, view)
+        self.ref.arm_pickup(cand.effect_payload)        # pre-send baseline
+        self.ref.directive_settlement = None
+        # an autoselect with no visible message is `unknown`: the bounded
+        # attempt is spent but the interaction phase and the target survive
+        self.ref.note_observation(mem)
+        self.assertEqual(self.ref.floor.outcome(ev), pickup.OUTCOME_UNKNOWN)
+        self.assertEqual(self.ref.intent, "pickup")
+        self.assertIsNotNone(self.ref.targets.held())
+        self.assertIsNone(self.ref.directive_settlement)
+        # a second bounded attempt, then the inventory delta confirms success
+        cand2 = self._pickup_candidate(mem, view)
+        self.ref.arm_pickup(cand2.effect_payload)
+        mem.inventory.refresh([{"text": "a dagger"},
+                               {"text": "some gold pieces"}], 2, 101)
+        self.ref.note_observation(mem)
+        self.assertEqual(self.ref.floor.outcome(ev), pickup.OUTCOME_SUCCESS)
+        self.assertEqual(self.ref.intent, "")
+        self.assertIsNone(self.ref.targets.held())
+        self.assertEqual(self.ref.directive_settlement[0], "reached")
 
     def test_pickup_choice_criteria_object_key_index_and_n_frozen(self):
         mem = self._mem()
