@@ -715,8 +715,9 @@ COMPASS_NAMES = {(0, 1): "south", (0, -1): "north", (1, 0): "east",
                  (-1, 0): "west", (1, 1): "southeast", (1, -1): "northeast",
                  (-1, 1): "southwest", (-1, -1): "northwest"}
 
-#: Deterministic summaries for the nine strategy goals, in the fixed priority
-#: order the directive vocabulary already has.
+#: Deterministic summaries for the strategy goals, in the fixed priority
+#: order the directive vocabulary already has.  Schema v2 adds exactly two
+#: destination goals (plan 2.2); the map must match the validator exactly.
 DIRECTIVE_SUMMARIES = {
     "survive": "Prioritize survival.",
     "acquire_food": "Acquire food.",
@@ -727,6 +728,8 @@ DIRECTIVE_SUMMARIES = {
     "descend_known_stairs": "Head toward known stairs down.",
     "inspect_inventory": "Review inventory when information is stale.",
     "disengage": "Withdraw from danger.",
+    "collect_items": "Collect the items visible at the directed location.",
+    "flee_to_upstairs": "Reach the known up staircase (do not ascend).",
 }
 
 #: The number of recent messages the payload carries, and the inventory row

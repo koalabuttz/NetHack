@@ -785,23 +785,28 @@ class TestJevContext(WireHarness):
             self.assertEqual(ctx.intent, intent)
         self.assertTrue(any(ctx.terrain is not None for ctx, _, _ in seen))
 
-    def test_directives_all_nine_goals_parameterized(self):
-        for goal in directives.GOALS:
-            with self.subTest(goal=goal):
-                dset = directives.DirectiveSet(goals=(goal,))
-                ctx = context_of(directives_=[directives.DirectiveView(dset, 1)])
-                summaries = presentation.render_state(ctx)["directives"]
-                self.assertEqual(summaries,
-                                 [presentation.DIRECTIVE_SUMMARIES[goal]])
-        # the whole vocabulary in its priority order, all nine covered
-        dset = directives.DirectiveSet(goals=directives.GOALS)
-        ctx = context_of(directives_=[directives.DirectiveView(dset, 1)])
-        summaries = presentation.render_state(ctx)["directives"]
-        self.assertEqual(summaries,
-                         [presentation.DIRECTIVE_SUMMARIES[g]
-                          for g in directives.GOALS])
+    def test_directives_all_goals_parameterized(self):
+        # Contract migration (Phase 2): the vocabulary grew from the nine v1
+        # goals to the eleven v2 goals; both are covered here.
+        for vocabulary in (directives.GOALS_V1, directives.GOALS_V2):
+            for goal in vocabulary:
+                with self.subTest(goal=goal):
+                    dset = directives.DirectiveSet(goals=(goal,))
+                    ctx = context_of(
+                        directives_=[directives.DirectiveView(dset, 1)])
+                    summaries = presentation.render_state(ctx)["directives"]
+                    self.assertEqual(
+                        summaries,
+                        [presentation.DIRECTIVE_SUMMARIES[goal]])
+            # the whole vocabulary in its priority order, all covered
+            dset = directives.DirectiveSet(goals=vocabulary)
+            ctx = context_of(directives_=[directives.DirectiveView(dset, 1)])
+            summaries = presentation.render_state(ctx)["directives"]
+            self.assertEqual(summaries,
+                             [presentation.DIRECTIVE_SUMMARIES[g]
+                              for g in vocabulary])
         self.assertEqual(set(presentation.DIRECTIVE_SUMMARIES),
-                         set(directives.GOALS))
+                         set(directives.GOALS_V2))
 
     def test_directive_target_risk_preconditions_clauses(self):
         dset = directives.DirectiveSet(

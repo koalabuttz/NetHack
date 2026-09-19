@@ -413,6 +413,23 @@ class DirectiveSchemaV2(unittest.TestCase):
                 self.assertEqual(dset.to_dict()["schema_version"], 2)
 
 
+class StrategyPromptSchemaV2(unittest.TestCase):
+    def test_strategy_prompt_v2_and_summary_goal_maps_match_validator(self):
+        from tools.agent import presentation, providers
+        prompt = providers._SYSTEM_PROMPT
+        # the v2 schema version is required explicitly
+        self.assertIn('"schema_version" (2)', prompt)
+        # every v2 goal is advertised, and only the v2 vocabulary is
+        self.assertEqual(set(directives.GOALS_V2),
+                         set(directives.GOALS_V1)
+                         | {"collect_items", "flee_to_upstairs"})
+        for goal in directives.GOALS_V2:
+            self.assertIn(goal, prompt)
+        # the presentation summary map covers exactly the accepted v2 goals
+        self.assertEqual(set(presentation.DIRECTIVE_SUMMARIES),
+                         set(directives.GOALS_V2))
+
+
 class TestDirectiveBook(unittest.TestCase):
     def _dset(self, goals=("survive",), ttl=5):
         dset, why = DSEV.validate_directive_set(

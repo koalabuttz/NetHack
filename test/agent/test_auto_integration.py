@@ -785,9 +785,12 @@ class JevPresentationIsolation(WireHarness):
                                        deepseek_model="deepseek-chat")
         prepared = providers.prepare_strategy_request(cfg, ctx)
         body = json.dumps(prepared.payload(), separators=(",", ":"))
+        # Contract migration (Phase 2): the schema-v2 system prompt changes the
+        # frozen request payload once (plan 2.3); the rendered snapshot above is
+        # unchanged.
         self.assertEqual(
             hashlib.sha256(body.encode("utf-8")).hexdigest(),
-            "9dc0e7c032da118f5bd5e00a531f73553b32797190bb2cfb551756abef566792")
+            "d98fc9d0230800b8749c216d73eb404f6c77e4a172574b5aea3451199f8c9088")
         # rendering the same context twice is byte-identical (render-once)
         self.assertEqual(providers._render_strategy_prompt(self._ctx()),
                          rendered)
@@ -806,9 +809,12 @@ class JevPresentationIsolation(WireHarness):
                                        deepseek_model="deepseek-chat")
         prepared = providers.prepare_strategy_request(cfg, self._ctx())
         body = json.dumps(prepared.payload(), separators=(",", ":"))
+        # Contract migration (Phase 2): the schema-v2 system prompt changes the
+        # frozen request payload once (plan 2.3); the rendered snapshot is
+        # unchanged.
         self.assertEqual(
             hashlib.sha256(body.encode("utf-8")).hexdigest(),
-            "9dc0e7c032da118f5bd5e00a531f73553b32797190bb2cfb551756abef566792")
+            "d98fc9d0230800b8749c216d73eb404f6c77e4a172574b5aea3451199f8c9088")
 
     def test_room_enrichment_leaves_relative_acceptance_and_applied_cap_unchanged(
             self):
