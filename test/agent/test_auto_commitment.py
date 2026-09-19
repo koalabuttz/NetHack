@@ -24,6 +24,7 @@ for _p in (_ROOT, _HERE):
         sys.path.insert(0, _p)
 
 from tools.agent import candidates, navigation, policy, protocol  # noqa: E402
+from tools.agent.directives import DirectiveSet, DirectiveView  # noqa: E402
 from tools.agent.providers import ProviderConfig  # noqa: E402
 
 import test_auto_navigation as nav_test  # noqa: E402  (shared fixtures)
@@ -292,6 +293,63 @@ class PrepareAndReconcile(unittest.TestCase):
                                    observed_kind="stationary-time-advanced",
                                    payload=payload)
         self.assertIsNone(self.ref.targets.held())
+
+
+class DefaultDestinationPool(unittest.TestCase):
+    """AC2: the default acquisition pool (plan 1.2)."""
+
+    def setUp(self):
+        self.ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+
+    def _corridor(self):
+        cells = {(x, 10): FLOOR for x in range(1, 8)}
+        cells[(7, 10)] = DOWN
+        return cells
+
+    def test_default_commits_door_or_frontier_before_stair(self):
+        mem = nav_test.mem_with(self._corridor(), (1, 10))
+        chosen = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.assertIn(chosen.family, ("frontier", "door"))
+
+    def test_explicit_stair_directive_selects_stair_destination(self):
+        mem = nav_test.mem_with(self._corridor(), (1, 10))
+        view = DirectiveView(DirectiveSet(goals=("descend_known_stairs",)), 1)
+        chosen = self.ref.prepare(
+            nav_test.ctx(mem, directives=[view])).table.scripted()
+        self.assertEqual(chosen.family, "stair")
+
+    def test_on_stair_descent_singleton_unaffected_by_commitment(self):
+        mem = nav_test.mem_with({(x, 10): FLOOR for x in range(1, 4)},
+                                (3, 10))
+        mem.grid[(3, 10)] = DOWN
+        mem.stairs_down.add((3, 10))
+        # a held, unrelated commitment must not interrupt descent
+        self.ref.targets.commit(instance_id=self.ref.instance_id or 0,
+                                purpose=navigation.COMMIT_EXPLORE_FRONTIER,
+                                pos=(2, 10), family=navigation.TFAM_FRONTIER)
+        chosen = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.assertEqual(chosen.action.to_wire(), {"key": ord(">")})
+
+    def test_unvisited_fallback_after_serviced_frontiers(self):
+        # a room whose walls are known except one unknown cell (a frontier),
+        # with the remaining cells unvisited and not frontiers
+        cells = {}
+        for x in range(1, 7):
+            cells[(x, 10)] = FLOOR
+        for x in range(1, 6):
+            cells[(x, 9)] = WALL
+            cells[(x, 11)] = WALL
+        tm = _terrain(cells)
+        dist, first = navigation.one_dijkstra(tm, (1, 10))
+        st = navigation.CommitmentStore()
+        first_choice = navigation.resolve_destination(tm, (1, 10), dist, first,
+                                                      None, store=st)
+        self.assertEqual(first_choice.family, navigation.TFAM_FRONTIER)
+        self.assertEqual(first_choice.pos, (6, 10))
+        st.note_serviced(first_choice.pos, ("sig",))
+        fallback = navigation.resolve_destination(tm, (1, 10), dist, first,
+                                                  None, store=st)
+        self.assertEqual(fallback.family, navigation.TFAM_UNVISITED)
 
 
 if __name__ == "__main__":

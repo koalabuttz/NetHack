@@ -200,6 +200,13 @@ class PrepareAndSelection(unittest.TestCase):
         self.assertEqual(res.action, {"key": protocol.DIR_KEYS[(1, 0)]})
 
     def test_farther_reachable_stair_is_chosen_when_nearer_is_isolated(self):
+        # Contract migration (AC2, plan section 6 checklist).  OLD expectation:
+        # the farther *reachable* stair beat the unreachable nearer one under
+        # default stair-first scoring.  NEW: the default destination pool
+        # commits a reachable door/frontier before down-stairs, so the
+        # reachable-farther-stair claim is preserved under *explicit stair
+        # advice* semantics; the unreachable-target exclusion is unchanged.
+        from tools.agent.directives import DirectiveSet, DirectiveView
         cells = {(x, 10): FLOOR for x in range(1, 12)}
         cells[(11, 10)] = DOWN
         cells[(3, 12)] = DOWN
@@ -208,10 +215,26 @@ class PrepareAndSelection(unittest.TestCase):
         cells[(3, 11)] = WALL
         cells[(3, 13)] = WALL
         mem = mem_with(cells, (6, 10))
-        prepared = self.ref.prepare(ctx(mem))
+        view = DirectiveView(DirectiveSet(goals=("descend_known_stairs",)), 1)
+        prepared = self.ref.prepare(ctx(mem, directives=[view]))
         chosen = prepared.table.scripted()
         self.assertEqual(chosen.family, "stair")
         self.assertIn("down stairs", chosen.reason)
+
+    def test_default_pool_prefers_frontier_over_reachable_stair(self):
+        # AC2: with no explicit stair advice the default pool commits a
+        # reachable frontier before a reachable down staircase.
+        cells = {(x, 10): FLOOR for x in range(1, 12)}
+        cells[(11, 10)] = DOWN
+        cells[(3, 12)] = DOWN
+        cells[(2, 12)] = WALL
+        cells[(4, 12)] = WALL
+        cells[(3, 11)] = WALL
+        cells[(3, 13)] = WALL
+        mem = mem_with(cells, (6, 10))
+        chosen = self.ref.prepare(ctx(mem)).table.scripted()
+        self.assertIn(chosen.family, ("frontier", "door"))
+        self.assertNotEqual(chosen.family, "stair")
 
     def test_explore_frontier_directive_holds_the_stair_back(self):
         from tools.agent.directives import DirectiveSet, DirectiveView
@@ -354,9 +377,13 @@ class AntiBacktrackPreference(unittest.TestCase):
 
     def test_navigation_preserves_uniquely_best_reverse_stair_and_door_routes(
             self):
-        # a uniquely reachable down stair behind a comparable frontier is not
-        # suppressed by the anti-backtrack preference (cross-family comparison
-        # is forbidden)
+        # Contract migration (AC2 / committed-destination semantics).  The
+        # default pool excludes down-stairs, so the uniquely-best *stair*
+        # route is asserted under explicit stair advice, where the
+        # default-acquisition anti-backtrack pass must still preserve it: a
+        # uniquely reachable down stair behind a comparable frontier is not
+        # suppressed (cross-family comparison is forbidden).
+        from tools.agent.directives import DirectiveSet, DirectiveView
         cells = {(2, 10): FLOOR, (3, 10): FLOOR, (4, 10): FLOOR,
                  (5, 10): FLOOR, (6, 10): DOWN}
         for pos in [(2, 9), (2, 11), (3, 9), (3, 11), (4, 9), (4, 11),
@@ -364,7 +391,8 @@ class AntiBacktrackPreference(unittest.TestCase):
             cells[pos] = WALL
         mem = self._prime(cells, [(5, 10), (4, 10)])
         self.assertEqual(self.ref.recovery.previous_distinct, (5, 10))
-        cand = self.ref.prepare(ctx(mem)).table.scripted()
+        view = DirectiveView(DirectiveSet(goals=("descend_known_stairs",)), 1)
+        cand = self.ref.prepare(ctx(mem, directives=[view])).table.scripted()
         # the stair is east (forward), never suppressed by the west reversal
         self.assertEqual(cand.family, "stair")
 

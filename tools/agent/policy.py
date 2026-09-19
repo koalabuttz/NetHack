@@ -773,7 +773,21 @@ class ScriptedReflex(object):
                 return (not self.targets.serviced(t.pos)
                         and not self.targets.failed(t.pos))
 
-            pool = [t for t in targets if ok(t)]
+            # The default destination pool (plan 1.2, AC2): reachable doors and
+            # frontiers are committed before down-stairs; unvisited known cells
+            # are the fallback; stairs compete only under explicit stair advice
+            # (``descend_known_stairs``) or when nothing else is available.
+            stair = [t for t in targets
+                     if t.family == navigation.TFAM_STAIR and ok(t)]
+            explore = [t for t in targets
+                       if t.family in (navigation.TFAM_DOOR,
+                                       navigation.TFAM_FRONTIER) and ok(t)]
+            unvisited = [t for t in targets
+                         if t.family == navigation.TFAM_UNVISITED and ok(t)]
+            if prefer_stairs and stair:
+                pool = stair
+            else:
+                pool = explore or unvisited or stair
         if not pool:
             return []
         scored = []
