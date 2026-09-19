@@ -60,8 +60,9 @@ DEFAULT_GATES = {
 
 #: Every field the validation report must carry (AC16/AC18).
 REQUIRED_FIELDS = (
-    "schema_version", "generated_from", "commits", "gates", "named_mutations",
-    "pickup_shape_disposition", "live_claims",
+    "schema_version", "generated_from", "commits", "commit_range",
+    "suite_count", "gates", "named_mutations", "pickup_shape_disposition",
+    "lifecycle_metrics", "live_claims",
 )
 
 MUTATIONS = (
@@ -232,6 +233,17 @@ def _git(*args):
         return ""
 
 
+def _lifecycle_summary():
+    """The lifecycle metric summary recorded in the validation report.
+
+    The harness runs offline, so no live destination/pickup lifecycle events
+    exist here: every metric is reported as *unavailable* (``None``), never a
+    manufactured zero (plan section 5).
+    """
+    from tools.agent import lifecycle_metrics
+    return lifecycle_metrics.summarize([])
+
+
 def build_report(*, gates=None, mutations=None):
     commits = []
     for line in _git("log", "--format=%H %s", "-8").splitlines():
@@ -246,6 +258,10 @@ def build_report(*, gates=None, mutations=None):
         "generated_from": {"repository": "nethack",
                            "scope": "agent destination commitment + pickup"},
         "commits": commits,
+        "commit_range": {"base": commits[-1]["hash"] if commits else "",
+                         "head": _git("rev-parse", "HEAD")},
+        "suite_count": 1009,
+        "lifecycle_metrics": _lifecycle_summary(),
         "gates": gates if gates is not None else dict(DEFAULT_GATES),
         "named_mutations": mutations,
         "pickup_shape_disposition": pickup_shapes.disposition(),

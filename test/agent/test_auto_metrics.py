@@ -268,6 +268,84 @@ class ControlledAlternationFixtures(unittest.TestCase):
         self.assertEqual(alternating_moves(stationary), (0, 0, 1))
 
 
+class LifecycleMetrics(unittest.TestCase):
+    """AC15: the additive lifecycle metric definitions (plan section 5)."""
+
+    def test_activation_and_override_execution_metrics_are_distinct(self):
+        from tools.agent import lifecycle_metrics as LM
+        rec = LM.LifecycleRecorder()
+        # generation 1 is activated and resolved but never executes
+        rec.record(LM.KIND_DIRECTIVE, LM.DIR_ELIGIBLE, generation=1)
+        rec.record(LM.KIND_DIRECTIVE, LM.DIR_RESOLVED, generation=1)
+        s = rec.summarize()
+        self.assertEqual(s["directive_activations"], 1)
+        self.assertEqual(s["directive_executions"], 0)
+        self.assertEqual(s["directive_override_execution_rate"], 0.0)
+        self.assertEqual(s["directive_unresolved_or_expired_before_action"],
+                         [1])
+        # generation 2 executes: activation and override execution differ
+        rec.record(LM.KIND_DIRECTIVE, LM.DIR_ELIGIBLE, generation=2)
+        rec.record(LM.KIND_DIRECTIVE, LM.DIR_RESOLVED, generation=2)
+        rec.record(LM.KIND_DIRECTIVE, LM.DIR_FIRST_ACTION, generation=2)
+        s2 = rec.summarize()
+        self.assertEqual(s2["directive_activations"], 2)
+        self.assertEqual(s2["directive_executions"], 1)
+        self.assertEqual(s2["directive_override_execution_rate"], 0.5)
+        self.assertNotEqual(s2["directive_activations"],
+                            s2["directive_executions"])
+
+    def test_pickup_attempt_and_confirmed_outcome_metrics_are_distinct(self):
+        from tools.agent import lifecycle_metrics as LM
+        rec = LM.LifecycleRecorder()
+        rec.record(LM.KIND_PICKUP, LM.PICKUP_OFFERED, token="t1")
+        rec.record(LM.KIND_PICKUP, LM.PICKUP_ATTEMPTED, token="t1")
+        rec.record(LM.KIND_PICKUP, LM.PICKUP_ATTEMPTED, token="t1")
+        rec.record(LM.KIND_PICKUP, LM.PICKUP_SUCCEEDED, token="t1")
+        rec.record(LM.KIND_PICKUP, LM.PICKUP_NO_ITEMS, token="t2")
+        s = rec.summarize()
+        self.assertEqual(s["pickup_attempts"], 2)
+        self.assertEqual(s["pickup_repeated_sites"], 1)
+        self.assertEqual(s["pickup_outcomes"][LM.PICKUP_SUCCEEDED], 1)
+        self.assertEqual(s["pickup_outcomes"][LM.PICKUP_NO_ITEMS], 1)
+        # a pickup *attempt* is not a confirmed *outcome*
+        self.assertNotEqual(s["pickup_attempts"],
+                            s["pickup_outcomes"][LM.PICKUP_SUCCEEDED])
+
+    def test_legacy_missing_commitment_metrics_report_unavailable(self):
+        from tools.agent import lifecycle_metrics as LM
+        s = LM.summarize([])
+        self.assertFalse(s["available"])
+        for field in ("commitment_length_median", "commitment_length_p90",
+                      "terminal_reasons", "destination_switch_rate",
+                      "directive_activations", "directive_executions",
+                      "directive_override_execution_rate",
+                      "directive_unresolved_or_expired_before_action",
+                      "target_reach_rate", "pickup_outcomes",
+                      "pickup_attempts", "pickup_repeated_sites",
+                      "pickup_unresolved_inspections"):
+            self.assertIsNone(s[field], field)
+        self.assertNotEqual(s["commitment_length_median"], 0)
+
+    def test_commitment_length_and_reach_rate_from_a_full_stream(self):
+        from tools.agent import lifecycle_metrics as LM
+        rec = LM.LifecycleRecorder()
+        rec.record(LM.KIND_DESTINATION, LM.DEST_ACQUIRED, serial=1)
+        for _ in range(4):
+            rec.record(LM.KIND_DESTINATION, LM.DEST_ACTION, serial=1)
+        rec.record(LM.KIND_DESTINATION, LM.DEST_REACHED, serial=1,
+                   reason="reached")
+        rec.record(LM.KIND_DESTINATION, LM.DEST_ACQUIRED, serial=2)
+        rec.record(LM.KIND_DESTINATION, LM.DEST_ACTION, serial=2)
+        rec.record(LM.KIND_DESTINATION, LM.DEST_FAILED, serial=2,
+                   reason="stalled")
+        s = rec.summarize()
+        self.assertEqual(s["commitment_length_median"], 4)
+        self.assertEqual(s["commitment_length_p90"], 4)
+        self.assertEqual(s["target_reach_rate"], 0.5)
+        self.assertEqual(s["terminal_reasons"], {"reached": 1, "stalled": 1})
+        self.assertEqual(s["destination_switch_rate"], 0.0)
+
+
 class ValidationReport(unittest.TestCase):
     """AC16/AC18: the validation report carries every required field."""
 
