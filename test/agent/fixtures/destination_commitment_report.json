@@ -1,9 +1,13 @@
 {
  "commit_range": {
   "base": "56c0c45a0739b29a3173b08b343d5fc786a56712",
-  "head": "183247ea8c96b9d8e9d28f029ca20bad1bf31568"
+  "head": "fb4ae178479c1b98a3d62f5a85ae5d360da4f722"
  },
  "commits": [
+  {
+   "hash": "fb4ae178479c1b98a3d62f5a85ae5d360da4f722",
+   "subject": "agent: regenerate report at final head"
+  },
   {
    "hash": "183247ea8c96b9d8e9d28f029ca20bad1bf31568",
    "subject": "agent: persist lifecycle stream to the sidecar"
@@ -31,10 +35,6 @@
   {
    "hash": "52fa81ae83ffe46a440dc0c84ec130bcb6ef3469",
    "subject": "agent: strategy context subcontent (5)"
-  },
-  {
-   "hash": "5ef9028b86990f1a99a1e8a0abb26983d1cc28a2",
-   "subject": "agent: tighten replay agreement threshold"
   }
  ],
  "gates": {
@@ -195,5 +195,5 @@
   ]
  },
  "schema_version": 1,
- "suite_count": 1019
+ "suite_count": 1023
 }

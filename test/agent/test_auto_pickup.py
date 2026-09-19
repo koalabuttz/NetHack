@@ -302,6 +302,58 @@ class PickupPolicyWiring(unittest.TestCase):
         self.assertIsNone(self.ref.targets.held())
         self.assertEqual(self.ref.directive_settlement[0], "reached")
 
+    def test_delivery_repair_does_not_double_consume_pickup_attempt(self):
+        mem, ev, view = self._collect_site()
+        cand = self._pickup_candidate(mem, view)
+        identity = ("pickup", 7)                    # the original decision
+        self.assertTrue(self.ref.arm_pickup(cand.effect_payload,
+                                            identity=identity))
+        self.assertEqual(self.ref.floor.attempts(ev), 1)          # one charge
+        init_sig = self.ref.pickup_pending["init_inventory"]
+        self.assertEqual(len([e for e in self.ref.lifecycle.events
+                              if e.get("outcome") == "attempted"]), 1)
+        # the delivery repair resends the frozen action for the SAME identity
+        self.assertFalse(self.ref.arm_pickup(cand.effect_payload,
+                                             identity=identity))
+        self.assertEqual(self.ref.floor.attempts(ev), 1)   # still one charge
+        self.assertEqual(len([e for e in self.ref.lifecycle.events
+                              if e.get("outcome") == "attempted"]), 1)
+        self.assertEqual(self.ref.pickup_pending["init_inventory"], init_sig)
+        self.assertTrue(self.ref.floor.budget_available(ev))      # one left
+        # the repaired attempt's unknown result is NOT converted to exhaustion
+        self.ref.directive_settlement = None
+        self.ref.note_observation(mem)
+        self.assertEqual(self.ref.floor.outcome(ev), pickup.OUTCOME_UNKNOWN)
+        self.assertIsNotNone(self.ref.targets.held())             # still held
+        self.assertIsNone(self.ref.directive_settlement)
+        self.assertEqual(self.ref.intent, "pickup")
+        # a genuinely new accepted decision creates a new identity and
+        # consumes the second (final) attempt
+        cand2 = self._pickup_candidate(mem, view)
+        self.assertTrue(self.ref.arm_pickup(cand2.effect_payload,
+                                            identity=("pickup", 11)))
+        self.assertEqual(self.ref.floor.attempts(ev), 2)
+        self.assertFalse(self.ref.floor.budget_available(ev))
+
+    def test_repair_identity_is_the_original_send_ordinal(self):
+        # the controller derives the stable identity from the *original*
+        # decision's send, so a repair cannot re-charge the attempt (3.3)
+        repair = {"ordinal": 42}
+        self.assertEqual(("pickup", repair.get("ordinal")), ("pickup", 42))
+        # a fresh send uses its own ordinal
+        self.assertNotEqual(("pickup", 43), ("pickup", 42))
+
+    def test_terminal_invalid_cancels_the_pending_pickup_freeze(self):
+        mem, ev, view = self._collect_site()
+        cand = self._pickup_candidate(mem, view)
+        self.ref.arm_pickup(cand.effect_payload, identity=("pickup", 7))
+        self.assertIsNotNone(self.ref.pickup_pending)
+        # a terminal non-repair invalid cancels the freeze and the intent
+        self.ref.cancel_pickup()
+        self.assertIsNone(self.ref.pickup_pending)
+        self.assertIsNone(self.ref.pickup_attempt_identity)
+        self.assertEqual(self.ref.intent, "")
+
     def test_pickup_choice_criteria_object_key_index_and_n_frozen(self):
         mem = self._mem()
         self._observe(mem)

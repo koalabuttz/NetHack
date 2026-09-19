@@ -1292,6 +1292,21 @@ class JevAppliedCap(WireHarness):
         self.assertTrue(r.book.has_active)
         self.assertIsNone(r._pending_directives)
 
+    def test_ordinary_invalid_cancels_the_pending_pickup_freeze(self):
+        # a terminal non-repair invalid cancels any in-flight pickup freeze so
+        # the rejected pickup cannot linger into the retry (plan 3.3)
+        fake = _ChoiceJev(usage={"prompt_tokens": 1000})
+        r, rec, _ = self._runner(fake, cap=1)
+        r.reflex.intent = "pickup"
+        r.reflex.pickup_pending = {"evidence": None, "purpose": "collect",
+                                   "generation": 0, "init_inventory": ()}
+        r.reflex.pickup_attempt_identity = ("pickup", 1)
+        r._on_invalid({"code": "kind"})
+        self.assertIsNone(r.reflex.pickup_pending)
+        self.assertIsNone(r.reflex.pickup_attempt_identity)
+        self.assertEqual(r.reflex.intent, "")
+        rec.finalize({})
+
     def test_jev_applied_send_later_native_invalid_is_not_refunded(self):
         fake = _ChoiceJev()
         r, rec, _ = self._runner(fake, cap=1)

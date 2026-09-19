@@ -184,6 +184,10 @@ class ScriptedReflex(object):
         # *send* boundary so the observation that reports the result is folded
         # against a pre-send baseline rather than a post-result one.
         self.pickup_pending = None
+        # The stable identity of the in-flight pickup attempt (the original
+        # accepted decision's send), so a delivery repair that resends the
+        # frozen action cannot consume a second attempt (plan 3.3).
+        self.pickup_attempt_identity = None
         # True when an active collect destination already sits under the hero,
         # so the acquired action is the pickup initiation (plan 1.5/3.3).
         self.on_square_collect = False
@@ -447,7 +451,7 @@ class ScriptedReflex(object):
                                              pickup.OUTCOME_REFUSED)
                 self._settle_pickup_target(pickup.OUTCOME_REFUSED, mem)
 
-    def arm_pickup(self, payload) -> None:
+    def arm_pickup(self, payload, identity=None) -> bool:
         """Freeze a pickup attempt at the *send* boundary (plan 1.5/3.3).
 
         The evidence identity, purpose, generation and the **pre-send**
@@ -455,18 +459,29 @@ class ScriptedReflex(object):
         reports the result, so that observation is classified against a true
         pre-send baseline on its own reconciliation boundary.  The bounded
         initiation is counted here, and only here, for a sent attempt.
+
+        *identity* is the **stable identity of the logical attempt** (the
+        original accepted decision's send).  A delivery repair resends the
+        frozen action for that same decision, so ``arm_pickup`` is called again
+        with the *same* identity: the frozen attempt, its pre-send baseline and
+        its counted initiation are preserved and nothing is counted or emitted
+        twice.  A genuinely new accepted pickup decision carries a new identity
+        and consumes the next attempt.  Returns whether a new attempt was
+        armed.
         """
+        if identity is not None and identity == self.pickup_attempt_identity:
+            return False                # delivery repair of the same attempt
         if not payload or payload[0] != "pickup":
-            return
+            return False
         (_tag, mode, iid, x, y, epoch) = payload[:6]
         pos = (int(x), int(y))
         ev = self.floor.evidence(pos)
         if ev is None or ev.source_epoch != int(epoch):
-            return                      # stale evidence token
+            return False                # stale evidence token
         if self.floor.declined(ev) or self.floor.negative(ev.instance, pos):
-            return
+            return False
         if not self.floor.budget_available(ev):
-            return
+            return False
         init_sig = payload[8] if len(payload) > 8 else None
         if init_sig is not None:
             init_sig = tuple(init_sig) if not isinstance(init_sig, tuple) \
@@ -479,6 +494,7 @@ class ScriptedReflex(object):
                            else int(self.directives.generation)),
             "init_inventory": init_sig,
         }
+        self.pickup_attempt_identity = identity
         self.lifecycle.record(lifecycle_metrics.KIND_PICKUP,
                               lifecycle_metrics.PICKUP_ATTEMPTED,
                               token=ev.token, purpose=mode)
@@ -486,6 +502,22 @@ class ScriptedReflex(object):
         self.pickup_purpose = mode
         self.pickup_evidence = ev
         self.pickup_init_inventory = init_sig
+        return True
+
+    def cancel_pickup(self) -> None:
+        """Cancel a pending pickup freeze on a terminal non-repair invalid.
+
+        The rejected attempt's action is excluded and the retry reselects, so
+        the in-flight pickup freeze (and any pending intent) must not survive
+        into the retry.
+        """
+        self.pickup_pending = None
+        self.pickup_attempt_identity = None
+        if self.intent == "pickup":
+            self.intent = ""
+            self.pickup_purpose = ""
+        self.pickup_evidence = None
+        self.pickup_init_inventory = None
 
     def _commit_pickup(self, payload, tick, mem) -> None:
         """Commit one selected, sent and reconciled pickup initiation (3.3).
@@ -1603,6 +1635,7 @@ class ScriptedReflex(object):
         self.pickup_purpose = ""
         self.pickup_init_inventory = None
         self.pickup_pending = None
+        self.pickup_attempt_identity = None
         hero = mem.hero
         self.lifecycle.record(
             lifecycle_metrics.KIND_PICKUP,
@@ -1654,6 +1687,7 @@ class ScriptedReflex(object):
         self.pickup_init_inventory = None
         self.pickup_generation = 0
         self.pickup_pending = None
+        self.pickup_attempt_identity = None
         self.directive_settlement = None
         self._cycled = False
         self.stuck = 0

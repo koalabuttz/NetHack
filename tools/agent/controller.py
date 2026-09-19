@@ -1759,8 +1759,11 @@ class _EpisodeRunner(object):
             # retry reselects the next member of the retained table rather
             # than resending the same winner (3.5).  It also drops Jev repair
             # eligibility: the rejected action must never be restored by a
-            # later ``incomplete`` repair.
+            # later ``incomplete`` repair.  Any pending pickup freeze is
+            # cancelled with it, so a rejected pickup cannot linger into the
+            # retry (plan 3.3).
             self._last_jev_send = None
+            self.reflex.cancel_pickup()
             had_attempt = self.attempt is not None
             self._exclude_attempt()
             self.attempt = None
@@ -2751,8 +2754,16 @@ class _EpisodeRunner(object):
             self._arm_attempt(ordinal, selected)
             if self._attempt_effect == "pickup":
                 # Freeze the pickup attempt at the send boundary (plan 1.5/3.3)
-                # so its result is classified against a pre-send baseline.
-                self.reflex.arm_pickup(self._attempt_payload)
+                # so its result is classified against a pre-send baseline.  A
+                # delivery repair resends the frozen action for the *original*
+                # decision, so it carries that decision's send ordinal as the
+                # stable attempt identity: the freeze, its pre-send baseline
+                # and its counted initiation are preserved rather than
+                # double-counted (AC15/3.3).
+                original = (repair.get("ordinal") if repair is not None
+                            else ordinal)
+                self.reflex.arm_pickup(self._attempt_payload,
+                                       identity=("pickup", original))
             self.tick += 1
         else:
             # A non-command send freezes its proposed effect (and any payload)
