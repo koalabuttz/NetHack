@@ -102,7 +102,10 @@ def build_parser():
                            "cache-hit tokens; unset falls back to the input "
                            "price (the conservative upper bound)")
     auto.add_argument("--reflex-call-cap", type=int, default=0,
-                      help="bound on paid reflex (Jev) calls; 0 disables Jev")
+                      help="cap on applied Jev decisions (complete sends of "
+                           "unoverridden, locally valid Jev proposals); "
+                           "rejected/skipped consultations do not spend it; "
+                           "0 disables Jev")
     # -- boundaries -------------------------------------------------------
     auto.add_argument("--boundary-cooldown-ticks", type=int, default=50)
     auto.add_argument("--boundary-cooldown-wall", type=float, default=5.0)

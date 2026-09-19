@@ -209,7 +209,14 @@ version is bumped to `jev-presentation/2`.
     dropped).
 
 `--reflex-call-cap N` (default 0)
-    a separate bound on **paid reflex** (Jev) calls; `0` disables Jev work.
+    the separate bound on **applied Jev decisions** -- accepted proposals that
+    are locally valid, not replaced by a fallback or a forced-search override,
+    and completely sent (independent of `--strategy-call-cap`); `0` disables
+    Jev work.  Rejected/skipped consultations do not spend it (they still cost
+    money).  The ledger contrasts `reflex.applied` (complete sends of
+    unoverridden, locally valid proposals, which this cap bounds) with the
+    reservation diagnostic `reflex.paid_dispatched` (consultations *reserved*,
+    which may exceed the applied count).
 
 ### Boundaries
 
@@ -443,7 +450,15 @@ A directive can never contribute an action of its own.
 Every episode carries a ledger in `ep-N.meta.json`:
 
   * reflex: attempted / successful / timeout / invalid / low-confidence /
-    fallback / paid-dispatched;
+    rejected / fallback / paid-dispatched / applied.  `rejected` counts only
+    defined Jev answer rejections (arbitration: confidence/concentration,
+    identity, index, rejected-member, eligibility); `fallback` is the broad
+    final-fallback count (it also counts recorder disablement, provider
+    unavailability, cap exhaustion, presentation skips, reservation refusals
+    and timeouts); `paid-dispatched` counts paid consultations *reserved* (the
+    historical diagnostic, which may exceed the applied count) and `applied`
+    counts complete sends of unoverridden, locally valid Jev proposals -- the
+    quantity `--reflex-call-cap` bounds;
   * strategy: boundaries detected / queued / dispatched / suppressed /
     expired / applied, plus calls dispatched and the postmortem count;
   * usage: prompt and completion tokens as actually reported, an estimated

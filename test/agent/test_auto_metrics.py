@@ -11,7 +11,9 @@ metrics run against a real recording, not a hand-built dict.
 
 import json
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -74,6 +76,38 @@ def alternating_moves(wire_path):
         else:
             run = 0
     return alternations, longest, len(cells)
+
+
+def alternation_share(wire_path):
+    """The fraction of confirmed moves that continue a period-2 alternation.
+
+    ``(alternations / (moves - 2), longest_run)`` -- the movers that *had* a
+    two-back predecessor, so a period-3 walk scores 0 while a perfect ABAB
+    walk scores 1.0.  A short wire cannot score above 0.
+    """
+    alternations, longest, moves = alternating_moves(wire_path)
+    return alternations / float(max(1, moves - 2)), longest
+
+
+def write_controlled_wire(directory, name, cells):
+    """Write one obs line per *cells* entry: a full-snapshot hero at each cell.
+
+    A minimal but real ``.wire.jsonl``: every frame is a complete ``base:null``
+    snapshot whose only painted cell is the hero, so the confirmed-move
+    sequence over the file is exactly ``cells`` (duplicates preserved).  This
+    is the controlled evidence a mutated ``alternating_moves`` cannot survive.
+    """
+    path = os.path.join(directory, name)
+    with open(path, "w", encoding="utf-8") as fh:
+        for i, (x, y) in enumerate(cells, start=1):
+            fh.write(json.dumps({
+                "v": 1, "ch": "player", "type": "obs", "seq": i,
+                "base": None, "s": {}, "cond": [],
+                "pal": [[0, " ", "none", 0, "none"],
+                        [1, "@", "gray", 0, "none"]],
+                "map": [[x, y, 1]], "cur": None,
+                "msg": [], "hist": [], "windows": []}) + "\n")
+    return path
 
 
 class ParseDlvl(unittest.TestCase):
@@ -169,6 +203,69 @@ class AlternatingMotionMetrics(unittest.TestCase):
         # scannable: the helper returns a bounded, nonnegative triple
         alt2, long2, moves2 = alternating_moves(_LEGACY)
         self.assertGreaterEqual(min(alt2, long2, moves2), 0)
+
+
+class ControlledAlternationFixtures(unittest.TestCase):
+    """Known wire fixtures pin the exact alternation measurement.
+
+    A mutated ``alternating_moves`` that returned ``(0, 0, moves)`` for every
+    input would still satisfy the loose bounds above; these fixtures carry a
+    known answer so any such mutation fails.
+    """
+
+    _A = (5, 5)
+    _B = (6, 5)
+    _C = (7, 5)
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="altmoves-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def _wire(self, name, cells):
+        return write_controlled_wire(self.dir, name, cells)
+
+    def test_exact_counts_ababa_stationary_and_period_three(self):
+        ababa = self._wire("ababa.wire.jsonl", [self._A, self._B] * 2 + [self._A])
+        self.assertEqual(confirmed_moves(ababa),
+                         [self._A, self._B, self._A, self._B, self._A])
+        # three AB-A / BA-B continuations, longest run three, five moves
+        self.assertEqual(alternating_moves(ababa), (3, 3, 5))
+
+        stationary = self._wire("stationary.wire.jsonl", [self._A] * 6)
+        # a stationary run collapses to one confirmed move, no alternation
+        self.assertEqual(alternating_moves(stationary), (0, 0, 1))
+
+        abc = self._wire("abc.wire.jsonl", [self._A, self._B, self._C] * 2)
+        # period-3 is not a period-2 alternation: zero, but six confirmed moves
+        self.assertEqual(alternating_moves(abc), (0, 0, 6))
+
+    def test_exact_alternation_share(self):
+        ababa = self._wire("ababa.wire.jsonl", [self._A, self._B] * 2 + [self._A])
+        self.assertEqual(alternation_share(ababa), (1.0, 3))
+
+        abc = self._wire("abc.wire.jsonl", [self._A, self._B, self._C] * 2)
+        self.assertEqual(alternation_share(abc), (0.0, 0))
+
+        stationary = self._wire("stationary.wire.jsonl", [self._A] * 6)
+        self.assertEqual(alternation_share(stationary), (0.0, 0))
+
+    def test_measurement_is_independent_of_stationary_loop_spans(self):
+        # a perfect two-cell oscillation has no duplicate (hero, time) frames,
+        # so the legacy stationary loop-span field is zero while alternation is
+        # at its maximum -- the two quantities are genuinely different
+        ababa = self._wire("ababa.wire.jsonl", [self._A, self._B] * 2 + [self._A])
+        loop = M.episode_metrics(ababa)
+        self.assertEqual(loop["longest_loop_span"], 0)
+        self.assertEqual(loop["loop_spans_ge_2"], 0)
+        self.assertEqual(alternating_moves(ababa), (3, 3, 5))
+
+        # conversely, a stationary run shows a positive loop span yet zero
+        # alternation: the alternation count is not derived from loop spans
+        stationary = self._wire("stationary.wire.jsonl", [self._A] * 6)
+        loop2 = M.episode_metrics(stationary)
+        self.assertGreaterEqual(loop2["longest_loop_span"], 2)
+        self.assertGreaterEqual(loop2["loop_spans_ge_2"], 1)
+        self.assertEqual(alternating_moves(stationary), (0, 0, 1))
 
 
 if __name__ == "__main__":

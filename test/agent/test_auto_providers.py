@@ -1764,6 +1764,51 @@ class TestJevWireContract(unittest.TestCase):
         self.assertNotIn("press h", expected)
 
 
+class GoldenRequestProvenance(unittest.TestCase):
+    """The golden fixture's declared commit must render its declared payload."""
+
+    def _commit_presentation_version(self, commit):
+        """``PRESENTATION_VERSION`` in ``presentation.py`` at *commit*.
+
+        Returns ``None`` when git or the recorded commit is unavailable, so
+        the check degrades to a skip rather than a false failure in an
+        environment that cannot resolve the recorded source.
+        """
+        try:
+            out = subprocess.run(
+                ["git", "show", "%s:tools/agent/presentation.py" % commit],
+                cwd=_ROOT, capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if out.returncode != 0:
+            return None
+        for line in out.stdout.splitlines():
+            if line.startswith("PRESENTATION_VERSION"):
+                _, _, value = line.partition("=")
+                return value.strip().strip('"')
+        return None
+
+    def test_capture_commit_renders_the_declared_presentation_version(self):
+        # the fixture's bytes come from a Phase-4 renderer; the recorded commit
+        # must therefore identify a source tree that emits the *declared*
+        # presentation version, not a stale Phase-3 one.
+        golden = json.loads(_read_fixture("jev_golden_request.json"))
+        capture = golden["capture"]
+        commit = capture["commit"]
+        self.assertRegex(commit, r"^[0-9a-f]{40}$")
+        self.assertEqual(capture["presentation_version"],
+                         providers.JEV_PRESENTATION_VERSION)
+        # an explicit clean-tree provenance claim, never a silent default
+        self.assertIs(capture.get("dirty"), False)
+        rendered = self._commit_presentation_version(commit)
+        if rendered is None:
+            self.skipTest("recorded source commit is not resolvable here")
+        self.assertEqual(
+            (rendered, commit), (capture["presentation_version"], commit),
+            "the declared presentation version does not match the renderer "
+            "at the recorded commit")
+
+
 class TestJevParser(unittest.TestCase):
     """AC.7: the strict choice parser still accepts exactly the right shape."""
 
