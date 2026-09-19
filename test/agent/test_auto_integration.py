@@ -616,6 +616,62 @@ class DirectiveSourceInstance(unittest.TestCase):
         self.assertTrue(r.book.has_active)
         self.assertEqual(r.boundary_queue.events, [(True, None)])
 
+    def test_pending_key_does_not_apply_new_destination(self):
+        # a v2 destination set is never activated on a key need (plan 1.5)
+        r = self._runner()
+        r.instance.begin_playable()
+        r.mem.status.dlvl = "1"
+        r._pending_directives = directives.DirectiveSet(
+            schema_version=2, goals=("collect_items",), target=(5, 5), ttl=50)
+        r._pending_directives_level = "1"
+        r._pending_directives_instance = 1
+        r._activate_pending_directives({"kind": "key", "id": 7})
+        self.assertFalse(r.book.has_active)
+        self.assertIsNotNone(r._pending_directives)     # preserved
+        self.assertEqual(r.boundary_queue.events, [])
+
+    def test_menu_or_yn_need_does_not_consume_pending_destination(self):
+        for kind in ("menu", "yn"):
+            with self.subTest(kind=kind):
+                r = self._runner()
+                r.instance.begin_playable()
+                r.mem.status.dlvl = "1"
+                r._pending_directives = directives.DirectiveSet(
+                    schema_version=2, goals=("flee_to_upstairs",), ttl=50)
+                r._pending_directives_level = "1"
+                r._pending_directives_instance = 1
+                r._activate_pending_directives({"kind": kind, "id": 7})
+                self.assertIsNotNone(r._pending_directives)
+                self.assertFalse(r.book.has_active)
+                # a following genuine command activates it
+                r._activate_pending_directives({"kind": "command", "id": 8})
+                self.assertTrue(r.book.has_active)
+                self.assertIsNone(r._pending_directives)
+
+    def test_v1_modifier_set_keeps_the_broad_gate(self):
+        # a modifier-only legacy set (no destination) may still activate on a
+        # direction need, where destination resolution is provably deferred
+        r = self._runner()
+        r.instance.begin_playable()
+        r.mem.status.dlvl = "1"
+        r._pending_directives = directives.DirectiveSet(
+            goals=("survive",), ttl=50)
+        r._pending_directives_level = "1"
+        r._pending_directives_instance = 1
+        r._activate_pending_directives({"kind": "direction", "id": 7})
+        self.assertTrue(r.book.has_active)
+
+    def test_active_view_expires_after_instance_change(self):
+        # the shared DirectiveBook instance scope (used by live and evaluator)
+        book = directives.DirectiveBook()
+        book.activate(directives.DirectiveSet(goals=("survive",), ttl=50),
+                      5, "1", instance=1)
+        st = directives.PreconditionState()
+        self.assertTrue(book.view(6, "1", st, instance=1).active)
+        # a same-level transition to a fresh instance expires the view
+        self.assertFalse(book.view(6, "1", st, instance=2).active)
+        self.assertFalse(book.has_active)
+
 
 # ---------------------------------------------------------------- MEDIUM 6
 

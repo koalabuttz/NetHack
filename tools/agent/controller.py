@@ -2007,9 +2007,16 @@ class _EpisodeRunner(object):
         """
         if self._pending_directives is None:
             return
-        if need.get("kind") not in ("command", "key", "direction"):
+        kind = need.get("kind")
+        if kind not in ("command", "key", "direction"):
             return
         dset = self._pending_directives
+        # One application rule (plan 1.5): a v2 destination set is
+        # command-gated -- it is neither consumed nor activated on a key,
+        # direction, menu or yes/no need, but preserved for the next genuine
+        # command decision.
+        if getattr(dset, "schema_version", 1) >= 2 and kind != "command":
+            return
         self._pending_directives = None
         level = self.mem.status.dlvl
         dispatched_level = self._pending_directives_level
@@ -2630,6 +2637,14 @@ class _EpisodeRunner(object):
              applied_token) = self._resend_repair(need, repair)
             proposal = selected if provider == "jev" else None
         else:
+            # The shared activation ordering (plan 2.2): service/settle has
+            # already happened upstream, then eligible pending advice activates
+            # HERE -- before ``_decide`` builds its directive view and context
+            # -- so a newly activated v2 destination steers this *same* command
+            # decision, exactly as in the evaluator.  Delivery repair (the
+            # ``repair is not None`` branch above) never activates or consumes
+            # pending advice; it stays preserved for the next fresh decision.
+            self._activate_pending_directives(need)
             proposal, provider, reason, latency, usage, decided_low = \
                 self._decide(need, deadline)
             sel_reason = ""
@@ -2650,7 +2665,6 @@ class _EpisodeRunner(object):
         else:
             role = ""
         self._note_low_conf(low)
-        self._activate_pending_directives(need)
         view = self.book.view(self.tick, self.mem.status.dlvl,
                               self._precondition_state(),
                               instance=self.instance.current())

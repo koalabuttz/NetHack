@@ -472,6 +472,9 @@ class ReplayPass(object):
         self._pending: Optional[_Need] = None
         self._strategy_pending = None
         self._strategy_level = None
+        # The level instance the pending advice was produced for (plan 2.2
+        # evaluator directive-scoping parity).
+        self._strategy_instance = None
         self._strategy_prepared = None
         # Every pass starts empty; the conversation and boundary history are
         # pass-local, exactly like the live episode's.
@@ -907,6 +910,7 @@ class ReplayPass(object):
         self._strategy_prepared = prepared
         self.boundary_queue.mark_dispatched(self.tick, self.clock())
         self._strategy_level = self.mem.status.dlvl
+        self._strategy_instance = self.instance.current()
         try:
             res = self.strategy.deliberate(ctx, self.clock()
                                            + self.config.strategy_deadline)
@@ -964,7 +968,8 @@ class ReplayPass(object):
             bits.append("Hunger %s" % st.hunger)
         if st.dlvl:
             bits.append("Dlvl %s" % st.dlvl)
-        view = self.book.view(self.tick, st.dlvl, self._precondition_state())
+        view = self.book.view(self.tick, st.dlvl, self._precondition_state(),
+                              instance=self.instance.current())
         return StrategyContext(
             episode=1, tick=self.tick,
             summary={"hp": st.hp, "hp_max": st.hp_max, "dlvl": st.dlvl},
@@ -988,16 +993,30 @@ class ReplayPass(object):
     def _activate_directives(self, need) -> None:
         if self._strategy_pending is None:
             return
-        if need.get("kind") not in ("command", "key", "direction"):
+        kind = need.get("kind")
+        if kind not in ("command", "key", "direction"):
             return
         dset = self._strategy_pending
+        # The one application rule (plan 1.5, evaluator parity): a v2
+        # destination set activates only on a genuine command need.
+        if getattr(dset, "schema_version", 1) >= 2 and kind != "command":
+            return
         self._strategy_pending = None
         level = self.mem.status.dlvl
         if self._strategy_level is not None and level is not None \
                 and level != self._strategy_level:
             self.boundary_queue.finish(False, "stale-level")
             return
-        self.book.activate(dset, self.tick, level)
+        # Instance scoping parity with live (plan 2.2): advice produced for a
+        # different level instance is stale and never activates.
+        current_instance = self.instance.current()
+        source_instance = self._strategy_instance
+        self._strategy_instance = None
+        if source_instance is not None and current_instance is not None \
+                and source_instance != current_instance:
+            self.boundary_queue.finish(False, "stale-instance")
+            return
+        self.book.activate(dset, self.tick, level, instance=current_instance)
         self.boundary_queue.finish(True)
 
     # -- decision --------------------------------------------------------
@@ -1015,7 +1034,8 @@ class ReplayPass(object):
         self._activate_directives(need.need)
 
         view = self.book.view(self.tick, self.mem.status.dlvl,
-                              self._precondition_state())
+                              self._precondition_state(),
+                              instance=self.instance.current())
         ctx = ReflexContext(
             episode=1, tick=self.tick, need=need.need,
             need_key=NeedKey(1, need.seq, need.nid), snapshot=self.snap,
