@@ -433,7 +433,7 @@ class ScriptedReflex(object):
                 if mem.hero is not None:
                     self.floor.note_negative(self.instance_id, mem.hero,
                                              pickup.OUTCOME_REFUSED)
-                self._settle_pickup_target(pickup.OUTCOME_REFUSED)
+                self._settle_pickup_target(pickup.OUTCOME_REFUSED, mem)
 
     def _commit_pickup(self, payload, tick, mem) -> None:
         """Commit one selected, sent and reconciled pickup initiation (3.3).
@@ -487,7 +487,7 @@ class ScriptedReflex(object):
             if hero is not None and tuple(hero) == pos:
                 # the observation that justified acquisition already satisfied
                 # it: record reached instead of installing (plan 1.4)
-                self.targets.note_serviced(pos, ())
+                self._note_serviced(mem, pos)
                 if source == navigation.SRC_DIRECTIVE:
                     self._settle_directive("reached", generation, reason)
                 return
@@ -504,7 +504,7 @@ class ScriptedReflex(object):
         if cur is None or cur.serial != int(expected):
             return                          # stale continuation: drop it
         if op == "arrive" or (hero is not None and tuple(hero) == pos):
-            self.targets.note_serviced(pos, ())
+            self._note_serviced(mem, pos)
             self.targets.retire("reached")
             if cur.source == navigation.SRC_DIRECTIVE:
                 self._settle_directive("reached", cur.generation, reason)
@@ -526,19 +526,28 @@ class ScriptedReflex(object):
             if hero is not None and recovery.chebyshev(hero, pos) <= 1:
                 self.targets.note_interact_attempt()
             if navigation.door_open(self._terrain(mem), pos):
-                self.targets.note_serviced(pos, ())
+                self._note_serviced(mem, pos)
                 self.targets.retire("door-opened")
                 return
+            sig = navigation.local_evidence_signature(self._terrain(mem),
+                                                      cur.pos)
             if self.targets.door_attempts_exhausted:
-                self.targets.retire("door-ineffective")
+                self.targets.retire("door-ineffective", pos=cur.pos,
+                                    signature=sig)
                 if cur.source == navigation.SRC_DIRECTIVE:
                     self._settle_directive("failed", cur.generation,
                                            "door-ineffective")
                 return
         if self.targets.stalled():
-            self.targets.retire("stalled")
-            if cur.source == navigation.SRC_DIRECTIVE:
-                self._settle_directive("failed", cur.generation, "stalled")
+            held = self.targets.held()
+            if held is not None:
+                self.targets.retire(
+                    "stalled", pos=held.pos,
+                    signature=navigation.local_evidence_signature(
+                        self._terrain(mem), held.pos))
+                if held.source == navigation.SRC_DIRECTIVE:
+                    self._settle_directive("failed", held.generation,
+                                           "stalled")
 
     def _commit_destination_failure(self, payload, tick, mem) -> None:
         """Settle an unresolved explicit destination (plan 1.5).
@@ -552,9 +561,16 @@ class ScriptedReflex(object):
             return
         (_tag, reason, generation) = payload
         held = self.targets.held()
-        if held is not None and held.source == navigation.SRC_DIRECTIVE:
-            self.targets.retire("directive-unresolved")
-        self._settle_directive("failed", generation, reason)
+        if held is not None:
+            self.targets.retire(
+                "unreachable" if reason == "unreachable"
+                else "directive-unresolved", pos=held.pos,
+                signature=navigation.local_evidence_signature(
+                    self._terrain(mem), held.pos))
+            if held.source == navigation.SRC_DIRECTIVE:
+                self._settle_directive("failed", held.generation, reason)
+        else:
+            self._settle_directive("failed", generation, reason)
 
     @staticmethod
     def _refresh_payload(payload):
@@ -870,6 +886,10 @@ class ScriptedReflex(object):
             routed = self._route_committed(held, terrain, hero, plan)
             if routed is not None:
                 return self._with_pickup((routed,), mem, hero)
+            # the held route became unreachable: emit a frozen failure
+            # operation settled at reconciliation rather than silently
+            # selecting around the active record (plan 1.5)
+            return (self._unreachable_destination_candidate(held),)
         cands = self._acquisition_candidates(context, mem, hero, plan,
                                              prefer_stairs, explore_first)
         if cands:
@@ -916,6 +936,7 @@ class ScriptedReflex(object):
         structured failure instead of silently exploring).
         """
         targets = plan.targets
+        terrain = self._terrain(mem, context)
         directive_purpose = None
         self.last_unresolved = ""
         if self._directive_bears_destination() \
@@ -934,8 +955,9 @@ class ScriptedReflex(object):
                     if tuple(t.pos) == tuple(self.directives.target)]
         else:
             def ok(t):
-                return (not self.targets.serviced(t.pos)
-                        and not self.targets.failed(t.pos))
+                sig = navigation.local_evidence_signature(terrain, t.pos)
+                return (not self.targets.serviced_under_evidence(t.pos, sig)
+                        and not self.targets.failed_under_evidence(t.pos, sig))
 
             # The default destination pool (plan 1.2, AC2): reachable doors and
             # frontiers are committed before down-stairs; unvisited known cells
@@ -1328,9 +1350,14 @@ class ScriptedReflex(object):
             # Cycle recovery invalidates the active destination before the
             # existing edge-legal recovery singleton runs, so a stale
             # destination cannot re-drive the loop (plan 1.5 "Cycle").
-            self.targets.invalidate_cycle()
+            held = self.targets.held()
+            sig = (navigation.local_evidence_signature(self._terrain(mem),
+                                                       held.pos)
+                   if held is not None else None)
+            self.targets.invalidate_cycle(sig)
         self._fold_floor(mem)
         self._fold_pickup_outcome(mem)
+        self._fold_door_outcome(mem)
         instance = getattr(mem, "instance", None)
         if instance is None:
             instance = self.instance_id
@@ -1380,6 +1407,40 @@ class ScriptedReflex(object):
                                                 tuple(hero))
                     break
 
+    def _note_serviced(self, mem, pos) -> None:
+        """Service a site under its current *local evidence* signature."""
+        self.targets.note_serviced(
+            tuple(pos),
+            navigation.local_evidence_signature(self._terrain(mem), tuple(pos)))
+
+    def _unreachable_destination_candidate(self, held):
+        """A frozen failure for a held destination with no route (plan 1.5)."""
+        payload = ("destfail", "unreachable", int(held.generation))
+        return self._cand({"key": KEY.KEY_SEARCH}, "unresolved-destination",
+                          "recovery", 0,
+                          "the held destination is unreachable",
+                          "dest-unresolved", effect_payload=payload)
+
+    def _fold_door_outcome(self, mem) -> None:
+        """Retire a held door commitment on an explicit refusal (plan 1.5).
+
+        Player-visible evidence only: a locked/refused door line fails the
+        commitment immediately instead of the agent repeatedly trying it.
+        """
+        held = self.targets.held()
+        if held is None or held.purpose != navigation.COMMIT_OPEN_DOOR:
+            return
+        joined = " ".join(t.lower() for t in mem.recent_messages(6))
+        if any(k in joined for k in ("is locked", "it's locked", "locked door",
+                                     "resists", "you cannot open")):
+            self.targets.retire(
+                "locked-door", pos=held.pos,
+                signature=navigation.local_evidence_signature(
+                    self._terrain(mem), held.pos))
+            if held.source == navigation.SRC_DIRECTIVE:
+                self._settle_directive("failed", held.generation,
+                                       "locked-door")
+
     def _fold_pickup_outcome(self, mem) -> None:
         """Classify one reconciled pickup attempt into an outcome (plan 3.3).
 
@@ -1415,16 +1476,19 @@ class ScriptedReflex(object):
             if terminal and hero is not None:
                 self.floor.note_negative(self.instance_id, tuple(hero), outcome)
         if terminal:
-            self._settle_pickup_target(outcome)
+            self._settle_pickup_target(outcome, mem)
 
-    def _settle_pickup_target(self, outcome: str) -> None:
+    def _settle_pickup_target(self, outcome: str, mem=None) -> None:
         """Settle a directive-owned collection target after an outcome (3.3)."""
         held = self.targets.held()
         self.pickup_evidence = None
         if held is None or held.source != navigation.SRC_DIRECTIVE:
             return
         if outcome == pickup.OUTCOME_SUCCESS:
-            self.targets.note_serviced(held.pos, ())
+            if mem is not None:
+                self._note_serviced(mem, held.pos)
+            else:
+                self.targets.note_serviced(held.pos, ())
             self.targets.retire("collected")
             self._settle_directive("reached", held.generation,
                                    "pickup-success")

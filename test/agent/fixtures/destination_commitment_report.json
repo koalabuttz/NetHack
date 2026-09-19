@@ -1,6 +1,10 @@
 {
  "commits": [
   {
+   "hash": "e2587e70c51d8d074107985435ecbae259332da7",
+   "subject": "agent: pickup outcome lifecycle end-to-end"
+  },
+  {
    "hash": "67cdedb09fd43bc00eba14649f701e6f2c4de44e",
    "subject": "agent: semantic v2 destination resolution"
   },
@@ -27,10 +31,6 @@
   {
    "hash": "04cb2263f2ac66e8f36c2a8e073f8cc170401a07",
    "subject": "agent: extend mutation checks to 10 of 11"
-  },
-  {
-   "hash": "7bfa476d6ce8090e6dbc06a9e8e268feb8b71fed",
-   "subject": "agent: persistent terrain routing (AC12)"
   }
  ],
  "gates": {

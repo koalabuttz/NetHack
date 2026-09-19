@@ -66,6 +66,25 @@ def door_open(terrain: "TerrainMemory", pos: Tuple[int, int]) -> bool:
     return terrain.ter(pos) in _DOOR_TERRAIN
 
 
+def local_evidence_signature(terrain: "TerrainMemory",
+                             pos: Tuple[int, int]) -> tuple:
+    """A bounded *local* evidence signature at *pos* (plan 1.5).
+
+    Player-visible classified terrain, occupancy and door state in the
+    immediate neighbourhood only.  Suppression is compared under this
+    signature, so an unrelated global-map change (a room discovered elsewhere)
+    can never reopen a serviced or failed site, while a relevant local change
+    (the ground, an occupant or a door here) does.
+    """
+    pos = tuple(pos)
+    out = [terrain.ter(pos)]
+    for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+        nb = (pos[0] + dx, pos[1] + dy)
+        out.append(terrain.ter(nb))
+        out.append("occ" if terrain.occupant(nb) != OCC_NONE else "")
+    return tuple(out)
+
+
 def edge_legal(terrain: TerrainMemory, a: Tuple[int, int],
                b: Tuple[int, int]) -> bool:
     """True when a *known-safe* edge exists from *a* to *b* (4.5).
@@ -451,6 +470,18 @@ class CommitmentStore(object):
     def failed_signature(self, pos: Tuple[int, int]) -> Optional[tuple]:
         return self._failed.get(tuple(pos))
 
+    def serviced_under_evidence(self, pos: Tuple[int, int],
+                                signature: tuple) -> bool:
+        """True when *pos* is serviced under the *unchanged* local evidence."""
+        cur = self._serviced.get(tuple(pos))
+        return cur is not None and tuple(cur) == tuple(signature)
+
+    def failed_under_evidence(self, pos: Tuple[int, int],
+                              signature: tuple) -> bool:
+        """True when *pos* failed under the *unchanged* local evidence."""
+        cur = self._failed.get(tuple(pos))
+        return cur is not None and tuple(cur) == tuple(signature)
+
     # -- folds -----------------------------------------------------------
     def commit(self, *, instance_id: int, purpose: str, pos: Tuple[int, int],
                family: str, source: str = SRC_DEFAULT, generation: int = 0,
@@ -503,8 +534,14 @@ class CommitmentStore(object):
             self.stall_attempts = 0
 
     def stalled(self) -> bool:
-        return (self.stall_attempts > STALL_MAX
-                or self.total_attempts > self.stall_cap)
+        """At most three no-progress attempts, plus the total-navigation cap.
+
+        Both caps are inclusive (``>=``): the plan permits *at most* three
+        reconciled navigation attempts without a new cell toward the route, and
+        a generous total selected-navigation cap.
+        """
+        return (self.stall_attempts >= STALL_MAX
+                or self.total_attempts >= self.stall_cap)
 
     @property
     def door_attempts_exhausted(self) -> bool:
@@ -520,22 +557,29 @@ class CommitmentStore(object):
         self._failed[tuple(pos)] = tuple(signature)
 
     def retire(self, reason: str, *, pos: Optional[Tuple[int, int]] = None,
-               signature: tuple = ()) -> None:
-        """Clear the active commitment, optionally recording its failure."""
+               signature: Optional[tuple] = None) -> None:
+        """Clear the active commitment, optionally recording its failure.
+
+        A failure is recorded only when an explicit local evidence *signature*
+        is supplied, so a successful completion (reached/collected) never
+        writes a spurious suppression, and a recorded failure can be reopened
+        exactly when its local evidence changes.
+        """
         c = self.current
         target_pos = c.pos if (pos is None and c is not None) else pos
-        if target_pos is not None and reason:
+        if signature is not None and target_pos is not None:
             self._failed[tuple(target_pos)] = tuple(signature)
         self.current = None
         self.events.append({"event": "retired", "reason": reason,
                             "pos": target_pos})
 
-    def invalidate_cycle(self, signature: tuple = ()) -> None:
+    def invalidate_cycle(self, signature: Optional[tuple] = None) -> None:
         """Cycle recovery invalidates and suppresses the held destination."""
         c = self.current
         if c is None:
             return
-        self._failed[tuple(c.pos)] = tuple(signature)
+        if signature is not None:
+            self._failed[tuple(c.pos)] = tuple(signature)
         self.current = None
         self.events.append({"event": "cycle-invalidated", "pos": c.pos})
 
@@ -572,7 +616,9 @@ def resolve_destination(terrain: "TerrainMemory", hero: Tuple[int, int],
     store = store or CommitmentStore()
 
     def eligible(t):
-        return not store.serviced(t.pos) and not store.failed(t.pos)
+        sig = local_evidence_signature(terrain, t.pos)
+        return (not store.serviced_under_evidence(t.pos, sig)
+                and not store.failed_under_evidence(t.pos, sig))
 
     chosen = None
     if directive_pos is not None:
@@ -711,7 +757,8 @@ __all__ = [
     "DIRECTIONS", "DIR_RANK", "BASE_STEP", "VISIT_PENALTY", "FAILED_PENALTY",
     "TFAM_STAIR", "TFAM_DOOR", "TFAM_FRONTIER", "TFAM_UNVISITED",
     "edge_legal", "one_dijkstra", "enumerate_targets", "is_frontier",
-    "door_open", "Target", "NavPlan", "plan", "PersistedTarget", "TargetStore",
+    "door_open", "local_evidence_signature",
+    "Target", "NavPlan", "plan", "PersistedTarget", "TargetStore",
     "COMMIT_EXPLORE_FRONTIER", "COMMIT_EXPLORE_UNVISITED", "COMMIT_OPEN_DOOR",
     "COMMIT_COLLECT_ITEMS", "COMMIT_FLEE_UPSTAIRS", "COMMIT_STAIR",
     "PHASE_TRAVELLING", "PHASE_INTERACTING", "SRC_DEFAULT", "SRC_DIRECTIVE",

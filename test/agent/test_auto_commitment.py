@@ -95,7 +95,7 @@ class CommitmentLifecycle(unittest.TestCase):
 
     def test_cycle_invalidates_and_suppresses_same_destination(self):
         st = _store_with()
-        st.invalidate_cycle()
+        st.invalidate_cycle(("sig",))
         self.assertIsNone(st.held())
         self.assertTrue(st.failed((3, 10)))
         # a failed site cannot be re-elected under the same evidence
@@ -130,7 +130,9 @@ class CommitmentLifecycle(unittest.TestCase):
                                                       None, store=st)
         self.assertIsNotNone(first_choice)
         # service that waypoint: it must not be immediately re-elected
-        st.note_serviced(first_choice.pos, ("sig",))
+        st.note_serviced(
+            first_choice.pos,
+            navigation.local_evidence_signature(tm, first_choice.pos))
         again = navigation.resolve_destination(tm, (1, 10), dist, first, None,
                                                store=st)
         self.assertNotEqual(again.pos, first_choice.pos)
@@ -354,7 +356,9 @@ class DefaultDestinationPool(unittest.TestCase):
                                                       None, store=st)
         self.assertEqual(first_choice.family, navigation.TFAM_FRONTIER)
         self.assertEqual(first_choice.pos, (6, 10))
-        st.note_serviced(first_choice.pos, ("sig",))
+        st.note_serviced(
+            first_choice.pos,
+            navigation.local_evidence_signature(tm, first_choice.pos))
         fallback = navigation.resolve_destination(tm, (1, 10), dist, first,
                                                   None, store=st)
         self.assertEqual(fallback.family, navigation.TFAM_UNVISITED)
@@ -383,7 +387,7 @@ class CommittedBehaviour(unittest.TestCase):
 
     def test_hard_blockage_retires_and_suppresses_destination(self):
         st = _store_with(pos=(3, 10))
-        st.retire("hard-blockage")
+        st.retire("hard-blockage", pos=(3, 10), signature=("sig",))
         self.assertIsNone(st.held())
         self.assertTrue(st.failed((3, 10)))
         cells = {(x, 10): FLOOR for x in range(1, 6)}
@@ -394,20 +398,64 @@ class CommittedBehaviour(unittest.TestCase):
         self.assertNotEqual(getattr(prop, "pos", None), (3, 10))
 
     def test_locked_door_fails_once_and_next_target_progresses(self):
+        # an explicit locked/refused door message is classified in production
+        # at the observation fold (not by a manual retire in the test)
+        mem = nav_test.mem_with({(3, 10): FLOOR, (4, 10): FLOOR,
+                                 (5, 10): DOOR, (6, 10): FLOOR}, (4, 10))
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_OPEN_DOOR,
+                                pos=(5, 10), family=navigation.TFAM_DOOR)
+        self.assertEqual(self.ref.targets.held().purpose,
+                         navigation.COMMIT_OPEN_DOOR)
+        mem.messages.append("The door is locked.")
+        self.ref.note_observation(mem)
+        self.assertIsNone(self.ref.targets.held())
+        self.assertTrue(self.ref.targets.failed((5, 10)))
+        # the next target progresses past the locked door
+        table = self.ref.prepare(nav_test.ctx(mem)).table
+        cand = table.scripted()
+        self.assertNotEqual(tuple(cand.effect_payload[4:6]), (5, 10))
+
+    def test_local_evidence_signature_reopens_only_on_relevant_change(self):
+        # an unrelated global-map change must not reopen a serviced site; a
+        # relevant local change does (plan 1.5)
         st = navigation.CommitmentStore()
-        st.commit(instance_id=1, purpose=navigation.COMMIT_OPEN_DOOR,
-                  pos=(5, 10), family=navigation.TFAM_DOOR)
-        st.retire("locked-door")            # an explicit refusal fails it
-        self.assertIsNone(st.held())
-        self.assertTrue(st.failed((5, 10)))
-        cells = {(3, 10): FLOOR, (4, 10): FLOOR, (5, 10): DOOR,
-                 (6, 10): FLOOR}
-        tm = _terrain(cells)
-        dist, first = navigation.one_dijkstra(tm, (3, 10))
-        prop = navigation.resolve_destination(tm, (3, 10), dist, first, None,
-                                              store=st)
-        self.assertIsNotNone(prop)
-        self.assertNotEqual(prop.pos, (5, 10))
+        tm = _terrain({(x, 10): FLOOR for x in range(1, 8)})
+        sig = navigation.local_evidence_signature(tm, (5, 10))
+        st.note_serviced((5, 10), sig)
+        self.assertTrue(st.serviced_under_evidence((5, 10), sig))
+        # unrelated change: a wall far away does not alter the local signature
+        tm.merge({(7, 15): WALL})
+        self.assertEqual(
+            navigation.local_evidence_signature(tm, (5, 10)), sig)
+        self.assertTrue(st.serviced_under_evidence(
+            (5, 10), navigation.local_evidence_signature(tm, (5, 10))))
+        # relevant change: a wall *adjacent* to the site reopens it
+        tm.merge({(5, 9): WALL})
+        self.assertNotEqual(
+            navigation.local_evidence_signature(tm, (5, 10)), sig)
+        self.assertFalse(st.serviced_under_evidence(
+            (5, 10), navigation.local_evidence_signature(tm, (5, 10))))
+
+    def test_unreachable_held_route_settles_as_a_failure(self):
+        # a held destination whose route vanishes fails at reconciliation
+        # instead of silently selecting around the active record
+        mem = nav_test.mem_with({(x, 10): FLOOR for x in range(1, 8)}, (1, 10))
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_EXPLORE_FRONTIER,
+                                pos=(6, 10), family=navigation.TFAM_FRONTIER)
+        # the corridor is severed between the hero and the destination
+        mem.grid[(2, 10)] = WALL
+        mem.grid[(3, 10)] = WALL
+        mem.grid[(4, 10)] = WALL
+        self.ref.directive_settlement = None
+        cand = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.assertEqual(cand.proposed_effect, "dest-unresolved")
+        self.ref.commit_effect(cand.proposed_effect, cand.semantic_label, 2,
+                               mem, observed_kind="no-time",
+                               payload=cand.effect_payload)
+        self.assertIsNone(self.ref.targets.held())
+        self.assertNotEqual(self.ref.targets.held(), (6, 10))
 
     def test_ineffective_door_attempts_are_bounded(self):
         st = _store_with(purpose=navigation.COMMIT_OPEN_DOOR, pos=(5, 10),
