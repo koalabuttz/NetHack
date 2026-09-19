@@ -1,9 +1,13 @@
 {
  "commit_range": {
   "base": "56c0c45a0739b29a3173b08b343d5fc786a56712",
-  "head": "e801e038d361533c5e82778982214f5148ae8ff2"
+  "head": "1b0a5b1d8cfaeec82f0a054a56cfd8218ff05c08"
  },
  "commits": [
+  {
+   "hash": "1b0a5b1d8cfaeec82f0a054a56cfd8218ff05c08",
+   "subject": "agent: regenerate report at final head"
+  },
   {
    "hash": "e801e038d361533c5e82778982214f5148ae8ff2",
    "subject": "agent: acquire on-square collect at pickup send"
@@ -31,10 +35,6 @@
   {
    "hash": "9a2b6d24a9022a2134b38059ecb1dab6c07527bb",
    "subject": "agent: regenerate report at final head"
-  },
-  {
-   "hash": "f214fd9a75c5d4caff5b61f68fcf77d6fac1b9fb",
-   "subject": "agent: persist lifecycle events live and evaluator"
   }
  ],
  "gates": {
@@ -195,5 +195,5 @@
   ]
  },
  "schema_version": 1,
- "suite_count": 1029
+ "suite_count": 1032
 }

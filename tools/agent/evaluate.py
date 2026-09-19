@@ -802,6 +802,13 @@ class ReplayPass(object):
         self._sent_action = None
         self._sent_stair = False
         self._sent_before = None
+        # Mirror the live controller's invalid ownership: an invalid that
+        # discards a modelled pickup send also cancels its in-flight freeze, so
+        # the rejected attempt's evidence/baseline can never be classified by a
+        # later observation (plan 3.3/1.5).  The evaluator models every invalid
+        # as a terminal non-repair rejection (it has no delivery-repair branch),
+        # so the freeze is always cancelled here rather than re-armed.
+        self.reflex.cancel_pickup()
         # It is recorded as its own decision row, and -- when the attempt it
         # rejected is known -- that rejected action is labelled here, distinct
         # from the accepted ground truth.  The invalid count for this NeedKey
@@ -823,6 +830,19 @@ class ReplayPass(object):
                                                     "direction")
                 retry_ordinal = self._model_send(retry_action,
                                                  gameplay=gameplay)
+                # A retry pickup action arms a *fresh* identity: the rejected
+                # attempt's freeze was cancelled above, so the retry is a new
+                # logical attempt (matching live's retry-send arming).
+                cand = getattr(self.reflex, "last_candidate", None)
+                if (cand is not None
+                        and candidates.candidate_to_wire(cand) == retry_action
+                        and cand.proposed_effect == "pickup"):
+                    self._pending_effect = (
+                        cand.proposed_effect, cand.semantic_label,
+                        tuple(getattr(cand, "effect_payload", ())))
+                    self.reflex.arm_pickup(self._pending_effect[2],
+                                           identity=("pickup", retry_ordinal),
+                                           tick=self.tick)
         self.decisions.append({
             "schema": EVAL_SCHEMA, "record": "need", "index": self.needs,
             "need": {"seq": (key[0] if key is not None else self.last_seq),

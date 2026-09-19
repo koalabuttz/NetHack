@@ -453,6 +453,109 @@ class LifecycleRecording(unittest.TestCase):
             self.assertEqual(summary["pickup_attempts"], 1)
             self.assertEqual(summary["pickup_outcomes"]["no-items"], 1)
 
+    def _pickup_attempt(self, rp):
+        """Arm a real on-square collection pickup attempt on *rp*."""
+        import test_auto_navigation as nav
+        from tools.agent.directives import DirectiveSet, DirectiveView
+        mem = nav.mem_with({(x, 10): nav.FLOOR for x in range(1, 8)}, (1, 10))
+        ev = rp.reflex.floor.observe_item(rp.reflex.instance_id, (1, 10),
+                                         "coin appearance")
+        dset = DirectiveSet(schema_version=2, goals=("collect_items",),
+                            target=(1, 10))
+        cand = rp.reflex.prepare(nav.ctx(mem, directives=[
+            DirectiveView(dset, 1)])).table.scripted()
+        self.assertTrue(rp.reflex.arm_pickup(cand.effect_payload,
+                                             identity=("pickup", 99), tick=2))
+        return mem, ev, cand
+
+    def test_evaluator_invalid_cancels_the_rejected_pickup_freeze(self):
+        """Round-5: the evaluator mirrors live invalid ownership (plan 3.3)."""
+        from tools.agent import evaluate
+        from tools.agent.providers import ProviderConfig
+        rp = evaluate.ReplayPass([], ProviderConfig(reflex="scripted",
+                                                    strategy="off"),
+                                 "scripted", "off")
+        mem, ev, cand = self._pickup_attempt(rp)
+        self.assertIsNotNone(rp.reflex.pickup_pending)
+        self.assertIsNotNone(rp.reflex.targets.held())   # on-square acquired
+        rp._pending_effect = ("pickup", "pick-up", tuple(cand.effect_payload))
+        rp._last_key = None
+        rp._last_need_kind = "command"
+        before = len(rp.reflex.lifecycle.events)
+        rp._on_invalid({"code": "kind"})
+        # the rejected freeze is gone before any observation
+        self.assertIsNone(rp.reflex.pickup_pending)
+        self.assertIsNone(rp.reflex.pickup_attempt_identity)
+        self.assertIsNone(rp._pending_effect)
+        # ... so a following observation attributes nothing to it
+        rp.tick = 3
+        rp.reflex.note_observation(mem)
+        self.assertIsNone(rp.reflex.floor.outcome(ev))
+        outcomes = [e["outcome"] for e in rp.reflex.lifecycle.events[before:]]
+        self.assertNotIn("reached", outcomes)
+        self.assertNotIn("failed", outcomes)             # no terminal event
+
+    def test_evaluator_retry_pickup_arms_a_fresh_identity(self):
+        from tools.agent import candidates, evaluate
+        from tools.agent.providers import ProviderConfig
+        rp = evaluate.ReplayPass([], ProviderConfig(reflex="scripted",
+                                                    strategy="off"),
+                                 "scripted", "off")
+        _mem, _ev, cand = self._pickup_attempt(rp)
+        retry = candidates.candidate_to_wire(cand)
+
+        class _Idx(object):
+            def accepted(self, key, n):
+                return None if n == 0 else retry      # rejected, then retry
+
+        rp.actions_index = _Idx()
+        rp._last_key = ("k", 1, 1)
+        rp._last_need_kind = "command"
+        rp.reflex.last_candidate = cand               # the retry matches it
+        rp._on_invalid({"code": "kind"})
+        # the retry pickup action armed a *fresh* identity, not the rejected one
+        self.assertIsNotNone(rp.reflex.pickup_pending)
+        self.assertNotEqual(rp.reflex.pickup_attempt_identity, ("pickup", 99))
+        self.assertEqual(rp.reflex.pickup_attempt_identity,
+                         ("pickup", rp._sent_ordinal))
+
+    def test_live_and_evaluator_invalid_cancel_parity(self):
+        """The same invalid leaves identical reflexive pickup state."""
+        from tools.agent import controller, evaluate, policy
+        from tools.agent.providers import ProviderConfig
+        # live
+        live = object.__new__(controller._EpisodeRunner)
+        live.reflex = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+        rp = evaluate.ReplayPass([], ProviderConfig(reflex="scripted",
+                                                    strategy="off"),
+                                 "scripted", "off")
+        for ref, run in ((live.reflex, None), (rp.reflex, rp)):
+            _mem, _ev, _cand = None, None, None
+            mem = self._arm_on(ref)
+            if run is not None:
+                run._pending_effect = None
+                run._last_key = None
+                run._last_need_kind = "command"
+                run._on_invalid({"code": "kind"})
+            else:
+                ref.cancel_pickup()
+            self.assertIsNone(ref.pickup_pending)
+            self.assertIsNone(ref.pickup_attempt_identity)
+            self.assertEqual(ref.intent, "")
+            self.assertEqual(ref.targets.held().phase, "interacting")
+
+    def _arm_on(self, ref):
+        import test_auto_navigation as nav
+        from tools.agent.directives import DirectiveSet, DirectiveView
+        mem = nav.mem_with({(x, 10): nav.FLOOR for x in range(1, 8)}, (1, 10))
+        ref.floor.observe_item(ref.instance_id, (1, 10), "coin appearance")
+        dset = DirectiveSet(schema_version=2, goals=("collect_items",),
+                            target=(1, 10))
+        cand = ref.prepare(nav.ctx(mem, directives=[
+            DirectiveView(dset, 1)])).table.scripted()
+        ref.arm_pickup(cand.effect_payload, identity=("pickup", 1), tick=2)
+        return mem
+
     def test_over_cap_lifecycle_stream_persists_completely(self):
         # an episode emitting more events than the retained window must still
         # persist every one of them in the sidecar (incremental sink, no
