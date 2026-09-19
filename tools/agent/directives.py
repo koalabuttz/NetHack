@@ -24,9 +24,31 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # Goals a strategy may name.  The reflex knows how each one biases its own
 # action; an unknown goal is a validation failure, never a silent ignore.
-GOALS = ("survive", "acquire_food", "eat_known_safe_food", "recover",
-         "explore_frontier", "search_dead_ends", "descend_known_stairs",
-         "inspect_inventory", "disengage")
+GOALS_V1 = ("survive", "acquire_food", "eat_known_safe_food", "recover",
+            "explore_frontier", "search_dead_ends", "descend_known_stairs",
+            "inspect_inventory", "disengage")
+# Schema v2 adds exactly two destination goals (plan 2.1).
+GOALS_V2 = GOALS_V1 + ("collect_items", "flee_to_upstairs")
+GOALS = GOALS_V1                       # back-compat alias (v1 vocabulary)
+
+# v2 positional goals: a set may name at most one, so the shared coordinate is
+# unambiguous.  ``explore_frontier``/``search_dead_ends`` are
+# **destination-selecting** (they resolve their destination locally and are not
+# coordinate-bearing); ``collect_items``/``flee_to_upstairs``/
+# ``descend_known_stairs`` carry or resolve explicit coordinates.
+POSITIONAL_GOALS = ("collect_items", "flee_to_upstairs", "explore_frontier",
+                    "search_dead_ends", "descend_known_stairs")
+DESTINATION_SELECTING_GOALS = ("explore_frontier", "search_dead_ends")
+COORDINATE_BEARING_GOALS = ("collect_items", "flee_to_upstairs",
+                            "descend_known_stairs")
+# The v2 target-legality matrix (plan 2.1): one rule per positional goal.
+TARGET_RULE = {
+    "collect_items": "required",        # a non-null target is mandatory
+    "flee_to_upstairs": "optional",     # null -> nearest reachable upstairs
+    "explore_frontier": "null",         # destination-selecting: no target
+    "search_dead_ends": "null",         # destination-selecting: no target
+    "descend_known_stairs": "optional",
+}
 
 # State predicates a directive may require.  Each is evaluated locally from
 # public state only; an unknown predicate is rejected.
@@ -34,6 +56,9 @@ PRECONDITIONS = ("hero_known", "hp_known", "hungry", "not_hungry",
                  "hp_below_half", "hp_above_half", "inventory_fresh")
 
 SCHEMA_VERSION = 1
+SCHEMA_VERSION_V1 = 1
+SCHEMA_VERSION_V2 = 2
+ACCEPTED_SCHEMA_VERSIONS = (SCHEMA_VERSION_V1, SCHEMA_VERSION_V2)
 MAX_GOALS = 8
 MAX_PRECONDITIONS = 4
 MAX_TTL = 500
@@ -88,9 +113,10 @@ def validate_directive_set(obj: Any) -> Tuple[Optional[DirectiveSet], str]:
             return _reject("field %r looks like wire content" % (name,))
         if name not in _ALLOWED_KEYS:
             return _reject("unexpected field %r" % (name,))
-    ver = obj.get("schema_version", SCHEMA_VERSION)
-    if ver != SCHEMA_VERSION:
-        return _reject("schema_version is not %d" % SCHEMA_VERSION)
+    ver = obj.get("schema_version", SCHEMA_VERSION_V1)
+    if not _is_int(ver) or ver not in ACCEPTED_SCHEMA_VERSIONS:
+        return _reject("schema_version must be 1 or 2")
+    allowed = GOALS_V1 if ver == SCHEMA_VERSION_V1 else GOALS_V2
     goals = obj.get("goals")
     if not isinstance(goals, list) or not goals:
         return _reject("goals must be a non-empty list")
@@ -98,7 +124,7 @@ def validate_directive_set(obj: Any) -> Tuple[Optional[DirectiveSet], str]:
         return _reject("too many goals (%d)" % len(goals))
     seen = set()
     for g in goals:
-        if not isinstance(g, str) or g not in GOALS:
+        if not isinstance(g, str) or g not in allowed:
             return _reject("unknown goal %r" % (g,))
         if g in seen:
             return _reject("duplicate goal %r" % (g,))
@@ -112,6 +138,10 @@ def validate_directive_set(obj: Any) -> Tuple[Optional[DirectiveSet], str]:
                 and MAP_MIN_Y <= target[1] <= MAP_MAX_Y):
             return _reject("target is outside the map rectangle")
         target = (target[0], target[1])
+    if ver == SCHEMA_VERSION_V2:
+        reason = _v2_target_legality(goals, target)
+        if reason is not None:
+            return _reject(reason)
     risk = obj.get("risk", 0.0)
     if not _finite(risk) or not (0.0 <= float(risk) <= 1.0):
         return _reject("risk must be a finite number in [0,1]")
@@ -138,7 +168,33 @@ def validate_directive_set(obj: Any) -> Tuple[Optional[DirectiveSet], str]:
     return (DirectiveSet(goals=tuple(goals), target=target,
                          risk=float(risk), ttl=int(ttl),
                          preconditions=tuple(pre), explanation=expl,
-                         schema_version=SCHEMA_VERSION), "")
+                         schema_version=ver), "")
+
+
+def _v2_target_legality(goals, target):
+    """The v2 target-legality matrix (plan 2.1): a reason, or ``None``.
+
+    One parameterized case per row: ``collect_items`` requires a target;
+    ``flee_to_upstairs`` and ``descend_known_stairs`` accept a null or a
+    coordinate; ``explore_frontier``/``search_dead_ends`` are
+    destination-selecting and reject a non-null target; and a set with no
+    positional goal must leave the target null.  At most one positional goal
+    is permitted, so the shared coordinate is unambiguous.
+    """
+    positional = [g for g in goals if g in POSITIONAL_GOALS]
+    if len(positional) > 1:
+        return ("v2 permits at most one positional goal, got %r"
+                % (positional,))
+    if positional:
+        rule = TARGET_RULE[positional[0]]
+        if rule == "required" and target is None:
+            return "%s requires a non-null target" % positional[0]
+        if rule == "null" and target is not None:
+            return ("%s is destination-selecting and must not carry a target"
+                    % positional[0])
+    elif target is not None:
+        return "no positional goal permits a target"
+    return None
 
 
 def _is_int(v) -> bool:
@@ -393,6 +449,18 @@ class DirectiveView(object):
     def wants_food(self) -> bool:
         return self.wants("acquire_food") \
             or self.wants("eat_known_safe_food")
+
+    def wants_collect(self) -> bool:
+        """An explicit ``collect_items`` destination goal (schema v2)."""
+        return self.wants("collect_items")
+
+    def wants_flee_upstairs(self) -> bool:
+        """An explicit ``flee_to_upstairs`` destination goal (schema v2)."""
+        return self.wants("flee_to_upstairs")
+
+    def destination_selecting(self) -> bool:
+        """True when a v2 destination-selecting goal is active."""
+        return any(self.wants(g) for g in DESTINATION_SELECTING_GOALS)
 
     def disengage(self) -> bool:
         return self.wants("disengage") or self.wants("survive")

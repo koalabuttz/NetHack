@@ -305,7 +305,13 @@ class TestDirectiveValidation(unittest.TestCase):
             ({"goals": ["survive"], "preconditions": ["immortal"]},
              "unknown precondition"),
             ({"goals": ["survive"], "explanation": "x" * 500}, "too long"),
-            ({"goals": ["survive"], "schema_version": 2}, "schema_version"),
+            # Contract migration (Phase 2): OLD rejected schema_version 2
+            # outright ("schema_version is not 1").  NEW accepts 1 and 2, so
+            # the invalid vectors are an unsupported version and a bool/float
+            # masquerading as a version (plan 2.1).
+            ({"goals": ["survive"], "schema_version": 3}, "schema_version"),
+            ({"goals": ["survive"], "schema_version": True}, "schema_version"),
+            ({"goals": ["survive"], "schema_version": 1.0}, "schema_version"),
             ({"survive": True}, "unexpected field"),
             ({"goals": ["survive", "survive"]}, "duplicate"),
             ("nope", "not an object"),
@@ -324,6 +330,87 @@ class TestDirectiveValidation(unittest.TestCase):
         self.assertTrue(DSEV.preconditions_met(dset, st))
         st.hp_frac = 0.9
         self.assertFalse(DSEV.preconditions_met(dset, st))
+
+
+class DirectiveSchemaV2(unittest.TestCase):
+    """Schema v2: the two new destination goals and the target matrix."""
+
+    def test_v1_directive_roundtrip_preserves_version_and_defaults(self):
+        dset, why = DSEV.validate_directive_set(
+            {"goals": ["survive", "acquire_food"], "ttl": 50})
+        self.assertEqual(why, "")
+        self.assertEqual(dset.schema_version, 1)
+        self.assertEqual(dset.to_dict()["schema_version"], 1)
+        self.assertEqual(dset.goals, ("survive", "acquire_food"))
+        self.assertEqual(dset.ttl, 50)
+        self.assertIsNone(dset.target)
+        # an accepted v1 record round-trips to the identical set (no v2
+        # normalization of old artifacts)
+        again, why2 = DSEV.validate_directive_set(dset.to_dict())
+        self.assertEqual(why2, "")
+        self.assertEqual(again, dset)
+
+    def test_v1_rejects_v2_destination_goals(self):
+        for goal in ("collect_items", "flee_to_upstairs"):
+            dset, why = DSEV.validate_directive_set(
+                {"schema_version": 1, "goals": [goal], "target": [5, 5]})
+            self.assertIsNone(dset)
+            self.assertIn("unknown goal", why)
+
+    def test_v2_requires_collect_coordinate_and_unambiguous_positional_goal(
+            self):
+        dset, why = DSEV.validate_directive_set(
+            {"schema_version": 2, "goals": ["collect_items"]})
+        self.assertIsNone(dset)
+        self.assertIn("requires a non-null target", why)
+        dset, why = DSEV.validate_directive_set(
+            {"schema_version": 2,
+             "goals": ["collect_items", "explore_frontier"], "target": [5, 5]})
+        self.assertIsNone(dset)
+        self.assertIn("at most one positional goal", why)
+
+    def test_v2_rejects_wire_fields_bool_version_and_invalid_coordinates(self):
+        for obj, needle in [
+                ({"schema_version": 2, "goals": ["collect_items"],
+                  "target": [5, 5], "key": 106}, "wire content"),
+                ({"schema_version": True, "goals": ["survive"]},
+                 "schema_version"),
+                ({"schema_version": 2, "goals": ["collect_items"],
+                  "target": [0, 5]}, "outside"),
+                ({"schema_version": 2, "goals": ["collect_items"],
+                  "target": [5]}, "[x,y]"),
+                ({"schema_version": 2, "goals": ["not_a_goal"]},
+                 "unknown goal")]:
+            dset, why = DSEV.validate_directive_set(obj)
+            self.assertIsNone(dset, obj)
+            self.assertIn(needle, why)
+
+    def test_v2_target_legality_matrix(self):
+        cases = [
+            (["collect_items"], [5, 5], True),
+            (["collect_items"], None, False),
+            (["flee_to_upstairs"], None, True),
+            (["flee_to_upstairs"], [5, 5], True),
+            (["explore_frontier"], None, True),
+            (["explore_frontier"], [5, 5], False),
+            (["search_dead_ends"], None, True),
+            (["search_dead_ends"], [5, 5], False),
+            (["descend_known_stairs"], None, True),
+            (["descend_known_stairs"], [5, 5], True),
+            (["survive"], None, True),
+            (["survive"], [5, 5], False),
+            (["collect_items", "survive"], [5, 5], True),
+        ]
+        for goals, target, ok in cases:
+            obj = {"schema_version": 2, "goals": goals}
+            if target is not None:
+                obj["target"] = target
+            dset, why = DSEV.validate_directive_set(obj)
+            self.assertEqual(dset is not None, ok,
+                             "%r target=%r -> %r" % (goals, target, why))
+            if ok:
+                self.assertEqual(dset.schema_version, 2)
+                self.assertEqual(dset.to_dict()["schema_version"], 2)
 
 
 class TestDirectiveBook(unittest.TestCase):
