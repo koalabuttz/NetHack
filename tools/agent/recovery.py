@@ -183,6 +183,11 @@ class CycleDetector(object):
     hero positions and reports a cycle when the trailing window is exactly a
     repetition of a shorter block.  No RNG, no wall clock.  Cycle recovery
     invalidates the current target so a stale destination cannot drive it.
+
+    The trailing window is **deduplicated**: a repeated confirmation equal to
+    the last retained position adds no movement and is skipped, so a stationary
+    frame cannot dilute or postpone a genuine oscillation.  A ``None`` position
+    (unknown hero) breaks continuity and clears the window.
     """
 
     def __init__(self, window: int = 6) -> None:
@@ -193,8 +198,13 @@ class CycleDetector(object):
     def observe(self, pos: Optional[Tuple[int, int]]) -> bool:
         """Fold one confirmed position; True on a 2- or 3-cycle."""
         if pos is None:
+            self.history = []
             return False
         pos = tuple(pos)
+        if self.history and self.history[-1] == pos:
+            # a duplicate confirmation is not new movement: it neither breaks
+            # nor advances the trailing movement history
+            return False
         self.history.append(pos)
         if len(self.history) > self.window:
             del self.history[:len(self.history) - self.window]
@@ -213,21 +223,47 @@ class CycleDetector(object):
         self.history = []
 
 
+def chebyshev(a, b) -> int:
+    """The Chebyshev distance between two grid cells."""
+    return max(abs(int(a[0]) - int(b[0])), abs(int(a[1]) - int(b[1])))
+
+
 # -- recovery state (the wave-4 integration surface) -----------------------
 
 class RecoveryState(object):
     """The reflex-local bounded recovery bookkeeping.
 
-    Combines the search budget, the cycle detector and a "search refused at
-    this site" flag so a decision can suppress a repeated ordinary ``s`` and
-    escalate per the ladder: justified search -> deterministic safe
-    alternative step -> invalidate/reselect target -> graceful termination.
+    Combines the search budget, the cycle detector, a "search refused at this
+    site" flag and an explicit **movement-history state machine** over the
+    confirmed positions, so a decision can suppress a repeated ordinary ``s``,
+    prefer not to immediately backtrack, and escalate per the ladder:
+    justified search -> deterministic safe alternative step -> invalidate/
+    reselect target -> graceful termination.
+
+    Movement history (plan section 4):
+
+    * ``current`` is the last confirmed position;
+    * ``previous_distinct`` is the last confirmed position distinct from
+      ``current`` (the anti-backtrack reference);
+    * the trailing movement history (``cycle.history``) is the deduplicated
+      window used for period-2/period-3 detection;
+    * ``cycle_active`` is whether that trailing movement is currently a
+      detected period-2/period-3 cycle.
+
+    The four transitions are: an *identical* confirmation preserves everything;
+    an *adjacent distinct* move appends and recomputes (clearing
+    ``cycle_active`` only when off-cycle); an *unknown or non-adjacent*
+    relocation clears the history, the previous-cell evidence and
+    ``cycle_active``; a fresh instance is a new object.
     """
 
     def __init__(self) -> None:
         self.search = SearchBudget()
         self.cycle = CycleDetector()
         self.refused_site: Optional[object] = None
+        self.current: Optional[Tuple[int, int]] = None
+        self.previous_distinct: Optional[Tuple[int, int]] = None
+        self.cycle_active = False
 
     def observe(self, messages: Sequence[str], pos: Optional[Tuple[int, int]],
                 site) -> None:
@@ -242,8 +278,55 @@ class RecoveryState(object):
     def note_search_completed(self, site) -> None:
         self.search.note_completed(site)
 
+    def movement_history(self) -> Tuple[Tuple[int, int], ...]:
+        """The deduplicated trailing confirmed-movement window."""
+        return tuple(self.cycle.history)
+
+    def _clear_movement(self) -> None:
+        self.current = None
+        self.previous_distinct = None
+        self.cycle.reset()
+        self.cycle_active = False
+
     def note_cycle(self, pos: Optional[Tuple[int, int]]) -> bool:
-        return self.cycle.observe(pos)
+        """Fold one confirmed position; return whether a cycle is active.
+
+        Only a *confirmed* observation reaches here (the controller calls it
+        once per committed snapshot), so a proposal, a rejected candidate or a
+        failed write can never fabricate motion.
+        """
+        self.cycle_active = self._fold_movement(pos)
+        return self.cycle_active
+
+    def _fold_movement(self, pos: Optional[Tuple[int, int]]) -> bool:
+        if pos is None:
+            # unknown hero: no continuity, and no false cycle
+            self._clear_movement()
+            return False
+        pos = tuple(pos)
+        if self.current is not None and pos == self.current:
+            # identical confirmation: preserve the previous cell, the trailing
+            # history and the active-cycle state unchanged
+            return self.cycle_active
+        if self.current is None:
+            # first confirmed position: seeds the history with no predecessor
+            self.previous_distinct = None
+            self.current = pos
+            self.cycle.reset()
+            self.cycle_active = self.cycle.observe(pos)
+            return self.cycle_active
+        if chebyshev(pos, self.current) > 1:
+            # an unknown-continuity relocation (teleport, level change without
+            # an instance transition): every stale cell reference is invalid
+            self._clear_movement()
+            self.current = pos
+            self.cycle_active = self.cycle.observe(pos)
+            return self.cycle_active
+        # a genuine adjacent move: it becomes the new anti-backtrack reference
+        self.previous_distinct = self.current
+        self.current = pos
+        self.cycle_active = self.cycle.observe(pos)
+        return self.cycle_active
 
 
 __all__ = [
@@ -251,4 +334,5 @@ __all__ = [
     "classify_food_negative", "FoodNegatives",
     "FOOD_NEG_INVENTORY", "FOOD_NEG_LOCATION",
     "SEARCH_SITE_LIMIT", "SearchBudget", "CycleDetector", "RecoveryState",
+    "chebyshev",
 ]

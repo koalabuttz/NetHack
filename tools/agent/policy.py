@@ -615,6 +615,11 @@ class ScriptedReflex(object):
             # a refused search at this site is suppressed (5.1): fall through
             # to navigation / a non-search recovery step, never another `s`
             return self._navigation_candidates(context, mem, hero)
+        # 3b. an active detected movement cycle (period-2 or period-3) enters
+        #     recovery even with no stationary no_progress: `_cycled` is an
+        #     independent condition, not merely a search suppressor
+        if self._cycled:
+            return self._cycle_candidate(mem, hero)
         # 4. inventory cache maintenance (never preempts safety or progress)
         if mem.inventory.stale(context.tick, INV_STALE_TICKS) \
                 and (context.tick - self.last_inv_tick) \
@@ -642,6 +647,11 @@ class ScriptedReflex(object):
         and unvisited cell, and the retained argmax picks the first step.  A
         directive only reorders candidates the reflex already knows how to
         build; it never supplies a key.
+
+        Before candidates are constructed, the scored targets pass through the
+        bounded same-family anti-backtrack preference (:meth:`_antibacktrack`),
+        which suppresses a *comparable* immediate reversal without ever
+        forbidding an edge or dropping a uniquely required retreat.
         """
         explore_first = self.directives.prefers_frontier() \
             and not self.directives.prefers_stairs()
@@ -651,16 +661,21 @@ class ScriptedReflex(object):
         terrain = self._terrain(mem)
         plan = navigation.plan(terrain, hero, mem.visits, None,
                                self._check_deadline)
-        cands = []
+        scored = []
         for target in plan.targets:
             key = KEY.DIR_KEYS[target.first_step]
             score = _target_score(target.family, target.cost, explore_first)
             score += self._directive_component(target)
+            scored.append((target, _NAV_FAMILY[target.family], key, score,
+                           target.first_step))
+        kept = self._antibacktrack(scored, hero, getattr(context, "rejected",
+                                                         None))
+        cands = []
+        for target, family, key, score, step, extra in kept:
             cands.append(self._cand(
-                {"key": key}, "navigate", _NAV_FAMILY[target.family], score,
-                "%s: %s" % (self._nav_reason(), target.reason), "navigate",
-                direction=target.first_step,
-                direction_rank=navigation.DIR_RANK[target.first_step]))
+                {"key": key}, "navigate", family, score,
+                "%s: %s" % (self._nav_reason(extra), target.reason), "navigate",
+                direction=step, direction_rank=navigation.DIR_RANK[step]))
         if cands:
             return tuple(cands)
         if mem.searches_since_progress < 3 \
@@ -670,6 +685,120 @@ class ScriptedReflex(object):
                                "secret-search", 300,
                                "search for secret doors",
                                "secret-search"),)
+        return self._search_fallback(mem, hero)
+
+    # The bounded same-family margin: a reversal is kept only when it scores
+    # strictly more than 40 above the best non-reversing alternative in its
+    # family (the +30 directive contribution participates in both scores).
+    ANTIBACKTRACK_MARGIN = 40
+
+    @staticmethod
+    def _is_reverse(step, hero, previous) -> bool:
+        """True when *step* returns to the previous distinct confirmed cell."""
+        if previous is None:
+            return False
+        return (hero[0] + step[0], hero[1] + step[1]) == tuple(previous)
+
+    def _antibacktrack(self, scored, hero, rejected):
+        """Bounded, same-family preference against an immediate reversal.
+
+        A pure operation over the *scored target/action representatives*,
+        applied while target metadata is still available and before candidate
+        construction.  Entries are grouped by ``(candidate family, canonical
+        first-step action signature)`` and each group keeps the deterministic
+        best representative dedup would keep.  Rejected action signatures are
+        removed from consideration first, so a rejected alternative can never
+        suppress the only usable retreat.  Within a family, a reversing
+        representative is suppressed unless no non-reversing alternative
+        exists, or the reversal scores strictly more than
+        :data:`ANTIBACKTRACK_MARGIN` above the family's best non-reversing
+        representative.  Directives never cross a family boundary: the
+        comparison is made within a family.
+        """
+        previous = self.recovery.previous_distinct
+
+        def sig_of(key):
+            return candidates.ImmutableAction.key(key).signature()
+
+        groups = {}
+        for entry in scored:
+            target, family, key, score, step = entry
+            gkey = (family, sig_of(key))
+            best = groups.get(gkey)
+            # deterministic best representative: highest score (a same-key,
+            # same-family tie has an identical candidate identity)
+            if best is None or score > best[3]:
+                groups[gkey] = entry
+        reps = list(groups.items())
+        # best non-reversing representative score per family, excluding any
+        # already-rejected action signature
+        best_alt = {}
+        for (family, sig), entry in reps:
+            if rejected is not None and rejected.excludes_signature(sig):
+                continue
+            if not self._is_reverse(entry[4], hero, previous):
+                best_alt[family] = max(best_alt.get(family, entry[3]), entry[3])
+        suppressed = set()
+        for (family, sig), entry in reps:
+            if not self._is_reverse(entry[4], hero, previous):
+                continue
+            if rejected is not None and rejected.excludes_signature(sig):
+                continue
+            alt = best_alt.get(family)
+            if alt is None:
+                continue        # no comparable alternative: keep the reversal
+            if not (entry[3] - alt > self.ANTIBACKTRACK_MARGIN):
+                suppressed.add((family, sig))
+        kept = []
+        for (family, sig), entry in reps:
+            if (family, sig) in suppressed:
+                continue
+            target, fam, key, score, step = entry
+            extra = ""
+            if any(f == fam for f, _ in suppressed) \
+                    and not self._is_reverse(step, hero, previous):
+                extra = "avoiding an immediate backtrack"
+            kept.append((target, fam, key, score, step, extra))
+        kept.sort(key=lambda e: e[0].order_key())
+        return kept
+
+    def _cycle_candidate(self, mem, hero):
+        """A singleton, edge-legal escape from an active movement cycle.
+
+        Enumerates known-safe neighbours with the same terrain and
+        :func:`navigation.edge_legal` checks planning uses (so no unsafe
+        diagonal or door entry leaks in), excludes monster/unknown
+        destinations, and prefers a non-reversing exit by a deterministic
+        visit-count/direction-rank order.  A traversable dead end whose only
+        legal escape is backtracking keeps that reversal -- it is never
+        misreported as trapped merely because of the preference.  With no legal
+        movement at all it reuses the existing bounded search-fallback /
+        forced-search nomination machinery rather than manufacturing an
+        unbudgeted search, a dangerous prefix or an indefinite wait.  Returns a
+        one-member candidate tuple, as the loop-breaker branches do.
+        """
+        terrain = self._terrain(mem)
+        previous = self.recovery.previous_distinct
+        options = []
+        for step in navigation.DIRECTIONS:
+            dest = (hero[0] + step[0], hero[1] + step[1])
+            if dest == hero:
+                continue
+            if not navigation.edge_legal(terrain, hero, dest):
+                continue
+            if state.monster_cell(mem.tile(dest), hero, dest):
+                continue
+            reversing = self._is_reverse(step, hero, previous)
+            options.append((0 if not reversing else 1,
+                            mem.visits.get(dest, 0),
+                            navigation.DIR_RANK[step], step))
+        if options:
+            options.sort()
+            step = options[0][3]
+            return (self._cand(
+                {"key": KEY.DIR_KEYS[step]}, "recovery-step", "recovery", 0,
+                "cycle recovery: leave the repeating movement", "recovery",
+                direction=step, direction_rank=navigation.DIR_RANK[step]),)
         return self._search_fallback(mem, hero)
 
     def _search_site(self, hero):
@@ -924,10 +1053,18 @@ class ScriptedReflex(object):
         return {"key": KEY.KEY_SEARCH}
 
     # -- navigation ------------------------------------------------------
-    def _nav_reason(self) -> str:
-        if not self.directives.active:
-            return "navigate"
-        return "navigate (%s)" % self.directives.top_goal()
+    def _nav_reason(self, extra: str = "") -> str:
+        """The navigate reason, optionally qualified by an additive note.
+
+        The extra note rides the existing parenthesized qualifier slot, so the
+        presentation's recognized-purpose mapping still resolves the route
+        purpose (a raw diagnostic is never exposed as an instruction).
+        """
+        if self.directives.active:
+            return "navigate (%s)" % self.directives.top_goal()
+        if extra:
+            return "navigate (%s)" % extra
+        return "navigate"
 
     def _frontier_target(self, mem, hero):
         best = None

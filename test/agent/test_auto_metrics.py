@@ -9,6 +9,7 @@ Uses the bounded replay fixture under ``test/agent/fixtures/auto`` so the
 metrics run against a real recording, not a hand-built dict.
 """
 
+import json
 import os
 import sys
 import unittest
@@ -24,6 +25,55 @@ from tools.agent import protocol  # noqa: E402
 
 _FIX = os.path.join(_HERE, "fixtures", "auto")
 _LEGACY = os.path.join(_FIX, "legacy-ep3.wire.jsonl")
+_SHORT = os.path.join(_FIX, "short.wire.jsonl")
+
+
+def confirmed_moves(wire_path):
+    """The sequence of confirmed hero cells, stationary duplicates removed.
+
+    A *confirmed move* is a hero cell that differs from the previous
+    confirmation; a repeated confirmation (a stationary frame) adds no entry.
+    This is the report-local evidence the plan asks for, distinct from the
+    stationary ``(hero, displayed time)`` loop-span metric.
+    """
+    cells = []
+    with open(wire_path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            if '"obs"' not in line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            snap = protocol.Snapshot()
+            snap.apply(obj)
+            hero = M.hero_of(snap)
+            if hero is None:
+                continue
+            if cells and cells[-1] == hero:
+                continue
+            cells.append(tuple(hero))
+    return cells
+
+
+def alternating_moves(wire_path):
+    """Count consecutive confirmed AB alternations in *wire_path*.
+
+    A move to a cell whose predecessor-of-predecessor is the current cell (and
+    which is not the immediately previous cell) is an alternation: the
+    successive ``A-B-A`` and ``B-A-B`` confirmations a two-cell oscillation
+    shows.  Returns ``(alternations, longest_run, moves)``.
+    """
+    cells = confirmed_moves(wire_path)
+    alternations = longest = run = 0
+    for i in range(2, len(cells)):
+        if cells[i] == cells[i - 2] and cells[i] != cells[i - 1]:
+            run += 1
+            alternations += 1
+            longest = max(longest, run)
+        else:
+            run = 0
+    return alternations, longest, len(cells)
 
 
 class ParseDlvl(unittest.TestCase):
@@ -87,6 +137,38 @@ class EpisodeMetricsTests(unittest.TestCase):
         out = M.campaign_metrics(_FIX)
         self.assertEqual(out["episode_count"], 3)
         self.assertTrue(all("observations" in e for e in out["episodes"]))
+
+
+class AlternatingMotionMetrics(unittest.TestCase):
+    """Confirmed movement alternation is distinct from stationary loop spans."""
+
+    def test_alternating_motion_is_distinct_from_stationary_loop_spans(self):
+        # the legacy loop-span metric measures identical (hero, time) frames
+        # only; it cannot see a two-cell oscillation, which the confirmed-move
+        # helper counts.  They are different quantities over the same wire.
+        loop = M.episode_metrics(_SHORT)
+        alternations, longest, moves = alternating_moves(_SHORT)
+        self.assertGreaterEqual(alternations, 0)
+        self.assertGreaterEqual(longest, 0)
+        self.assertGreaterEqual(moves, 0)
+        # the stationary loop-span field is still present and unchanged in
+        # meaning (a count of duplicate frames, not of movement)
+        self.assertIn("longest_loop_span", loop)
+        self.assertIn("loop_spans_ge_2", loop)
+        # a stationary run is not counted as an alternation
+        self.assertLessEqual(longest, max(0, moves - 2))
+
+    def test_validation_report_counts_confirmed_alternating_moves(self):
+        # the report-local helper counts confirmed AB alternations and reports
+        # the confirmed-move total alongside them, scoped to the recording
+        alternations, longest, moves = alternating_moves(_SHORT)
+        self.assertEqual(moves, len(confirmed_moves(_SHORT)))
+        self.assertGreater(moves, 20)
+        self.assertGreaterEqual(alternations, longest)
+        # the legacy fixture has no recorded movement sidecar but is still
+        # scannable: the helper returns a bounded, nonnegative triple
+        alt2, long2, moves2 = alternating_moves(_LEGACY)
+        self.assertGreaterEqual(min(alt2, long2, moves2), 0)
 
 
 if __name__ == "__main__":

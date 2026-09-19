@@ -546,5 +546,56 @@ class LiveWiring(WireHarness):
         self.assertNotIn("#", keys)
 
 
+class CycleRecoveryOwnership(WireHarness):
+    """An active movement cycle never steals the forced-search suffix."""
+
+    def test_cycle_recovery_does_not_steal_forced_suffix_ownership(self):
+        from tools.agent import (controller, policy, protocol,  # noqa: F401
+                                 recording, state)
+        from tools.agent.providers import ProviderConfig
+        from test_auto import hello
+        from test_auto_providers import paced
+        cfg = ProviderConfig(max_ticks=200, postmortem_reserve=0)
+        ctl = controller.Controller(
+            cfg, controller.ControllerPaths("w", "r", "d", "s"), self.dir,
+            episode_timeout=5.0)
+        result = controller.EpisodeResult(index=1)
+        rec = recording.EpisodeRecorder(self.dir, 1)
+        proc = paced([hello()], [0.0])
+        self.addCleanup(proc.close)
+        r = controller._EpisodeRunner(ctl, proc, rec, result)
+        r.pending_key = protocol.NeedKey(1, 1, 1)
+        r.pending_seq = 1
+        r.pending_need = {"id": 1, "kind": "command", "prompt": ""}
+        # a confirmed A-B-A-B oscillation drives the reflex into cycle recovery
+        for pos in [(3, 10), (2, 10), (3, 10), (2, 10)]:
+            r.mem.grid[pos] = "."
+            r.mem.hero = pos
+            r.reflex.note_observation(r.mem)
+        for nb in [(2, 9), (2, 11), (3, 9), (3, 11), (1, 10)]:
+            r.mem.grid[nb] = "|"
+        r.mem.status.hp = 10
+        r.mem.status.hp_max = 10
+        r.mem.inventory.refresh([], 0, 0)
+        r.req.begin({"id": 1, "kind": "command", "prompt": ""}, 1)
+        self.assertTrue(r.reflex._cycled)
+        # the controller-owned forced-search override outranks the cycle
+        # recovery proposal after final selection
+        r._forced_override = lambda need, selected: (
+            {"key": protocol.KEY_SEARCH}, "forced search suffix", "")
+        sent = {}
+        real_emit = r._emit
+
+        def capture(kind, obj, need_key=None, write_deadline=None):
+            sent["obj"] = obj
+            return real_emit(kind, obj, need_key=need_key,
+                             write_deadline=write_deadline)
+
+        r._emit = capture
+        r._answer_now(None)
+        rec.finalize({})
+        self.assertEqual(sent["obj"]["action"], {"key": protocol.KEY_SEARCH})
+
+
 if __name__ == "__main__":
     unittest.main()

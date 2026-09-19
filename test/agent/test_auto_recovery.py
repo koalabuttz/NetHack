@@ -128,6 +128,217 @@ class CycleDetectorTest(unittest.TestCase):
     def test_unknown_position_is_ignored(self):
         c = recovery.CycleDetector()
         self.assertFalse(c.observe(None))
+        # the stronger invariant: an unknown position breaks continuity, so a
+        # stray cycle can never be fabricated across it
+        for p in [(1, 1), (2, 2), (1, 1)]:
+            self.assertFalse(c.observe(p))
+        self.assertFalse(c.observe(None))
+        self.assertEqual(c.history, [])
+        self.assertFalse(c.observe((1, 1)))
+        self.assertFalse(c.observe((2, 2)))
+        self.assertFalse(c.observe((1, 1)))
+
+
+class MovementHistoryTest(unittest.TestCase):
+    """The observation-owned movement-history state machine (plan section 4)."""
+
+    def _state(self, *positions):
+        rs = recovery.RecoveryState()
+        for pos in positions:
+            rs.note_cycle(pos)
+        return rs
+
+    def test_ab_cycle_activates_after_four_confirmed_moves(self):
+        rs = self._state((3, 10), (2, 10), (3, 10), (2, 10))
+        self.assertTrue(rs.cycle_active)
+        self.assertEqual(rs.current, (2, 10))
+        self.assertEqual(rs.previous_distinct, (3, 10))
+
+    def test_period_three_trailing_movement_preserved(self):
+        # a genuine 3-cycle over adjacent cells: a 2x2 corner path
+        # (1,1)->(2,1)->(2,2)->(1,1) (the last leg is a diagonal adjacency)
+        rs = self._state((1, 1), (2, 1), (2, 2), (1, 1), (2, 1), (2, 2))
+        self.assertTrue(rs.cycle_active)
+        self.assertEqual(rs.movement_history(), ((1, 1), (2, 1), (2, 2),
+                                                 (1, 1), (2, 1), (2, 2)))
+
+    def test_duplicate_observations_do_not_dilute_movement_cycle(self):
+        # a stationary frame between the alternating moves must neither break
+        # nor postpone detection
+        rs = recovery.RecoveryState()
+        for pos in [(3, 10), (2, 10), (2, 10), (3, 10), (3, 10), (2, 10)]:
+            rs.note_cycle(pos)
+        self.assertTrue(rs.cycle_active)
+        self.assertEqual(rs.movement_history(), ((3, 10), (2, 10), (3, 10),
+                                                 (2, 10)))
+
+    def test_duplicate_observation_before_detection_preserves_previous_cell(
+            self):
+        rs = self._state((3, 10), (2, 10))
+        before = (rs.previous_distinct, rs.movement_history())
+        rs.note_cycle((2, 10))                 # identical confirmation
+        self.assertEqual((rs.previous_distinct, rs.movement_history()), before)
+        self.assertEqual(rs.current, (2, 10))
+
+    def test_duplicate_observation_after_detection_keeps_cycle_active(self):
+        rs = self._state((3, 10), (2, 10), (3, 10), (2, 10))
+        self.assertTrue(rs.cycle_active)
+        rs.note_cycle((2, 10))                 # a stationary frame at B
+        self.assertTrue(rs.cycle_active)
+
+    def test_door_opening_stationary_observation_keeps_cycle_active(self):
+        # a door-opening key that leaves the hero on the same square is an
+        # identical confirmation, not a new traversed edge
+        rs = self._state((3, 10), (2, 10), (3, 10), (2, 10))
+        self.assertTrue(rs.cycle_active)
+        rs.note_cycle((2, 10))
+        self.assertTrue(rs.cycle_active)
+        self.assertEqual(rs.previous_distinct, (3, 10))
+
+    def test_adjacent_third_exit_clears_cycle_active(self):
+        rs = self._state((3, 10), (2, 10), (3, 10), (2, 10))
+        self.assertTrue(rs.cycle_active)
+        rs.note_cycle((3, 9))                  # an off-cycle adjacent move
+        self.assertFalse(rs.cycle_active)
+        self.assertEqual(rs.current, (3, 9))
+        self.assertEqual(rs.previous_distinct, (2, 10))
+
+    def test_unknown_or_relocated_hero_invalidates_backtrack_evidence(self):
+        rs = self._state((3, 10), (2, 10), (3, 10), (2, 10))
+        self.assertTrue(rs.cycle_active)
+        rs.note_cycle((9, 9))                  # a non-adjacent relocation
+        self.assertFalse(rs.cycle_active)
+        self.assertIsNone(rs.previous_distinct)
+
+    def test_unknown_hero_clears_movement_history_and_cycle(self):
+        rs = self._state((3, 10), (2, 10), (3, 10), (2, 10))
+        self.assertTrue(rs.cycle_active)
+        rs.note_cycle(None)
+        self.assertFalse(rs.cycle_active)
+        self.assertIsNone(rs.previous_distinct)
+        self.assertIsNone(rs.current)
+        self.assertEqual(rs.movement_history(), ())
+
+    def test_nonadjacent_relocation_clears_movement_history_and_cycle(self):
+        rs = self._state((3, 10), (2, 10), (3, 10), (2, 10))
+        rs.note_cycle((20, 5))
+        self.assertFalse(rs.cycle_active)
+        self.assertIsNone(rs.previous_distinct)
+        self.assertEqual(rs.current, (20, 5))
+        self.assertEqual(rs.movement_history(), ((20, 5),))
+
+    def test_instance_reset_clears_previous_cell_and_cycle(self):
+        ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+        mem = mem_with({(3, 10): FLOOR, (2, 10): FLOOR}, (3, 10))
+        for pos in [(3, 10), (2, 10), (3, 10), (2, 10)]:
+            mem.hero = pos
+            ref.note_observation(mem)
+        self.assertTrue(ref.recovery.cycle_active)
+        ref.begin_instance(2)
+        self.assertIsNone(ref.recovery.previous_distinct)
+        self.assertFalse(ref.recovery.cycle_active)
+        self.assertEqual(ref.recovery.movement_history(), ())
+
+
+class CycleRecoveryPolicy(unittest.TestCase):
+    """`_cycled` independently enters safe recovery (AC.9/AC.10)."""
+
+    def setUp(self):
+        self.ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+
+    def _fold(self, mem, positions):
+        for pos in positions:
+            mem.hero = pos
+            self.ref.note_observation(mem)
+
+    def _third_exit_map(self):
+        cells = {(2, 10): FLOOR, (3, 10): FLOOR, (4, 10): FLOOR,
+                 (5, 10): FLOOR, (3, 9): FLOOR}
+        for pos in [(2, 9), (2, 11), (3, 11), (4, 9), (4, 11), (5, 9),
+                    (5, 11)]:
+            cells[pos] = WALL
+        return cells
+
+    def test_ab_cycle_enters_recovery_with_zero_stationary_no_progress(self):
+        mem = mem_with(self._third_exit_map(), (3, 10))
+        self._fold(mem, [(3, 10), (2, 10), (3, 10), (2, 10), (3, 10)])
+        self.assertEqual(mem.no_progress, 0)
+        self.assertTrue(self.ref._cycled)
+        cand = self.ref.prepare(ctx(mem)).table.scripted()
+        self.assertEqual(cand.family, "recovery")
+
+    def test_cycle_recovery_chooses_third_exit_by_four_alternating_moves(self):
+        mem = mem_with(self._third_exit_map(), (3, 10))
+        # after A-B-A-B the cycle is detected, and the next decision (with the
+        # hero back at A) takes the third exit rather than reversing again
+        self._fold(mem, [(3, 10), (2, 10), (3, 10), (2, 10), (3, 10)])
+        self.assertTrue(self.ref._cycled)
+        cand = self.ref.prepare(ctx(mem)).table.scripted()
+        # the north third exit (not the reversing west step) is chosen
+        self.assertEqual(cand.direction, (0, -1))
+
+    def test_cycle_with_only_reverse_exit_does_not_quit(self):
+        cells = {(2, 10): FLOOR, (3, 10): FLOOR, (1, 10): WALL, (2, 9): WALL,
+                 (2, 11): WALL, (3, 9): WALL, (3, 11): WALL, (4, 10): WALL}
+        mem = mem_with(cells, (3, 10))
+        self._fold(mem, [(3, 10), (2, 10), (3, 10), (2, 10)])
+        self.assertTrue(self.ref._cycled)
+        cand = self.ref.prepare(ctx(mem)).table.scripted()
+        # the traversable dead end keeps the backtracking exit, never a quit
+        self.assertEqual(cand.direction, (1, 0))
+        self.assertNotEqual(cand.semantic_label, "trapped")
+
+    def test_cycle_without_exit_respects_search_budget_and_nomination(self):
+        # a boxed-in hero with an active cycle: no legal movement exists, so
+        # the bounded search-fallback machinery answers (never an unbounded
+        # search or a manufactured dangerous prefix)
+        cells = {(3, 10): FLOOR, (2, 10): WALL, (4, 10): WALL, (3, 9): WALL,
+                 (3, 11): WALL}
+        mem = mem_with(cells, (3, 10))
+        self.ref._cycled = True
+        cand = self.ref.prepare(ctx(mem)).table.scripted()
+        self.assertEqual(cand.family, "recovery")
+
+    def test_stationary_recovery_ladder_3_6_10_unchanged(self):
+        cells = {(10, 10): FLOOR}
+        mem = mem_with(cells, (10, 10))
+        mem.no_progress = 3
+        self.assertEqual(self.ref.prepare(ctx(mem)).table.scripted().family,
+                         "recovery")
+        ref2 = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+        mem2 = mem_with(cells, (10, 10))
+        mem2.no_progress = 6
+        self.assertEqual(ref2.prepare(ctx(mem2)).table.scripted().family,
+                         "recovery")
+        ref3 = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+        mem3 = mem_with(cells, (10, 10))
+        mem3.no_progress = 10
+        self.assertEqual(ref3.prepare(ctx(mem3)).table.scripted().family,
+                         "recovery")
+
+    def test_failed_proposal_does_not_fold_motion_history(self):
+        # preparing a proposal (even a rejected one) never advances the
+        # observation-owned history
+        mem = mem_with(self._third_exit_map(), (3, 10))
+        self._fold(mem, [(3, 10), (2, 10)])
+        before = self.ref.recovery.movement_history()
+        self.ref.prepare(ctx(mem))
+        self.ref.decide(ctx(mem))
+        self.assertEqual(self.ref.recovery.movement_history(), before)
+        self.ref.prepare(ctx(mem))
+        self.assertEqual(self.ref.recovery.movement_history(), before)
+
+    def test_failed_and_partial_act_write_do_not_fold_motion_history(self):
+        # only a committed observation reaches note_observation; a send that
+        # failed or was partial never does, so history is unchanged and an
+        # active cycle is not cleared
+        mem = mem_with(self._third_exit_map(), (3, 10))
+        self._fold(mem, [(3, 10), (2, 10), (3, 10), (2, 10)])
+        self.assertTrue(self.ref.recovery.cycle_active)
+        history = self.ref.recovery.movement_history()
+        # no further note_observation happens for a failed/partial write
+        self.assertEqual(self.ref.recovery.movement_history(), history)
+        self.assertTrue(self.ref.recovery.cycle_active)
 
 
 class FoodNegativesTest(unittest.TestCase):
@@ -177,6 +388,7 @@ def ctx(mem, tick=0):
 
 
 FLOOR = (".", "gray", 0, "none")
+WALL = ("|", "gray", 0, "none")
 
 
 class RefusalSuppression(unittest.TestCase):

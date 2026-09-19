@@ -68,10 +68,18 @@ def mem_with(cells, hero):
     return mem
 
 
-def _walk(cells, hero, steps):
-    """A deterministic scripted walk over *cells*; returns visited cells."""
+def _walk(cells, hero, steps, fold=True):
+    """A deterministic scripted walk over *cells*; returns visited cells.
+
+    With ``fold`` (the default) each step is followed by a committed-observation
+    fold, exactly as the controller does once per applied snapshot, so the
+    movement-history state machine advances and the anti-backtrack preference
+    is exercised.
+    """
     ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
     mem = mem_with(cells, hero)
+    if fold:
+        ref.note_observation(mem)
     history = [hero]
     for i in range(steps):
         chosen = ref.prepare(ctx(mem, tick=i)).table.scripted()
@@ -86,6 +94,8 @@ def _walk(cells, hero, steps):
         history.append(hero)
         mem.hero = hero
         mem.visits[hero] = mem.visits.get(hero, 0) + 1
+        if fold:
+            ref.note_observation(mem)
     return history
 
 
@@ -164,23 +174,31 @@ class PinAppliedCap(unittest.TestCase):
 
 
 class PinNavigation(unittest.TestCase):
-    """Navigation-generated reversals (Phase 3 changes this)."""
+    """Navigation-generated reversals, and the anti-oscillation that fixes them.
 
-    def test_pin_two_frontier_pockets_alternate(self):
-        # A one-wide corridor with a frontier pocket at each end: the shipped
-        # frontier scoring drives an avoidable two-cell oscillation.
+    Phase 3 flipped these pins: the movement history is now observation-owned,
+    a comparable reversal is suppressed, and an active cycle forces a singleton
+    recovery decision instead of ordinary navigation.
+    """
+
+    def test_pin_two_frontier_pockets_no_longer_sustain_a_cycle(self):
+        # A one-wide corridor with a frontier pocket at each end used to
+        # oscillate (3,10)<->(2,10) forever.  The anti-backtrack preference
+        # breaks the sustained two-cell cycle and makes progress east.
         cells = {}
         for x in range(2, 7):
             cells[(x, 10)] = FLOOR
             cells[(x, 9)] = WALL
             cells[(x, 11)] = WALL
-        history = _walk(cells, (3, 10), 6)
-        self.assertEqual(history[:4], [(3, 10), (2, 10), (3, 10), (2, 10)])
+        history = _walk(cells, (3, 10), 8)
+        # not the old sustained ABAB run
+        self.assertNotEqual(history[:4], [(3, 10), (2, 10), (3, 10), (2, 10)])
+        # it reaches the far end of the corridor
+        self.assertIn((6, 10), history)
 
-    def test_pin_cycled_flag_alone_does_not_enter_recovery(self):
-        # The detected cycle flag currently only *suppresses* search; with no
-        # stationary no_progress it does not force a recovery decision, so the
-        # scripted reflex still offers ordinary navigation.
+    def test_pin_cycled_flag_now_enters_singleton_recovery(self):
+        # `_cycled` is now an independent recovery condition even with a zero
+        # stationary no_progress: the reflex offers one recovery candidate.
         cells = {}
         for x in range(2, 7):
             cells[(x, 10)] = FLOOR
@@ -190,13 +208,14 @@ class PinNavigation(unittest.TestCase):
         ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
         ref._cycled = True
         table = ref.prepare(ctx(mem)).table
-        self.assertGreater(len(table.ordered_candidates), 1)
-        self.assertEqual(table.scripted().family, "frontier")
+        self.assertEqual(len(table.ordered_candidates), 1)
+        self.assertEqual(table.scripted().family, "recovery")
 
-    def test_pin_recovery_state_has_no_movement_history_surface(self):
+    def test_pin_recovery_state_exposes_movement_history(self):
         rs = recovery.RecoveryState()
-        self.assertFalse(hasattr(rs, "previous_distinct"))
-        self.assertFalse(hasattr(rs, "cycle_active"))
+        self.assertIsNone(rs.previous_distinct)
+        self.assertFalse(rs.cycle_active)
+        self.assertEqual(rs.movement_history(), ())
 
 
 if __name__ == "__main__":

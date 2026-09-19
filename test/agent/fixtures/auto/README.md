@@ -17,12 +17,12 @@ episodes are never checked in):
 | file | bytes |
 |---|---|
 | `startup.wire.jsonl` | 18830 |
-| `short.wire.jsonl` | 84786 |
-| `short.actions.jsonl` | 12661 |
-| `short.decisions.jsonl` | 10085 |
+| `short.wire.jsonl` | 89013 |
+| `short.actions.jsonl` | 12436 |
+| `short.decisions.jsonl` | 10806 |
 | `legacy-ep3.wire.jsonl` | 39341 |
 
-Total: **165703 bytes** (161.8 KiB) of fixture data.  With this README the
+Total: **170426 bytes** (166.4 KiB) of fixture data.  With this README the
 directory is still well under 172 KiB, and
 `test_auto_replay.FixtureIntegrityTest.test_total_budget_is_bounded` asserts
 the whole directory stays within the 256 KiB budget.
@@ -35,9 +35,9 @@ recordings are not in the repository):
 - `short.wire.jsonl`
   `30e322b2b82eab83c84968c3fbe8c885e730543a06839f4c74f66da7b254d727`
 - `short.actions.jsonl`
-  `b7a985c96a902033c1539a7aca1ec3fdb7b8740b3132ce0f85d483bbd2f2635d`
+  `d878b72ab525ce07d945b7771177786a7e0d2c3fcce0397f86a26a039e5ca669`
 - `short.decisions.jsonl`
-  `64541dec1de0e431abb3682c453220bc2a2f081faedb236139c5091a8f1c0ef5`
+  `5d0929242fa1f3bbaa3c4b2c125e6e46d79ad8ed99d57f35aaf1682f201ba953`
 - `legacy-ep3.wire.jsonl`
   `f59639a98d043c95c315cf4ab2bd93aa1fb656e7bb150e30a5dbf3294f4d00e7`
 
@@ -113,7 +113,12 @@ Because the recording was produced by the scripted reflex itself, replaying it
 with the *same* configuration reproduces every original action
 (agreement 47/47).  The `short.*` sidecars were re-captured for the wave-3
 one-Dijkstra navigation rewrite (a legitimate policy change invalidates the
-old trajectory, exactly as this README warns).  **The `--max-ticks` value must
+old trajectory, exactly as this README warns), and again for the Phase-3
+anti-oscillation change: that recorded trajectory was produced by the
+pre-change scripted reflex and encoded its avoidable two-cell oscillation, so
+driving the *current* reflex over the unchanged `short.wire.jsonl` through the
+real `_EpisodeRunner` (and letting `EpisodeRecorder` write the sidecars)
+legitimately replaces them.  **The `--max-ticks` value must
 match the recording's** —
 the replay's reflex quits at the same tick cap, and a different cap changes
 the `extcmd` answer and the tick at which the quit is requested.  A mismatch

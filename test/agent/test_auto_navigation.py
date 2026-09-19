@@ -284,5 +284,168 @@ class ScoreBoundaries(unittest.TestCase):
         self.assertGreater(unvisited, stair)
 
 
+class AntiBacktrackPreference(unittest.TestCase):
+    """Bounded same-family anti-backtrack preference (plan section 4, AC.8)."""
+
+    def setUp(self):
+        self.ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+
+    def _prime(self, cells, path):
+        mem = mem_with(cells, path[0])
+        for pos in path:
+            mem.hero = pos
+            self.ref.note_observation(mem)
+        return mem
+
+    def _corridor(self, lo=2, hi=8, y=10):
+        cells = {}
+        for x in range(lo, hi + 1):
+            cells[(x, y)] = FLOOR
+            cells[(x, y - 1)] = WALL
+            cells[(x, y + 1)] = WALL
+        return cells
+
+    def test_navigation_prefers_comparable_nonbacktracking_frontier(self):
+        # the hero arrived at (5,10) from (4,10) (west); a comparable west
+        # frontier (a reversal) and an east frontier are both reachable, so the
+        # reversal is suppressed and the east route kept
+        cells = self._corridor()
+        mem = self._prime(cells, [(4, 10), (5, 10)])
+        self.assertEqual(self.ref.recovery.previous_distinct, (4, 10))
+        cand = self.ref.prepare(ctx(mem)).table.scripted()
+        self.assertEqual(cand.direction, (1, 0))
+        self.assertEqual(cand.family, "frontier")
+
+    def test_navigation_backtrack_filter_applies_before_action_deduplication(
+            self):
+        # the suppressed reversal is removed before candidates are built, so
+        # no deduplicated representative can resurrect it
+        cells = self._corridor()
+        mem = self._prime(cells, [(4, 10), (5, 10)])
+        table = self.ref.prepare(ctx(mem)).table
+        directions = {c.direction for c in table.ordered_candidates}
+        self.assertNotIn((-1, 0), directions)
+        self.assertIn((1, 0), directions)
+
+    def test_navigation_ignores_rejected_nonbacktracking_alternative(self):
+        # if the non-reversing alternative is already rejected it cannot
+        # suppress the only usable retreat: the reversal is kept
+        from tools.agent.arbitration import RejectionSet
+        cells = self._corridor()
+        mem = self._prime(cells, [(4, 10), (5, 10)])
+        rejected = RejectionSet()
+        rejected.signatures.add(
+            candidates.ImmutableAction.key(protocol.DIR_KEYS[(1, 0)])
+            .signature())
+        context = ctx(mem)
+        context.rejected = rejected
+        cand = self.ref.prepare(context).table.scripted()
+        self.assertEqual(cand.direction, (-1, 0))
+
+    def test_navigation_preserves_only_dead_end_exit(self):
+        # a pocket whose only exit is back the way the hero came keeps that
+        # reversal: it is a legitimate retreat, not an avoidable oscillation
+        cells = {(2, 10): FLOOR, (3, 10): FLOOR, (1, 10): WALL, (2, 9): WALL,
+                 (2, 11): WALL, (3, 9): WALL, (3, 11): WALL, (4, 10): WALL}
+        mem = self._prime(cells, [(3, 10), (2, 10)])
+        self.assertEqual(self.ref.recovery.previous_distinct, (3, 10))
+        cand = self.ref.prepare(ctx(mem)).table.scripted()
+        self.assertEqual(cand.direction, (1, 0))
+
+    def test_navigation_preserves_uniquely_best_reverse_stair_and_door_routes(
+            self):
+        # a uniquely reachable down stair behind a comparable frontier is not
+        # suppressed by the anti-backtrack preference (cross-family comparison
+        # is forbidden)
+        cells = {(2, 10): FLOOR, (3, 10): FLOOR, (4, 10): FLOOR,
+                 (5, 10): FLOOR, (6, 10): DOWN}
+        for pos in [(2, 9), (2, 11), (3, 9), (3, 11), (4, 9), (4, 11),
+                    (5, 9), (5, 11)]:
+            cells[pos] = WALL
+        mem = self._prime(cells, [(5, 10), (4, 10)])
+        self.assertEqual(self.ref.recovery.previous_distinct, (5, 10))
+        cand = self.ref.prepare(ctx(mem)).table.scripted()
+        # the stair is east (forward), never suppressed by the west reversal
+        self.assertEqual(cand.family, "stair")
+
+    def test_antibacktrack_score_exception_at_40_41_and_directive_bonus(self):
+        from tools.agent.directives import DirectiveSet, DirectiveView
+        self.ref.recovery.previous_distinct = (4, 10)
+        hero = (5, 10)
+
+        def entry(pos, step, score):
+            target = navigation.Target(pos, navigation.TFAM_FRONTIER, step, 0,
+                                       "r")
+            return (target, "frontier", protocol.DIR_KEYS[step], score, step)
+
+        west = lambda s: entry((2, 10), (-1, 0), s)     # reversing
+        east = lambda s: entry((8, 10), (1, 0), s)      # non-reversing
+        # a 40-point margin does NOT qualify: the reversal is suppressed
+        kept = self.ref._antibacktrack([west(540), east(500)], hero, None)
+        self.assertEqual([e[3] for e in kept], [500])
+        # a 41-point margin keeps it
+        kept = self.ref._antibacktrack([west(541), east(500)], hero, None)
+        self.assertEqual(sorted(e[3] for e in kept), [500, 541])
+        # the +30 directive contribution participates: boosting the
+        # alternative to 530 drops the margin to 11, so the reversal is
+        # suppressed again
+        kept = self.ref._antibacktrack([west(541), east(530)], hero, None)
+        self.assertEqual([e[3] for e in kept], [530])
+        # and the directive component is exactly the +30 the plan names
+        self.ref.directives = DirectiveView(
+            DirectiveSet(goals=("explore_frontier",), target=(8, 10)), 1)
+        self.assertEqual(
+            self.ref._directive_component(
+                navigation.Target((8, 10), navigation.TFAM_FRONTIER, (1, 0), 0)),
+            30)
+
+    def test_navigation_preparation_does_not_advance_movement_history(self):
+        cells = self._corridor()
+        mem = self._prime(cells, [(4, 10), (5, 10)])
+        before = (self.ref.recovery.current,
+                  self.ref.recovery.previous_distinct,
+                  self.ref.recovery.movement_history())
+        for _ in range(3):
+            self.ref.prepare(ctx(mem))
+            self.ref.decide(ctx(mem))
+        self.assertEqual((self.ref.recovery.current,
+                          self.ref.recovery.previous_distinct,
+                          self.ref.recovery.movement_history()), before)
+
+
+class CycleRecoveryLegality(unittest.TestCase):
+    """Cycle recovery obeys the planner's edge legality (AC.10)."""
+
+    def setUp(self):
+        self.ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+
+    def test_cycle_recovery_obeys_door_diagonal_and_corner_legality(self):
+        # the only apparent escape is a diagonal corner squeeze between two
+        # walls, which the planner forbids; the legal cardinal exit is taken
+        cells = {(3, 10): FLOOR, (4, 11): FLOOR, (4, 10): WALL,
+                 (3, 11): WALL, (2, 10): FLOOR}
+        for pos in [(2, 9), (2, 11), (3, 9)]:
+            cells[pos] = WALL
+        mem = mem_with(cells, (3, 10))
+        # the hero came from (2,10); the (4,11) diagonal is illegal
+        self.ref.recovery.previous_distinct = (2, 10)
+        self.ref._cycled = True
+        cand = self.ref.prepare(ctx(mem)).table.scripted()
+        self.assertNotEqual(cand.direction, (1, 1))
+        self.assertEqual(cand.direction, (-1, 0))
+
+    def test_emergency_disengagement_may_reverse(self):
+        # low HP with an adjacent monster: the emergency branch is untouched
+        # and may step straight back toward where the hero just came from
+        cells = {(10, 10): FLOOR, (11, 10): FLOOR, (12, 10): FLOOR}
+        mem = mem_with(cells, (11, 10))
+        mem.status.hp = 1
+        mem.status.hp_max = 20
+        self.ref.recovery.previous_distinct = (12, 10)   # arrived from the east
+        self.ref._cycled = True                          # a cycle is active too
+        cand = self.ref.prepare(ctx(mem)).table.scripted()
+        self.assertEqual(cand.family, "emergency")
+
+
 if __name__ == "__main__":
     unittest.main()

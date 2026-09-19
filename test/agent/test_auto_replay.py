@@ -408,9 +408,9 @@ class FixtureIntegrityTest(unittest.TestCase):
         "short.wire.jsonl": (
           "30e322b2b82eab83c84968c3fbe8c885e730543a06839f4c74f66da7b254d727"),
         "short.actions.jsonl": (
-          "b7a985c96a902033c1539a7aca1ec3fdb7b8740b3132ce0f85d483bbd2f2635d"),
+          "d878b72ab525ce07d945b7771177786a7e0d2c3fcce0397f86a26a039e5ca669"),
         "short.decisions.jsonl": (
-          "64541dec1de0e431abb3682c453220bc2a2f081faedb236139c5091a8f1c0ef5"),
+          "5d0929242fa1f3bbaa3c4b2c125e6e46d79ad8ed99d57f35aaf1682f201ba953"),
         "legacy-ep3.wire.jsonl": (
           "f59639a98d043c95c315cf4ab2bd93aa1fb656e7bb150e30a5dbf3294f4d00e7"),
     }
