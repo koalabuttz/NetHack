@@ -183,6 +183,22 @@ native-prefix:
 	    --private-root \
 	    "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-native-prefix)"
 
+# The native pickup-shape probe (Phase 0 of the destination-commitment plan,
+# AC17/AC18): drives the real worker's `dopickup` through a real pickup command
+# on a bare floor square, proves the no-object protocol shape (no menu, no
+# inventory change, no time), and reports the native-vs-manual disposition of
+# all eight shapes.  Shapes that cannot be constructed deterministically are
+# marked unsupported (manual-required) rather than silently skipped.  Needs a
+# built agent worker and launcher, so it is opt-in like `play`.
+native-pickup:
+	@test -n "$(WORKER)" -a -n "$(RUNNER)" -a -n "$(DATA)" || \
+	    { echo "set WORKER, RUNNER, DATA (and optionally SYSCONF,"; \
+	      echo "PRIVATE_ROOT) for the native pickup probe"; exit 2; }
+	python3 native_pickup_probe.py --runner "$(RUNNER)" --worker "$(WORKER)" \
+	    --data "$(DATA)" $(if $(SYSCONF),--sysconf "$(SYSCONF)") \
+	    --private-root \
+	    "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-native-pickup)"
+
 # Interaction breadth on real engine menus (inventory, farlook, help with text
 # paging, annotation, native quit confirmations).  Needs a built agent worker
 # and launcher, so it is opt-in like `play`.
