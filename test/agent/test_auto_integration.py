@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 import types
 import unittest
 
@@ -1076,6 +1077,104 @@ class JevAppliedCap(WireHarness):
         rec.finalize({})
         self.assertEqual(r.ledger.reflex_applied, 1)
 
+    def test_incomplete_repair_cannot_resurrect_older_rejected_jev_action(
+            self):
+        # cap=1: accepted Jev A is applied and sent, then an ordinary engine
+        # invalid rejects the retry, then the scripted retry gets an
+        # `incomplete`.  The stale Jev record must NOT be resendable, so the
+        # already-rejected A is never resurrected.
+        fake = _ChoiceJev(usage={"prompt_tokens": 1000})
+        r, rec, _ = self._runner(fake, cap=1)
+        self._answer(r)
+        self.assertEqual(r.ledger.reflex_applied, 1)
+        self.assertEqual(fake.decides, 1)
+        self.assertEqual(r.action_ordinal, 1)
+        # ordinary invalid (excludes A): Jev repair eligibility is dropped
+        r._on_invalid({"code": "kind"})
+        self.assertIsNone(r._last_jev_send)
+        # the retry falls back to scripted (applied cap reached): no new Jev
+        self._answer(r)
+        self.assertEqual(fake.decides, 1)
+        self.assertEqual(r.ledger.reflex_applied, 1)
+        self.assertEqual(r.action_ordinal, 2)
+        self.assertIsNone(r._last_jev_send)
+        # an incomplete on the scripted retry must not arm a Jev repair
+        r._on_invalid({"code": "incomplete"})
+        self.assertIsNone(r._repair_send)
+        self._answer(r)
+        rec.finalize({})
+        # no resurrection: no new consultation, one applied decision, one
+        # paid reservation
+        self.assertEqual(fake.decides, 1)
+        self.assertEqual(r.ledger.reflex_applied, 1)
+        self.assertEqual(r.ledger.reflex_paid_dispatched, 1)
+
+    def test_incomplete_repair_fails_closed_when_rejection_identity_stale(
+            self):
+        # the frozen repair record is only honoured while its rejection
+        # identity is unchanged: a rejection-version bump between the send and
+        # the repair makes it stale, so the resend falls back to scripted
+        # instead of reusing the frozen Jev token/action.
+        fake = _ChoiceJev(usage={"prompt_tokens": 1000})
+        r, rec, _ = self._runner(fake, cap=1)
+        self._answer(r)
+        self.assertEqual(r.ledger.reflex_applied, 1)
+        # a rejection-version change between the send and the repair
+        r._rejection_for(r.pending_key).version += 1
+        r._on_invalid({"code": "incomplete"})
+        self.assertIsNotNone(r._repair_send)
+        # the resend helper refuses the stale record (scripted, no token)
+        _sel, provider, reason, _lat, _usage, low, token = \
+            r._resend_repair(r.pending_need, r._repair_send)
+        self.assertEqual(provider, "scripted")
+        self.assertIsNone(token)
+        self.assertTrue(low)
+        self.assertIn("stale", reason)
+        self._answer(r)
+        rec.finalize({})
+        self.assertEqual(fake.decides, 1)
+        self.assertEqual(r.ledger.reflex_applied, 1)
+        self.assertEqual(r.ledger.reflex_paid_dispatched, 1)
+
+    def test_reflex_rejected_counts_only_defined_answer_rejections(self):
+        # one arbitration rejection + one pre-dispatch skip + one timeout +
+        # one cap-reached fallback: rejected is 1 (the arbitration rejection),
+        # fallback is the broad 4.
+        reject = _ChoiceJev(index=99, usage={"prompt_tokens": 10})
+        skip = _ChoiceJev(usage={"prompt_tokens": 10})
+        slow = _ChoiceJev()          # sleeps past the reflex deadline
+
+        def slow_decide(ctx, deadline=0.0):
+            slow.decides += 1
+            time.sleep(1.2)
+            return None
+        slow.decide = slow_decide
+
+        rej, rec, _ = self._runner(reject, cap=2)
+
+        def use(provider):
+            rej.reflex_provider = provider
+            self._answer(rej)
+
+        # 1. an arbitration rejection (invalid selected index)
+        use(reject)
+        # 2. a pre-dispatch skip: the request build refuses the whole request,
+        #    so no reservation is made
+        skip.build_request = lambda ctx: providers.JevBuild(
+            None, "unsupported need")
+        use(skip)
+        # 3. a paid timeout that exceeds the reflex deadline
+        use(slow)
+        # 4. the applied cap is reached: the paid tier is suppressed
+        rej.ledger.reflex_applied = rej.ledger.reflex_cap
+        use(reject)
+        rec.finalize({})
+        self.assertEqual(rej.ledger.reflex_rejected, 1)
+        self.assertEqual(rej.ledger.reflex_fallback, 4)
+        self.assertEqual(rej.ledger.reflex_timeout, 1)
+        self.assertEqual(rej.ledger.as_dict()["reflex"]["rejected"], 1)
+        self.assertEqual(rej.ledger.as_dict()["reflex"]["fallback"], 4)
+
     def test_jev_rejected_usage_settled_once_and_sidecar_retained(self):
         records = []
         fake = _ChoiceJev(index=99, usage={"prompt_tokens": 1000})
@@ -1170,6 +1269,30 @@ class SummaryCompatibility(unittest.TestCase):
         self.assertEqual(summary2["totals"]["reflex"]["paid_dispatched"], 7)
         # a JSON round trip stays parseable by an older consumer
         json.dumps(summary2)
+
+    def test_reflex_rejected_defaults_to_zero_and_is_summed_distinctly(self):
+        # an OLD artifact without reflex.rejected defaults to 0 -- and stays
+        # distinct from the broad fallback count
+        old = self._result(1, {
+            "usage": {"prompt_tokens": 5},
+            "reflex": {"applied": 1, "paid_dispatched": 3, "successful": 1,
+                       "fallback": 2, "timeout": 0, "invalid": 0,
+                       "low_confidence": 0}})
+        ep = controller._episode_summary(old)
+        self.assertEqual(ep["reflex"]["rejected"], 0)
+        self.assertEqual(ep["reflex"]["fallback"], 2)
+        # a NEW artifact carries a distinct rejected count, preserved verbatim
+        new = self._result(2, {
+            "usage": {"prompt_tokens": 5},
+            "reflex": {"applied": 0, "paid_dispatched": 4, "successful": 0,
+                       "rejected": 1, "fallback": 4, "timeout": 1,
+                       "invalid": 0, "low_confidence": 0}})
+        ep2 = controller._episode_summary(new)
+        self.assertEqual(ep2["reflex"]["rejected"], 1)
+        self.assertEqual(ep2["reflex"]["fallback"], 4)
+        summary = controller.campaign_summary([old, new], ProviderConfig(), 1.0)
+        self.assertEqual(summary["totals"]["reflex"]["rejected"], 1)
+        self.assertEqual(summary["totals"]["reflex"]["fallback"], 6)
 
 
 if __name__ == "__main__":

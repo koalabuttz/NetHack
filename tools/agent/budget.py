@@ -191,6 +191,15 @@ class BudgetLedger(object):
         self.reflex_invalid = 0
         self.reflex_low_confidence = 0
         self.reflex_fallback = 0
+        # Defined Jev answer *rejections*: only the arbitration rejection of a
+        # returned choice (confidence/concentration, identity, index,
+        # rejected-member or eligibility gate).  This is deliberately narrower
+        # than ``reflex_fallback`` (the broad final-fallback count, which also
+        # counts recorder disablement, provider unavailability, cap exhaustion,
+        # presentation skips, reservation refusals and timeouts).  Episode
+        # owned and reset with the episode; absent in legacy artifacts, it
+        # defaults to 0 on read.
+        self.reflex_rejected = 0
         # Reservations made (the historical ``paid_dispatched`` diagnostic: it
         # counts paid consultations *reserved*, not decisions applied).
         self.reflex_paid_dispatched = 0
@@ -703,6 +712,7 @@ class BudgetLedger(object):
                 "invalid": self.reflex_invalid,
                 "low_confidence": self.reflex_low_confidence,
                 "fallback": self.reflex_fallback,
+                "rejected": self.reflex_rejected,
                 "paid_dispatched": self.reflex_paid_dispatched,
                 "applied": self.reflex_applied,
             },

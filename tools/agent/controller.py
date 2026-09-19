@@ -753,11 +753,17 @@ class _EpisodeRunner(object):
         # Applied-decision accounting: the controller-owned token of the most
         # recent *accepted* Jev proposal (set by ``_decide_jev``), the
         # per-episode sequence that keeps two tokens distinct even for the same
-        # action, the last completely-sent Jev decision (kept only so an
-        # ``invalid(incomplete)`` delivery repair can resend it without
-        # consulting Jev again), and the pending repair record itself.
+        # action, the ordinal of the latest successfully sent answer, the last
+        # completely-sent Jev decision (kept only so an ``invalid(incomplete)``
+        # delivery repair can resend it without consulting Jev again), and the
+        # pending repair record itself.  The repair record is eligible only
+        # while it still describes the latest successfully sent answer and its
+        # frozen table/need identity; any newer non-Jev/overridden complete
+        # send, and every ordinary invalid, clears it, so a stale record can
+        # never resurrect an older action the engine already rejected.
         self._applied_token = None
         self._applied_seq = 0
+        self._last_send_ordinal = None
         self._last_jev_send = None
         self._repair_send = None
         self.reflex_timeouts = 0
@@ -1389,6 +1395,7 @@ class _EpisodeRunner(object):
         self.force_fallback = False
         self.retries = 0
         # A new need cannot be the repair of a previous decision's delivery.
+        self._last_send_ordinal = None
         self._last_jev_send = None
         self._repair_send = None
         if need is not None:
@@ -1721,14 +1728,24 @@ class _EpisodeRunner(object):
             self.req.reset_delivery()
             # A repaired delivery resends the frozen validated action rather
             # than consulting Jev again; the applied-decision token rides
-            # along so the resend cannot double-charge (idempotent).
-            if getattr(self, "_last_jev_send", None) is not None:
-                self._repair_send = self._last_jev_send
+            # along so the resend cannot double-charge (idempotent).  Only the
+            # Jev record that still describes the *latest successfully sent
+            # answer* is eligible: the sent ordinal must match, so a stale
+            # record left over from an earlier, already-rejected decision is
+            # never resendable (the deeper table/rejection-version check lives
+            # in ``_resend_repair``).
+            record = getattr(self, "_last_jev_send", None)
+            if (record is not None
+                    and record.get("ordinal") == self._last_send_ordinal):
+                self._repair_send = record
         else:
             # an ordinary/engine invalid terminally excludes the exact
             # in-flight attempt's canonical action for this NeedKey, so the
             # retry reselects the next member of the retained table rather
-            # than resending the same winner (3.5)
+            # than resending the same winner (3.5).  It also drops Jev repair
+            # eligibility: the rejected action must never be restored by a
+            # later ``incomplete`` repair.
+            self._last_jev_send = None
             had_attempt = self.attempt is not None
             self._exclude_attempt()
             self.attempt = None
@@ -2565,12 +2582,22 @@ class _EpisodeRunner(object):
         Returns ``(selected, provider, reason, latency, usage, low,
         applied_token)``.  A repair resends the *same* decision without
         consulting Jev again, so it carries the original applied-decision
-        token (whose charge is idempotent).  When the need/table identity has
-        gone stale the resend fails closed to the scripted action and charges
-        nothing, rather than treating the stale resend as the same decision.
+        token (whose charge is idempotent).  The repair is honoured only while
+        it still describes the very send it came from -- the need id/key, the
+        sent ordinal and the frozen table/rejection identity must all be
+        unchanged.  On any mismatch the resend fails closed to the scripted
+        action and charges nothing, rather than resurrecting an older action
+        (possibly one the engine already rejected) as if it were the same
+        decision.
         """
-        if (need is not None and need.get("id") == repair.get("need_id")
-                and self.pending_key == repair.get("need_key")):
+        same_need = (need is not None
+                     and need.get("id") == repair.get("need_id")
+                     and self.pending_key == repair.get("need_key"))
+        same_send = repair.get("ordinal") == self._last_send_ordinal
+        same_table = (repair.get("table_version") is not None
+                      and repair.get("rejection_version")
+                      == self._rejection_for(self.pending_key).version)
+        if same_need and same_send and same_table:
             return (repair["action"], "jev", "jev delivery repair resend",
                     repair.get("latency", 0.0), repair.get("usage", {}), False,
                     repair.get("token"))
@@ -2641,18 +2668,37 @@ class _EpisodeRunner(object):
             # because motion/tick semantics belong to gameplay commands only
             # (plan 3.1).
             self._freeze_noncommand_effect(selected)
+        # The *latest successfully sent answer* is the only repair candidate.
+        # Its sent ordinal is always recorded; a Jev send additionally records
+        # its frozen table/need identity so a subsequent ``invalid(incomplete)``
+        # can prove the repair still refers to this very decision.
+        self._last_send_ordinal = ordinal
+        prepared = getattr(self.reflex, "last_prepared", None)
+        table = getattr(prepared, "table", None)
         if applied_token is not None:
             # The applied-decision cap is charged exactly here: after the
             # complete send of the unoverridden, locally valid Jev proposal.
             # ``note_reflex_applied`` is idempotent, so a delivery repair that
             # resends the same token still counts once.  The sent decision is
-            # remembered so an ``invalid(incomplete)`` repair can resend it
-            # without consulting Jev again.
+            # remembered -- with its sent ordinal and frozen table/rejection
+            # identity -- so an ``invalid(incomplete)`` repair can resend it
+            # without consulting Jev again, and only while it still describes
+            # this decision.
             self.ledger.note_reflex_applied(applied_token)
             self._last_jev_send = {
                 "action": selected, "token": applied_token,
                 "need_id": need.get("id"), "need_key": self.pending_key,
+                "ordinal": ordinal,
+                "table_id": getattr(prepared, "table_id", ""),
+                "table_version": getattr(table, "table_version", None),
+                "rejection_version": self._rejection_for(
+                    self.pending_key).version,
                 "latency": latency, "usage": usage}
+        else:
+            # Every newer non-Jev or overridden complete send clears Jev repair
+            # eligibility: the stale record must not survive a later scripted or
+            # forced answer and resurrect a rejected action on an incomplete.
+            self._last_jev_send = None
         if role:
             self._forced_after_send(role, ordinal)
         self.pending = False
@@ -2898,6 +2944,10 @@ class _EpisodeRunner(object):
             mode=getattr(self.c.config, "jev_confidence_mode", "relative"),
             factor=getattr(self.c.config, "jev_relative_factor", 1.5))
         if not outcome.accepted:
+            # A defined Jev *answer rejection* (arbitration: confidence/
+            # concentration, identity, index, rejected-member or eligibility)
+            # is counted distinctly from the broad final-fallback counter.
+            self.ledger.reflex_rejected += 1
             self.ledger.reflex_fallback += 1
             return (fallback_action, "scripted",
                     "jev rejected: %s" % (outcome.reason or outcome.code),
@@ -3028,12 +3078,16 @@ def _episode_summary(r: EpisodeResult) -> dict:
         # paid consultations *reserved* (the historical diagnostic, which may
         # exceed the applied cap); ``applied`` counts complete sends of
         # unoverridden, locally valid Jev proposals, which the applied cap
-        # bounds.  Absent legacy fields default to 0.
+        # bounds.  ``rejected`` is the narrow count of defined Jev answer
+        # rejections (arbitration), distinct from ``fallback`` -- the broad
+        # final-fallback count that also covers recorder disablement, provider
+        # unavailability, cap exhaustion, presentation skips, reservation
+        # refusals and timeouts.  Absent legacy fields default to 0.
         "reflex": {
             "applied": reflex.get("applied", 0),
             "paid_dispatched": reflex.get("paid_dispatched", 0),
             "accepted": reflex.get("successful", 0),
-            "rejected": reflex.get("fallback", 0),
+            "rejected": reflex.get("rejected", 0),
             "fallback": reflex.get("fallback", 0),
             "timeout": reflex.get("timeout", 0),
             "invalid": reflex.get("invalid", 0),
