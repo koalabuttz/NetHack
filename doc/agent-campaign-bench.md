@@ -26,13 +26,26 @@ Modules:
 python3 -m tools.agent.bench validate SPEC.json      # spec + preflight report
 python3 -m tools.agent.bench run      SPEC.json --out-dir RUN_DIR
 python3 -m tools.agent.bench score    SPEC.json --out-dir RUN_DIR
-python3 -m tools.agent.bench tune     SPEC.json
+python3 -m tools.agent.bench compare  --run-dir RUN_DIR [--baseline-dir BASE_DIR]
+python3 -m tools.agent.bench tune     SPEC.json --run-dir RUN_DIR
+python3 -m tools.agent.bench package  --run-dir RUN_DIR [--max-excerpts N] \
+                                      [--package-max-bytes N]
 ```
+
+`run` writes the whole workflow's artifacts in one pass: `precommit.json`
+before any result, a sealed scorecard per episode (with source checksums), a
+`manifest.json` entry per episode, the advisory judge calls, then
+`comparison.json`, `postmortem/manifest.json` and `tuning-report.json`.
+`compare`, `tune` and `package` re-run their stages over an existing run
+directory and **write their artifacts** (they never return a stub failure):
+`comparison.json`, `tuning-report.json`, and `postmortem/manifest.json`.
 
 `run --tier dry-run` performs **offline evaluation only**: it makes no provider
 call and reports `judge_behavior: "not-evaluated"`. Enabling the paid judge is
 allowed only for an explicit live tier, and a live tier additionally requires
-the caller's vapor-cloud attestation (see **AC10** below).
+the caller's vapor-cloud attestation (see **AC10** below) — the value
+`BENCH_VAPOR_CLOUD_ATTESTED` must equal the exact token
+`vapor-cloud-fix-landed-and-tested`; any other non-empty value is refused.
 
 ## Spec schema (`bench-spec/1`)
 
@@ -152,9 +165,17 @@ decision/reason, config diff and provenance differences.
   sample count or resampling policy are forbidden — abandon and re-precut
   instead (`bench.assert_precommitted`). **4 episodes/arm is unconditionally
   diagnostic-only** and never authorizes apply.
-* **Interleaving.** Baseline and candidate episodes run in a fixed seeded,
-  **counterbalanced** schedule (both AB and BA occur), so ordering effects
-  cannot align with the candidate.
+* **Interleaving and the precommitted design.** The run commits a
+  `precommit.json` **before any result exists** containing the comparison
+  policy *and* the exact **balanced** counterbalanced schedule
+  (`episode_schedule`): every full pair runs one baseline and one candidate
+  episode in a seeded AB/BA order, so the AB and BA counts differ by at most 1
+  and both orders occur whenever there are ≥ 2 pairs. The runner executes that
+  committed schedule. The comparison then requires the observed **arm counts**
+  and **order** to match the committed design exactly — a committed 10/arm
+  rejects 10/11 *and* 11/11, an edited design is caught by its hash
+  (`precommit-hash-mismatch`), and only an exact 10/10 with the committed order
+  may apply.
 * **Unpaired bootstrap** intervals over episode-level metrics at a fixed seed
   and resample count, with simultaneous guardrail coverage (Bonferroni).
 * **attempts_source admission.** Admission and apply require
@@ -231,9 +252,20 @@ One **advisory** judgment per eligible episode, run **after scorecard sealing**
 and outside gameplay, charged to a separate bench ledger. The judge state is an
 **allowlisted scorecard subset only** (metrics, units, availability flags,
 terminal class) capped at 8 KiB, and never includes raw transcripts, credentials
-or file paths. Answers are strictly typed; a partial response is **invalid**,
-never partially credited; there are **no automatic retries**, and rejudging is
-an explicit new recorded call. The cache key is
+or file paths.
+
+Each answer is **strictly typed and validated**: the `noul` answer carries a
+probability in [0,1]; the `score` answer carries `score`, `confidence`, a
+`legend` keyed exactly by the level indices, and `probabilities` keyed exactly
+by the level indices, each in [0,1] and summing to 1 (the validated
+legend/probabilities/confidence are retained as typed metadata, with the score
+normalized to 0–1 on the `0..len(criteria)-1` scale). A partial response, a
+missing or extra field, a malformed legend or probability vector, or a body
+whose `model` is not the requested model (or its documented alias
+`jev-latest` → `jev-1.13.0`) is **invalid**, never partially credited. There are
+**no automatic retries**, and rejudging is an explicit new recorded call. The
+dispatch embeds the **exact rubric instance** whose hash/version the result
+records (`self.rubric`, not a module constant). The cache key is
 `scorecard hash + rubric hash + model hash`, so a rubric-only change forces
 rejudgment. Cache hits are reported separately from dispatched calls.
 
@@ -248,11 +280,34 @@ manifest identifying failed gates and the config diff; provenance and source
 checksums; the relevant scorecards, comparison slice and judge answers (labelled
 advisory); artifact paths; deterministic excerpts around protocol faults, the
 largest loop/stationary spans, unresolved directives, unexplained replacements
-and repeated pickup sites — each with line/event/tick ranges and omitted counts;
-the mutation validation report; and a concise task for the coding agent whose
-text is explicitly framed as **not instructions** (transcript strings are
-untrusted data). No automatic DeepSeek analysis, transcript upload or
-self-rewriting tuner.
+and repeated pickup sites; the mutation validation report; and a concise task
+for the coding agent whose text is explicitly framed as **not instructions**
+(transcript strings are untrusted data).
+
+Boundedness and evidence integrity are enforced, not aspirational:
+
+* every source is **streamed** line by line under an input/read cap
+  (`DEFAULT_MAX_INPUT_BYTES`, 1 MiB) — a multi-megabyte artifact is never
+  `read().splitlines()`-ed whole, so peak read memory is bounded by the window
+  plus one line;
+* a byte cap on the kept lines records `truncated_bytes`, and when the input cap
+  is hit `omissions_exact` is `false` with `omitted_at_least: true` (the omitted
+  count is a lower bound, stated explicitly);
+* excerpts carry the **line range**, `omitted_before`/`omitted_after`, and the
+  **tick range** / **event range** of the kept records when present;
+* the whole package is held inside an explicit **byte/count budget**
+  (`DEFAULT_PACKAGE_MAX_BYTES`, `DEFAULT_PACKAGE_MAX_EXCERPTS`); oversized or
+  excess excerpts are dropped **deterministically** and recorded in
+  `omitted` with their reason;
+* `source_checksums` are **recomputed from every referenced source**
+  (`artifact_paths` and each excerpt's file) — a caller-supplied checksum is
+  retained only as `source_checksums_supplied` and any disagreement is listed
+  in `source_checksum_mismatches`;
+* which episodes are excerpted is chosen by the deterministic
+  `select_evidence()` ranking (fault reasons, then largest loop span, then
+  episode id) — never by iteration order.
+
+No automatic DeepSeek analysis, transcript upload or self-rewriting tuner.
 
 ## Tuning and apply policy (AC9)
 
@@ -265,11 +320,18 @@ frozen** unless a specific confidence-policy approval authorizes it;
 confidence mode/threshold, eligibility/safety checks, emergency cooldown,
 stall/door constants and forced-search budgets are not automatic tuning knobs.
 
-`apply-approved` writes a versioned **nonsecret** config overlay only after a
-fresh confirmation passes, the termination-safety contract passes, the approval
-is valid, every changed key/value is in its exact authorized grid/range, and
-the baseline config hash matches. It atomically advances an operator-designated
-active-config reference and retains the previous reference for **rollback**. It
+`apply-approved` writes a versioned **nonsecret** config overlay only after
+**all** of: a fresh confirmation passes, the termination-safety contract passes,
+a **verified approval object** is present (an `id`, an `authorization_hash`,
+a non-empty `authorized` grid/range map, and an `expiry` in the future relative
+to trusted time — `None`/omitted always fails), every changed key/value is
+inside its exact **authorized** grid/range, and the baseline config hash
+matches. Overlays are **immutable and versioned**: two valid applies create two
+distinct files (overwriting is refused). Each apply persists an
+`bench-apply-record/1` with the exact before/after diff, the confirmation
+evidence/run ids, the approval expiry and authorization hash, and the previous
+active reference. `rollback_apply()` restores the previous overlay
+**byte-for-byte** (it returns the restored content and its checksum). The bench
 never rewrites a secret config file or patches a running agent.
 
 ## Stop escalation and containment (AC7)
@@ -314,7 +376,9 @@ baseline.
 | AC12 | A postmortem package is bounded, checksummed and untrusted-transcript-safe |
 
 **AC10 status: pending-operator.** The caller must attest that the vapor-cloud
-fix is landed before any live bench testing: set `BENCH_VAPOR_CLOUD_ATTESTED`.
+fix is landed before any live bench testing: set `BENCH_VAPOR_CLOUD_ATTESTED` to
+the **exact documented token** `vapor-cloud-fix-landed-and-tested` (any other
+non-empty value — `yes`, `true`, a label — is refused by preflight).
 `mutation_checks.py` records `live_claims.measured: false`; no live campaign was
 run in this implementation.
 

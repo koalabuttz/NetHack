@@ -469,15 +469,24 @@ def budget_preflight(spec: dict, config) -> Optional[str]:
 #: The caller-supplied attestation that the vapor-cloud fix is landed.  The
 #: bench never invents it; without it no live tier passes preflight (AC10).
 VAPOR_CLOUD_ENV = "BENCH_VAPOR_CLOUD_ATTESTED"
+#: The **exact** affirmative token the operator must supply.  A non-empty
+#: string is not enough: an attestation is a structured, unambiguous claim, so
+#: only the documented value is accepted.
+VAPOR_CLOUD_TOKEN = "vapor-cloud-fix-landed-and-tested"
 
 
 def vapor_cloud_attestation(source: Optional[dict] = None) -> Dict[str, Any]:
-    """Whether the operator has attested the vapor-cloud prerequisite."""
+    """Whether the operator has supplied the *exact* vapor-cloud attestation.
+
+    The attestation must equal :data:`VAPOR_CLOUD_TOKEN`; any other value
+    (including a generic ``"yes"`` or an empty string) is **not** attested.
+    """
     source = os.environ if source is None else source
     value = (source.get(VAPOR_CLOUD_ENV) or "").strip()
-    if not value:
+    if value != VAPOR_CLOUD_TOKEN:
         return {"attested": False,
-                "reason": "pending-operator (set %s)" % VAPOR_CLOUD_ENV}
+                "reason": ("pending-operator: set %s=%s"
+                           % (VAPOR_CLOUD_ENV, VAPOR_CLOUD_TOKEN))}
     return {"attested": True, "token": value,
             "reason": "operator-attested"}
 

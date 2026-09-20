@@ -624,7 +624,7 @@ class StopAndAbort(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         spec = _valid_spec(tier="live", episodes=5)
-        os.environ[B.VAPOR_CLOUD_ENV] = "attested"
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
         self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         runner = B.BenchRunner(spec, tmp)
         calls = {"n": 0}
@@ -709,7 +709,7 @@ class StopAndAbort(unittest.TestCase):
         self.addCleanup(sentinel.kill)
 
         spec = _valid_spec(tier="live", episodes=1)
-        os.environ[B.VAPOR_CLOUD_ENV] = "attested"
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
         self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         runner = B.BenchRunner(
             spec, tmp, grace=0.5,
@@ -750,7 +750,7 @@ class StopAndAbort(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp, True)
         root_py, _pidfile = self._nested_tree_scripts(tmp)
         spec = _valid_spec(tier="live", episodes=1)
-        os.environ[B.VAPOR_CLOUD_ENV] = "attested"
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
         self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         runner = B.BenchRunner(
             spec, tmp, grace=0.3,
@@ -840,7 +840,7 @@ class PrecommitAndSchedule(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         spec = _valid_spec(tier="live", episodes=4)
-        os.environ[B.VAPOR_CLOUD_ENV] = "attested"
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
         self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         runner = B.BenchRunner(spec, tmp)
         calls = {"n": 0}
@@ -1094,13 +1094,24 @@ class LiveGate(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertEqual(report["stage"], "live-gate")
         self.assertIn("pending-operator", report["error"])
-        os.environ[B.VAPOR_CLOUD_ENV] = "attested-in-test"
+        # a NON-EMPTY but wrong value is still not an attestation
+        for bogus in ("attested-in-test", "yes", "true", "landed"):
+            os.environ[B.VAPOR_CLOUD_ENV] = bogus
+            try:
+                self.assertFalse(B.vapor_cloud_attestation()["attested"], bogus)
+                self.assertFalse(B.preflight(spec)["ok"], bogus)
+            finally:
+                os.environ.pop(B.VAPOR_CLOUD_ENV, None)
+        # only the exact documented token is accepted
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
         try:
             report = B.preflight(spec)
         finally:
             os.environ.pop(B.VAPOR_CLOUD_ENV, None)
         self.assertTrue(report["ok"])
         self.assertEqual(B.vapor_cloud_attestation({})["attested"], False)
+        self.assertFalse(B.vapor_cloud_attestation(
+            {B.VAPOR_CLOUD_ENV: "anything"})["attested"])
 
 
 # ==========================================================================
@@ -1231,7 +1242,7 @@ class WorkflowWiring(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         spec, spec_path = self._spec(tmp)
-        os.environ[B.VAPOR_CLOUD_ENV] = "attested"
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
         self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
 
         dispatches = {"n": 0}
@@ -1503,7 +1514,7 @@ class PrecommitScheduleRunner(unittest.TestCase):
     def test_production_runner_executes_counterbalanced_order(self):
         spec = _valid_spec(tier="live", episodes=4)
         spec["comparison"]["resampling_seed"] = 3
-        os.environ[B.VAPOR_CLOUD_ENV] = "attested"
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
         self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
