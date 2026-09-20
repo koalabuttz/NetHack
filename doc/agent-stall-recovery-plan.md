@@ -1,6 +1,8 @@
-# Stall recovery, effect ownership, and exploration progression plan (Revision 2 — DRAFT, pending plan review)
+# Stall recovery, effect ownership, and exploration progression plan (Revision 3 — DRAFT, pending plan review)
 
 > **Round-1 plan-review provenance.** Review verdict: **REVISE — 7 findings, all addressed**; the reviewer verified root-cause claims (a)–(i). Changes: (1) an exact acquisition/stationary-attempt counting contract as a transition table keyed by frozen pre-send hero, selected operation, and reconciled outcome (§2A, new); (2) a lifecycle transition/event table with exactly one terminal disposition per acquired serial, an additive `schema_version` bump, and defined `destination_switch_rate` semantics for `replaced` events (§3); (3) an evidence-signature split into `service_signature`, `door_failure_signature`, and `blocked_edge_signature` with an instance + edge/action-keyed blockage ledger (§4); (4) door-refusal binding to newly observed message IDs since the frozen attempt baseline, with live/evaluator parity (§4); (5) recovery retirement timing fixed at the selected/reconciled recovery-effect boundary (§1); (6) an explicit AC1–AC9 → named-test table including existing regression pins and report-schema/value tests (§AC → named-test map); (7) two implementable replacements for the same-wire test, keeping the forced-override coincidence test separate (§Phase 1, AC3); (8) a mandated post-implementation reviewer loop against the actual diff and AC1–AC9 plus inherited contracts (§Review and documentation); (9) a contract-migration checklist entry for `test_stationary_recovery_ladder_3_6_10_unchanged` with gate/nav-plan clause and code-comment updates (§Review and documentation). Sections not named here are retained verbatim from the draft.
+
+> **Round-2 plan-review provenance.** Review verdict: **APPROVE WITH FIXES — 3 Medium, 3 Low, all addressed** in this revision. Changes: (1) the Phase 3 file list is expanded to include `state.py`, `controller.py`, `evaluate.py`, and the selected-decision/attempt record, and an explicit door-refusal-seam substep binds refusal to the message-ID/text baseline captured when the exact door candidate is armed (§Phase 3, §4); (2) every mutation-check category reference is replaced by exact test names from the AC map, with a new dedicated `test_write_failure_commits_no_selected_destination_or_recovery_effect` for the commit-before-write/retained-override-payload mutation and the AC8 tests named for the gate/Choice-order/historical-bytes pins (§Mutation checks); (3) the AC4 map row now also carries `test_new_locked_message_fails_matching_door_once` and `test_stale_locked_message_does_not_fail_new_door` (kept under AC7); (4) the exact persisted lifecycle record shape is stated, with `outcome=replaced` terminal and the sole input to replacement switch pairing, and a legacy-stream rule for old `schema`-only records (§3); (5) reviewer-scrutiny items 4 and 7 are reworded and the migration entry's old expectation corrected to "all three thresholds return the recovery family" (§Reviewer scrutiny, §Contract migration checklist); (6) the review loop assigns the fix/rebut duty to the execute agent and requires redispatch after Critical/Important fixes (§Review and documentation). Sections not named here are retained verbatim from Revision 2.
 
 Design produced by `architect:architect-stall-wander` from the post-commitment live-campaign diagnosis. Follow-up to `doc/agent-destination-commitment-plan.md` (live) and `doc/agent-jev-gate-nav-plan.md` (live).
 
@@ -145,6 +147,8 @@ For each **acquired serial**, exactly one terminal disposition is emitted by the
 - **Additive schema extension.** Add a `schema_version` field to the lifecycle record (bumped), with backward-compatible readers: records lacking the field are read as version 1, and new fields (`replacement_serial`, the stable `reason` enum) are additive. No field is renamed or removed.
 - **`destination_switch_rate` consumes `replaced` events.** A `replaced` terminal followed by a distinct acquisition counts as exactly one switch (one pair), never two; an acquisition that overwrites a serial with no preceding terminal is an unexplained switch and must be flagged. Expired/instance/episode terminals are not switches. Telemetry must not count a replacement twice.
 
+**Exact persisted record shape.** Each lifecycle record keeps the existing outer envelope `schema` field and adds `schema_version` inside the `kind`-tagged payload, e.g. `{"schema": "<envelope>", "schema_version": 2, "kind": "destination", "outcome": "replaced", "serial": OLD, "reason": "replaced", "replacement_serial": NEW}`. `outcome=replaced` is **terminal for completeness accounting** and is the **sole input to replacement switch pairing** (`serial` → `replacement_serial`); no other field substitutes. Readers encountering an old `schema`-only record (no `kind`/`schema_version`/`outcome`) treat it as a **legacy stream**: lifecycle metrics are reported **unavailable rather than zero**.
+
 Named tests: `test_default_and_directive_replacement_emit_terminal_then_acquisition`, `test_directive_expiry_emits_expired_terminal`, `test_instance_transition_emits_expired_terminal_before_reset`, `test_episode_close_emits_expired_terminal`, `test_unreachable_default_retirement_is_visible`, `test_one_hop_atomic_completion_lifecycle`.
 
 ### 4. Evidence-scoped progression
@@ -157,7 +161,7 @@ Split successful exploration service signatures from failure signatures into **t
 
 - Key the **blockage ledger by instance + edge/action**, not only by the semantic destination, so a different edge to the same destination is independently eligible.
 - **Retry/suppression bound and reopening rule:** a failed edge is suppressed for its `blocked_edge_signature` and reopens when that signature changes (the destination or side occupancy clears, or the terrain/legality that `edge_legal` reads changes). `service_signature` and `door_failure_signature` reopen only on their own evidence change and never on unrelated occupancy movement.
-- **Door refusal binding (review-raised to High).** Door refusal is consumed **only** from newly observed message IDs/text since the frozen attempt baseline (the message-id/text snapshot captured when the door attempt was armed) and **only** when a matching door serial/action was in flight; old refusal text never fails a new target. Bind identically in live and evaluator.
+- **Door refusal binding (review-raised to High).** Door refusal is consumed **only** from newly observed message IDs/text since the frozen attempt baseline (the message-id/text snapshot captured when the door attempt was armed) and **only** when a matching door serial/action was in flight; old refusal text never fails a new target. Capture the baseline in the selected-decision/attempt record when the exact door candidate is armed, carry it through send and reconciliation, and classify refusal at the matched effect/reconciliation reducer (or pass matched attempt evidence into the observation fold); `state.py` must retain the message IDs `EpisodeMemory.commit` currently discards (`state.py:636-641`). General recent-message scanning must not retire doors. Bind identically in live and evaluator (see §Phase 3).
 
 Named tests: `test_blocked_edge_signature_reopens_when_blocker_leaves`, `test_target_occupant_does_not_reopen_locked_door`, `test_diagonal_side_blocker_is_part_of_edge_signature`, `test_unrelated_occupancy_movement_does_not_reopen_anything`, `test_stale_locked_message_does_not_fail_new_door`, `test_new_locked_message_fails_matching_door_once` (the last two with live/evaluator parity).
 
@@ -194,6 +198,7 @@ Files: `tools/agent/controller.py`, `evaluate.py`, `policy.py`, `navigation.py`;
 - `test_jev_accepts_different_action_non_scripted_candidate_and_commits_its_exact_payload`
 - `test_stale_candidate_same_wire_from_other_table_is_rejected_by_identity`
 - `test_override_does_not_commit_discarded_destination`
+- `test_write_failure_commits_no_selected_destination_or_recovery_effect`
 - `test_delivery_repair_preserves_effect_and_applied_token_once`
 
 The two identity tests replace the former single same-wire test: action deduplication is unchanged and no duplicate Choice members are added. The former same-wire test's intent — that a non-scripted Jev action commits its **exact** member payload — is split into (i) acceptance of a different-action non-scripted candidate committing that exact payload, and (ii) rejection of a stale same-wire candidate that belongs to another prepared table, matched by identity rather than wire equality. The forced-override coincidence test (`test_override_does_not_commit_discarded_destination`) remains separate.
@@ -235,7 +240,7 @@ Files: policy/navigation/recovery/controller/evaluate/lifecycle_metrics plus rec
 
 ### Phase 3 — Evidence-stable progression
 
-Files: navigation/policy; navigation, commitment and recovery suites.
+Files: `navigation.py`, `policy.py`, `state.py`, `controller.py`, `evaluate.py`, and the selected-decision/attempt record; tests in navigation, commitment and recovery suites.
 
 **AC7:** Serviced frontiers remain suppressed through neighboring creature movement, hero overlay, time, visits and unrelated map discovery; a genuine local exploration change can reopen. Blockage removal can reopen a blocked route; unrelated occupancy cannot reopen a locked door. With unchanged serviced frontiers exhausted, unvisited cells then stairs progress according to existing ordering.
 - `test_serviced_frontier_ignores_transient_neighbor_occupancy`
@@ -251,6 +256,16 @@ Files: navigation/policy; navigation, commitment and recovery suites.
 - `test_serviced_frontiers_progress_to_unvisited_then_stairs`
 - `test_reacquisition_preserves_previous_distinct_and_strict_margin`
 - `test_committed_reverse_survives_reacquisition_preferences`
+
+**Door-refusal seam (explicit Phase 3 substep; §4).** Bind refusal to the exact attempt rather than to general recent-message scanning:
+
+1. Capture the message-ID/text baseline when the exact door candidate is **armed**; the selected-decision/attempt record must carry it.
+2. Carry that baseline with the selected attempt through send and reconciliation.
+3. Classify refusal at the **matched effect/reconciliation reducer** (or pass the matched attempt evidence into the observation fold), not by rescanning recent messages.
+4. `state.py` must retain the message IDs it currently discards: `EpisodeMemory.commit` drops IDs at `state.py:636-641`, so the baseline cannot be compared until that is fixed.
+5. Mirror the exact path in the evaluator (its matching path is at `evaluate.py:1192-1196`).
+
+Preserve the established reconciliation ordering (reconcile the observation → commit memory → `note_observation` → `commit_effect`); general recent-message scanning must **not** retire doors.
 
 ### Phase 4 — Verification, review and controlled campaign
 
@@ -272,8 +287,8 @@ Each acceptance criterion's named tests; a mutation that regresses an AC must fa
 |---|---|
 | AC1 | `test_cap_exhausted_locked_door_adjacent_monster_enters_bounded_recovery`, `test_default_locked_door_retirement_is_visible` |
 | AC2 | `test_jev_non_scripted_choice_preserves_destination_effect`, `test_default_destination_terminal_accounting_complete` |
-| AC3 | `test_selected_candidate_effect_survives_all_fallback_reasons`, `test_jev_accepts_different_action_non_scripted_candidate_and_commits_its_exact_payload`, `test_stale_candidate_same_wire_from_other_table_is_rejected_by_identity`, `test_override_does_not_commit_discarded_destination`, `test_delivery_repair_preserves_effect_and_applied_token_once`, `test_delivery_repair_does_not_double_consume_pickup_attempt` |
-| AC4 | `test_cap_exhausted_held_destination_retires_at_three_zero_time_attempts`, `test_acquisition_no_time_is_not_progress`, `test_first_no_time_acquisition_is_attempt_one_of_three`, `test_prompt_observations_do_not_advance_stationary_stage`, `test_move_to_door_approach_is_not_an_interaction`, `test_door_interaction_bound_counts_sent_interactions_only`, `test_long_route_cap_uses_initial_hops`, `test_live_replay_selected_effect_parity` |
+| AC3 | `test_selected_candidate_effect_survives_all_fallback_reasons`, `test_jev_accepts_different_action_non_scripted_candidate_and_commits_its_exact_payload`, `test_stale_candidate_same_wire_from_other_table_is_rejected_by_identity`, `test_override_does_not_commit_discarded_destination`, `test_write_failure_commits_no_selected_destination_or_recovery_effect`, `test_delivery_repair_preserves_effect_and_applied_token_once`, `test_delivery_repair_does_not_double_consume_pickup_attempt` |
+| AC4 | `test_cap_exhausted_held_destination_retires_at_three_zero_time_attempts`, `test_acquisition_no_time_is_not_progress`, `test_first_no_time_acquisition_is_attempt_one_of_three`, `test_prompt_observations_do_not_advance_stationary_stage`, `test_move_to_door_approach_is_not_an_interaction`, `test_door_interaction_bound_counts_sent_interactions_only`, `test_new_locked_message_fails_matching_door_once`, `test_stale_locked_message_does_not_fail_new_door`, `test_long_route_cap_uses_initial_hops`, `test_live_replay_selected_effect_parity` |
 | AC5 | `test_stationary_thresholds_3_6_10_share_legal_bounded_recovery`, `test_np10_recovery_never_routes_through_locked_door`, `test_cycle_with_stationary_count_does_not_fall_back_into_navigation`, `test_recovery_no_time_edge_failure_is_suppressed`, `test_recovery_only_legal_reverse_is_not_trapped`, `test_no_alternative_uses_forced_search_then_trapped_quit`, `test_episode2_three_prefix_cap_and_trapped_reason_preserved` |
 | AC6 | `test_default_arrival_stall_locked_cycle_and_instance_emit_terminal_once`, `test_one_hop_acquisition_has_coherent_lifecycle`, `test_one_hop_atomic_completion_lifecycle`, `test_default_and_directive_replacement_emit_terminal_then_acquisition`, `test_directive_expiry_emits_expired_terminal`, `test_instance_transition_emits_expired_terminal_before_reset`, `test_episode_close_emits_expired_terminal`, `test_unreachable_default_retirement_is_visible`, `test_earlier_fold_retirement_cannot_be_reinstalled`, `test_emergency_suspension_does_not_spend_destination_stall` |
 | AC7 | `test_serviced_frontier_ignores_transient_neighbor_occupancy`, `test_frontier_reopens_only_for_local_exploration_change`, `test_failed_route_reopens_after_blocker_leaves`, `test_blocked_edge_signature_reopens_when_blocker_leaves`, `test_diagonal_side_blocker_is_part_of_edge_signature`, `test_unrelated_occupancy_movement_does_not_reopen_anything`, `test_target_occupant_does_not_reopen_locked_door`, `test_locked_door_not_reenabled_by_neighbor_monster_motion`, `test_stale_locked_message_does_not_fail_new_door`, `test_new_locked_message_fails_matching_door_once`, `test_serviced_frontiers_progress_to_unvisited_then_stairs`, `test_reacquisition_preserves_previous_distinct_and_strict_margin`, `test_committed_reverse_survives_reacquisition_preferences` |
@@ -284,18 +299,18 @@ Each acceptance criterion's named tests; a mutation that regresses an AC must fa
 
 Each mutation must be killed by a named regression, not merely reported as executed:
 - Restore >=10 legacy `_unblock` routing → `test_np10_recovery_never_routes_through_locked_door`.
-- Gate no-progress on time advancing → capped three-zero-time-attempt and recovery tests.
-- Change stall `>=` to `>` or seed progress at target → three-attempt/baseline tests.
+- Gate no-progress on time advancing → `test_cap_exhausted_held_destination_retires_at_three_zero_time_attempts`, `test_acquisition_no_time_is_not_progress`, `test_first_no_time_acquisition_is_attempt_one_of_three`, `test_stationary_thresholds_3_6_10_share_legal_bounded_recovery`.
+- Change stall `>=` to `>` or seed progress at target → `test_first_no_time_acquisition_is_attempt_one_of_three`, `test_cap_exhausted_held_destination_retires_at_three_zero_time_attempts`, `test_long_route_cap_uses_initial_hops`.
 - Omit acquisition attempt or clear no-time stalls → `test_acquisition_no_time_is_not_progress`.
-- Drop accepted Jev candidate payload/use scripted winner → exact-member selection tests.
-- Commit before write / retain discarded override payload → override and write-failure tests.
-- Ignore serial/instance guard or reinstall a retired serial → earlier-fold retirement test.
-- Count delivery repair twice or charge scripted fallback → repair/applied-token test.
-- Restore raw passable recovery or unbounded search/wait → legal bounded recovery tests.
-- Emit terminals only for directives / emit twice → terminal completeness tests.
-- Put occupancy back into successful frontier servicing or ignore it for blocked-route failure → paired signature tests.
-- Apply anti-backtrack to held routes or reject sole reverse → committed-reverse/only-exit tests.
-- Change strict relative gate boundary, reorder Choice criteria, or rerender historical strategy bytes → retain existing gate/presentation/cache regression pins.
+- Drop accepted Jev candidate payload/use scripted winner → `test_selected_candidate_effect_survives_all_fallback_reasons`, `test_jev_accepts_different_action_non_scripted_candidate_and_commits_its_exact_payload`, `test_stale_candidate_same_wire_from_other_table_is_rejected_by_identity`.
+- Commit before write / retain discarded override payload → `test_write_failure_commits_no_selected_destination_or_recovery_effect`, `test_override_does_not_commit_discarded_destination`.
+- Ignore serial/instance guard or reinstall a retired serial → `test_earlier_fold_retirement_cannot_be_reinstalled`.
+- Count delivery repair twice or charge scripted fallback → `test_delivery_repair_preserves_effect_and_applied_token_once`, `test_delivery_repair_does_not_double_consume_pickup_attempt`.
+- Restore raw passable recovery or unbounded search/wait → `test_stationary_thresholds_3_6_10_share_legal_bounded_recovery`, `test_np10_recovery_never_routes_through_locked_door`, `test_recovery_no_time_edge_failure_is_suppressed`, `test_recovery_only_legal_reverse_is_not_trapped`, `test_no_alternative_uses_forced_search_then_trapped_quit`.
+- Emit terminals only for directives / emit twice → `test_default_arrival_stall_locked_cycle_and_instance_emit_terminal_once`, `test_default_and_directive_replacement_emit_terminal_then_acquisition`, `test_directive_expiry_emits_expired_terminal`, `test_instance_transition_emits_expired_terminal_before_reset`, `test_episode_close_emits_expired_terminal`, `test_unreachable_default_retirement_is_visible`, `test_one_hop_atomic_completion_lifecycle`.
+- Put occupancy back into successful frontier servicing or ignore it for blocked-route failure → `test_serviced_frontier_ignores_transient_neighbor_occupancy`, `test_frontier_reopens_only_for_local_exploration_change`, `test_blocked_edge_signature_reopens_when_blocker_leaves`, `test_diagonal_side_blocker_is_part_of_edge_signature`, `test_unrelated_occupancy_movement_does_not_reopen_anything`, `test_target_occupant_does_not_reopen_locked_door`, `test_locked_door_not_reenabled_by_neighbor_monster_motion`.
+- Apply anti-backtrack to held routes or reject sole reverse → `test_committed_reverse_survives_reacquisition_preferences`, `test_reacquisition_preserves_previous_distinct_and_strict_margin`.
+- Change strict relative gate boundary, reorder Choice criteria, or rerender historical strategy bytes → `TestJevRoomAwareness::test_criteria_keys_order_indices_and_option_count_unchanged`, `test_strategy_historical_bytes_not_rerendered_after_commitment_change`, `test_emergency_singleton_precedes_destination_application`.
 
 ## Review and documentation
 
@@ -305,13 +320,13 @@ Maintain Choice criteria as an insertion-ordered object, exact retained-index ma
 
 Have reviewers inspect selection/send/reconcile ownership first, then recovery safety, then lifecycle/evidence changes. Implementer should report exact commands and outcomes for repository suites and native pickup regression coverage where affected. Keep bug-fix phases separable for rollback; do not roll back bounded recovery merely because an optional progression preference harms coverage.
 
-**Post-implementation review loop (required).** After all automated tests and mutation checks pass, dispatch the prescribed reviewer against the **actual diff** and AC1–AC9 plus the inherited contracts (Choice/cache, providers, pickup, reservation/cancellation, applied cap, and the gate/nav and commitment plans). The reviewer must fix or explicitly rebut every finding, rerun the affected tests, and repeat after any Critical/Important finding until none remain or an operator decision is required. This mirrors the loop prescribed in `doc/agent-jev-gate-nav-plan.md` §10 and `doc/agent-destination-commitment-plan.md` §9.
+**Post-implementation review loop (required).** After all automated tests and mutation checks pass, dispatch the prescribed reviewer against the **actual diff** and AC1–AC9 plus the inherited contracts (Choice/cache, providers, pickup, reservation/cancellation, applied cap, and the gate/nav and commitment plans). The **execute agent** must fix or explicitly rebut every reviewer finding, rerun affected tests, and redispatch review after Critical/Important fixes, repeating until none remain or an operator decision is required. This mirrors the loop prescribed in `doc/agent-jev-gate-nav-plan.md` §10 and `doc/agent-destination-commitment-plan.md` §9.
 
 ### Contract migration checklist
 
 Each existing test/fixture whose committed contract changes, with old vs new expectation; implementers add any further entry discovered during implementation:
 
-- `test/agent/test_auto_recovery.py::test_stationary_recovery_ladder_3_6_10_unchanged` (`test_auto_recovery.py:302-317`): **old** pins the legacy 3/6/10 ladder branch behavior (its raw-grid recovery exits); **new** rename/rewrite it to assert the **preserved threshold values (3/6/10)** and **emergency precedence** while explicitly expecting the **new shared legal bounded builder** and **attempt-owned semantics** — the thresholds stay correct, only the expected recovery mechanism changes.
+- `test/agent/test_auto_recovery.py::test_stationary_recovery_ladder_3_6_10_unchanged` (`test_auto_recovery.py:302-317`): **old** only checks that all three thresholds (3/6/10) return the recovery family — insufficient mechanism-level coverage, since it does **not** pin the raw-grid exit behavior or any specific recovery mechanism; **new** rename/rewrite it to assert the **preserved threshold values (3/6/10)** and **emergency precedence** while explicitly expecting the **new shared legal bounded builder** and **attempt-owned semantics** — the thresholds stay correct, only the expected recovery mechanism changes.
 - Same-wire identity fixtures in the wiring/replay suites: the single same-wire identity expectation is replaced by the two identity tests (§Phase 1, AC3), with action deduplication and Choice membership unchanged.
 - Gate/nav plan clause and code comments: during the documentation phase, update the `doc/agent-jev-gate-nav-plan.md` stationary-semantics preservation clause (line 185) and the corresponding source code comments in `tools/agent/policy.py` (the 3/6/10 ladder and the `_unblock`/`_random_move` exits) to describe the shared legal bounded recovery and attempt-owned counting, without changing strict >40 anti-backtrack or p>k/N.
 
@@ -331,10 +346,10 @@ Each existing test/fixture whose committed contract changes, with old vs new exp
 1. Demand a fixture showing the selected recovery label for the episode-4 geometry. Wire evidence and source strongly support `_unblock`; current logs alone do not prove the branch or serial-73 lifetime.
 2. Verify the store actually clears on `This door is locked.` before any stale continuation, and public telemetry records that fact exactly once.
 3. Ensure the selected immutable candidate—not a reconstructed action match—is authoritative through Jev acceptance, final override and delivery repair. Same action does not necessarily mean same destination effect.
-4. Resolve the precise acquisition-attempt counting contract before implementation. Three no-progress attempts means three real attempts, not four due to an incorrect progress baseline; two door interactions means actual interactions, not merely ending a move adjacent to a door.
+4. Verify implementation matches §2A exactly. Three no-progress attempts means three real matched gameplay attempts, not four due to an incorrect progress baseline; two door interactions means actual door-targeting interactions, not merely ending a move adjacent to a door.
 5. Do not let recovery retirement spend budgets on isolated emergency/maintenance suspension; do not let suspended targets survive an actual hard refusal or cycle indefinitely.
 6. Verify every recovery edge with persistent classified terrain/current occupancy and retain the only legal reversal. Ensure dangerous forced search still has all controller gates and its three-activation cap.
-7. Inspect stale recent-message handling: current door refusal scans recent messages rather than a target-bound attempt. Avoid failing a newly acquired different door based on an old refusal; use existing matched-attempt/public evidence context to bind negatives where possible.
+7. Verify §4's mandatory matched-attempt binding. Door refusal scans recent messages today rather than a target-bound attempt; the implementation must consume refusal only from the message-ID/text baseline captured when the exact door candidate was armed and only when a matching door serial/action was in flight, so old refusal text never fails a newly acquired different door.
 8. Inspect live/evaluator parity and pickup send/repair ownership; this patch must not move pickup initiation back to post-observation inventory state.
 9. Reject conclusions that /3 context caused probability diffusion without controlled matched-N/table evidence; sampled rejections show valid strict-threshold behavior.
 10. Campaign aggregate metrics, terminal counts and apparent low switch rates need regenerated, complete lifecycle reporting. Episode 2 is observed graceful exhaustion, not established death.
