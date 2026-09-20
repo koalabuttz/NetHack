@@ -1041,6 +1041,84 @@ class LiveGate(unittest.TestCase):
 # spec validation
 # ==========================================================================
 
+class FailClosedEvidence(unittest.TestCase):
+    """Finding #3: missing evidence is unavailable, never a pass."""
+
+    _ZEROS = {"activations": 0, "suffixes": 0, "successes": 0, "cancels": 0,
+              "denials": 0, "trapped": 0, "uncleared": 0}
+
+    def _cards(self, n, entered, decisions="empty", forced=True, **over):
+        cards = []
+        for i in range(n):
+            card = M.build_scorecard(
+                episode_id="ep-%d-%s" % (i, entered), provenance_id="p",
+                meta=_meta(**over), budget=_budget(), wire_path=_SHORT,
+                actions_path=_ACTIONS,
+                decisions=([] if decisions == "empty" else decisions),
+                forced_search=(dict(self._ZEROS) if forced else None))
+            card["exploration"]["entered_cells_instance_scoped"] = entered
+            cards.append(card)
+        return cards
+
+    def test_missing_sources_are_unavailable_not_zero(self):
+        self.assertIsNone(M.classify_invalids(None)["native_by_code"])
+        self.assertFalse(M.classify_invalids(None)["available"])
+        self.assertIsNone(M.forbidden_uncleared(None))
+        # a present-but-empty source IS available (a real measured zero)
+        self.assertTrue(M.classify_invalids([])["available"])
+        self.assertEqual(M.forbidden_uncleared({"uncleared": 0}), 0)
+
+    def test_operational_stop_reasons_cannot_pass(self):
+        for stop in M.OPERATIONAL_STOP_REASONS:
+            base = self._cards(6, 10.0)
+            cand = self._cards(6, 40.0, stop_reason=stop)
+            self.assertEqual(cand[0]["terminal_class"], M.OPERATIONAL_FAILURE,
+                             stop)
+            self.assertTrue(cand[0]["gates"]["hard_failure"], stop)
+            result = M.compare_arms(base, cand, _policy(),
+                                    base_provenance=_prov(),
+                                    cand_provenance=_prov())
+            self.assertEqual(result["verdict"], "fail", stop)
+            self.assertFalse(result["admission"]["apply_allowed"], stop)
+
+    def test_no_decisions_source_cannot_pass(self):
+        base = self._cards(6, 10.0)
+        cand = self._cards(6, 40.0, decisions=None)
+        self.assertFalse(cand[0]["gates"]["invalid_evidence_available"])
+        self.assertIsNone(cand[0]["invalids"]["native_by_code"])
+        result = M.compare_arms(base, cand, _policy(),
+                                base_provenance=_prov(),
+                                cand_provenance=_prov())
+        self.assertEqual(result["verdict"], "inconclusive")
+        self.assertFalse(result["admission"]["apply_allowed"])
+
+    def test_no_forced_search_source_cannot_pass(self):
+        base = self._cards(6, 10.0)
+        cand = self._cards(6, 40.0, forced=False)
+        self.assertFalse(cand[0]["gates"]["forced_search_evidence_available"])
+        self.assertIsNone(cand[0]["gates"]["uncleared_forced_search"])
+        result = M.compare_arms(base, cand, _policy(),
+                                base_provenance=_prov(),
+                                cand_provenance=_prov())
+        self.assertEqual(result["verdict"], "inconclusive")
+        self.assertFalse(result["admission"]["apply_allowed"])
+
+    def test_operational_failures_do_not_dilute_safety_rate(self):
+        # an arm whose operational failures are excluded from exposure: the
+        # adverse-rate denominator counts only real episodes.
+        base = self._cards(6, 10.0)
+        cand = self._cards(4, 40.0, stop_reason="closed", outcome="death")
+        cand += self._cards(2, 40.0, stop_reason="protocol-failure")
+        admission = M.termination_safety_admission(base, cand, _policy(
+            min_completed_episodes_per_arm=1))
+        self.assertEqual(admission["candidate"]["considered"], 4)
+        self.assertEqual(admission["candidate"]["rate"], 1.0)
+
+
+# ==========================================================================
+# spec validation
+# ==========================================================================
+
 class WorkflowWiring(unittest.TestCase):
     """Finding #1: the public workflow actually wires the helpers."""
 

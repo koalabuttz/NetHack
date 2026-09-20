@@ -210,6 +210,13 @@ _GENERIC_CLOSED_OUTCOME = {
 #: The classes that count against the termination-safety admission contract.
 SAFETY_CLASSES = (ADVERSE_EARLY, ADVERSE_UNKNOWN, UNRECOGNIZED)
 
+#: The exact administrative ``stop_reason`` values that are operational or
+#: integrity failures (rows 5-10 of the classification table).
+OPERATIONAL_STOP_REASONS = (
+    "protocol-failure", "transport-failure-write", "transport-failure-eof",
+    "spawn-failure", "recorder-failure", "closed-unanswered",
+)
+
 #: The bench-owned persisted reasons (added by the runner, never the engine).
 BENCH_STOPPED_GRACEFUL = "bench-stopped-graceful"
 BENCH_ABORTED = "bench-aborted"
@@ -378,6 +385,20 @@ def classify_invalids(decisions: Optional[Sequence[dict]],
     """
     from . import protocol
     meta = meta or {}
+    if decisions is None:
+        # No decisions source: the taxonomy is UNAVAILABLE, not a set of
+        # native zeros.  A fabricated zero would read as "no invalids".
+        return {
+            "available": False,
+            "reason": AVAIL_MISSING,
+            "native_by_code": None,
+            "native_non_incomplete": None,
+            "incomplete_seen": None,
+            "incomplete_resolved": None,
+            "incomplete_unresolved": None,
+            "local_validation_fallbacks": None,
+            "hard_failure": False,
+        }
     native: Dict[str, int] = {code: 0 for code in protocol.INVALID_CODES}
     local_fallback = 0
     saw_incomplete = 0
@@ -413,6 +434,8 @@ def classify_invalids(decisions: Optional[Sequence[dict]],
             resolved = incomplete
     hard_failure = non_incomplete > 0 or unresolved > 0
     return {
+        "available": True,
+        "reason": None,
         "native_by_code": native,
         "native_non_incomplete": non_incomplete,
         "incomplete_seen": saw_incomplete,
@@ -423,12 +446,18 @@ def classify_invalids(decisions: Optional[Sequence[dict]],
     }
 
 
-def forbidden_uncleared(forced_search: Optional[dict]) -> int:
+def forbidden_uncleared(forced_search: Optional[dict]) -> Optional[int]:
+    """The uncleared-prefix count, or ``None`` when the evidence is missing.
+
+    An absent forced-search source is *not* proof that no prefix was left
+    uncleared, so it returns ``None`` (unavailable) rather than ``0``.
+    """
     if not forced_search:
-        return 0
+        return None
     value = forced_search.get("uncleared")
-    return int(value) if isinstance(value, int) and not isinstance(value, bool) \
-        else 0
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -455,16 +484,46 @@ def _torn_lines(path: Optional[str]) -> int:
     return torn
 
 
+def _operational_failure_reasons(meta: dict) -> List[str]:
+    """Reasons an episode is an operational/integrity failure (not gameplay).
+
+    A protocol/transport/spawn/recorder/teardown failure is never a clean
+    ending and never a safety *event* -- it is a hard failure.
+    """
+    reasons: List[str] = []
+    stop = meta.get("stop_reason")
+    if stop in OPERATIONAL_STOP_REASONS and stop != GENERIC_CLOSED:
+        reasons.append("stop-reason:%s" % stop)
+    if meta.get("protocol_failure"):
+        reasons.append("protocol-failure")
+    if meta.get("failure_reason"):
+        reasons.append("failure-reason")
+    if meta.get("teardown_failure"):
+        reasons.append("teardown-failure")
+    if meta.get("recorder_failed"):
+        reasons.append("recorder-failure")
+    if meta.get("forced_kill"):
+        reasons.append("forced-kill")
+    rc = meta.get("returncode")
+    if rc is not None and rc != 0:
+        reasons.append("returncode:%s" % rc)
+    return reasons
+
+
 def integrity_status(*, meta_present: bool, meta_valid: bool,
                      recording_complete: Optional[bool],
                      wire_path: Optional[str] = None,
                      events_path: Optional[str] = None,
-                     actions_path: Optional[str] = None) -> Tuple[str, List[str]]:
+                     actions_path: Optional[str] = None,
+                     operational: Optional[Sequence[str]] = None
+                     ) -> Tuple[str, List[str]]:
     """Return ``(status, reasons)`` for one episode's artifacts.
 
     ``partial`` is returned for a torn sidecar *even when the lifecycle
     summarizer still produced output* -- the summarizer skips malformed lines,
-    so its output alone is not proof of completeness.
+    so its output alone is not proof of completeness.  Operational failures
+    (protocol/transport/spawn/recorder/teardown) make the artifact *partial*:
+    evidence that cannot be trusted must never pass as complete.
     """
     reasons: List[str] = []
     if not meta_present:
@@ -480,6 +539,7 @@ def integrity_status(*, meta_present: bool, meta_valid: bool,
             reasons.append("torn-%s-lines=%d" % (label, torn))
     if recording_complete is False:
         reasons.append("recorder-incomplete")
+    reasons.extend(operational or [])
     if reasons:
         return "partial", reasons
     return "complete", []
@@ -627,11 +687,14 @@ def build_scorecard(*, episode_id: str, provenance_id: Optional[str],
 
     # -- integrity -------------------------------------------------------
     meta_valid = bool(meta)
+    operational = _operational_failure_reasons(meta) if meta_valid else []
     status, reasons = integrity_status(
         meta_present=bool(meta), meta_valid=meta_valid,
         recording_complete=meta.get("recording_complete"),
-        wire_path=wire_path, events_path=events_path, actions_path=actions_path)
+        wire_path=wire_path, events_path=events_path, actions_path=actions_path,
+        operational=operational)
     coverage = tier_coverage(meta, requested_tiers)
+    operational_ok = _operational_ok(meta)
 
     # -- termination -----------------------------------------------------
     stop_reason = meta.get("stop_reason")
@@ -713,6 +776,8 @@ def build_scorecard(*, episode_id: str, provenance_id: Optional[str],
     # -- taxonomy / gates ------------------------------------------------
     invalids = classify_invalids(decisions, meta)
     uncleared = forbidden_uncleared(forced_search)
+    invalid_evidence = bool(invalids.get("available"))
+    forced_evidence = uncleared is not None
     postmortem_reserve = (budget.get("strategy") or {}).get(
         "postmortem_reserve") if isinstance(budget.get("strategy"), dict) \
         else None
@@ -723,17 +788,25 @@ def build_scorecard(*, episode_id: str, provenance_id: Optional[str],
         bool(postmortem_dispatched)
     if postmortem_reserve is None and postmortem_dispatched is None:
         avail["gates.postmortem_reserve"] = AVAIL_LEGACY
+    operational_failure = terminal_class == OPERATIONAL_FAILURE
     gates = {
         "integrity_ok": status == "complete",
+        "operational_ok": operational_ok,
+        "operational_integrity_failure": operational_failure,
         "invalid_hard_failure": invalids["hard_failure"],
+        "invalid_evidence_available": invalid_evidence,
+        "forced_search_evidence_available": forced_evidence,
+        "evidence_available": invalid_evidence and forced_evidence,
         "uncleared_forced_search": uncleared,
         "prohibited_postmortem": prohibited_postmortem,
         "postmortem_reserve": postmortem_reserve,
         "postmortem_dispatched": postmortem_dispatched,
     }
     hard_failure = (not gates["integrity_ok"]
+                    or not operational_ok
+                    or operational_failure
                     or invalids["hard_failure"]
-                    or uncleared > 0
+                    or (uncleared or 0) > 0
                     or prohibited_postmortem)
     gates["hard_failure"] = hard_failure
 
@@ -889,8 +962,12 @@ def termination_safety_admission(base_cards: Sequence[dict],
     min_ticks = int(policy.get("min_aggregate_at_risk_ticks_per_arm", 0) or 0)
 
     def arm(cards):
+        # bench-owned stops (excluded) and operational/integrity failures are
+        # NOT safety events and NOT exposure: they are hard failures handled
+        # elsewhere, and must not dilute the adverse-rate denominator.
         considered = [c for c in cards
-                      if c.get("terminal_class") != EXCLUDED]
+                      if c.get("terminal_class") not in (EXCLUDED,
+                                                         OPERATIONAL_FAILURE)]
         safety = [c for c in considered if is_safety_event(
             c.get("terminal_class"))]
         ticks = 0
@@ -971,6 +1048,12 @@ def compare_arms(base_cards: Sequence[dict], cand_cards: Sequence[dict],
     hard_failures = [(c.get("episode_id"), c.get("gates", {}))
                      for c in list(base_list) + list(cand_list)
                      if (c.get("gates") or {}).get("hard_failure")]
+    # required-evidence availability: a card whose invalid/forced-search source
+    # is missing carries no evidence, so it can never be a pass.
+    unavailable_evidence = [c.get("episode_id")
+                            for c in list(base_list) + list(cand_list)
+                            if (c.get("gates") or {}).get(
+                                "evidence_available") is False]
 
     metrics = [target] + list(HIGHER_BETTER_GUARDRAILS) + \
         list(LOWER_BETTER_GUARDRAILS)
@@ -1015,6 +1098,10 @@ def compare_arms(base_cards: Sequence[dict], cand_cards: Sequence[dict],
         verdict = "fail"
         reasons.append("hard-gate-failure:%s"
                        % ",".join(str(e) for e, _ in hard_failures))
+    elif unavailable_evidence:
+        verdict = "inconclusive"
+        reasons.append("unavailable-required-evidence:%s"
+                       % ",".join(str(e) for e in unavailable_evidence))
     elif min(len(base_list), len(cand_list)) < min_samples:
         verdict = "inconclusive"
         reasons.append("below-min-samples:%d<%d"
