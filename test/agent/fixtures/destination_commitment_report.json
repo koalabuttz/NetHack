@@ -1,7 +1,7 @@
 {
  "commit_range": {
   "base": "56c0c45a0739b29a3173b08b343d5fc786a56712",
-  "head": "b83d56e5d2cde2522c33dabf4d19461a65b9a71e"
+  "head": "82bf8694201e2b3210d02858a3e2fde6258918e5"
  },
  "commits": [
   {
@@ -319,6 +319,26 @@
   {
    "hash": "b83d56e5d2cde2522c33dabf4d19461a65b9a71e",
    "subject": "agent: revise campaign bench plan to rev 5"
+  },
+  {
+   "hash": "627cd35befd95449df86ff70483c5b620f7fb58c",
+   "subject": "agent: bind prompt decline to response key"
+  },
+  {
+   "hash": "baeabb58814a869786086fdaa501926c6e8908ef",
+   "subject": "agent: real prompt-edge e2e and parity tests"
+  },
+  {
+   "hash": "64bf4a623ed8c9c7f9989c0eae1643af2d2806e9",
+   "subject": "agent: document exit-b conservative persistence"
+  },
+  {
+   "hash": "3aeaf325fcf1249436ff94727c6532ba8aa79a51",
+   "subject": "agent: retarget prompt-edge mutations"
+  },
+  {
+   "hash": "82bf8694201e2b3210d02858a3e2fde6258918e5",
+   "subject": "agent: test invalid clearing of pending prompt"
   }
  ],
  "gates": {
@@ -542,6 +562,16 @@
    "status": "killed"
   },
   {
+   "killer": "test_auto_prompt_edge.LiveEvaluatorParity.test_re_presented_same_id_prompt_stays_bound_live_and_replay",
+   "name": "mutation_full_seq_prompt_continuity",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_prompt_edge.LiveEvaluatorParity.test_evaluator_invalid_clears_prompt_transaction_like_live",
+   "name": "mutation_evaluator_invalid_keeps_prompt_transaction",
+   "status": "killed"
+  },
+  {
    "killer": "test_auto_prompt_edge.EdgeAdmissiblePredicate.test_forbidden_edge_filters_seed_and_interior",
    "name": "mutation_filter_only_seed_edges",
    "status": "killed"
@@ -619,5 +649,5 @@
   ]
  },
  "schema_version": 1,
- "suite_count": 1213
+ "suite_count": 1219
 }

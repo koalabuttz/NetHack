@@ -553,6 +553,41 @@ MUTATIONS = (
                    "test_emergency_step_three_both_records_are_not_retried"),
     },
     {
+        # round-2 F1
+        "name": "mutation_full_seq_prompt_continuity",
+        "file": "tools/agent/arbitration.py",
+        "old": ("    identity = prompt_request_identity(frame_key)\n"
+                "    if identity is None:\n"
+                "        return False\n"
+                "    if identity != prompt_request_identity("
+                "pending.response_need_key):\n"
+                "        return False\n"
+                "    return normalize_prompt_text(frame_prompt) \\\n"
+                "        == normalize_prompt_text(pending.prompt_text)"),
+        "new": ("    if tuple(candidates.normalize_need_key(frame_key)) \\\n"
+                "            != tuple(candidates.normalize_need_key("
+                "pending.response_need_key)):\n"
+                "        return False\n"
+                "    return normalize_prompt_text(frame_prompt) \\\n"
+                "        == normalize_prompt_text(pending.prompt_text)"),
+        "killer": ("test_auto_prompt_edge.LiveEvaluatorParity."
+                   "test_re_presented_same_id_prompt_stays_bound_live_and_"
+                   "replay"),
+    },
+    {
+        # round-2 F2
+        "name": "mutation_evaluator_invalid_keeps_prompt_transaction",
+        "file": "tools/agent/evaluate.py",
+        "old": ("        self.reflex.clear_pending_prompt()\n"
+                "        # It is recorded as its own decision row, and -- when "
+                "the attempt it"),
+        "new": ("        # It is recorded as its own decision row, and -- when "
+                "the attempt it"),
+        "killer": ("test_auto_prompt_edge.LiveEvaluatorParity."
+                   "test_evaluator_invalid_clears_prompt_transaction_like_"
+                   "live"),
+    },
+    {
         "name": "mutation_filter_only_seed_edges",
         "file": "tools/agent/navigation.py",
         "old": ("            if not admit(pos, nb):\n"
