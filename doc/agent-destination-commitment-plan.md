@@ -583,3 +583,34 @@ Validation report should list commit/config identifiers, suite counts and exact 
 8. Schema-v2 single-positional-goal validation is deliberately stricter than v1. Validate real DeepSeek responses against the new prompt rather than silently relaxing it when a model combines incompatible positional goals.
 9. Do not carry command semantics into `key`/`direction` needs. The existing broad activation gate makes this an especially important integration review point.
 10. Changing navigation to persistent terrain is correctness-critical but affects edge eligibility beyond commitment. Require existing navigation, recovery, room-awareness, and forced-search regressions, not just new happy-path tests.
+
+## Addendum — actual semantics as implemented (stall-recovery plan Rev 3)
+
+This section records how the contracts in this plan are **actually realised** in
+`tools/agent/`, superseding any wording above that predates the
+`doc/agent-stall-recovery-plan.md` (Revision 3) work.
+
+- **One destination terminal owner.** Every termination source (arrival, door
+  open/refusal/ineffective, stall, cycle/recovery invalidation, unreachable,
+  instance change, replacement) funnels through a single owner in
+  `policy.ScriptedReflex` (`_retire_owned` / `_retire_cycle_owned` /
+  `_emit_destination_terminal`).  It captures `(instance, serial, source,
+  purpose, generation)` *before* clearing state and emits exactly one terminal
+  destination event.  Directive settlement remains a once-only side effect
+  layered on top, never the only path that terminates a destination.  A
+  replacement emits a `replaced` terminal for the **superseded** serial with
+  `replacement_serial=<new>`, then a distinct acquisition for the new serial.
+- **Pre-send baseline / attempt semantics.** Route progress is seeded from the
+  hero baseline, not the target position; a no-time acquisition installs the
+  target and counts as no-progress attempt 1 of 3, while a moved acquisition
+  starts progress from the reconciled hero.  Only matched gameplay attempts
+  advance the stationary stage; prompts, inventory and unmatched observations do
+  not.
+- **Evidence-specific servicing.** `navigation.service_signature` (exploration
+  terrain only) suppresses a successfully serviced site; `door_failure_signature`
+  suppresses a refused door; `blocked_edge_signature` keys a failed edge to its
+  legality-relevant cells.  Neighbouring occupancy movement reopens none of them.
+- **Recovery vs suspension.** Only a *selected and reconciled* recovery effect
+  retires a destination or spends destination counters; ordinary emergency,
+  hunger and inventory interruptions suspend/revalidate rather than consume
+  navigation stalls.

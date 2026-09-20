@@ -2233,6 +2233,33 @@ class _EpisodeRunner(object):
             hp_frac=frac, hungry=hunger_index(st.hunger) >= 0,
             inventory_fresh=fresh)
 
+    def _decision_diagnostics(self, provider, provider_reason,
+                              sel_reason) -> dict:
+        """Additive, backward-compatible decision diagnostics (plan §5).
+
+        Keeps the provider fallback reason *separate* from the selected
+        candidate's own reason/semantic label, so a ``jev paid-reflex cap
+        reached`` fallback never hides the scripted candidate (e.g. the shared
+        bounded recovery step or search) that was actually selected.  No Choice
+        wire, DeepSeek prompt or historical bytes are touched.
+        """
+        record = getattr(self, "selected_decision", None) or {}
+        cand = record.get("candidate")
+        store = getattr(self.reflex, "targets", None)
+        held = store.held() if store is not None else None
+        label = getattr(cand, "semantic_label", "") if cand is not None else ""
+        return {
+            "provider": provider,
+            "provider_reason": provider_reason,
+            "selected_reason": sel_reason,
+            "semantic_label": label,
+            "recovery_stage": label,
+            "held_serial": (held.serial if held is not None else None),
+            "stall_attempts": getattr(store, "stall_attempts", None),
+            "door_attempts": getattr(store, "interact_attempts", None),
+            "reconciliation_kind": self._attempt_kind,
+        }
+
     def _note_low_conf(self, low: bool):
         """Track sustained low confidence from the FINAL selection outcome.
 
@@ -2775,6 +2802,7 @@ class _EpisodeRunner(object):
         repair = getattr(self, "_repair_send", None)
         self._repair_send = None
         applied_token = None
+        reason = ""                     # the provider-side reason (repair: none)
         if repair is not None:
             # A delivery repair resends the frozen validated action: no fresh
             # paid consultation, no forced override, and an idempotent applied
@@ -2851,7 +2879,9 @@ class _EpisodeRunner(object):
         self.rec.record_decision(
             proposal=proposal, selected=selected, provider=provider,
             reason=sel_reason, boundaries=boundaries, latency=latency,
-            usage=usage, directives=directives)
+            usage=usage, directives=directives,
+            diagnostics=self._decision_diagnostics(provider, reason,
+                                                   sel_reason))
         obj = protocol.make_act(self.pending_seq, need["id"], selected)
         try:
             ordinal = self._emit("act", obj, need_key=self.pending_key,

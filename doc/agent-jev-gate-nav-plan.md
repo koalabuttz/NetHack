@@ -182,7 +182,7 @@ For cycle-triggered recovery, reuse the safe-movement part of the existing recov
 - Prefer a non-reversing exit; use deterministic visit-count/direction-rank ordering for this branch.
 - If the only legal escape is backtracking, retain it. Never classify a traversable dead end as trapped merely because of the preference.
 - If no legal movement exists, use existing bounded search-fallback/forced-search nomination machinery. Do not manufacture an unbudgeted search, direct dangerous prefix, or indefinite wait.
-- Leave ordinary stationary 3/6/10 recovery semantics unchanged except shared safe helper improvements proven by regression tests.
+- ~~Leave ordinary stationary 3/6/10 recovery semantics unchanged except shared safe helper improvements proven by regression tests.~~ **SUPERSEDED by `doc/agent-stall-recovery-plan.md` (Revision 3) §1.** The stationary 3/6/10 thresholds now share **the same** legal, edge-legal bounded recovery builder as cycle recovery (the former "unchanged" clause is withdrawn). This changes only the *recovery mechanism*; the strict `>40` uncommitted anti-backtrack margin, the strict `p > k/N` relative confidence gate, and the emergency/hunger/mandatory-continuation precedence above recovery are all unchanged.
 
 The recovery selection should be a singleton recovery candidate, as existing loop-breaker actions are, so Jev cannot choose the oscillating alternative on that tick. The next committed off-cycle movement clears the cycle condition naturally; do not mutate cycle history merely because a proposal was produced.
 

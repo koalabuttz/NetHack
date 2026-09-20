@@ -1544,6 +1544,43 @@ class SelectedDecisionOwnership(JevAppliedCap):
                          tuple(chosen.effect_payload))
 
 
+class DecisionDiagnostics(JevAppliedCap):
+    """AC9: the decision sidecar keeps the cap reason AND the scripted reason."""
+
+    def _runner(self, fake, cap=2, config=None):
+        r, rec, proc = super()._runner(fake, cap=cap, config=config)
+        r.terrain.merge({p: (".", "gray", 0, "none")
+                         for p in [(5, 5), (4, 5), (6, 5), (5, 4), (5, 6)]})
+        return r, rec, proc
+
+    def test_decision_diagnostics_keep_cap_reason_and_scripted_reason(self):
+        seen = []
+        fake = _ChoiceJev()
+        r, rec, _ = self._runner(fake, cap=1)
+        real = r.rec.record_decision
+
+        def capture(**kw):
+            seen.append(kw)
+            return real(**kw)
+
+        r.rec.record_decision = capture
+        # spend the applied cap, then answer: the paid tier is cap-unavailable
+        self._answer(r)
+        self._answer(r)
+        rec.finalize({})
+        self.assertEqual(len(seen), 2)
+        capped = seen[-1]
+        # the provider fallback reason is preserved verbatim ...
+        self.assertEqual(capped["reason"], "jev paid-reflex cap reached")
+        diag = capped["diagnostics"]
+        # ... and the *scripted* candidate's own reason/label is carried
+        # separately, so the cap reason does not hide the selected mechanism
+        self.assertEqual(diag["provider"], "scripted")
+        self.assertTrue(diag["provider_reason"])
+        self.assertTrue(diag["selected_reason"])
+        self.assertTrue(diag["semantic_label"])
+
+
 class SummaryCompatibility(unittest.TestCase):
     """AC.7: additive ``reflex.applied`` reporting keeps old consumers working."""
 

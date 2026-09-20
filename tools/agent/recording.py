@@ -237,7 +237,7 @@ class EpisodeRecorder(object):
 
     def record_decision(self, proposal, selected, provider, reason,
                         boundaries=(), directives=(), latency=0.0,
-                        usage=None):
+                        usage=None, diagnostics=None):
         obj = {"schema": SCHEMA_DECISIONS,
                "proposal": proposal, "selected": selected,
                "provider": provider, "reason": reason,
@@ -245,6 +245,13 @@ class EpisodeRecorder(object):
                "directives": list(directives),
                "latency": round(latency, 6), "usage": usage or {},
                "t": round(time.time() - self.started, 6)}
+        # Additive, backward-compatible decision diagnostics (stall-recovery
+        # plan §5): the selected semantic label/reason, recovery stage, held
+        # serial, stall/door counters and the provider fallback reason are
+        # carried *separately*, so a `cap reached` fallback never hides the
+        # scripted candidate's own reason.
+        if diagnostics:
+            obj["diagnostics"] = dict(diagnostics)
         self.decisions += 1
         if not self._decs.submit(_json_line(obj)):
             self.incomplete = True
