@@ -1,0 +1,46 @@
+{
+  "conservative_persistent_suppression": true,
+  "elements": {
+    "choices_default": {
+      "status": "manual-required",
+      "why": "no worker supplied; offline disposition only"
+    },
+    "decline_result": {
+      "status": "manual-required",
+      "why": "no worker supplied; offline disposition only"
+    },
+    "destination_tuple": {
+      "status": "manual-required",
+      "why": "no worker supplied; offline disposition only"
+    },
+    "overlay_transition": {
+      "status": "manual-required",
+      "why": "no deterministic engine construction hook for a vapor/fog cloud; gray '#' folds to T_CORRIDOR"
+    },
+    "pre_move_hero_time": {
+      "status": "manual-required",
+      "why": "no worker supplied; offline disposition only"
+    },
+    "prompt_text": {
+      "status": "manual-required",
+      "why": "no worker supplied; offline disposition only"
+    }
+  },
+  "encoding": {
+    "classified_terrain": "corridor",
+    "corridor_glyph": "#",
+    "indistinguishable": true,
+    "vapor_color": "gray",
+    "vapor_glyph": "#"
+  },
+  "exit": "b",
+  "native_run": {},
+  "operator_gated_trace": {
+    "mandatory": true,
+    "recorded": false,
+    "why": "required before any positive cloud-disappearance reopening claim"
+  },
+  "phase": "0",
+  "plan": "doc/agent-prompt-edge-plan.md",
+  "positive_reopening_enabled": false
+}

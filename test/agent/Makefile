@@ -199,6 +199,22 @@ native-pickup:
 	    --private-root \
 	    "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-native-pickup)"
 
+# The native cloud-encoding probe (Phase 0 of the prompt-edge plan): drives
+# the real worker toward a vapor-cloud entry prompt and records the prompt
+# text/choices/default, the pre-move hero/time, the destination tuple and the
+# decline result -- or, when a vapor cloud cannot be constructed
+# deterministically (no engine hook; gray '#' folds to T_CORRIDOR), records the
+# explicit native-vs-operator-manual disposition with the operator-gated trace
+# mandatory before any positive reopening claim.  Opt-in like `native-pickup`.
+native-cloud:
+	@test -n "$(WORKER)" -a -n "$(RUNNER)" -a -n "$(DATA)" || \
+	    { echo "set WORKER, RUNNER, DATA (and optionally SYSCONF,"; \
+	      echo "PRIVATE_ROOT) for the native cloud probe"; exit 2; }
+	python3 native_cloud_probe.py --runner "$(RUNNER)" --worker "$(WORKER)" \
+	    --data "$(DATA)" $(if $(SYSCONF),--sysconf "$(SYSCONF)") \
+	    --private-root \
+	    "$(if $(PRIVATE_ROOT),$(PRIVATE_ROOT),/tmp/agent-native-cloud)"
+
 # Interaction breadth on real engine menus (inventory, farlook, help with text
 # paging, annotation, native quit confirmations).  Needs a built agent worker
 # and launcher, so it is opt-in like `play`.

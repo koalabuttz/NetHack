@@ -47,6 +47,79 @@ def ep4_cells():
     return cells
 
 
+# --- Phase 0 (prompt-edge plan): the vapor-cloud freeze geometry ----------
+#
+# A fog/vapor cloud is rendered as a **gray ``#``** (``include/defsym.h``
+# ``S_vapor``/``S_poisoncloud``); ``instances.classify_cell`` folds a gray
+# ``#`` to ``T_CORRIDOR`` -- structurally indistinguishable from a corridor
+# glyph.  The wire therefore exposes *no* local overlay token that reveals the
+# cloud at all, so the observed entry edge is a legal corridor edge right up
+# to the engine's paranoid check ("Step into that vapor cloud?").
+
+#: A vapor-cloud cell exactly as the agent sees it: a gray ``#`` (corridor).
+VAPOR = ("#", "gray", 0, "none")
+
+#: The live freeze geometry: the hero in a corridor whose only outbound edge is
+#: the vapor step east; ``(12,10)`` is a frontier *beyond* the cloud.
+VAPOR_HERO = (10, 10)
+VAPOR_SRC = (10, 10)
+VAPOR_DST = (11, 10)
+VAPOR_BEYOND = (12, 10)
+#: The exact player-visible blocking prompt (``src/hack.c:2542``).
+VAPOR_PROMPT = "Step into that vapor cloud?"
+
+
+def _walls(x0, x1, y0, y1):
+    return {(x, y): WALL for x in range(x0, x1) for y in range(y0, y1)}
+
+
+def vapor_corridor_cells():
+    """Hero at ``(10,10)``; the only outbound edge is the vapor step east.
+
+    ``(11,10)`` is the gray-``#`` vapor cell (a legal corridor edge to
+    ``edge_legal``); ``(12,10)`` is a floor frontier whose unknown neighbour
+    ``(13,10)`` makes it the elected default destination.  After the decline
+    the edge is the only route, so the fixture exercises the fully-trapped
+    variant of the freeze.
+    """
+    cells = _walls(9, 14, 9, 12)
+    cells[VAPOR_SRC] = FLOOR
+    cells[VAPOR_DST] = VAPOR
+    cells[VAPOR_BEYOND] = FLOOR
+    return cells
+
+
+def vapor_corridor_two_frontiers_cells():
+    """Two frontier destinations that share only the vapor entry edge.
+
+    ``(12,10)`` (east, beyond the cloud) and ``(11,9)`` (north, reachable only
+    by first stepping east into the cloud) both route through ``(11,10)``, so a
+    suppression of that one directed edge must starve *both* acquisitions
+    rather than redirect to a second destination crossing the same edge.
+    """
+    cells = vapor_corridor_cells()
+    cells[(11, 9)] = FLOOR          # frontier: (11,8) stays unknown
+    return cells
+
+
+def vapor_corridor_route_around_cells():
+    """The same vapor edge plus a legal north detour that never enters it.
+
+    ``(10,10)->(10,9)->(11,9)->(12,9)->(12,10)`` is a longer (4-hop) but legal
+    route to the same frontier, so filtering the vapor edge must keep the
+    commitment satisfiable along the alternate route instead of retiring it.
+    The detour cells are walled off above so they are *not* frontiers: the
+    elected destination stays beyond the cloud and only its route changes.
+    """
+    cells = vapor_corridor_cells()
+    for x in range(9, 14):
+        cells[(x, 8)] = WALL
+    cells[(10, 9)] = FLOOR
+    cells[(11, 9)] = FLOOR
+    cells[(12, 9)] = FLOOR
+    return cells
+
+
 #: The ep-2 trapped sequence: three forced-search activations, the trapped
 #: denial, and the native quit handshake.  Player-visible messages only.
 EP2_TRAPPED_MESSAGES = (
