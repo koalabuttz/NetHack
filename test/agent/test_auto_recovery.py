@@ -582,6 +582,79 @@ class Phase2BoundedRecovery(unittest.TestCase):
         self.assertEqual(cand.semantic_label, "recovery-step")
 
 
+class Phase2EdgeFailureAndExhaustion(unittest.TestCase):
+    """AC5/AC7: scoped edge-failure suppression and bounded exhaustion."""
+
+    def setUp(self):
+        self.ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+
+    def _corridor(self):
+        return {(10, 10): FLOOR, (11, 10): FLOOR, (9, 10): WALL,
+                (10, 9): WALL, (10, 11): WALL}
+
+    def test_recovery_no_time_edge_failure_is_suppressed(self):
+        mem = mem_with(self._corridor(), (10, 10),
+                       messages=["You already found a monster."])
+        mem.no_progress = 10
+        cand = self.ref.prepare(ctx(mem)).table.scripted()
+        self.assertEqual(cand.direction, (1, 0))
+        # the selected recovery move fails no-time: its edge is recorded
+        self.ref.commit_effect(cand.proposed_effect, cand.semantic_label, 1,
+                               mem, observed_kind="no-time",
+                               payload=cand.effect_payload, pre_hero=(10, 10))
+        self.assertTrue(self.ref.blocked_edges)
+        # unchanged evidence cannot select that same edge again
+        again = self.ref.prepare(ctx(mem)).table.scripted()
+        self.assertNotEqual(again.action.to_wire().get("key"),
+                            protocol.DIR_KEYS[(1, 0)])
+
+    def test_failed_route_reopens_after_blocker_leaves(self):
+        cells = {(10, 10): FLOOR, (11, 11): FLOOR, (11, 10): FLOOR,
+                 (10, 11): FLOOR}
+        mem = mem_with(cells, (10, 10))
+        src, dst = (10, 10), (11, 11)
+        self.ref.blocked_edges[(self.ref.instance_id, src, dst)] = (
+            navigation.blocked_edge_signature(self.ref._terrain(mem), src, dst))
+        self.assertTrue(self.ref._edge_blocked(self.ref._terrain(mem),
+                                               src, dst))
+        # a legality-relevant side cell changes (a blocker leaves/moves): the
+        # stored signature no longer matches, so the edge reopens
+        mem.grid[(11, 10)] = ("d", "white", 0, "none")
+        self.assertFalse(self.ref._edge_blocked(self.ref._terrain(mem),
+                                                src, dst))
+
+    def test_no_alternative_uses_forced_search_then_trapped_quit(self):
+        from unittest import mock
+        # an adjacent monster makes a hold unsafe and no neighbour is a legal
+        # step (all unknown), with the ordinary search refused
+        mem = mem_with({(10, 10): FLOOR, (10, 9): (":", "gray", 0, "none")},
+                       (10, 10), messages=["You already found a monster."])
+        mem.no_progress = 10
+        cand = self.ref.prepare(ctx(mem)).table.scripted()
+        # no legal movement and a refused search: the bounded endpoint is the
+        # forced-search nomination or the graceful trapped quit
+        self.assertIn(cand.semantic_label, ("forced-search", "trapped"))
+        # with the reflex-local forced-search gates failing, the endpoint is the
+        # graceful trapped quit -- never an unbounded search or wait
+        with mock.patch.object(forced_search, "local_ok", return_value=False):
+            fb = self.ref._search_fallback(mem, (10, 10))
+        self.assertEqual(fb[0].semantic_label, "trapped")
+
+    def test_episode2_three_prefix_cap_and_trapped_reason_preserved(self):
+        # the ep-2 sequence is a bounded graceful exhaustion: at most three
+        # forced-search activations, and a stable trapped reason
+        self.assertEqual(forced_search.ACTIVATION_CAP, 3)
+        self.assertEqual(forced_search.TRAPPED_QUIT_REASON,
+                         "policy-exhausted/trapped")
+        b = forced_search.ForcedSearchBudget()
+        self.assertTrue(b.allows())
+        for _ in range(forced_search.ACTIVATION_CAP):
+            b.consume()
+        self.assertFalse(b.allows())
+        self.assertTrue(b.exhausted())
+        self.assertEqual(b.remaining(), 0)
+
+
 class Ep2TrappedQuit(unittest.TestCase):
     """AC1 (ep-2 half): the trapped sequence stays a bounded graceful quit."""
 

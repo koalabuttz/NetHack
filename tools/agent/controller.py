@@ -1410,6 +1410,13 @@ class _EpisodeRunner(object):
         self._attempt_effect = None
         self._attempt_label = ""
         self._attempt_payload = ()
+        # A held directive-owned destination whose advice is no longer active
+        # (TTL/precondition lapse) is terminated once with a stable reason
+        # (plan §3): directive expiry is never laundered into a default.
+        if not self.book.has_active:
+            expire = getattr(self.reflex, "on_directive_expired", None)
+            if expire is not None:
+                expire(None)
         # Boundary detection runs once per applied snapshot, on public state
         # only.  An id is emitted once, so re-presenting the same snapshot
         # (or replaying history) yields no new events; simultaneous reasons
@@ -1837,6 +1844,11 @@ class _EpisodeRunner(object):
     def _on_closed(self, rec):
         self.closed = True
         self.reflex_provider.on_closed()
+        # The episode-close terminal for a still-held destination (plan §3) is
+        # emitted before any episode state is cleared.
+        episode_close = getattr(self.reflex, "episode_close", None)
+        if episode_close is not None:
+            episode_close()
         # a closed episode stops further gameplay commits: discard any
         # in-flight attempt without crediting a gameplay outcome (3.4)
         self.instance.stop()

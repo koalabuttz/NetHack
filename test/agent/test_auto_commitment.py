@@ -814,6 +814,96 @@ class AttemptCounting(unittest.TestCase):
         self.assertEqual(self.ref.targets.stall_attempts, before)
 
 
+class Phase3Progression(unittest.TestCase):
+    """AC7: exploration-stable progression and reacquisition preferences."""
+
+    def setUp(self):
+        self.ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+
+    def _corridor(self):
+        return {(x, 10): FLOOR for x in range(1, 8)}
+
+    def test_frontier_reopens_only_for_local_exploration_change(self):
+        tm = nav_test.terrain(self._corridor())
+        st = navigation.CommitmentStore()
+        sig = navigation.service_signature(tm, (5, 10))
+        st.note_serviced((5, 10), sig)
+        # occupancy/visits do not reopen it
+        tm.occupancy[(4, 10)] = "monster"
+        self.assertTrue(st.serviced_under_evidence(
+            (5, 10), navigation.service_signature(tm, (5, 10))))
+        # a genuine local terrain change does reopen it
+        tm.merge({(5, 9): WALL})
+        self.assertNotEqual(navigation.service_signature(tm, (5, 10)), sig)
+        self.assertFalse(st.serviced_under_evidence(
+            (5, 10), navigation.service_signature(tm, (5, 10))))
+
+    def test_serviced_frontiers_progress_to_unvisited_then_stairs(self):
+        cells = {(x, 10): FLOOR for x in range(1, 7)}
+        cells[(5, 10)] = DOWN                 # the stair, already visited
+        for x in range(1, 6):
+            cells[(x, 9)] = WALL
+            cells[(x, 11)] = WALL
+        cells[(6, 9)] = WALL
+        cells[(6, 11)] = WALL
+        tm = nav_test.terrain(cells)
+        dist, first = navigation.one_dijkstra(tm, (1, 10))
+        visits = {(5, 10): 1}
+        st = navigation.CommitmentStore()
+        # 1. the frontier (6,10, beyond the stair) is preferred first
+        first_choice = navigation.resolve_destination(tm, (1, 10), dist, first,
+                                                      visits, store=st)
+        self.assertEqual(first_choice.family, navigation.TFAM_FRONTIER)
+        st.note_serviced(first_choice.pos,
+                         navigation.service_signature(tm, first_choice.pos))
+        # 2. with the frontier serviced, unvisited cells follow
+        second = navigation.resolve_destination(tm, (1, 10), dist, first,
+                                                visits, store=st)
+        self.assertEqual(second.family, navigation.TFAM_UNVISITED)
+        # 3. once every unvisited cell is serviced, the stairs progress last
+        for x in range(2, 5):
+            st.note_serviced((x, 10),
+                             navigation.service_signature(tm, (x, 10)))
+        third = navigation.resolve_destination(tm, (1, 10), dist, first,
+                                               visits, store=st)
+        self.assertEqual(third.family, navigation.TFAM_STAIR)
+
+    def test_reacquisition_preserves_previous_distinct_and_strict_margin(self):
+        mem = nav_test.mem_with({(x, 10): FLOOR for x in range(2, 9)}, (5, 10))
+        self.ref.recovery.previous_distinct = (4, 10)
+        before = self.ref.recovery.previous_distinct
+        cand = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.assertIsNotNone(cand)
+        # an acquisition proposal does not mutate the movement-history reference
+        self.assertEqual(self.ref.recovery.previous_distinct, before)
+        # the strict >40 same-family margin is unchanged at the boundary
+        def entry(pos, step, score):
+            target = navigation.Target(pos, navigation.TFAM_FRONTIER, step, 0,
+                                       "r")
+            return (target, "frontier", protocol.DIR_KEYS[step], score, step)
+
+        west = lambda s: entry((2, 10), (-1, 0), s)     # reversing
+        east = lambda s: entry((8, 10), (1, 0), s)      # non-reversing
+        kept = self.ref._antibacktrack([west(540), east(500)], (5, 10), None)
+        self.assertEqual([e[3] for e in kept], [500])
+        kept = self.ref._antibacktrack([west(541), east(500)], (5, 10), None)
+        self.assertEqual(sorted(e[3] for e in kept), [500, 541])
+
+    def test_committed_reverse_survives_reacquisition_preferences(self):
+        cells = {(x, 10): FLOOR for x in range(2, 9)}
+        mem = nav_test.mem_with(cells, (5, 10))
+        self.ref.recovery.previous_distinct = (4, 10)
+        # control: uncommitted, the west reversal is suppressed by the east
+        control = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.assertEqual(control.direction, (1, 0))
+        # committed: the held destination's required reversal is offered
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_EXPLORE_FRONTIER,
+                                pos=(2, 10), family=navigation.TFAM_FRONTIER)
+        held = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.assertEqual(held.direction, (-1, 0))
+
+
 class DoorAndRouteAccounting(unittest.TestCase):
     """AC4: door interactions are counted only when the action targets the
     door from an approach square, and the route cap uses the initial hops."""
@@ -1104,6 +1194,89 @@ class DestinationTerminalOwner(unittest.TestCase):
         self.ref.commit_effect("navigate", "navigate", 2, mem,
                                observed_kind="moved", payload=cont)
         self.assertIsNone(self.ref.targets.held())
+
+    def test_directive_expiry_emits_expired_terminal(self):
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_OPEN_DOOR,
+                                pos=(5, 10), family=navigation.TFAM_DOOR,
+                                source=navigation.SRC_DIRECTIVE, generation=3)
+        serial = self.ref.targets.held().serial
+        self.ref.on_directive_expired(3)
+        self.assertIsNone(self.ref.targets.held())
+        terms = [e for e in self.ref.lifecycle.events
+                 if e.get("kind") == "destination" and e.get("serial") == serial
+                 and e.get("outcome") == "expired"]
+        self.assertEqual(len(terms), 1)
+        self.assertEqual(terms[0].get("reason"), "directive_expired")
+
+    def test_episode_close_emits_expired_terminal(self):
+        self._acquire()
+        serial = self.ref.targets.held().serial
+        self.ref.episode_close()
+        # a second close is a no-op: exactly one terminal for the serial
+        self.ref.episode_close()
+        terms = [e for e in self.ref.lifecycle.events
+                 if e.get("kind") == "destination" and e.get("serial") == serial
+                 and e.get("outcome") == "expired"]
+        self.assertEqual(len(terms), 1)
+        self.assertEqual(terms[0].get("reason"), "episode_close")
+
+    def test_unreachable_default_retirement_is_visible(self):
+        cells = {(x, 10): FLOOR for x in range(1, 9)}
+        mem = nav_test.mem_with(cells, (1, 10))
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_EXPLORE_FRONTIER,
+                                pos=(7, 10), family=navigation.TFAM_FRONTIER)
+        serial = self.ref.targets.held().serial
+        # the corridor is severed between the hero and the destination
+        for x in (3, 4, 5, 6):
+            mem.grid[(x, 10)] = WALL
+        cand = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.assertEqual(cand.proposed_effect, "dest-unresolved")
+        self.ref.commit_effect(cand.proposed_effect, cand.semantic_label, 2,
+                               mem, observed_kind="no-time",
+                               payload=cand.effect_payload)
+        self.assertIsNone(self.ref.targets.held())
+        terms = [e for e in self.ref.lifecycle.events
+                 if e.get("kind") == "destination" and e.get("serial") == serial
+                 and e.get("outcome") in ("failed", "expired")]
+        self.assertEqual(len(terms), 1)
+
+    def test_one_hop_acquisition_has_coherent_lifecycle(self):
+        mem = nav_test.mem_with({(3, 10): FLOOR, (4, 10): FLOOR}, (3, 10))
+        payload = policy.ScriptedReflex._dest_payload(
+            "acquire", None,
+            target=navigation.Target((3, 10), navigation.TFAM_UNVISITED,
+                                     (0, 0), 0))
+        self.ref.commit_effect("navigate", "navigate", 1, mem,
+                               observed_kind="moved", payload=payload)
+        self.assertIsNone(self.ref.targets.held())
+        events = [e for e in self.ref.lifecycle.events
+                  if e.get("kind") == "destination"]
+        acquired = [e for e in events if e.get("outcome") == "acquired"]
+        reached = [e for e in events if e.get("outcome") == "reached"]
+        self.assertEqual(len(acquired), 1)
+        self.assertEqual(len(reached), 1)
+        self.assertEqual(acquired[0].get("serial"), reached[0].get("serial"))
+
+    def test_one_hop_atomic_completion_lifecycle(self):
+        mem = nav_test.mem_with({(3, 10): FLOOR, (4, 10): FLOOR}, (3, 10))
+        payload = policy.ScriptedReflex._dest_payload(
+            "acquire", None,
+            target=navigation.Target((3, 10), navigation.TFAM_UNVISITED,
+                                     (0, 0), 0))
+        self.ref.commit_effect("navigate", "navigate", 1, mem,
+                               observed_kind="moved", payload=payload)
+        events = [e for e in self.ref.lifecycle.events
+                  if e.get("kind") == "destination"]
+        acquired = [e for e in events if e.get("outcome") == "acquired"]
+        reached = [e for e in events if e.get("outcome") == "reached"]
+        # the completion is atomic: acquisition immediately precedes the single
+        # terminal, with no parked hold between them
+        self.assertEqual(events.index(reached[0]), events.index(acquired[0]) + 1)
+        self.assertEqual(len([e for e in events
+                              if e.get("outcome") in
+                              ("reached", "failed", "expired")]), 1)
 
     def test_emergency_suspension_does_not_spend_destination_stall(self):
         # an emergency/maintenance preemption *alone* emits no destination

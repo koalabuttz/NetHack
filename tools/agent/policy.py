@@ -642,6 +642,21 @@ class ScriptedReflex(object):
             return False
         return (ph[0] + int(dirdata[0]), ph[1] + int(dirdata[1])) == dp
 
+    def _edge_blocked(self, terrain, src, dst) -> bool:
+        """True while a recorded failure holds this edge under unchanged (§1/§4).
+
+        The scoped ledger stores the edge's :func:`blocked_edge_signature`; the
+        edge remains suppressed only while the *current* signature is identical,
+        so a change to the edge's legality-relevant cells (a blocker leaving)
+        reopens it.
+        """
+        key = (self.instance_id, tuple(src), tuple(dst))
+        stored = self.blocked_edges.get(key)
+        if stored is None:
+            return False
+        return stored == navigation.blocked_edge_signature(terrain, tuple(src),
+                                                           tuple(dst))
+
     def _note_recovery_outcome(self, step, observed_kind, mem,
                                pre_hero) -> None:
         """Record one *selected and reconciled* recovery move's edge outcome.
@@ -726,10 +741,24 @@ class ScriptedReflex(object):
                     self._record_directive_resolved(source, generation, reason)
                     return
                 # the observation that justified acquisition already satisfied
-                # it: record reached instead of installing (plan 1.4)
-                self._note_serviced(mem, pos)
+                # it: record reached instead of installing (plan 1.4).  A
+                # default one-hop acquisition emits a coherent acquired ->
+                # terminal pair with exactly one real attempt (plan §2A/§3);
+                # a directive-owned one settles through ``_settle_directive``.
                 if source == navigation.SRC_DIRECTIVE:
+                    self._note_serviced(mem, pos)
                     self._settle_directive("reached", generation, reason)
+                    return
+                self._note_serviced(mem, pos)
+                serial = self.targets._serial + 1
+                self.lifecycle.record(
+                    lifecycle_metrics.KIND_DESTINATION,
+                    lifecycle_metrics.DEST_ACQUIRED, serial=serial,
+                    purpose=purpose, source=source, generation=int(generation),
+                    reason=reason)
+                self._emit_destination_terminal(
+                    lifecycle_metrics.DEST_REACHED, "reached", serial,
+                    purpose=purpose, source=source, generation=int(generation))
                 return
             cur = self.targets.held()
             if (cur is not None and cur.pos == pos
@@ -1376,6 +1405,40 @@ class ScriptedReflex(object):
             lifecycle_metrics.KIND_DIRECTIVE, lifecycle_metrics.DIR_RESOLVED,
             generation=int(generation), resolved=bool(resolved), reason=reason)
 
+    def on_directive_expired(self, generation=None) -> None:
+        """Terminal for a held directive-owned destination whose advice lapsed.
+
+        Directive expiry / precondition failure is a *directive-owned* terminal
+        (plan §3): it is never laundered into a default destination, and it is
+        emitted exactly once before the destination is cleared.
+        """
+        held = self.targets.held()
+        if held is None or held.source != navigation.SRC_DIRECTIVE:
+            return
+        if generation is not None and held.generation != int(generation):
+            return
+        self._emit_destination_terminal(
+            lifecycle_metrics.DEST_EXPIRED, "directive_expired", held.serial,
+            purpose=held.purpose, source=held.source,
+            generation=held.generation)
+        self.targets.retire("directive-expired")
+
+    def episode_close(self) -> None:
+        """Emit the episode-close terminal for a held destination (plan §3).
+
+        Emitted *before* episode state is cleared, so a destination still held
+        at episode end cannot silently vanish from the lifecycle stream.
+        """
+        held = self.targets.held()
+        if held is None:
+            return
+        self._emit_destination_terminal(
+            lifecycle_metrics.DEST_EXPIRED, "episode_close", held.serial,
+            purpose=held.purpose, source=held.source,
+            generation=held.generation)
+        # clear it so a second close is a no-op (exactly one terminal)
+        self.targets.retire("episode-close")
+
     def _emit_destination_terminal(self, outcome, reason, serial, *,
                                    purpose=None, source=None, generation=None,
                                    replacement_serial=None) -> None:
@@ -1707,9 +1770,7 @@ class ScriptedReflex(object):
             # blocked-edge signature (plan §1/§4): unchanged evidence cannot
             # select a zero-time-failed recovery edge forever, while a change
             # to that edge's legality/occupancy signature reopens it.
-            key = (self.instance_id, tuple(hero), dest)
-            sig = navigation.blocked_edge_signature(terrain, hero, dest)
-            if self.blocked_edges.get(key) == sig:
+            if self._edge_blocked(terrain, hero, dest):
                 continue
             reversing = self._is_reverse(step, hero, previous)
             options.append((0 if not reversing else 1,
@@ -2234,8 +2295,12 @@ class ScriptedReflex(object):
             # the classified edge legality helper (plan §1): never a raw
             # passability check, so a closed door or an illegal diagonal can
             # no longer be chosen
-            if navigation.edge_legal(terrain, hero, dest):
-                return KEY.DIR_KEYS[d], "random walk (known floor)"
+            if not navigation.edge_legal(terrain, hero, dest):
+                continue
+            # a scoped failure suppresses the edge under unchanged evidence too
+            if self._edge_blocked(terrain, hero, dest):
+                continue
+            return KEY.DIR_KEYS[d], "random walk (known floor)"
         if hero is not None and self._safe_to_rest(mem, mem.status, hero):
             return KEY.KEY_WAIT, "no known floor: wait"
         return KEY.KEY_SEARCH, "no known floor and unsafe to rest: search"
