@@ -473,8 +473,8 @@ def preflight(spec: dict) -> Dict[str, Any]:
             "cost_mode_forced_from": forced_from,
             "unattended_apply_allowed": unattended,
             "judge_transport": judge_transport,
-            "allocations": plan_allocations(spec, max(1, spec["budget"][
-                "max_candidates"])),
+            "allocations": plan_allocations(spec, spec["budget"][
+                "max_candidates"]),
             "postmortem_reserve": config.postmortem_reserve}
 
 
@@ -496,12 +496,15 @@ def effective_cost_mode(spec: dict, config) -> Tuple[str, bool, Optional[str]]:
 
 
 def budget_preflight(spec: dict, config) -> Optional[str]:
-    """Reject an allocation plan that exceeds the declared limits."""
+    """Reject an allocation plan that exceeds the declared limits.
+
+    Every cap is compared **literally**, including zero: ``max_total_episodes =
+    0`` means zero episodes and ``strategy_calls_total = 0`` means zero strategy
+    calls, never "unlimited".
+    """
     budget = spec["budget"]
-    comp = spec["comparison"]
     episodes = spec["episodes"]
-    if budget["max_total_episodes"] and \
-            episodes > budget["max_total_episodes"]:
+    if episodes > budget["max_total_episodes"]:
         return ("episodes (%d) exceed budget.max_total_episodes (%d)"
                 % (episodes, budget["max_total_episodes"]))
     # the whole campaign must fit the campaign timeout
@@ -511,23 +514,18 @@ def budget_preflight(spec: dict, config) -> Optional[str]:
                 "(%g)" % (episodes * spec["episode_timeout_s"], campaign))
     # judge budget: zero is literally zero, and enabled needs a real budget
     if spec["judge"]["enabled"]:
-        if budget["judge_calls_total"] <= 0:
-            return ("judge.enabled requires budget.judge_calls_total > 0 "
-                    "(zero means zero judge calls)")
         if episodes > budget["judge_calls_total"]:
             return ("episodes (%d) exceed budget.judge_calls_total (%d): one "
-                    "bundled dispatch per eligible episode"
+                    "bundled dispatch per eligible episode (zero means zero)"
                     % (episodes, budget["judge_calls_total"]))
-    # strategy demand against the strategy-call budget
-    strategy_cap = int(getattr(config, "strategy_call_cap", 0) or 0)
-    if getattr(config, "strategy", "off") != "off" and strategy_cap:
-        demand = episodes * max(1, strategy_cap)
-        if budget["strategy_calls_total"] and \
-                demand > budget["strategy_calls_total"]:
+    # strategy demand against the strategy-call budget (zero is literal)
+    if getattr(config, "strategy", "off") != "off":
+        cap = int(getattr(config, "strategy_call_cap", 0) or 0)
+        demand = episodes * max(1, cap)
+        if demand > budget["strategy_calls_total"]:
             return ("strategy demand (%d = episodes x strategy_call_cap) "
                     "exceeds budget.strategy_calls_total (%d)"
                     % (demand, budget["strategy_calls_total"]))
-    del comp
     return None
 
 
@@ -700,19 +698,35 @@ def plan_allocations(spec: dict, n_candidates: int) -> Dict[str, Any]:
     total_episodes = screening_episodes + confirmation_episodes
     total_judges = judge_per_episode * total_episodes
     reasons: List[str] = []
-    if budget["max_candidates"] and n_candidates > budget["max_candidates"]:
+    if n_candidates > budget["max_candidates"]:
         reasons.append("candidate-budget: %d > %d"
                        % (n_candidates, budget["max_candidates"]))
-    if budget["max_total_episodes"] and total_episodes > \
-            budget["max_total_episodes"]:
+    if total_episodes > budget["max_total_episodes"]:
         reasons.append("episode-budget: %d > %d"
                        % (total_episodes, budget["max_total_episodes"]))
-    if budget["judge_calls_total"] and total_judges > \
-            budget["judge_calls_total"]:
+    if total_judges > budget["judge_calls_total"]:
         reasons.append("judge-budget: %d > %d"
                        % (total_judges, budget["judge_calls_total"]))
     if judge["enabled"] and not budget["judge_calls_total"]:
         reasons.append("judge enabled but judge_calls_total is 0")
+    if total_episodes and int(budget["max_total_wall_s"] or 0) and \
+            total_episodes * float(spec["episode_timeout_s"]) > \
+            float(budget["max_total_wall_s"]):
+        reasons.append("wall-budget: %g > %g"
+                       % (total_episodes * float(spec["episode_timeout_s"]),
+                          float(budget["max_total_wall_s"])))
+    # strategy demand across the whole tuning plan (zero budget is literal)
+    overrides = spec.get("overrides") or {}
+    ref = spec.get("provider_config_ref")
+    ref = ref if isinstance(ref, dict) else {}
+    strategy = overrides.get("strategy", ref.get("strategy"))
+    if strategy not in (None, "off"):
+        cap = int(overrides.get("strategy_call_cap",
+                                ref.get("strategy_call_cap", 0)) or 0)
+        demand = total_episodes * max(1, cap)
+        if demand > budget["strategy_calls_total"]:
+            reasons.append("strategy-budget: %d > %d"
+                           % (demand, budget["strategy_calls_total"]))
     return {
         "schema_version": "bench-allocations/1",
         "n_candidates": int(n_candidates),
@@ -1572,8 +1586,7 @@ class BenchRunner(object):
                                  spec_ref=spec.get("name"))
         self.abort_tree = OwnedProcessTree()
         self.started = now()
-        self.plan = plan_allocations(spec, spec["budget"]["max_candidates"]
-                                     or 1)
+        self.plan = plan_allocations(spec, spec["budget"]["max_candidates"])
         self.judge = None
         self._prov = None
         self.spec_path = spec_path
@@ -2237,12 +2250,8 @@ def promote_baseline(*, run_status: str, comparison: Optional[dict],
 # §6 tuner (report-only coordinate search; apply only with approval)
 # --------------------------------------------------------------------------
 
-def tuner_candidates(spec: dict) -> List[Dict[str, Any]]:
-    """The finite, deterministic coordinate-search candidate list.
-
-    One parameter at a time, deterministic order, at most the spec's knob count;
-    frozen knobs are never proposed.
-    """
+def tuner_grid(spec: dict) -> List[Dict[str, Any]]:
+    """The **full** deterministic grid (before the candidate cap is applied)."""
     params = spec["tuning"]["parameters"]
     candidates: List[Dict[str, Any]] = []
     for knob in TUNER_ELIGIBLE_KNOBS:
@@ -2251,7 +2260,17 @@ def tuner_candidates(spec: dict) -> List[Dict[str, Any]]:
             continue
         for value in rail["grid"]:
             candidates.append({knob: value})
-    return candidates[: max(1, spec["budget"]["max_candidates"])]
+    return candidates
+
+
+def tuner_candidates(spec: dict) -> List[Dict[str, Any]]:
+    """The finite, deterministic coordinate-search candidate list.
+
+    One parameter at a time, deterministic order, capped at the spec's
+    ``max_candidates`` (zero candidates stays zero -- no hidden minimum).
+    """
+    grid = tuner_grid(spec)
+    return grid[: max(0, spec["budget"]["max_candidates"])]
 
 
 def tuner_plan(spec: dict) -> Dict[str, Any]:
@@ -2264,8 +2283,37 @@ def tuner_plan(spec: dict) -> Dict[str, Any]:
             "confirmation_episodes_per_arm":
                 spec["comparison"]["confirmation_episodes_per_arm"],
             "allocations": alloc,
-            "sweeps": min(2, max(1, len(candidates))),
+            "sweeps": min(2, max(0, len(candidates))),
             "finite": True}
+
+
+def tuning_preflight(spec: dict) -> Dict[str, Any]:
+    """Reject a tuning plan whose complete allocation exceeds any campaign cap.
+
+    The **full** screening + confirmation allocation is checked against the
+    episode, judge, strategy and wall caps (zero caps included), and a plan with
+    no candidates is refused -- all **before** any child or worker is spawned.
+    """
+    problem = validate_spec(spec)
+    if problem:
+        return {"ok": False, "stage": "spec", "error": problem, "reasons":
+                [problem]}
+    plan = tuner_plan(spec)
+    reasons = list(plan["allocations"]["reasons"])
+    if not plan["candidates"]:
+        reasons.append("no-candidates: budget.max_candidates is 0")
+    grid = tuner_grid(spec)
+    if len(grid) > spec["budget"]["max_candidates"]:
+        reasons.append("candidate-budget: %d > %d"
+                       % (len(grid), spec["budget"]["max_candidates"]))
+    wall = int(spec["budget"].get("max_total_wall_s") or 0)
+    if wall and plan["allocations"]["total_episodes"] * \
+            float(spec["episode_timeout_s"]) > wall:
+        reasons.append("wall-budget: %g > %d"
+                       % (plan["allocations"]["total_episodes"]
+                          * float(spec["episode_timeout_s"]), wall))
+    return {"ok": not reasons, "stage": "tuning", "reasons": reasons,
+            "plan": plan, "allocations": plan["allocations"]}
 
 
 def tuner_report(spec: dict, results: Sequence[dict]) -> Dict[str, Any]:
@@ -2521,6 +2569,9 @@ def _cmd_tune(args) -> int:
     """Emit the finite tuner plan/report and write the artifact."""
     spec = load_spec(args.spec)
     report = tuner_plan(spec)
+    pre = tuning_preflight(spec)
+    report["within_budget"] = pre["ok"]
+    report["allocation_reasons"] = pre["reasons"]
     if args.run_dir:
         results = []
         loaded = _read_json(os.path.join(args.run_dir, "scorecards.json"))
@@ -2532,6 +2583,12 @@ def _cmd_tune(args) -> int:
     else:
         report["ranked"] = []
     report["mode"] = spec["tuning"]["mode"]
+    if not pre["ok"]:
+        # the complete allocation exceeds a campaign cap: refuse before any
+        # child or worker is spawned, and write nothing as if it were accepted.
+        print(json.dumps({"rejected": True, "reasons": pre["reasons"]},
+                         indent=2, sort_keys=True))
+        return 2
     out_dir = args.out_dir or args.run_dir or "."
     out = os.path.join(out_dir, "tuning-report.json")
     write_json_atomic(out, report)

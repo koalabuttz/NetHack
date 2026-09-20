@@ -1212,8 +1212,8 @@ class WorkflowWiring(unittest.TestCase):
                          "rubric_version": "bench-judge-rubric/1",
                          "deadline_s": 10.0, "max_state_bytes": 8192,
                          "max_response_bytes": 65536, "retries": 0}
-        spec["budget"]["judge_calls_total"] = 10
-        spec["budget"]["max_total_episodes"] = 100
+        spec["budget"]["judge_calls_total"] = 100
+        spec["budget"]["max_total_episodes"] = 200
         path = os.path.join(tmp, "spec.json")
         with open(path, "w") as fh:
             json.dump(spec, fh)
@@ -2234,6 +2234,103 @@ class HandshakeAndCancel(unittest.TestCase):
             self.assertEqual(payload["signals"], [int(signal.SIGTERM)])
         finally:
             handlers.restore()
+
+
+class LiteralZeroAndTuningBudget(unittest.TestCase):
+    """Finding #5: zero caps are literal and the tuning allocation is checked."""
+
+    def _spawn_counting_runner(self, spec, tmp):
+        launched = {"n": 0}
+
+        def fake_episode(config, paths, episode_dir, index, timeout):
+            launched["n"] += 1
+            return _meta(), episode_dir
+
+        runner = B.BenchRunner(spec, tmp)
+        runner.episode_runner = fake_episode
+        return runner, launched
+
+    def test_zero_max_episodes_is_literally_zero(self):
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
+        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
+        spec = _valid_spec(episodes=2, tier="live")
+        spec["budget"]["max_total_episodes"] = 0
+        report = B.preflight(spec)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["stage"], "budget")
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        runner, launched = self._spawn_counting_runner(spec, tmp)
+        out = runner.run()
+        self.assertFalse(out["ok"])
+        self.assertEqual(launched["n"], 0)
+
+    def test_zero_strategy_calls_with_strategy_on_fails(self):
+        spec = _valid_spec(episodes=2)
+        spec["overrides"] = {"strategy": "deepseek"}
+        spec["budget"]["strategy_calls_total"] = 0
+        report = B.preflight(spec)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["stage"], "budget")
+        self.assertIn("strategy demand", report["error"])
+
+    def test_zero_candidates_is_refused_by_tuning_preflight(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        spec = _valid_spec()
+        spec["budget"]["max_candidates"] = 0
+        self.assertEqual(B.tuner_candidates(spec), [])
+        pre = B.tuning_preflight(spec)
+        self.assertFalse(pre["ok"])
+        self.assertTrue(any("no-candidates" in r for r in pre["reasons"]), pre)
+        path = os.path.join(tmp, "spec.json")
+        with open(path, "w") as fh:
+            json.dump(spec, fh)
+        self.assertEqual(B.main(["tune", path, "--run-dir", tmp]), 2)
+        self.assertFalse(os.path.exists(os.path.join(tmp,
+                                                     "tuning-report.json")))
+
+    def test_tuning_allocation_exceeding_each_cap_is_refused(self):
+        def fresh():
+            spec = _valid_spec()
+            spec["budget"]["max_total_episodes"] = 1000
+            spec["budget"]["max_candidates"] = 6
+            spec["campaign_timeout_s"] = 100000.0
+            return spec
+
+        # episode cap smaller than the whole tuning allocation
+        spec = fresh()
+        spec["budget"]["max_total_episodes"] = 10
+        self.assertFalse(B.tuning_preflight(spec)["ok"])
+        self.assertTrue(any("episode-budget" in r
+                            for r in B.tuning_preflight(spec)["reasons"]))
+        # judge cap smaller than the eligible-episode count (judge enabled)
+        spec = fresh()
+        spec["judge"] = {"enabled": True, "model": "jev-latest",
+                         "rubric_version": "r1", "deadline_s": 10.0,
+                         "max_state_bytes": 8192, "max_response_bytes": 65536,
+                         "retries": 0}
+        spec["budget"]["judge_calls_total"] = 5
+        self.assertTrue(any("judge-budget" in r
+                            for r in B.tuning_preflight(spec)["reasons"]))
+        # strategy cap smaller than the whole tuning demand
+        spec = fresh()
+        spec["overrides"] = {"strategy": "deepseek", "strategy_call_cap": 8}
+        spec["budget"]["strategy_calls_total"] = 100
+        self.assertTrue(any("strategy-budget" in r
+                            for r in B.tuning_preflight(spec)["reasons"]))
+        # wall cap smaller than the whole tuning duration
+        spec = fresh()
+        spec["budget"]["max_total_wall_s"] = 10
+        self.assertTrue(any("wall-budget" in r
+                            for r in B.tuning_preflight(spec)["reasons"]))
+        # candidate cap smaller than the deterministic grid
+        spec = fresh()
+        spec["budget"]["max_candidates"] = 2
+        self.assertTrue(any("candidate-budget" in r
+                            for r in B.tuning_preflight(spec)["reasons"]))
+        # a plan that fits every cap is accepted
+        self.assertTrue(B.tuning_preflight(fresh())["ok"])
 
 
 if __name__ == "__main__":
