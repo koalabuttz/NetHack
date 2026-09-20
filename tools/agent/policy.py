@@ -1591,9 +1591,15 @@ class ScriptedReflex(object):
         # Additive 13th field: the initial route hop count of a fresh
         # acquisition (plan §2), derived from the target's Dijkstra cost.
         hops = None
-        if held is None and target is not None \
-                and getattr(target, "cost", None):
-            hops = max(1, int(target.cost) // navigation.BASE_STEP)
+        if held is None and target is not None:
+            # the TRUE edge count when the caller has it (review item 5); the
+            # weighted Dijkstra cost folds in visit/failure penalties and is
+            # only a last-resort fallback for a caller that did not supply it
+            true_hops = getattr(target, "hops", None)
+            if true_hops is not None:
+                hops = max(1, int(true_hops))
+            elif getattr(target, "cost", None):
+                hops = max(1, int(target.cost) // navigation.BASE_STEP)
         return ("dest", op, int(iid), purpose, int(pos[0]), int(pos[1]),
                 family, source, int(generation), int(expected),
                 str(reason or ""),

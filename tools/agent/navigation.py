@@ -178,10 +178,29 @@ def one_dijkstra(terrain: TerrainMemory, hero: Tuple[int, int],
     The traversal is bounded by *deadline_check* (a callable that may raise),
     so a single preparation cannot overrun the reflex allowance.
     """
+    dist, first, _steps = one_dijkstra_steps(terrain, hero, visits, failed,
+                                             deadline_check)
+    return dist, first
+
+
+def one_dijkstra_steps(terrain: TerrainMemory, hero: Tuple[int, int],
+                       visits: Optional[Dict[Tuple[int, int], int]] = None,
+                       failed: Optional[Dict[Tuple[int, int], int]] = None,
+                       deadline_check=None):
+    """One Dijkstra plus the **true edge count** to every reached cell (§2).
+
+    Returns ``(dist, first, steps)``: like :func:`one_dijkstra`, plus
+    ``steps[pos]`` -- the number of edges on the chosen shortest path from the
+    hero.  The weighted ``dist`` folds in visit/failure penalties, so it is NOT
+    a hop count; this separate counter is what the total-attempt cap must use
+    (review item 5), so two equal-length routes with different visit histories
+    carry the same hop count while their weighted cost differs.
+    """
     visits = visits or {}
     failed = failed or {}
     dist: Dict[Tuple[int, int], int] = {hero: 0}
     first: Dict[Tuple[int, int], Tuple[int, int]] = {}
+    steps: Dict[Tuple[int, int], int] = {hero: 0}
     heap = []
     for step in DIRECTIONS:
         nb = (hero[0] + step[0], hero[1] + step[1])
@@ -191,6 +210,7 @@ def one_dijkstra(terrain: TerrainMemory, hero: Tuple[int, int],
         if c < dist.get(nb, INF):
             dist[nb] = c
             first[nb] = step
+            steps[nb] = 1
             heapq.heappush(heap, (c, DIR_RANK[step], nb))
     while heap:
         d, _rank, pos = heapq.heappop(heap)
@@ -207,8 +227,9 @@ def one_dijkstra(terrain: TerrainMemory, hero: Tuple[int, int],
             if nd < dist.get(nb, INF):
                 dist[nb] = nd
                 first[nb] = fstep
+                steps[nb] = steps[pos] + 1
                 heapq.heappush(heap, (nd, DIR_RANK[fstep], nb))
-    return dist, first
+    return dist, first, steps
 
 
 # -- targets ---------------------------------------------------------------
@@ -222,6 +243,9 @@ class Target:
     first_step: Tuple[int, int]
     cost: int
     reason: str = ""
+    #: The **true edge count** of the chosen shortest path (review item 5), not
+    #: the weighted ``cost``.  ``None`` when the caller did not supply it.
+    hops: Optional[int] = None
 
     def order_key(self) -> tuple:
         return (self.cost, DIR_RANK.get(self.first_step, 99), self.pos)
@@ -256,7 +280,8 @@ def _approach_of(terrain: TerrainMemory, door: Tuple[int, int],
 def enumerate_targets(terrain: TerrainMemory, hero: Tuple[int, int],
                       dist: Dict[Tuple[int, int], int],
                       first: Dict[Tuple[int, int], Tuple[int, int]],
-                      visits: Optional[Dict[Tuple[int, int], int]] = None
+                      visits: Optional[Dict[Tuple[int, int], int]] = None,
+                      steps: Optional[Dict[Tuple[int, int], int]] = None
                       ) -> Tuple[Target, ...]:
     """Every reachable target, with no ``[:8]`` prefilter (4.5, M08).
 
@@ -267,6 +292,7 @@ def enumerate_targets(terrain: TerrainMemory, hero: Tuple[int, int],
     that is walled off can no longer suppress a reachable farther one (M09).
     """
     visits = visits or {}
+    steps = steps or {}
     out = []
     hero_set = (hero,)
     # 1. reachable down stairs (a monster-covered stair is not reachable)
@@ -274,7 +300,7 @@ def enumerate_targets(terrain: TerrainMemory, hero: Tuple[int, int],
         if pos in hero_set or pos not in dist:
             continue
         out.append(Target(pos, TFAM_STAIR, first[pos], dist[pos],
-                          "reachable down stairs"))
+                          "reachable down stairs", hops=steps.get(pos)))
     # 2. cardinal closed-door approaches: the door itself is not walkable, so
     #    the target is the approach cell and the effect is opening the door
     for door in sorted(p for p, t in terrain.terrain.items()
@@ -287,17 +313,18 @@ def enumerate_targets(terrain: TerrainMemory, hero: Tuple[int, int],
             # hero is already on the approach: open the door directly
             step = (door[0] - hero[0], door[1] - hero[1])
         out.append(Target(door, TFAM_DOOR, step, dist.get(approach, 0),
-                          "approach a closed door"))
+                          "approach a closed door",
+                          hops=steps.get(approach)))
     # 3. frontiers and unvisited known cells
     for pos in sorted(dist):
         if pos in hero_set:
             continue
         if is_frontier(terrain, pos):
             out.append(Target(pos, TFAM_FRONTIER, first[pos], dist[pos],
-                              "observation frontier"))
+                              "observation frontier", hops=steps.get(pos)))
         elif visits.get(pos, 0) == 0:
             out.append(Target(pos, TFAM_UNVISITED, first[pos], dist[pos],
-                              "unvisited known cell"))
+                              "unvisited known cell", hops=steps.get(pos)))
     return tuple(sorted(out, key=lambda t: t.order_key()))
 
 
@@ -316,8 +343,9 @@ def plan(terrain: TerrainMemory, hero: Tuple[int, int],
          failed: Optional[Dict[Tuple[int, int], int]] = None,
          deadline_check=None) -> NavPlan:
     """One Dijkstra and all-reachable-target enumeration (the 4.5 gate)."""
-    dist, first = one_dijkstra(terrain, hero, visits, failed, deadline_check)
-    targets = enumerate_targets(terrain, hero, dist, first, visits)
+    dist, first, steps = one_dijkstra_steps(terrain, hero, visits, failed,
+                                            deadline_check)
+    targets = enumerate_targets(terrain, hero, dist, first, visits, steps)
     return NavPlan(hero=hero, dist=dist, first=first, targets=targets)
 
 
@@ -840,7 +868,8 @@ def resolve_semantic_destination(
 __all__ = [
     "DIRECTIONS", "DIR_RANK", "BASE_STEP", "VISIT_PENALTY", "FAILED_PENALTY",
     "TFAM_STAIR", "TFAM_DOOR", "TFAM_FRONTIER", "TFAM_UNVISITED",
-    "edge_legal", "one_dijkstra", "enumerate_targets", "is_frontier",
+    "edge_legal", "one_dijkstra", "one_dijkstra_steps", "enumerate_targets",
+    "is_frontier",
     "door_open", "local_evidence_signature", "service_signature",
     "door_failure_signature", "blocked_edge_signature",
     "Target", "NavPlan", "plan", "PersistedTarget", "TargetStore",

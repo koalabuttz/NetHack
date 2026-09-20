@@ -1131,6 +1131,50 @@ class DoorAndRouteAccounting(unittest.TestCase):
                 + navigation.STALL_TOTAL_SLACK))
         self.assertGreater(st.stall_cap, navigation.STALL_TOTAL_MIN)
 
+    def test_hop_count_is_true_edges_not_weighted_cost(self):
+        # review item 5: the 13th payload field must be the TRUE edge count, not
+        # the weighted Dijkstra cost (which folds in visit/failure penalties)
+        cells = {(x, 10): FLOOR for x in range(1, 13)}
+        tm = nav_test.terrain(cells)
+        dist0, _f0, steps0 = navigation.one_dijkstra_steps(tm, (1, 10), {})
+        # the same corridor, every cell maximally visited: same edges, higher cost
+        visited = {p: navigation.VISIT_CAP + 5 for p in cells}
+        dist1, _f1, steps1 = navigation.one_dijkstra_steps(tm, (1, 10), visited)
+        target = (10, 10)
+        self.assertEqual(steps0[target], 9)          # (1,10) -> (10,10)
+        self.assertEqual(steps0[target], steps1[target])
+        self.assertNotEqual(dist0[target], dist1[target])
+        t0 = navigation.Target(target, navigation.TFAM_FRONTIER, (1, 0),
+                               dist0[target], "r", hops=steps0[target])
+        t1 = navigation.Target(target, navigation.TFAM_FRONTIER, (1, 0),
+                               dist1[target], "r", hops=steps1[target])
+        p0 = policy.ScriptedReflex._dest_payload("acquire", None, target=t0)
+        p1 = policy.ScriptedReflex._dest_payload("acquire", None, target=t1)
+        # the 13th field is the true hop count, equal for both routes ...
+        self.assertEqual(p0[12], 9)
+        self.assertEqual(p0[12], p1[12])
+        # ... while the weighted cost differs, so the stall cap is identical
+        self.assertNotEqual(t0.cost, t1.cost)
+        st0 = navigation.CommitmentStore()
+        st1 = navigation.CommitmentStore()
+        for st, hops in ((st0, p0[12]), (st1, p1[12])):
+            st.commit(instance_id=1,
+                      purpose=navigation.COMMIT_EXPLORE_FRONTIER,
+                      pos=target, family=navigation.TFAM_FRONTIER, hops=hops)
+        self.assertEqual(st0.stall_cap, st1.stall_cap)
+
+    def test_weighted_cost_fallback_still_inflates_without_true_hops(self):
+        # a caller with no true hop count still degrades to the weighted-cost
+        # estimate (documented fallback), so the field is never silently 0
+        cells = {(x, 10): FLOOR for x in range(1, 13)}
+        tm = nav_test.terrain(cells)
+        dist, _f, _s = navigation.one_dijkstra_steps(tm, (1, 10), {})
+        t = navigation.Target((10, 10), navigation.TFAM_FRONTIER, (1, 0),
+                              dist[(10, 10)], "r")     # no hops supplied
+        payload = policy.ScriptedReflex._dest_payload("acquire", None, target=t)
+        self.assertIsNotNone(payload[12])
+        self.assertGreaterEqual(payload[12], 1)
+
 
 class Phase3EvidenceSplit(unittest.TestCase):
     """AC7: split evidence signatures and the door-refusal seam (§4/§Phase 3)."""
