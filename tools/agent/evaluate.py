@@ -529,6 +529,9 @@ class ReplayPass(object):
         # (Jev) choice, and cleared by a substitution.  The frozen effect is
         # taken from here, never re-derived from the wire action.
         self._selected_candidate = None
+        # The frozen movement identity of the modeled gameplay send (prompt-edge
+        # plan §A), mirroring the live controller.
+        self._movement_origin = None
 
     # -- provider construction ------------------------------------------
     def _build_reflex(self, name):
@@ -634,14 +637,25 @@ class ReplayPass(object):
         frame_need = rec.get("need")
         frame_kind = (frame_need.get("kind")
                       if isinstance(frame_need, dict) else None)
+        # (2) Validate the *complete* need shape BEFORE movement-prompt
+        # recognition (prompt-edge plan §Phase 1), identically to the live path.
+        if frame_need is not None:
+            reason = protocol.validate_need(frame_need)
+            if reason:
+                self.protocol_failure = "malformed need: %s" % reason
+                self.closed = True
+                return
+        matched_prompt = self._capture_movement_prompt(frame_need, staged)
         self._reconcile(staged)
         self.mem.commit(
             staged, hero=self._resolved_hero,
             advance_stationary=bool(
-                self._matched_gameplay
-                and frame_kind in ("command", "key", "direction")))
+                (self._matched_gameplay
+                 and frame_kind in ("command", "key", "direction"))
+                or matched_prompt))
         self.reflex.note_observation(self.mem)
         self._commit_effect()
+        self._resolve_pending_prompt(frame_need, staged)
         # a new obs supersedes any need still awaiting pages: that need was
         # never answered in the recorded trajectory
         if self._pending is not None and not self._pending.decided:
@@ -649,13 +663,9 @@ class ReplayPass(object):
             self._pending = None
 
         detected = self._detect_boundaries()
-        need = rec.get("need")
-        if need is not None:
-            reason = protocol.validate_need(need)
-            if reason:
-                self.protocol_failure = "malformed need: %s" % reason
-                self.closed = True
-                return
+        # The complete need shape was validated above (prompt-edge plan §Phase
+        # 1); the later duplicate pass is removed.
+        need = frame_need
         self.req.begin(need, seq)
         if need is None:
             return
@@ -1301,7 +1311,51 @@ class ReplayPass(object):
             self._sent_before = {"hero": self.mem.hero,
                                  "time": self.mem.status.time,
                                  "dlvl": self.mem.status.dlvl}
+            # Freeze the movement identity of this modeled gameplay send (plan
+            # §A), mirroring the live controller's send boundary.
+            self._movement_origin = arbitration.movement_origin_from_selected(
+                self._selected_candidate, self._last_need_kind or "",
+                self.instance.current() or 0, self.mem.hero,
+                (self._last_key, self._sent_ordinal))
+        else:
+            # Bind a modeled non-command ``yn`` answer to the pending prompt
+            # context (plan §C), exactly as the live controller does.
+            if self.reflex.pending_prompt is not None \
+                    and isinstance(action, dict) and "yn" in action:
+                self.reflex.note_prompt_answer_sent(self._sent_ordinal)
         return self._sent_ordinal
+
+    def _capture_movement_prompt(self, frame_need, staged):
+        """Arm the one bounded pending prompt context (evaluator mirror, §A/§C)."""
+        origin = self._movement_origin
+        self._movement_origin = None
+        if origin is None or not isinstance(frame_need, dict):
+            return False
+        if frame_need.get("kind") != "yn":
+            return False
+        arm = getattr(self.reflex, "arm_movement_prompt", None)
+        if arm is None or self.reflex.pending_prompt is not None:
+            return False
+        return bool(arm(
+            origin, frame_need, self.instance.current(), staged.hero,
+            need_key=(self._last_key or ())))
+
+    def _resolve_pending_prompt(self, frame_need, staged):
+        """Confirm a decline iff the post-answer observation proves it (§C)."""
+        resolve = getattr(self.reflex, "resolve_prompt_decline", None)
+        pending = getattr(self.reflex, "pending_prompt", None)
+        if resolve is None or pending is None or not pending.answer_sent:
+            return
+        kind = (frame_need.get("kind")
+                if isinstance(frame_need, dict) else None)
+        prompt = ((frame_need.get("prompt") or "")
+                  if isinstance(frame_need, dict) else "")
+        if kind == "yn" and arbitration.is_movement_entry_confirmation(prompt):
+            return
+        resolve(self.mem, self.instance.current(), self._resolved_hero, True)
+        clear = getattr(self.reflex, "clear_pending_prompt", None)
+        if clear is not None:
+            clear()
 
     def _propose(self, ctx) -> Tuple[Optional[dict], str, str, bool]:
         """Run the candidate provider; return (action, label, reason, fb).

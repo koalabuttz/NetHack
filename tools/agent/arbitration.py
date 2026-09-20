@@ -324,6 +324,164 @@ def direction_delta(action, dir_keys) -> Optional[Tuple[int, int]]:
     return None
 
 
+# -- matched movement accounting and prompt-edge evidence (prompt-edge plan) --
+#
+# These helpers are the single, pure transport seam shared by live control and
+# offline evaluation (plan §A/§B): the movement identity of a successfully sent
+# step, the recognized blocking-confirmation recognizer, and the confirmed
+# decline test.  Nothing here mutates state or reads policy/engine memory.
+
+#: The door-open destination purpose.  Mirrored as a literal (this module is a
+#: dependency-neutral leaf and must never import ``navigation``); a
+#: direction-shaped *door interaction* is not movement and must fail closed.
+DOOR_PURPOSE = "open-door"
+
+#: Accepted operation classes: ``label -> (operation, action_class)``.  Every
+#: other label fails closed (plan §A rejected rows).
+_ACCEPTED_MOVEMENT_OPS = {
+    "navigate": ("destination", "normal"),
+    "recovery-step": ("recovery", "recovery"),
+    "escape": ("emergency", "emergency"),
+}
+
+#: Labels that are *never* movement even though they may carry a direction.
+_REJECTED_MOVEMENT_LABELS = frozenset(
+    ("search", "site-search", "secret-search", "descend", "forced-search",
+     "trapped", "unblock", "random-move", "recovery"))
+
+
+def _dest_purpose(candidate) -> str:
+    """The destination purpose of a candidate's frozen payload, or ``""``."""
+    payload = getattr(candidate, "effect_payload", ()) or ()
+    if len(payload) >= 4 and payload[0] == "dest":
+        return str(payload[3])
+    return ""
+
+
+def movement_origin_from_selected(candidate, need_kind, source_instance,
+                                  pre_hero, attempt_key):
+    """The frozen :class:`MovementOrigin` of a selected step, or ``None`` (§A).
+
+    Total, side-effect-free, and dependent only on its arguments plus the
+    candidate's immutable identity.  Accepts the four operation classes
+    (destination acquire/continue, recovery step, directional emergency
+    escape); rejects every other row -- door interaction, movement prefix,
+    stair traversal, wait/search/forced-search, classless direction
+    continuations, and synthesized/effect-less candidates -- so unknown or
+    synthetic intent fails closed for edge learning.
+    """
+    if candidate is None or pre_hero is None:
+        return None
+    label = getattr(candidate, "semantic_label", "")
+    if not label or label in _REJECTED_MOVEMENT_LABELS:
+        return None
+    op = _ACCEPTED_MOVEMENT_OPS.get(label)
+    if op is None:
+        return None
+    # the action must actually be a plain movement-direction key
+    delta = direction_delta(candidate.action, _DIR_KEYS)
+    if delta is None:
+        return None
+    # a destination operation must carry its frozen destination payload: a
+    # synthesized/effect-less navigate candidate fails closed, and a
+    # direction-shaped door *interaction* is not movement.
+    if label == "navigate":
+        payload = getattr(candidate, "effect_payload", ()) or ()
+        if not (len(payload) >= 4 and payload[0] == "dest"):
+            return None
+        if str(payload[3]) == DOOR_PURPOSE:
+            return None
+    src = (int(pre_hero[0]), int(pre_hero[1]))
+    dst = (src[0] + delta[0], src[1] + delta[1])
+    operation, action_class = op
+    return candidates.MovementOrigin(
+        attempt_key=tuple(attempt_key) if attempt_key else (),
+        origin_need_kind=str(need_kind or ""),
+        instance=int(source_instance) if source_instance is not None else 0,
+        src=src, delta=tuple(delta), dst=dst,
+        candidate_id=getattr(candidate, "candidate_id", ""),
+        proposed_effect=getattr(candidate, "proposed_effect", ""),
+        operation=operation, action_class=action_class)
+
+
+def is_movement_entry_confirmation(prompt_text) -> bool:
+    """True for a source-verified blocking movement-entry confirmation (§A).
+
+    Starts with the exact engine confirmations (``src/hack.c:2542``:
+    ``%s into that %s cloud?`` -- vapor or poison gas) and nothing else; the
+    recognizer is intentionally narrow so an unrelated ``yn`` prompt can never
+    be treated as a movement confirmation.
+    """
+    if not prompt_text:
+        return False
+    low = " ".join(str(prompt_text).lower().split())
+    return ("into that " in low and low.rstrip().endswith("cloud?")
+            and ("vapor cloud" in low or "poison gas cloud" in low))
+
+
+def matched_movement_prompt(origin, response_need, instance, confirmed_hero,
+                            need_key=()):
+    """The pending prompt context for a matched blocking confirmation, or None.
+
+    Created only when the response is a ``yn`` need carrying a recognized
+    movement-entry confirmation, the instance is the origin's instance, and the
+    *confirmed* hero is still the frozen source square (a moved hero is not a
+    stationary confirmation).  ``None`` for every other frame.
+    """
+    if origin is None or not isinstance(response_need, dict):
+        return None
+    if response_need.get("kind") != "yn":
+        return None
+    prompt = response_need.get("prompt") or ""
+    if not is_movement_entry_confirmation(prompt):
+        return None
+    if instance is None or int(instance) != int(origin.instance):
+        return None
+    if confirmed_hero is None or tuple(confirmed_hero) != tuple(origin.src):
+        return None
+    return candidates.MatchedMovementPrompt(
+        attempt_key=tuple(origin.attempt_key),
+        instance=int(origin.instance),
+        src=tuple(origin.src), dst=tuple(origin.dst),
+        action_class=origin.action_class,
+        prompt_text=" ".join(str(prompt).split()),
+        need_key=tuple(need_key))
+
+
+def prompt_decline_confirmed(pending, instance, hero, dismissed) -> bool:
+    """True only when a decline is proven by the post-answer observation (§C).
+
+    Requires the answer to have been *sent*, the observation to be in the same
+    instance, the confirmed hero to be unchanged at the frozen source square,
+    and the engine to have left the confirmation (``dismissed``).  A stale
+    ``n``, a failed write, a replacement prompt or a re-presented confirmation
+    therefore never writes evidence.
+    """
+    if pending is None or not pending.answer_sent:
+        return False
+    if instance is None or int(instance) != int(pending.instance):
+        return False
+    if not dismissed:
+        return False
+    if hero is None or tuple(hero) != tuple(pending.src):
+        return False
+    return True
+
+
+# ``protocol.DIR_KEYS`` mirrored as a literal so this leaf never imports
+# ``protocol`` (a circular-safe, dependency-neutral seam).  The order and the
+# values match ``protocol.DIR_KEYS`` exactly.
+_DIR_KEYS = {(-1, -1): ord("y"), (0, -1): ord("k"), (1, -1): ord("u"),
+             (-1, 0): ord("h"), (1, 0): ord("l"), (-1, 1): ord("b"),
+             (0, 1): ord("j"), (1, 1): ord("n")}
+
+
+def set_dir_keys(dir_keys) -> None:
+    """Bind the canonical ``{(dx, dy): wire_key}`` table (test/DI seam)."""
+    global _DIR_KEYS
+    _DIR_KEYS = dict(dir_keys)
+
+
 __all__ = [
     "REJECTION_CODES", "DEFAULT_CONFIDENCE_THRESHOLD", "RejectionSet",
     "CONFIDENCE_RELATIVE", "CONFIDENCE_ABSOLUTE", "CONFIDENCE_MODES",
@@ -332,4 +490,7 @@ __all__ = [
     "ChoiceOutcome", "validate_raw_choice", "Reconciliation",
     "classify_outcome", "arrival_outcome", "direction_delta",
     "ARRIVAL_PHRASES",
+    "DOOR_PURPOSE", "movement_origin_from_selected",
+    "is_movement_entry_confirmation", "matched_movement_prompt",
+    "prompt_decline_confirmed", "set_dir_keys",
 ]

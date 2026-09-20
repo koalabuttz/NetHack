@@ -276,6 +276,13 @@ class ReflexContext(object):
     # optional, so a direct caller that supplies neither renders ``null``.
     role: str = ""
     destination: Any = None
+    # Internal-only, policy-input-only (prompt-edge plan §A): the frozen
+    # movement origin of the in-flight send and the one bounded pending
+    # movement-confirmation context.  ``providers``/presentation never consume,
+    # render or serialize these, and they never affect the Choice/prompt/wire
+    # shape.
+    prompt_origin: Any = None
+    matched_movement_prompt: Any = None
 
 
 @dataclass

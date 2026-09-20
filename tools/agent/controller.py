@@ -698,6 +698,11 @@ class _EpisodeRunner(object):
         # True only when the current observation reconciles a matched gameplay
         # attempt (plan §2A); set per observation by _reconcile_observation.
         self._matched_gameplay_attempt = False
+        # The frozen movement identity of the in-flight gameplay attempt
+        # (prompt-edge plan §A), captured at the send boundary and consumed once
+        # by the first reconciled response.  ``None`` for a non-movement or
+        # non-command send.
+        self._movement_origin = None
         # The frozen payload of a non-command effect awaiting its reconciled
         # observation (the observed inventory rows, tick and game time).
         self._attempt_payload = ()
@@ -1405,12 +1410,25 @@ class _EpisodeRunner(object):
         frame_need = rec.get("need")
         frame_kind = (frame_need.get("kind")
                       if isinstance(frame_need, dict) else None)
+        # (2) Validate the *complete* need shape BEFORE movement-prompt
+        # recognition (prompt-edge plan §Phase 1 ordering): a malformed
+        # cloud-shaped need must fail here, creating no stationary count and no
+        # pending prompt context.
+        if frame_need is not None:
+            reason = protocol.validate_need(frame_need)
+            if reason:
+                raise _ProtocolFailure("malformed need: %s" % reason)
+        # (3) Derive and capture the matched movement prompt while the frozen
+        # origin and the pre-send hero are still available.  Only a matched,
+        # recognized blocking confirmation whose hero is unchanged may count.
+        matched_prompt = self._capture_movement_prompt(frame_need, staged)
         self._reconcile_observation(staged)
         self.mem.commit(
             staged, hero=self._resolved_hero,
             advance_stationary=bool(
-                self._matched_gameplay_attempt
-                and frame_kind in ("command", "key", "direction")))
+                (self._matched_gameplay_attempt
+                 and frame_kind in ("command", "key", "direction"))
+                or matched_prompt))
         # The committed observation is folded once into the reflex's bounded
         # recovery/refusal/food evidence (plan 5.1/5.2).  This is the *only*
         # place that mutation happens, so candidate construction and proposal
@@ -1432,6 +1450,10 @@ class _EpisodeRunner(object):
         self._attempt_effect = None
         self._attempt_label = ""
         self._attempt_payload = ()
+        # Resolve the bounded pending prompt context against this committed
+        # observation (prompt-edge plan §C): a proven dismissal with an
+        # unchanged hero writes the decline record exactly once.
+        self._resolve_pending_prompt(frame_need, staged)
         # A held directive-owned destination whose advice is no longer active
         # (TTL/precondition lapse) is terminated once with a stable reason
         # (plan §3): directive expiry is never laundered into a default.
@@ -1444,15 +1466,10 @@ class _EpisodeRunner(object):
         # (or replaying history) yields no new events; simultaneous reasons
         # coalesce into the single pending strategy request.
         self._detect_boundaries()
-        # Validate the *complete* need shape before any of it is stored on the
-        # outstanding request: a malformed need must fail this episode here,
-        # not raise later from pages_complete/next_page_request, which run
-        # outside run()'s per-episode failure boundary.
-        need = rec.get("need")
-        if need is not None:
-            reason = protocol.validate_need(need)
-            if reason:
-                raise _ProtocolFailure("malformed need: %s" % reason)
+        # The *complete* need shape was validated above, before movement-prompt
+        # recognition (prompt-edge plan §Phase 1); the second validation pass is
+        # therefore removed here.
+        need = frame_need
         self.req.begin(need, seq)
         self.pending = need is not None
         self.pending_need = need
@@ -1735,6 +1752,73 @@ class _EpisodeRunner(object):
                          if purpose == navigation.COMMIT_OPEN_DOOR else None)
         if self._is_stair_action(self.attempt):
             self.instance.note_transition_sent(True)
+        # Freeze the movement identity of this gameplay send (prompt-edge plan
+        # §A): the exact directed edge (frozen pre-send hero + selected delta)
+        # and the operation/action class, derived by the one pure transport
+        # seam.  A non-movement send (door interaction, prefix, stair,
+        # synthesized candidate) freezes ``None`` and can learn no edge.
+        need_kind = (getattr(self, "pending_need", None) or {}).get(
+            "kind") if isinstance(getattr(self, "pending_need", None),
+                                  dict) else ""
+        self._movement_origin = arbitration.movement_origin_from_selected(
+            cand, need_kind, self.instance.current() or 0, hero,
+            self.attempt.primary_key)
+
+    def _capture_movement_prompt(self, frame_need, staged):
+        """Arm the one bounded pending prompt context for a matched confirmation.
+
+        Returns ``True`` only when a *new* context was created (the
+        identity-bound term folded into ``advance_stationary``).  A re-presented
+        confirmation creates no second context and therefore earns no second
+        count.  The frozen origin is consumed here so it can never be attached
+        to a later, unrelated frame.
+        """
+        origin = self._movement_origin
+        self._movement_origin = None
+        if origin is None or not isinstance(frame_need, dict):
+            return False
+        if frame_need.get("kind") != "yn":
+            return False
+        arm = getattr(self.reflex, "arm_movement_prompt", None)
+        if arm is None or self.reflex.pending_prompt is not None:
+            return False
+        return bool(arm(
+            origin, frame_need, self.instance.current(), staged.hero,
+            need_key=(getattr(self, "pending_key", None) or ())))
+
+    def _bind_prompt_answer(self, ordinal, selected):
+        """Bind a sent ``yn`` answer to the pending prompt context (plan §C)."""
+        if getattr(self.reflex, "pending_prompt", None) is None:
+            return
+        act = selected if isinstance(selected, dict) else {}
+        if "yn" not in act:
+            return
+        note = getattr(self.reflex, "note_prompt_answer_sent", None)
+        if note is not None:
+            note(ordinal)
+
+    def _resolve_pending_prompt(self, frame_need, staged):
+        """Confirm a decline iff the post-answer observation proves it (§C).
+
+        The confirmation is *dismissed* when this frame no longer presents the
+        same cloud confirmation; the record is written only for an unchanged
+        confirmed hero in the same instance.  A re-presented confirmation keeps
+        the context; any other post-answer frame resolves it exactly once.
+        """
+        resolve = getattr(self.reflex, "resolve_prompt_decline", None)
+        pending = getattr(self.reflex, "pending_prompt", None)
+        if resolve is None or pending is None or not pending.answer_sent:
+            return
+        kind = (frame_need.get("kind")
+                if isinstance(frame_need, dict) else None)
+        prompt = ((frame_need.get("prompt") or "")
+                  if isinstance(frame_need, dict) else "")
+        if kind == "yn" and arbitration.is_movement_entry_confirmation(prompt):
+            return                      # still presenting: keep waiting
+        resolve(self.mem, self.instance.current(), self._resolved_hero, True)
+        clear = getattr(self.reflex, "clear_pending_prompt", None)
+        if clear is not None:
+            clear()
 
     def _freeze_noncommand_effect(self, selected):
         """Freeze a non-command candidate's effect for the next observation.
@@ -2960,6 +3044,8 @@ class _EpisodeRunner(object):
             # because motion/tick semantics belong to gameplay commands only
             # (plan 3.1).
             self._freeze_noncommand_effect(selected)
+            # Bind a sent decline answer to the pending prompt context (§C).
+            self._bind_prompt_answer(ordinal, selected)
         # The *latest successfully sent answer* is the only repair candidate.
         # Its sent ordinal is always recorded; a Jev send additionally records
         # its frozen table/need identity so a subsequent ``invalid(incomplete)``

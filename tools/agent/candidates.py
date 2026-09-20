@@ -659,6 +659,62 @@ def make_sent_attempt(need_key: Any, table: CandidateTable,
         expected_effect=expected_effect or candidate.proposed_effect)
 
 
+@dataclass(frozen=True)
+class MovementOrigin:
+    """The frozen movement identity of one successfully sent step (plan §A).
+
+    Derived by exactly one pure function
+    (:func:`tools.agent.arbitration.movement_origin_from_selected`) from the
+    selected candidate, its need kind, the source instance and the frozen
+    pre-send hero square.  It is *not* re-derived from the semantic destination
+    (which may be several steps away): ``dst`` is the frozen ``src`` plus the
+    selected movement delta, so a blocking prompt on this exact edge is bound to
+    this exact directed edge and no other.
+    """
+
+    attempt_key: tuple
+    origin_need_kind: str
+    instance: int
+    src: Tuple[int, int]
+    delta: Tuple[int, int]
+    dst: Tuple[int, int]
+    candidate_id: str
+    proposed_effect: str
+    #: The accepted operation class label (``destination``/``recovery``/
+    #: ``emergency``), used for diagnostics only.
+    operation: str
+    #: The movement action class (``normal``/``recovery``/``emergency``) the
+    #: learned decline evidence is keyed by (plan §D/§E).
+    action_class: str
+    expected_destination_serial: int = 0
+
+
+@dataclass(frozen=True)
+class MatchedMovementPrompt:
+    """One bounded pending movement-confirmation context (plan §C).
+
+    Created at the prompt's arrival (the first reconciled response to the
+    matched movement attempt), bound to the frozen origin's exact directed
+    edge, and retained until its actual answer is sent and the post-answer
+    observation proves the confirmation was dismissed with an unchanged hero.
+    Only then is a ``prompt-declined`` edge record written.
+    """
+
+    attempt_key: tuple
+    instance: int
+    src: Tuple[int, int]
+    dst: Tuple[int, int]
+    action_class: str
+    prompt_text: str
+    need_key: tuple
+    #: True only once the originating attempt has been counted stationary, so
+    #: the count can never be applied twice.
+    counted: bool = False
+    #: Bound after a complete send of the answer.
+    answer_sent: bool = False
+    answer_ordinal: Optional[int] = None
+
+
 # Re-export ``field`` so callers that want to extend these dataclasses can do
 # so without importing dataclasses themselves; keeps the leaf the single
 # source of the DTO vocabulary.
@@ -671,5 +727,6 @@ __all__ = [
     "candidate_to_wire", "dedup_and_order", "normalize_need_key",
     "build_table", "table_body", "jev_payload", "family_rank",
     "make_sent_attempt", "reset_canonicalize_count", "canonicalize_count",
+    "MovementOrigin", "MatchedMovementPrompt",
     "field",
 ]
