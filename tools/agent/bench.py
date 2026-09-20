@@ -434,6 +434,13 @@ def assert_precommitted(pre: dict, comparison: dict) -> None:
                          "(abandon the run and re-precut it)" % drift)
 
 
+def precommit_record(comparison: dict) -> Dict[str, Any]:
+    """A hashable precommit record, persisted before any result exists."""
+    policy = precommit(comparison)
+    return {"schema_version": "bench-precommit/1", "policy": policy,
+            "hash": M.sha256_json(policy)}
+
+
 # --------------------------------------------------------------------------
 # budget planning
 # --------------------------------------------------------------------------
@@ -770,6 +777,106 @@ def write_json_atomic(path: str, obj: Any, mode: int = 0o600) -> None:
     os.replace(tmp, path)
 
 
+def _read_json(path: Optional[str]) -> Optional[dict]:
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            obj = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _read_jsonl(path: Optional[str]) -> Optional[List[dict]]:
+    """Records from a JSONL sidecar, or ``None`` when the file is absent.
+
+    ``None`` (unavailable) is deliberately distinct from ``[]`` (a present but
+    empty source), so fail-closed evidence handling can tell them apart.
+    """
+    if not path or not os.path.exists(path):
+        return None
+    out: List[dict] = []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(obj, dict):
+                    out.append(obj)
+    except OSError:
+        return None
+    return out
+
+
+def episode_artifact_paths(episode_dir: str, index: int) -> Dict[str, str]:
+    """The per-episode artifact paths the recorder writes."""
+    base = os.path.join(episode_dir, "ep-%d" % index)
+    return {
+        "wire": base + ".wire.jsonl",
+        "actions": base + ".actions.jsonl",
+        "decisions": base + ".decisions.jsonl",
+        "events": base + ".events.jsonl",
+        "meta": base + ".meta.json",
+        "campaign": os.path.join(episode_dir, "campaign.json"),
+    }
+
+
+def source_hashes_of(paths: Dict[str, str]) -> Dict[str, str]:
+    """sha256 of each *present* artifact, keyed by logical name."""
+    out: Dict[str, str] = {}
+    for name, path in sorted(paths.items()):
+        digest = M.sha256_file(path)
+        if digest is not None:
+            out[name] = digest
+    return out
+
+
+def result_to_meta(result: Any) -> Dict[str, Any]:
+    """Normalize an EpisodeResult (or mapping) into the meta shape."""
+    if result is None:
+        return {}
+    if isinstance(result, dict):
+        return dict(result)
+    fields = ("stop_reason", "outcome", "closed", "eof", "forced_kill",
+              "teardown_failure", "unanswered", "recorder_failed",
+              "protocol_failure", "failure_reason", "ticks", "needs",
+              "invalids", "actions", "returncode", "recording_complete",
+              "boundaries", "strategy_calls", "directives_applied", "budget")
+    meta = {}
+    for name in fields:
+        if hasattr(result, name):
+            meta[name] = getattr(result, name)
+    meta.setdefault("game_outcome", meta.get("outcome"))
+    return meta
+
+
+def forced_search_of(result: Any) -> Optional[Dict[str, Any]]:
+    """The forced-search counters from an EpisodeResult, or ``None``.
+
+    ``None`` means the source carries no forced-search evidence, which the
+    gate treats as *unavailable* rather than as a measured zero.
+    """
+    if result is None or not all(
+            hasattr(result, "forced_" + f) for f in
+            ("activations", "uncleared")):
+        return None
+    return {
+        "activations": getattr(result, "forced_activations", None),
+        "suffixes": getattr(result, "forced_suffixes", None),
+        "successes": getattr(result, "forced_successes", None),
+        "cancels": getattr(result, "forced_cancels", None),
+        "denials": getattr(result, "forced_denials", None),
+        "trapped": getattr(result, "forced_trapped", None),
+        "uncleared": getattr(result, "forced_uncleared", None),
+    }
+
+
 class Manifest(object):
     """The bench campaign manifest with atomic, additive updates."""
 
@@ -867,11 +974,13 @@ class BenchRunner(object):
 
     def __init__(self, spec: dict, out_dir: str, *,
                  episode_runner: Optional[Callable] = None,
+                 judge_factory: Optional[Callable] = None,
                  stop_file: Optional[str] = None,
                  now: Callable[[], float] = time.monotonic):
         self.spec = spec
         self.out_dir = out_dir
         self.episode_runner = episode_runner or default_episode_runner
+        self.judge_factory = judge_factory
         self.stop = StopController(stop_file)
         self.now = now
         self.manifest = Manifest(os.path.join(out_dir, "manifest.json"),
@@ -880,6 +989,27 @@ class BenchRunner(object):
         self.started = now()
         self.plan = plan_allocations(spec, spec["budget"]["max_candidates"]
                                      or 1)
+        self.judge = None
+        self._prov = None
+
+    # -- provenance --------------------------------------------------------
+    def provenance_id(self) -> Optional[str]:
+        if self._prov is None:
+            try:
+                self._prov = M.provenance_manifest(
+                    imported_code=M.imported_module_hashes(),
+                    versions={"scorecard_schema": M.SCORECARD_SCHEMA,
+                              "comparison_policy":
+                                  self.spec["comparison"].get(
+                                      "metric_policy_version")})
+            except Exception:  # noqa: BLE001 - provenance is best-effort
+                self._prov = {}
+        return self._prov.get("provenance_id")
+
+    def _write_run_artifact(self, name: str, obj: Any) -> str:
+        path = os.path.join(self.out_dir, name)
+        write_json_atomic(path, obj)
+        return path
 
     def run(self) -> Dict[str, Any]:
         if self.spec["tier"] == DRY_RUN:
@@ -916,14 +1046,22 @@ class BenchRunner(object):
                                      error=pre["error"])
             return {"ok": False, "error": pre["error"], "stage": pre["stage"]}
         config = pre["config"]
+        requested = {"reflex": config.reflex, "strategy": config.strategy,
+                     "judge": ("jev" if self.spec["judge"]["enabled"]
+                               else "none")}
         self.manifest.set_status("running", tier=LIVE,
-                                 requested_tiers={
-                                     "reflex": config.reflex,
-                                     "strategy": config.strategy,
-                                     "judge": ("jev"
-                                               if self.spec["judge"]["enabled"]
-                                               else "none")})
-        results = []
+                                 requested_tiers=requested,
+                                 cost_mode=pre.get("effective_cost_mode"),
+                                 unattended_apply_allowed=pre.get(
+                                     "unattended_apply_allowed"))
+        # Precommit the comparison design BEFORE any result exists.
+        pre_record = precommit_record(self.spec["comparison"])
+        self._write_run_artifact("precommit.json", pre_record)
+        self.judge = self._make_judge(pre)
+
+        results: List[Tuple[int, Any, str]] = []
+        cards: List[dict] = []
+        judge_results: List[dict] = []
         planned = self.spec["episodes"]
         index = 0
         with signal_handlers(
@@ -932,24 +1070,54 @@ class BenchRunner(object):
             while index < planned:
                 if self.stop.should_stop():
                     break
-                if self._wall_exceeded():
-                    self.manifest.set_status("partial", stop_reason=
-                                             M.BENCH_ABORTED,
-                                             reason="campaign-wall-exceeded")
-                    return self._finish(results, "partial",
-                                        M.BENCH_ABORTED)
+                if self._deadline_exceeded():
+                    self.manifest.set_status(
+                        "partial", stop_reason=M.BENCH_ABORTED,
+                        reason="campaign-deadline-exceeded")
+                    return self._after_loop(cards, "partial", M.BENCH_ABORTED,
+                                            judge_results)
                 index += 1
-                episode_dir = os.path.join(self.out_dir,
-                                           "ep-%d" % index)
+                episode_dir = os.path.join(self.out_dir, "ep-%d" % index)
                 self.manifest.reserve("ep-%d" % index,
                                       {"episode": index,
                                        "dir": episode_dir})
                 result, episode_dir = self._run_one(config, episode_dir, index)
-                self.manifest.settle("ep-%d" % index, "completed")
+                card, hashes, paths = self._seal_episode(
+                    episode_dir, index, result, requested)
+                cards.append(card)
                 results.append((index, result, episode_dir))
+                self.manifest.settle("ep-%d" % index, "completed")
+                self.manifest.add_episode({
+                    "index": index, "dir": episode_dir,
+                    "scorecard_hash": M.sha256_bytes(
+                        M.pretty_scorecard(card).encode("utf-8")),
+                    "source_hashes": hashes,
+                    "integrity": card["integrity"]["status"],
+                    "terminal_class": card["terminal_class"],
+                    "hard_failure": card["gates"]["hard_failure"],
+                })
+                judged = self._judge_episode(card, index)
+                if judged is not None:
+                    judge_results.append(judged)
         stop_reason = self.stop.stop_reason()
         status = "complete" if stop_reason is None else "partial"
-        return self._finish(results, status, stop_reason)
+        return self._after_loop(cards, status, stop_reason, judge_results)
+
+    def _make_judge(self, pre: dict):
+        """Construct the advisory judge when enabled and budgeted."""
+        if not self.spec["judge"]["enabled"]:
+            return None
+        calls_total = self.spec["budget"]["judge_calls_total"]
+        if calls_total <= 0:
+            return None
+        if self.judge_factory is not None:
+            return self.judge_factory(calls_total, self.spec["judge"])
+        from . import bench_judge as J
+        return J.BenchJudge(model=self.spec["judge"]["model"],
+                            rubric_version=self.spec["judge"]["rubric_version"],
+                            deadline_s=self.spec["judge"]["deadline_s"],
+                            max_state_bytes=self.spec["judge"]["max_state_bytes"],
+                            calls_total=calls_total)
 
     def _run_one(self, config, episode_dir, index):
         paths = self._paths()
@@ -957,6 +1125,166 @@ class BenchRunner(object):
             config, paths, episode_dir, index,
             self.spec["episode_timeout_s"])
         return result, episode_dir
+
+    def _seal_episode(self, episode_dir: str, index: int, result: Any,
+                      requested: dict) -> Tuple[dict, dict, dict]:
+        """Hash the artifacts and build/store the immutable scorecard."""
+        paths = episode_artifact_paths(episode_dir, index)
+        meta = _read_json(paths["meta"])
+        if not meta:
+            meta = result_to_meta(result)
+        decisions = _read_jsonl(paths["decisions"])
+        hashes = source_hashes_of(paths)
+        budget = meta.get("budget") if isinstance(meta.get("budget"), dict) \
+            else (getattr(result, "budget", {}) if result is not None else {})
+        card = M.build_scorecard(
+            episode_id="ep-%d" % index, provenance_id=self.provenance_id(),
+            source_hashes=hashes, meta=meta, budget=budget or {},
+            wire_path=paths["wire"], actions_path=paths["actions"],
+            events_path=paths["events"], decisions=decisions,
+            forced_search=forced_search_of(result), requested_tiers=requested,
+            deadline_classification=self.spec["comparison"][
+                "deadline_classification"])
+        return card, hashes, paths
+
+    def _judge_episode(self, card: dict, index: int) -> Optional[dict]:
+        """One advisory dispatch per *eligible* episode, after sealing."""
+        if self.judge is None:
+            return None
+        if card["integrity"]["status"] == "missing":
+            return None
+        if card.get("terminal_class") == M.EXCLUDED:
+            return None
+        try:
+            result = self.judge.evaluate(card)
+        except Exception as exc:  # noqa: BLE001 - advisory never fatal
+            result = {"status": "error", "error": str(exc), "advisory": True}
+        self.manifest.data["judge_calls"].append(
+            {"episode": index, "status": result.get("status"),
+             "dispatches": result.get("dispatches", 0),
+             "cache_hit": result.get("cache_hit", False),
+             "flags": result.get("flags", [])})
+        self.manifest.flush()
+        return dict(result, episode=index)
+
+    def _baseline_cards(self) -> List[dict]:
+        ref = self.spec.get("baseline_ref")
+        if not ref:
+            return []
+        path = ref if ref.endswith(".json") else os.path.join(
+            ref, "scorecards.json")
+        loaded = _read_json(path)
+        if not loaded:
+            return []
+        cards = loaded.get("candidate") or loaded.get("cards") or []
+        return list(cards)
+
+    def _live_validation(self, cards: Sequence[dict]) -> Dict[str, Any]:
+        required = False
+        failed = []
+        for card in cards:
+            req = card["integrity"]["requested_tiers"]
+            obs = card["integrity"]["observed_tiers"]
+            check = M.live_jev_validation(req, obs)
+            if check["required"]:
+                required = True
+                if not check["ok"]:
+                    failed.append({"episode": card["episode_id"],
+                                   "reason": check["reason"]})
+        return {"required": required, "ok": not failed, "failures": failed}
+
+    def _after_loop(self, cards: List[dict], status: str,
+                    stop_reason: Optional[str],
+                    judge_results: Sequence[dict]) -> Dict[str, Any]:
+        """Comparison, postmortem packaging and tuner stages after the loop."""
+        live = self._live_validation(cards)
+        scorecards_path = self._write_run_artifact("scorecards.json", {
+            "schema_version": "bench-scorecards/1",
+            "candidate": cards,
+            "precommit": precommit_record(self.spec["comparison"]),
+        })
+        comparison = self._compare(cards, live)
+        comparison_path = self._write_run_artifact("comparison.json",
+                                                   comparison)
+        postmortem_path = self._package(cards, comparison, live,
+                                        judge_results)
+        tuning_path = self._tuning_stage(comparison)
+        self.manifest.set_status(
+            status, stop_reason=stop_reason, episodes_done=len(cards),
+            partial=(status != "complete"),
+            live_validation=live,
+            scorecards=scorecards_path, comparison=comparison_path,
+            postmortem=postmortem_path, tuning=tuning_path)
+        return {"ok": status == "complete" and live["ok"],
+                "status": status, "stop_reason": stop_reason,
+                "episodes": len(cards), "live_validation": live,
+                "comparison": comparison, "scorecards": cards,
+                "postmortem": postmortem_path, "tuning": tuning_path,
+                "manifest": self.manifest.data}
+
+    def _compare(self, cards: List[dict], live: dict) -> Dict[str, Any]:
+        if not live["ok"]:
+            return {"schema_version": M.COMPARISON_SCHEMA, "refused": True,
+                    "refusal_reason": "live-tier-validation-failed",
+                    "live_validation": live,
+                    "admission": {"apply_allowed": False},
+                    "verdict": "not-comparable"}
+        baseline = self._baseline_cards()
+        if not baseline:
+            return {"schema_version": M.COMPARISON_SCHEMA, "refused": True,
+                    "refusal_reason": "no-baseline",
+                    "admission": {"apply_allowed": False},
+                    "verdict": "inconclusive"}
+        policy = dict(self.spec["comparison"])
+        policy["admission_margin"] = 0.0
+        result = M.compare_arms(baseline, cards, policy,
+                                base_provenance=None,
+                                cand_provenance=self._prov)
+        result["design"] = precommit_record(self.spec["comparison"])
+        return result
+
+    def _package(self, cards: List[dict], comparison: dict, live: dict,
+                 judge_results: Sequence[dict]) -> Optional[str]:
+        hard = [c["episode_id"] for c in cards
+                if c["gates"]["hard_failure"]]
+        flags = [j for j in judge_results if j.get("flags")]
+        verdict = comparison.get("verdict")
+        needs = bool(hard) or not live["ok"] or bool(flags) or \
+            verdict in ("fail", "inconclusive") or comparison.get("refused")
+        if not needs:
+            return None
+        excerpt_paths = {}
+        anchors = {}
+        for card in cards:
+            if not card["gates"]["hard_failure"]:
+                continue
+            name = card["episode_id"]
+            wire = os.path.join(self.out_dir, name, name + ".wire.jsonl")
+            decisions = os.path.join(self.out_dir, name,
+                                     name + ".decisions.jsonl")
+            if os.path.exists(wire):
+                excerpt_paths["%s.wire" % name] = wire
+            if os.path.exists(decisions):
+                excerpt_paths["%s.decisions" % name] = decisions
+        pkg = M.build_postmortem_package(
+            out_dir=self.out_dir, failure_kind="bench-gate-or-regression",
+            failed_gates=sorted({g for c in cards
+                                 for g, v in c["gates"].items()
+                                 if v is True and g.endswith("hard_failure")}),
+            comparison=comparison, scorecards=cards,
+            judge_answers=list(judge_results),
+            artifact_paths={c["episode_id"]: os.path.join(
+                self.out_dir, c["episode_id"]) for c in cards},
+            excerpt_paths=excerpt_paths, excerpt_anchors=anchors,
+            spec_ref=self.spec.get("name"))
+        return pkg.get("written_to")
+
+    def _tuning_stage(self, comparison: dict) -> str:
+        report = tuner_plan(self.spec)
+        report["comparison_verdict"] = comparison.get("verdict")
+        report["apply_allowed"] = bool(
+            (comparison.get("admission") or {}).get("apply_allowed"))
+        return self._write_run_artifact("tuning-report.json", report)
 
     def _paths(self):
         """Resolve the worker/runner/data paths from the environment.
@@ -972,31 +1300,36 @@ class BenchRunner(object):
         return {"worker": worker, "runner": runner, "data": data,
                 "sysconf": os.environ.get("BENCH_SYSCONF") or None}
 
-    def _wall_exceeded(self) -> bool:
-        limit = self.spec["budget"].get("max_total_wall_s") or 0
+    def _deadline(self) -> float:
+        """The campaign wall budget: the stricter of the two declared limits."""
+        limits = []
+        for key in ("max_total_wall_s", "campaign_timeout_s"):
+            value = self.spec["budget"].get(key) \
+                if key == "max_total_wall_s" else self.spec.get(key)
+            if value:
+                limits.append(float(value))
+        return min(limits) if limits else 0.0
+
+    def _deadline_exceeded(self) -> bool:
+        limit = self._deadline()
         if not limit:
             return False
         return (self.now() - self.started) > limit
 
     def _force_abort(self, results) -> None:
         # forced: reap the owned tree of every recorded episode process
+        teardown_failed = False
         for entry in list(self.manifest.data["episodes"]):
             pid = entry.get("root_pid")
             if pid:
                 outcome = self.abort_tree.reap(int(pid))
                 if outcome.get("teardown_failure"):
-                    self.manifest.set_status(
-                        "teardown-failure", teardown_failure=True)
+                    teardown_failed = True
         self.manifest.note_unknown_exposure(
             {"reason": "forced-abort", "episodes": len(results)})
-
-    def _finish(self, results, status, stop_reason) -> Dict[str, Any]:
-        self.manifest.set_status(status, stop_reason=stop_reason,
-                                 episodes_done=len(results),
-                                 partial=(status != "complete"))
-        return {"ok": status == "complete", "status": status,
-                "stop_reason": stop_reason,
-                "episodes": len(results), "manifest": self.manifest.data}
+        if teardown_failed:
+            self.manifest.set_status("teardown-failure",
+                                     teardown_failure=True)
 
 
 # --------------------------------------------------------------------------
@@ -1178,19 +1511,120 @@ def _cmd_run(args) -> int:
 
 
 def _cmd_compare(args) -> int:
-    print("compare requires scored artifacts; see doc/agent-campaign-bench.md")
-    return 1
+    """Compare a run's candidate scorecards against a baseline, write JSON."""
+    spec = load_spec(args.spec) if args.spec else None
+    run_dir = args.run_dir or args.out_dir or ("." if not args.spec else None)
+    if not run_dir:
+        print("error: compare needs --run-dir", file=sys.stderr)
+        return 2
+    loaded = _read_json(os.path.join(run_dir, "scorecards.json"))
+    if not loaded:
+        print("error: no scorecards.json under %s" % run_dir, file=sys.stderr)
+        return 2
+    candidate = list(loaded.get("candidate") or loaded.get("cards") or [])
+    baseline_dir = args.baseline_dir
+    baseline = []
+    if baseline_dir:
+        base_loaded = _read_json(os.path.join(baseline_dir, "scorecards.json"))
+        baseline = list((base_loaded or {}).get("candidate")
+                        or (base_loaded or {}).get("cards") or [])
+    if spec is None:
+        policy = dict(loaded.get("precommit", {}).get("policy") or {})
+    else:
+        policy = dict(spec["comparison"])
+    policy.setdefault("admission_margin", 0.0)
+    if not baseline:
+        result = {"schema_version": M.COMPARISON_SCHEMA, "refused": True,
+                  "refusal_reason": "no-baseline",
+                  "admission": {"apply_allowed": False},
+                  "verdict": "inconclusive"}
+    else:
+        result = M.compare_arms(baseline, candidate, policy)
+        if spec is not None:
+            result["design"] = precommit_record(spec["comparison"])
+    out = os.path.join(run_dir, "comparison.json")
+    write_json_atomic(out, result)
+    print(json.dumps({"verdict": result.get("verdict"), "written": out},
+                     indent=2, sort_keys=True))
+    return 0 if result.get("verdict") else 1
 
 
 def _cmd_tune(args) -> int:
+    """Emit the finite tuner plan/report and write the artifact."""
     spec = load_spec(args.spec)
-    print(json.dumps(tuner_plan(spec), indent=2, sort_keys=True))
+    report = tuner_plan(spec)
+    if args.run_dir:
+        results = []
+        loaded = _read_json(os.path.join(args.run_dir, "scorecards.json"))
+        if loaded:
+            results = [{"candidate": None,
+                        "comparison": _read_json(os.path.join(
+                            args.run_dir, "comparison.json")) or {}}]
+        report["ranked"] = tuner_report(spec, results)["ranked"]
+    else:
+        report["ranked"] = []
+    report["mode"] = spec["tuning"]["mode"]
+    out_dir = args.out_dir or args.run_dir or "."
+    out = os.path.join(out_dir, "tuning-report.json")
+    write_json_atomic(out, report)
+    print(json.dumps({"n_candidates": report["n_candidates"], "written": out},
+                     indent=2, sort_keys=True))
     return 0
 
 
 def _cmd_package(args) -> int:
-    print("package requires a run directory; see doc/agent-campaign-bench.md")
-    return 1
+    """Assemble the bounded postmortem package from a run directory."""
+    run_dir = args.run_dir or args.out_dir
+    if not run_dir:
+        print("error: package needs --run-dir", file=sys.stderr)
+        return 2
+    loaded = _read_json(os.path.join(run_dir, "scorecards.json"))
+    cards = list((loaded or {}).get("candidate")
+                 or (loaded or {}).get("cards") or [])
+    comparison = _read_json(os.path.join(run_dir, "comparison.json"))
+    excerpt_paths: Dict[str, str] = {}
+    artifact_paths: Dict[str, str] = {}
+    for card in cards:
+        name = card.get("episode_id")
+        if not name:
+            continue
+        ep_dir = os.path.join(run_dir, name)
+        artifact_paths[name] = ep_dir
+        for label in ("wire", "decisions", "events", "actions"):
+            path = os.path.join(ep_dir, "%s.%s.jsonl" % (name, label))
+            if os.path.exists(path):
+                excerpt_paths["%s.%s" % (name, label)] = path
+    pkg = M.build_postmortem_package(
+        out_dir=run_dir,
+        failure_kind=args.failure_kind or "operator-requested",
+        failed_gates=sorted({g for c in cards
+                             for g, v in (c.get("gates") or {}).items()
+                             if v is True and g.endswith("hard_failure")}),
+        comparison=comparison, scorecards=cards,
+        artifact_paths=artifact_paths, excerpt_paths=excerpt_paths)
+    print(json.dumps({"written": pkg.get("written_to"),
+                      "excerpts": sorted(pkg["excerpts"])},
+                     indent=2, sort_keys=True))
+    return 0
+
+
+def _cmd_child(args) -> int:
+    """Run exactly one controller episode in its own process/session."""
+    from . import controller as C
+    spec = load_spec(args.spec)
+    config, err = resolve_provider_config(spec)
+    if err:
+        print("error: %s" % err, file=sys.stderr)
+        return 2
+    paths = {"worker": args.worker, "runner": args.runner, "data": args.data,
+             "sysconf": args.sysconf or None}
+    ctl = C.Controller(config, C.ControllerPaths(**paths), args.episode_dir,
+                       episode_timeout=args.timeout)
+    results = ctl.run_campaign(1)
+    result = result_to_meta(results[0] if results else None)
+    write_json_atomic(os.path.join(args.episode_dir, "bench-child.json"),
+                      {"ok": True, "result": result})
+    return 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -1200,18 +1634,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         p = sub.add_parser(name)
         p.add_argument("spec", nargs="?")
         p.add_argument("--out-dir", default=None)
+        p.add_argument("--run-dir", default=None)
+        p.add_argument("--baseline-dir", default=None)
+        p.add_argument("--failure-kind", default=None)
+    child = sub.add_parser("_child")
+    for flag in ("--spec", "--worker", "--runner", "--data", "--sysconf",
+                 "--episode-dir", "--timeout"):
+        child.add_argument(flag, required=flag in ("spec", "worker", "runner",
+                                                   "data", "episode-dir"))
     args = ap.parse_args(argv)
     handlers = {"validate": _cmd_validate, "run": _cmd_run,
                 "score": _cmd_score, "compare": _cmd_compare,
-                "tune": _cmd_tune, "package": _cmd_package}
+                "tune": _cmd_tune, "package": _cmd_package,
+                "_child": _cmd_child}
     handler = handlers.get(args.command)
     if handler is None:
         ap.print_help()
         return 2
-    if args.command != "compare" and args.command != "package" and not \
-            args.spec:
+    if args.command in ("validate", "run", "score", "tune") and not args.spec:
         print("error: a spec path is required", file=sys.stderr)
         return 2
+    if args.command == "tune":
+        args.run_dir = args.run_dir or args.out_dir
+    if args.command == "_child":
+        args.timeout = float(args.timeout or 300.0)
     return handler(args)
 
 

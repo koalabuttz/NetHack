@@ -970,6 +970,123 @@ class LiveGate(unittest.TestCase):
 # spec validation
 # ==========================================================================
 
+class WorkflowWiring(unittest.TestCase):
+    """Finding #1: the public workflow actually wires the helpers."""
+
+    def _spec(self, tmp):
+        ov = {"reflex": "jev", "jev_accept_terms": True, "reflex_call_cap": 8}
+        spec = _valid_spec(tier="live", episodes=3, overrides=ov)
+        spec["judge"] = {"enabled": True, "model": "jev-latest",
+                         "rubric_version": "bench-judge-rubric/1",
+                         "deadline_s": 10.0, "max_state_bytes": 8192,
+                         "max_response_bytes": 65536, "retries": 0}
+        spec["budget"]["judge_calls_total"] = 10
+        spec["budget"]["max_total_episodes"] = 100
+        path = os.path.join(tmp, "spec.json")
+        with open(path, "w") as fh:
+            json.dump(spec, fh)
+        return spec, path
+
+    def _write_episode(self, episode_dir, index, stop_reason):
+        os.makedirs(episode_dir, exist_ok=True)
+        meta = {
+            "stop_reason": stop_reason, "outcome": "unknown", "closed": True,
+            "returncode": 0, "recording_complete": True, "ticks": 40,
+            "needs": 5, "actions": 5, "invalids": 0, "boundaries": 0,
+            "strategy_calls": 0, "directives_applied": 0, "forced_kill": False,
+            "teardown_failure": False, "unanswered": False,
+            "protocol_failure": None, "failure_reason": None,
+            "config": {"reflex": "jev", "strategy": "off"},
+            "budget": {"usage": {"prompt_tokens": 0, "completion_tokens": 0,
+                                 "estimated_usd": 0.0},
+                       "providers": {},  # zero observed Jev calls
+                       "reflex": {"applied": 0, "paid_dispatched": 0,
+                                  "successful": 0},
+                       "strategy": {"postmortem_reserve": 0}},
+        }
+        with open(os.path.join(episode_dir, "ep-%d.meta.json" % index),
+                  "w") as fh:
+            json.dump(meta, fh)
+        with open(os.path.join(episode_dir,
+                               "ep-%d.decisions.jsonl" % index), "w") as fh:
+            fh.write("")
+
+    def test_live_run_seals_scores_judges_and_manifests(self):
+        from tools.agent import bench_judge as J
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        spec, spec_path = self._spec(tmp)
+        os.environ[B.VAPOR_CLOUD_ENV] = "attested"
+        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
+
+        dispatches = {"n": 0}
+
+        def transport(payload):
+            dispatches["n"] += 1
+            self.assertEqual(set(payload["questions"]),
+                             {"degenerate_loop", "exploration_productivity",
+                              "termination_sanity"})
+            return {"model": "jev-1.13.0",
+                    "answers": {
+                        "degenerate_loop": {"type": "noul", "noul": 0.1},
+                        "exploration_productivity": {
+                            "type": "score", "score": 2.5, "confidence": 0.9},
+                        "termination_sanity": {"type": "noul", "noul": 0.9}},
+                    "usage": {"input_tokens": 300, "output_tokens": 20}}
+
+        def judge_factory(calls_total, jspec):
+            return J.BenchJudge(model=jspec["model"], calls_total=calls_total,
+                                transport=transport)
+
+        runner = B.BenchRunner(spec, tmp, judge_factory=judge_factory)
+        class _Result(object):
+            budget = {}
+            forced_activations = 0
+            forced_suffixes = 0
+            forced_successes = 0
+            forced_cancels = 0
+            forced_denials = 0
+            forced_trapped = 0
+            forced_uncleared = 0
+
+        def fake_runner(config, paths, episode_dir, index, timeout):
+            stop = ("bench-stopped-graceful" if index == 3
+                    else "tick-cap-graceful-quit")
+            self._write_episode(episode_dir, index, stop)
+            return _Result(), episode_dir
+
+        runner.episode_runner = fake_runner
+        out = runner.run()
+
+        # scorecards + manifest entries with checksums
+        self.assertEqual(len(out["scorecards"]), 3)
+        self.assertTrue(os.path.exists(os.path.join(tmp, "scorecards.json")))
+        self.assertEqual(len(out["manifest"]["episodes"]), 3)
+        for entry in out["manifest"]["episodes"]:
+            self.assertTrue(entry["source_hashes"].get("meta"))
+            self.assertTrue(entry["scorecard_hash"])
+        # exactly one bundled dispatch per ELIGIBLE episode (2 of 3)
+        self.assertEqual(dispatches["n"], 2)
+        self.assertEqual(len(out["manifest"]["judge_calls"]), 2)
+        # requested Jev with zero observed Jev calls -> live validation failed
+        self.assertTrue(out["live_validation"]["required"])
+        self.assertFalse(out["live_validation"]["ok"])
+        # comparison/apply refused
+        self.assertTrue(out["comparison"]["refused"])
+        self.assertFalse(out["comparison"]["admission"]["apply_allowed"])
+        self.assertFalse(B.promote_baseline(
+            run_status=out["status"], comparison=out["comparison"])["promoted"])
+
+        # the three CLI commands produce their artifacts
+        self.assertEqual(B.main(["compare", "--run-dir", tmp]), 0)
+        self.assertTrue(os.path.exists(os.path.join(tmp, "comparison.json")))
+        self.assertEqual(B.main(["tune", spec_path, "--run-dir", tmp]), 0)
+        self.assertTrue(os.path.exists(os.path.join(tmp, "tuning-report.json")))
+        self.assertEqual(B.main(["package", "--run-dir", tmp]), 0)
+        self.assertTrue(os.path.exists(
+            os.path.join(tmp, "postmortem", "manifest.json")))
+
+
 class SpecValidation(unittest.TestCase):
     def test_valid_spec_passes_and_unknown_knob_rejected(self):
         self.assertIsNone(B.validate_spec(_valid_spec()))
