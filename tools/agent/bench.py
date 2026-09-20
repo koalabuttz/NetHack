@@ -1,0 +1,1219 @@
+"""Campaign bench CLI, spec validation, runner and suggest-first tuner.
+
+The bench is **agent-side tooling that observes and configures**: it validates
+a declarative ``bench-spec/1``, runs bounded campaigns by wrapping the existing
+``Controller.run_campaign(1)`` in isolated episode directories, scores the
+artifacts with :mod:`tools.agent.bench_metrics`, compares runs, requests an
+advisory per-episode Jev judgment (see :mod:`tools.agent.bench_judge`), and
+suggests (or, only with explicit approval, narrowly applies) parameter changes.
+It never patches the engine, the controller or a running agent.
+
+Commands:
+
+    python3 -m tools.agent.bench {validate,run,score,compare,tune,package} ...
+
+Hard rules enforced here:
+* the bench observes and configures -- no live controller/reflex edits;
+* credentials stay config *references* (never copied into output);
+* artifacts are versioned, additive, and record *unavailable* rather than zero;
+* ``postmortem_reserve`` is forced to 0 (no DeepSeek postmortems in bench);
+* stops admit no further work and reap only the owned episode tree.
+"""
+
+import argparse
+import json
+import math
+import os
+import signal
+import subprocess
+import sys
+import time
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+from . import bench_metrics as M
+
+SPEC_SCHEMA = "bench-spec/1"
+MANIFEST_SCHEMA = "bench-manifest/1"
+DRY_RUN = "dry-run"
+LIVE = "live"
+PROFILES = ("smoke", "full", "confirmation")
+TIERS = (DRY_RUN, LIVE)
+COST_MODES = ("priced-bound", "call-bounded", "operator-approved-unknown")
+
+SPEC_TOP_KEYS = (
+    "schema_version", "name", "tier", "profile", "provider_config_ref",
+    "overrides", "episodes", "episode_timeout_s", "campaign_timeout_s",
+    "replay_inputs", "baseline_ref", "budget", "judge", "comparison",
+    "tuning",
+)
+BUDGET_KEYS = ("strategy_calls_total", "judge_calls_total",
+               "max_total_episodes", "max_candidates", "max_total_wall_s",
+               "usd_limit", "cost_mode", "external_limit_ref")
+JUDGE_KEYS = ("enabled", "model", "rubric_version", "deadline_s",
+              "max_state_bytes", "max_response_bytes", "retries")
+COMPARISON_KEYS = (
+    "metric_policy_version", "target_metric", "min_improvement",
+    "noninferiority_margins", "min_samples", "resampling_seed", "resamples",
+    "confidence_level", "screening_episodes_per_arm",
+    "confirmation_episodes_per_arm", "min_completed_episodes_per_arm",
+    "min_aggregate_at_risk_ticks_per_arm", "deadline_classification",
+    "invalid_policy_version", "invalid_policy_approval_hash",
+)
+TUNING_KEYS = ("mode", "parameters", "approval_id", "approval_expiry",
+               "expected_base_config_hash")
+DEADLINE_CLASSES = ("horizon-completion", "adverse-early")
+
+#: Provider knobs an operator may override through a spec, and the frozen ones.
+OVERRIDABLE_KNOBS = (
+    "reflex", "strategy", "role", "max_ticks", "strategy_call_cap",
+    "reflex_call_cap", "boundary_cooldown_ticks",
+    "boundary_cooldown_wall", "boundary_emergency_wall", "token_cap",
+    "usd_cap", "deepseek_price_in", "deepseek_price_out",
+    "deepseek_price_cache_hit", "deepseek_model", "deepseek_base_url",
+    "deepseek_key_file", "jev_key_file", "jev_base_url", "jev_accept_terms",
+    "jev_relative_factor", "jev_confidence_mode", "postmortem_reserve",
+)
+
+#: The tuner's eligible coordinate-search knobs (plan §6 rails).  Everything
+#: else -- especially ``jev_relative_factor`` -- is frozen by default.
+TUNER_ELIGIBLE_KNOBS = ("reflex_call_cap", "strategy_call_cap",
+                        "boundary_cooldown_ticks", "boundary_cooldown_wall")
+TUNER_FROZEN_KNOBS = ("jev_relative_factor", "jev_confidence_mode",
+                      "confidence_threshold", "low_confidence_needs",
+                      "boundary_emergency_wall", "max_ticks")
+
+
+# --------------------------------------------------------------------------
+# spec validation
+# --------------------------------------------------------------------------
+
+def _finite(v) -> bool:
+    return (not isinstance(v, bool) and isinstance(v, (int, float))
+            and math.isfinite(float(v)))
+
+
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _unknown_keys(obj: dict, allowed: Sequence[str], where: str) -> List[str]:
+    if not isinstance(obj, dict):
+        return ["%s must be an object" % where]
+    return ["%s: unknown key %r" % (where, k) for k in sorted(obj)
+            if k not in allowed]
+
+
+def validate_spec(spec: dict) -> Optional[str]:
+    """Return an error string for an invalid ``bench-spec/1``, else ``None``."""
+    if not isinstance(spec, dict):
+        return "spec must be an object"
+    problem = _unknown_keys(spec, SPEC_TOP_KEYS, "spec")
+    if problem:
+        return problem[0]
+    for key in SPEC_TOP_KEYS:
+        if key not in spec:
+            return "spec missing required key %r" % key
+    if spec.get("schema_version") != SPEC_SCHEMA:
+        return "schema_version must be %r" % SPEC_SCHEMA
+    if spec.get("tier") not in TIERS:
+        return "tier must be one of %s" % (TIERS,)
+    if spec.get("profile") not in PROFILES:
+        return "profile must be one of %s" % (PROFILES,)
+    if not isinstance(spec.get("name"), str) or not spec["name"]:
+        return "name must be a non-empty string"
+    if not _is_int(spec.get("episodes")) or spec["episodes"] < 1:
+        return "episodes must be a positive integer"
+    for key in ("episode_timeout_s", "campaign_timeout_s"):
+        if not _finite(spec.get(key)) or spec[key] <= 0:
+            return "%s must be a positive finite number" % key
+    if not isinstance(spec.get("provider_config_ref"), (str, dict)):
+        return "provider_config_ref must be a string or object reference"
+    if not isinstance(spec.get("overrides"), dict):
+        return "overrides must be an object"
+    bad = [k for k in spec["overrides"] if k not in OVERRIDABLE_KNOBS]
+    if bad:
+        return "overrides contains non-allowlisted knob %r" % bad[0]
+    if not isinstance(spec.get("replay_inputs"), list):
+        return "replay_inputs must be a list"
+
+    problem = _validate_budget(spec["budget"])
+    if problem:
+        return problem
+    problem = _validate_judge(spec["judge"])
+    if problem:
+        return problem
+    problem = _validate_comparison(spec["comparison"])
+    if problem:
+        return problem
+    problem = _validate_tuning(spec["tuning"])
+    if problem:
+        return problem
+    return None
+
+
+def _validate_budget(b: dict) -> Optional[str]:
+    problem = _unknown_keys(b, BUDGET_KEYS, "budget")
+    if problem:
+        return problem[0]
+    for key in BUDGET_KEYS:
+        if key not in b:
+            return "budget missing required key %r" % key
+    for key in ("strategy_calls_total", "judge_calls_total",
+                "max_total_episodes", "max_candidates", "max_total_wall_s"):
+        if not _is_int(b[key]) or b[key] < 0:
+            return "budget.%s must be a nonnegative integer" % key
+    if b["cost_mode"] not in COST_MODES:
+        return "budget.cost_mode must be one of %s" % (COST_MODES,)
+    if b["usd_limit"] is not None:
+        if not _finite(b["usd_limit"]) or b["usd_limit"] < 0:
+            return "budget.usd_limit must be null or nonnegative finite"
+        if b["cost_mode"] != "priced-bound":
+            return ("budget.usd_limit requires cost_mode=priced-bound")
+    if b["external_limit_ref"] is not None \
+            and not isinstance(b["external_limit_ref"], str):
+        return "budget.external_limit_ref must be null or a string"
+    return None
+
+
+def _validate_judge(j: dict) -> Optional[str]:
+    problem = _unknown_keys(j, JUDGE_KEYS, "judge")
+    if problem:
+        return problem[0]
+    for key in JUDGE_KEYS:
+        if key not in j:
+            return "judge missing required key %r" % key
+    if not isinstance(j["enabled"], bool):
+        return "judge.enabled must be a boolean"
+    if not isinstance(j["model"], str) or not j["model"]:
+        return "judge.model must be a non-empty string"
+    if not isinstance(j["rubric_version"], str) or not j["rubric_version"]:
+        return "judge.rubric_version must be a non-empty string"
+    if j["retries"] != 0:
+        return "judge.retries must be exactly 0 (no automatic retries)"
+    for key in ("deadline_s",):
+        if not _finite(j[key]) or j[key] <= 0:
+            return "judge.%s must be positive and finite" % key
+    for key in ("max_state_bytes", "max_response_bytes"):
+        if not _is_int(j[key]) or j[key] < 1:
+            return "judge.%s must be a positive integer" % key
+    if j["max_state_bytes"] > 8 * 1024:
+        return "judge.max_state_bytes must be <= 8192 (initial 8 KiB cap)"
+    return None
+
+
+def _validate_comparison(c: dict) -> Optional[str]:
+    problem = _unknown_keys(c, COMPARISON_KEYS, "comparison")
+    if problem:
+        return problem[0]
+    for key in COMPARISON_KEYS:
+        if key not in c:
+            return "comparison missing required key %r" % key
+    for key in ("screening_episodes_per_arm", "confirmation_episodes_per_arm",
+                "min_samples", "resamples", "resampling_seed",
+                "min_completed_episodes_per_arm",
+                "min_aggregate_at_risk_ticks_per_arm"):
+        if not _is_int(c[key]) or c[key] < 0:
+            return "comparison.%s must be a nonnegative integer" % key
+    if c["screening_episodes_per_arm"] < 1:
+        return "comparison.screening_episodes_per_arm must be >= 1"
+    if c["confirmation_episodes_per_arm"] <= \
+            c["screening_episodes_per_arm"]:
+        return ("comparison.confirmation_episodes_per_arm must be strictly "
+                "greater than screening_episodes_per_arm")
+    if c["min_samples"] < 1:
+        return "comparison.min_samples must be >= 1"
+    if c["min_completed_episodes_per_arm"] == 0 \
+            and c["min_aggregate_at_risk_ticks_per_arm"] == 0:
+        return ("comparison requires a predeclared exposure floor: at least one "
+                "of min_completed_episodes_per_arm / "
+                "min_aggregate_at_risk_ticks_per_arm must be non-zero")
+    if c["deadline_classification"] not in DEADLINE_CLASSES:
+        return "comparison.deadline_classification must be one of %s" \
+            % (DEADLINE_CLASSES,)
+    for key in ("min_improvement", "confidence_level"):
+        if not _finite(c[key]):
+            return "comparison.%s must be a finite number" % key
+    if not (0.0 < c["confidence_level"] < 1.0):
+        return "comparison.confidence_level must be in (0, 1)"
+    if not isinstance(c["noninferiority_margins"], dict):
+        return "comparison.noninferiority_margins must be an object"
+    for k, v in c["noninferiority_margins"].items():
+        if not _finite(v):
+            return "noninferiority_margins[%r] must be finite" % k
+    for key in ("metric_policy_version", "invalid_policy_version"):
+        if not isinstance(c[key], str) or not c[key]:
+            return "comparison.%s must be a non-empty string" % key
+    if not isinstance(c["invalid_policy_approval_hash"], str) \
+            or not c["invalid_policy_approval_hash"]:
+        return ("comparison.invalid_policy_approval_hash must be a non-empty "
+                "string")
+    return None
+
+
+def _validate_tuning(t: dict) -> Optional[str]:
+    problem = _unknown_keys(t, TUNING_KEYS, "tuning")
+    if problem:
+        return problem[0]
+    for key in TUNING_KEYS:
+        if key not in t:
+            return "tuning missing required key %r" % key
+    if t["mode"] not in ("suggest", "apply-approved"):
+        return "tuning.mode must be suggest or apply-approved"
+    if not isinstance(t["parameters"], dict):
+        return "tuning.parameters must be an object"
+    for knob, rail in t["parameters"].items():
+        if knob not in TUNER_ELIGIBLE_KNOBS and knob not in TUNER_FROZEN_KNOBS:
+            return "tuning.parameters has unknown knob %r" % knob
+        if not isinstance(rail, dict) or "grid" not in rail:
+            return "tuning.parameters[%r] must have a grid" % knob
+        grid = rail["grid"]
+        if not isinstance(grid, list) or not grid:
+            return "tuning.parameters[%r].grid must be a non-empty list" % knob
+        if any(not _finite(v) for v in grid):
+            return "tuning.parameters[%r].grid must be finite numbers" % knob
+        lo, hi = rail.get("min"), rail.get("max")
+        if (lo is not None and any(v < lo for v in grid)) or \
+                (hi is not None and any(v > hi for v in grid)):
+            return ("tuning.parameters[%r].grid exceeds operator rails" % knob)
+    return None
+
+
+def load_spec(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as fh:
+        spec = json.load(fh)
+    problem = validate_spec(spec)
+    if problem:
+        raise ValueError(problem)
+    return spec
+
+
+# --------------------------------------------------------------------------
+# provider-config resolution (references only, postmortem reserve forced 0)
+# --------------------------------------------------------------------------
+
+def resolve_provider_config(spec: dict, *, base: Optional[dict] = None
+                            ) -> Tuple[Optional[Any], Optional[str]]:
+    """Resolve ``provider_config_ref`` + allowlisted ``overrides`` to a config.
+
+    Returns ``(config, error)``.  ``postmortem_reserve`` is forced to 0 and the
+    resolved values are validated through ``ProviderConfig.validate`` -- the one
+    authority -- so an impossible cap is rejected before any spawn.
+    """
+    from . import providers
+    ref = spec["provider_config_ref"]
+    values: Dict[str, Any] = {}
+    if isinstance(ref, dict):
+        values.update(ref)
+    elif isinstance(ref, str) and os.path.exists(ref):
+        with open(ref, "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+        if not isinstance(loaded, dict):
+            return None, "provider_config_ref file must contain an object"
+        values.update(loaded)
+    if base:
+        values.update(base)
+    values.update(spec.get("overrides") or {})
+    # Bench policy: no DeepSeek postmortems, ever.  Reject an explicit attempt
+    # to enable them rather than silently clamping.
+    if values.get("postmortem_reserve", 0):
+        return None, ("postmortem_reserve must be 0 in a bench campaign "
+                      "(DeepSeek postmortems are disabled)")
+    values["postmortem_reserve"] = 0
+    unknown = [k for k in values if k not in OVERRIDABLE_KNOBS]
+    if unknown:
+        return None, "provider config has unknown knob %r" % unknown[0]
+    try:
+        config = providers.ProviderConfig(**values)
+    except TypeError as exc:
+        return None, "provider config: %s" % exc
+    problem = config.validate(episodes=spec["episodes"],
+                              episode_timeout=spec["episode_timeout_s"])
+    if problem:
+        return None, problem
+    return config, None
+
+
+def jev_profile_conflict(config) -> Optional[str]:
+    """Reject a live Jev profile whose caps would silently disable Jev.
+
+    A token cap or a USD cap disables paid Jev dispatch in the ledger, so a
+    "strict-budget live-Jev" spec cannot honestly ship by wrapping those caps.
+    """
+    if getattr(config, "reflex", None) != "jev":
+        return None
+    if getattr(config, "token_cap", 0):
+        return ("live Jev reflex with a token cap: Jev dispatch is disabled "
+                "under a token cap, so this profile cannot provide the live "
+                "coverage it claims")
+    if getattr(config, "usd_cap", None) is not None:
+        return ("live Jev reflex with a USD cap: Jev dispatch is disabled "
+                "under a USD cap")
+    return None
+
+
+def paid_call_bound(config) -> Dict[str, Any]:
+    """The *paid* Jev call bound, if a verified one exists -- else unavailable.
+
+    The applied reflex cap bounds *applied decisions*, not paid calls, so the
+    bench never multiplies it by a presumed cost to manufacture a spend bound.
+    """
+    if getattr(config, "reflex", None) != "jev":
+        return {"basis": "not-a-paid-tier", "bound": None}
+    return {
+        "basis": "no-verified-bound",
+        "bound": None,
+        "applied_cap": getattr(config, "reflex_call_cap", 0),
+        "note": ("applied cap bounds applied decisions, not paid calls; a "
+                 "token/USD cap disables Jev, so no strict spend bound exists "
+                 "without an external provider-account limit"),
+    }
+
+
+def preflight(spec: dict) -> Dict[str, Any]:
+    """Validate a spec end-to-end before any spawn.  Returns a report dict."""
+    problem = validate_spec(spec)
+    if problem:
+        return {"ok": False, "stage": "spec", "error": problem}
+    if spec["tier"] == LIVE:
+        attest = vapor_cloud_attestation()
+        if not attest["attested"]:
+            return {"ok": False, "stage": "live-gate",
+                    "error": ("live bench testing requires the vapor-cloud "
+                              "attestation: %s" % attest["reason"])}
+    config, err = resolve_provider_config(spec)
+    if err:
+        return {"ok": False, "stage": "provider_config", "error": err}
+    conflict = jev_profile_conflict(config)
+    if conflict:
+        return {"ok": False, "stage": "scope", "error": conflict}
+    b = spec["budget"]
+    if b["cost_mode"] == "priced-bound":
+        from . import providers
+        if not providers.tariff_complete(config):
+            return {"ok": False, "stage": "cost",
+                    "error": ("cost_mode=priced-bound requires a complete "
+                              "DeepSeek tariff (price_in and price_out)")}
+    return {"ok": True, "stage": "done", "config": config,
+            "paid_call_bound": paid_call_bound(config),
+            "postmortem_reserve": config.postmortem_reserve}
+
+
+#: The caller-supplied attestation that the vapor-cloud fix is landed.  The
+#: bench never invents it; without it no live tier passes preflight (AC10).
+VAPOR_CLOUD_ENV = "BENCH_VAPOR_CLOUD_ATTESTED"
+
+
+def vapor_cloud_attestation(source: Optional[dict] = None) -> Dict[str, Any]:
+    """Whether the operator has attested the vapor-cloud prerequisite."""
+    source = os.environ if source is None else source
+    value = (source.get(VAPOR_CLOUD_ENV) or "").strip()
+    if not value:
+        return {"attested": False,
+                "reason": "pending-operator (set %s)" % VAPOR_CLOUD_ENV}
+    return {"attested": True, "token": value,
+            "reason": "operator-attested"}
+
+
+def precommit(comparison: dict) -> Dict[str, Any]:
+    """Freeze the comparison policy at run start (no post-result change)."""
+    keys = ("target_metric", "min_improvement", "noninferiority_margins",
+            "min_samples", "resampling_seed", "resamples", "confidence_level",
+            "screening_episodes_per_arm", "confirmation_episodes_per_arm",
+            "min_completed_episodes_per_arm",
+            "min_aggregate_at_risk_ticks_per_arm", "deadline_classification",
+            "metric_policy_version", "invalid_policy_version")
+    return {k: comparison.get(k) for k in keys}
+
+
+def assert_precommitted(pre: dict, comparison: dict) -> None:
+    """Raise when a policy field changed after results (forbidden in place)."""
+    current = precommit(comparison)
+    drift = [k for k in pre if pre[k] != current.get(k)]
+    if drift:
+        raise ValueError("comparison policy changed after precommit: %s "
+                         "(abandon the run and re-precut it)" % drift)
+
+
+# --------------------------------------------------------------------------
+# budget planning
+# --------------------------------------------------------------------------
+
+def plan_allocations(spec: dict, n_candidates: int) -> Dict[str, Any]:
+    """Reserve the whole campaign's episodes and judge calls up front.
+
+    Every candidate is screened on ``screening_episodes_per_arm`` per arm, and
+    the selected winner is confirmed on ``confirmation_episodes_per_arm`` per
+    arm.  Judge calls are bounded at eligible episodes x request count.
+    """
+    comp = spec["comparison"]
+    budget = spec["budget"]
+    judge = spec["judge"]
+    screen = int(comp["screening_episodes_per_arm"])
+    confirm = int(comp["confirmation_episodes_per_arm"])
+    judge_per_episode = 1 if spec.get("judge", {}).get("enabled") else 0
+    screening_episodes = 2 * screen * max(0, int(n_candidates))
+    confirmation_episodes = 2 * confirm
+    total_episodes = screening_episodes + confirmation_episodes
+    total_judges = judge_per_episode * total_episodes
+    reasons: List[str] = []
+    if budget["max_candidates"] and n_candidates > budget["max_candidates"]:
+        reasons.append("candidate-budget: %d > %d"
+                       % (n_candidates, budget["max_candidates"]))
+    if budget["max_total_episodes"] and total_episodes > \
+            budget["max_total_episodes"]:
+        reasons.append("episode-budget: %d > %d"
+                       % (total_episodes, budget["max_total_episodes"]))
+    if budget["judge_calls_total"] and total_judges > \
+            budget["judge_calls_total"]:
+        reasons.append("judge-budget: %d > %d"
+                       % (total_judges, budget["judge_calls_total"]))
+    if judge["enabled"] and not budget["judge_calls_total"]:
+        reasons.append("judge enabled but judge_calls_total is 0")
+    return {
+        "schema_version": "bench-allocations/1",
+        "n_candidates": int(n_candidates),
+        "screening_episodes_per_arm": screen,
+        "confirmation_episodes_per_arm": confirm,
+        "screening_episodes": screening_episodes,
+        "confirmation_episodes": confirmation_episodes,
+        "total_episodes": total_episodes,
+        "judge_per_episode": judge_per_episode,
+        "total_judge_calls": total_judges,
+        "within_budget": not reasons,
+        "reasons": reasons,
+    }
+
+
+# --------------------------------------------------------------------------
+# §7 forced-abort containment: ownership-isolated /proc PPID-recursion walk
+# --------------------------------------------------------------------------
+
+class ProcReader(object):
+    """The pluggable ``/proc`` + signal abstraction (failure injectable)."""
+
+    #: A reaped-but-unwaited process is still in /proc; it is not alive.
+    DEAD_STATES = ("Z", "X", "x")
+
+    def children(self, pid: int) -> List[int]:
+        out = []
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                identity = self.identity(int(entry))
+            except ProcError:
+                continue
+            if identity and identity.get("ppid") == pid \
+                    and identity.get("state") not in self.DEAD_STATES:
+                out.append(int(entry))
+        return sorted(out)
+
+    def identity(self, pid: int) -> Optional[Dict[str, Any]]:
+        try:
+            with open("/proc/%d/stat" % pid, "r") as fh:
+                stat = fh.read()
+        except OSError:
+            return None
+        try:
+            # comm may contain spaces/parens; parse after the last ')'.
+            rest = stat[stat.rindex(")") + 2:].split()
+            state = rest[0]
+            ppid = int(rest[1])
+            pgid = int(rest[2])
+            session = int(rest[3])
+            starttime = rest[19]
+        except (ValueError, IndexError):
+            return None
+        return {"pid": pid, "ppid": ppid, "pgid": pgid, "session": session,
+                "starttime": starttime, "state": state}
+
+    def pgid(self, pid: int) -> int:
+        try:
+            return os.getpgid(pid)
+        except (ProcessLookupError, PermissionError, OSError):
+            return -1
+
+    def signal(self, pid: int, sig: int) -> None:
+        os.kill(pid, sig)
+
+    def signal_group(self, pgid: int, sig: int) -> None:
+        os.killpg(pgid, sig)
+
+
+class ProcError(Exception):
+    """A permission / identity-validation failure in the abort walk."""
+
+
+class OwnedProcessTree(object):
+    """Reap **only** a captured episode tree; never the supervisor's group.
+
+    The walk re-discovers descendants by PPID recursion from the root, keeps
+    the root alive while it does so, re-walks until the tree is stable, then
+    reaps the root last and verifies no captured identity survives.  A
+    permission or identity-validation failure is **fatal**: it sets
+    ``teardown_failure`` and marks the run non-success.
+    """
+
+    def __init__(self, reader: Optional[ProcReader] = None, *,
+                 grace: float = 2.0, bound: float = 10.0):
+        self.reader = reader or ProcReader()
+        self.grace = grace
+        self.bound = bound
+
+    def capture(self, pid: int) -> List[Dict[str, Any]]:
+        """Capture the owned identities: the root plus its descendants."""
+        return self._walk(pid)
+
+    def _walk(self, root: int) -> List[Dict[str, Any]]:
+        seen: Dict[int, Dict[str, Any]] = {}
+        frontier = [root]
+        while frontier:
+            pid = frontier.pop()
+            if pid in seen:
+                continue
+            try:
+                ident = self.reader.identity(pid)
+            except Exception as exc:  # noqa: BLE001 - any failure is fatal
+                raise ProcError("identity read failed for %d: %s" % (pid, exc))
+            if ident is None:
+                continue
+            seen[pid] = ident
+            try:
+                kids = self.reader.children(pid)
+            except Exception as exc:  # noqa: BLE001
+                raise ProcError("children read failed for %d: %s" % (pid, exc))
+            frontier.extend(kids)
+        # Determine each member's own pgid, re-validating identity.
+        for ident in seen.values():
+            pg = self.reader.pgid(ident["pid"])
+            ident["own_pgid"] = pg
+        return list(seen.values())
+
+    def reap(self, root: int) -> Dict[str, Any]:
+        """The forced path: SIGKILL the owned tree, root last."""
+        result = {"teardown_failure": False, "killed": [], "survivors": [],
+                  "permission_failure": False}
+        try:
+            captured = self.capture(root)
+        except ProcError as exc:
+            result["teardown_failure"] = True
+            result["permission_failure"] = True
+            result["error"] = str(exc)
+            return result
+        root_identity = next((i for i in captured if i["pid"] == root), None)
+        deadline = time.monotonic() + self.bound
+        stable = 0
+        while time.monotonic() < deadline and stable < 2:
+            try:
+                tree = self._walk(root)
+            except ProcError as exc:
+                result["teardown_failure"] = True
+                result["permission_failure"] = True
+                result["error"] = str(exc)
+                return result
+            ids = {i["pid"] for i in tree}
+            if ids == {i["pid"] for i in captured}:
+                stable += 1
+            else:
+                stable = 0
+            captured = tree
+            # kill descendants (never the root yet) and their owned groups
+            for ident in captured:
+                if ident["pid"] == root:
+                    continue
+                self._kill(ident, result)
+            time.sleep(0.05)
+        # reap the root last
+        if root_identity is not None:
+            self._kill(root_identity, result)
+        # verify no captured identity survives (bounded: SIGKILL delivery and
+        # zombie reaping are asynchronous)
+        poll_deadline = time.monotonic() + self.grace + 2.0
+        while True:
+            surviving = [i["pid"] for i in captured if self._alive(i)]
+            if not surviving or time.monotonic() >= poll_deadline:
+                break
+            time.sleep(0.05)
+        for pid in surviving:
+            result["survivors"].append(pid)
+        if result["survivors"] or result["permission_failure"]:
+            result["teardown_failure"] = True
+        return result
+
+    def _kill(self, ident: Dict[str, Any], result: Dict[str, Any]) -> None:
+        pid = ident["pid"]
+        try:
+            current = self.reader.identity(pid)
+        except Exception as exc:  # noqa: BLE001 - fatal
+            raise ProcError("identity re-check failed for %d: %s" % (pid, exc))
+        if current is None:
+            return
+        if current.get("starttime") != ident.get("starttime"):
+            # PID reuse: do not signal a different process.
+            return
+        pg = ident.get("own_pgid", -1)
+        try:
+            if pg and pg > 0 and pg != os.getpgrp():
+                self.reader.signal_group(pg, signal.SIGKILL)
+            self.reader.signal(pid, signal.SIGKILL)
+            result["killed"].append(pid)
+        except PermissionError as exc:
+            result["teardown_failure"] = True
+            result["permission_failure"] = True
+            result.setdefault("errors", []).append(
+                "signal permission failure for %d: %s" % (pid, exc))
+        except (ProcessLookupError, OSError):
+            return
+
+    def _alive(self, ident: Dict[str, Any]) -> bool:
+        try:
+            current = self.reader.identity(ident["pid"])
+        except Exception:  # noqa: BLE001
+            return False
+        if current is None:
+            return False
+        if current.get("state") in getattr(self.reader, "DEAD_STATES", ("Z",)):
+            return False
+        return current.get("starttime") == ident.get("starttime")
+
+
+# --------------------------------------------------------------------------
+# stop controller
+# --------------------------------------------------------------------------
+
+class StopController(object):
+    """Stop-after-episode: first SIGINT/SIGTERM or stop-file is graceful.
+
+    The bench-owned reasons are persisted verbatim (``bench-stopped-graceful``
+    / ``bench-aborted``) so a stop is never mistaken for a game outcome.
+    """
+
+    def __init__(self, stop_file: Optional[str] = None):
+        self.stop_file = stop_file
+        self.level = 0
+
+    def request(self) -> int:
+        self.level += 1
+        return self.level
+
+    def stop_reason(self) -> Optional[str]:
+        if self.level <= 0:
+            return None
+        if self.level >= 2:
+            return M.BENCH_ABORTED
+        return M.BENCH_STOPPED_GRACEFUL
+
+    def should_stop(self) -> bool:
+        if self.level > 0:
+            return True
+        if self.stop_file and os.path.exists(self.stop_file):
+            self.level = max(1, self.level + 1)
+            return True
+        return False
+
+    def forced(self) -> bool:
+        return self.level >= 2
+
+
+class signal_handlers(object):
+    """Install bench SIGINT/SIGTERM handlers for the duration of a block."""
+
+    def __init__(self, controller: StopController, *,
+                 on_forced: Optional[Callable[[], None]] = None):
+        self.controller = controller
+        self.on_forced = on_forced
+        self._saved: Dict[int, Any] = {}
+
+    def __enter__(self):
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                self._saved[sig] = signal.getsignal(sig)
+                signal.signal(sig, self._handle)
+            except (ValueError, OSError):
+                pass
+        return self
+
+    def __exit__(self, *exc):
+        for sig, handler in self._saved.items():
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                pass
+        return False
+
+    def _handle(self, signum, frame):  # noqa: ARG002
+        level = self.controller.request()
+        if level >= 2 and self.on_forced is not None:
+            self.on_forced()
+
+
+# --------------------------------------------------------------------------
+# manifest (atomic updates)
+# --------------------------------------------------------------------------
+
+def write_json_atomic(path: str, obj: Any, mode: int = 0o600) -> None:
+    """Write JSON to *path* atomically (temp + rename), at 0600."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    tmp = path + ".tmp.%d" % os.getpid()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(obj, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    os.replace(tmp, path)
+
+
+class Manifest(object):
+    """The bench campaign manifest with atomic, additive updates."""
+
+    def __init__(self, path: str, *, spec_ref: Optional[str] = None):
+        self.path = path
+        self.data: Dict[str, Any] = {
+            "schema_version": MANIFEST_SCHEMA,
+            "spec_ref": spec_ref,
+            "status": "planned",
+            "episodes": [],
+            "judge_calls": [],
+            "reservations": [],
+            "stop_reason": None,
+            "actual_tiers": {"reflex": None, "strategy": None, "judge": None},
+            "unknown_exposure": [],
+            "rollback": None,
+        }
+
+    def add_episode(self, entry: dict) -> None:
+        self.data["episodes"].append(entry)
+        self.flush()
+
+    def reserve(self, key: str, detail: dict) -> None:
+        self.data["reservations"].append(dict(detail, key=key,
+                                              settled=False))
+        self.flush()
+
+    def settle(self, key: str, outcome: str) -> None:
+        for entry in self.data["reservations"]:
+            if entry["key"] == key and not entry["settled"]:
+                entry["settled"] = True
+                entry["outcome"] = outcome
+        self.flush()
+
+    def note_unknown_exposure(self, detail: dict) -> None:
+        self.data["unknown_exposure"].append(dict(detail))
+        self.flush()
+
+    def reconcile(self) -> List[dict]:
+        """Move interrupted reservations to unknown exposure (not refunded).
+
+        Resume is opt-in: a reservation that was never settled may still have
+        been billed upstream, so it becomes *unknown exposure* rather than a
+        refund.  Returns the newly-recorded entries.
+        """
+        recorded = []
+        for entry in self.data["reservations"]:
+            if not entry["settled"]:
+                entry["settled"] = True
+                entry["outcome"] = "unknown-exposure"
+                record = {"key": entry["key"], "reason":
+                          "interrupted-reservation-not-refunded",
+                          "episode": entry.get("episode")}
+                self.data["unknown_exposure"].append(record)
+                recorded.append(record)
+        self.flush()
+        return recorded
+
+    def set_status(self, status: str, **extra) -> None:
+        self.data["status"] = status
+        self.data.update(extra)
+        self.flush()
+
+    def flush(self) -> None:
+        write_json_atomic(self.path, self.data)
+
+
+# --------------------------------------------------------------------------
+# the runner
+# --------------------------------------------------------------------------
+
+def default_episode_runner(config, paths, episode_dir: str, index: int,
+                           timeout: float):
+    """Run exactly one episode via ``Controller.run_campaign(1)``."""
+    from . import controller as C
+    if not paths:
+        raise RuntimeError("bench live tier needs BENCH_WORKER/BENCH_RUNNER/"
+                           "BENCH_DATA")
+    if isinstance(paths, dict):
+        paths = C.ControllerPaths(**paths)
+    os.makedirs(episode_dir, mode=0o700, exist_ok=True)
+    ctl = C.Controller(config, paths, episode_dir, episode_timeout=timeout)
+    results = ctl.run_campaign(1)
+    result = results[0] if results else None
+    return result, episode_dir
+
+
+class BenchRunner(object):
+    """Run a bounded bench campaign, one episode at a time, in isolation.
+
+    A default in-process fake is **not** provided: the dry-run tier performs
+    offline scoring only (no provider, no spawn); the live tier needs a real
+    worker/launcher.  Tests inject ``episode_runner``.
+    """
+
+    def __init__(self, spec: dict, out_dir: str, *,
+                 episode_runner: Optional[Callable] = None,
+                 stop_file: Optional[str] = None,
+                 now: Callable[[], float] = time.monotonic):
+        self.spec = spec
+        self.out_dir = out_dir
+        self.episode_runner = episode_runner or default_episode_runner
+        self.stop = StopController(stop_file)
+        self.now = now
+        self.manifest = Manifest(os.path.join(out_dir, "manifest.json"),
+                                 spec_ref=spec.get("name"))
+        self.abort_tree = OwnedProcessTree()
+        self.started = now()
+        self.plan = plan_allocations(spec, spec["budget"]["max_candidates"]
+                                     or 1)
+
+    def run(self) -> Dict[str, Any]:
+        if self.spec["tier"] == DRY_RUN:
+            return self.run_dry()
+        return self.run_live()
+
+    # -- dry-run tier: offline only, impossible to reach the network -------
+    def run_dry(self) -> Dict[str, Any]:
+        self.manifest.set_status(
+            "running", tier=DRY_RUN,
+            actual_tiers={"reflex": "replay", "strategy": "off",
+                          "judge": "none"},
+            network_calls=0, judge_behavior="not-evaluated")
+        cards = []
+        for i, wire in enumerate(self.spec.get("replay_inputs") or [], start=1):
+            card = M.build_scorecard(
+                episode_id="replay-%d" % i, provenance_id=None,
+                wire_path=wire if os.path.exists(wire) else None,
+                deadline_classification=self.spec["comparison"][
+                    "deadline_classification"])
+            cards.append(card)
+        self.manifest.set_status("complete", tier=DRY_RUN, scorecards=cards,
+                                 network_calls=0,
+                                 judge_behavior="not-evaluated "
+                                 "(dry-run makes no Jev calls)")
+        return {"tier": DRY_RUN, "scorecards": cards, "network_calls": 0,
+                "judge_behavior": "not-evaluated"}
+
+    # -- live tier ---------------------------------------------------------
+    def run_live(self) -> Dict[str, Any]:
+        pre = preflight(self.spec)
+        if not pre["ok"]:
+            self.manifest.set_status("rejected", stage=pre["stage"],
+                                     error=pre["error"])
+            return {"ok": False, "error": pre["error"], "stage": pre["stage"]}
+        config = pre["config"]
+        self.manifest.set_status("running", tier=LIVE,
+                                 requested_tiers={
+                                     "reflex": config.reflex,
+                                     "strategy": config.strategy,
+                                     "judge": ("jev"
+                                               if self.spec["judge"]["enabled"]
+                                               else "none")})
+        results = []
+        planned = self.spec["episodes"]
+        index = 0
+        with signal_handlers(
+                self.stop,
+                on_forced=lambda: self._force_abort(results)) as _handlers:
+            while index < planned:
+                if self.stop.should_stop():
+                    break
+                if self._wall_exceeded():
+                    self.manifest.set_status("partial", stop_reason=
+                                             M.BENCH_ABORTED,
+                                             reason="campaign-wall-exceeded")
+                    return self._finish(results, "partial",
+                                        M.BENCH_ABORTED)
+                index += 1
+                episode_dir = os.path.join(self.out_dir,
+                                           "ep-%d" % index)
+                self.manifest.reserve("ep-%d" % index,
+                                      {"episode": index,
+                                       "dir": episode_dir})
+                result, episode_dir = self._run_one(config, episode_dir, index)
+                self.manifest.settle("ep-%d" % index, "completed")
+                results.append((index, result, episode_dir))
+        stop_reason = self.stop.stop_reason()
+        status = "complete" if stop_reason is None else "partial"
+        return self._finish(results, status, stop_reason)
+
+    def _run_one(self, config, episode_dir, index):
+        paths = self._paths()
+        result, episode_dir = self.episode_runner(
+            config, paths, episode_dir, index,
+            self.spec["episode_timeout_s"])
+        return result, episode_dir
+
+    def _paths(self):
+        """Resolve the worker/runner/data paths from the environment.
+
+        The bench never stores a path in the spec; the operator supplies the
+        built launcher and worker through the standard ``BENCH_*`` variables.
+        """
+        worker = os.environ.get("BENCH_WORKER")
+        runner = os.environ.get("BENCH_RUNNER")
+        data = os.environ.get("BENCH_DATA")
+        if not (worker and runner and data):
+            return None
+        return {"worker": worker, "runner": runner, "data": data,
+                "sysconf": os.environ.get("BENCH_SYSCONF") or None}
+
+    def _wall_exceeded(self) -> bool:
+        limit = self.spec["budget"].get("max_total_wall_s") or 0
+        if not limit:
+            return False
+        return (self.now() - self.started) > limit
+
+    def _force_abort(self, results) -> None:
+        # forced: reap the owned tree of every recorded episode process
+        for entry in list(self.manifest.data["episodes"]):
+            pid = entry.get("root_pid")
+            if pid:
+                outcome = self.abort_tree.reap(int(pid))
+                if outcome.get("teardown_failure"):
+                    self.manifest.set_status(
+                        "teardown-failure", teardown_failure=True)
+        self.manifest.note_unknown_exposure(
+            {"reason": "forced-abort", "episodes": len(results)})
+
+    def _finish(self, results, status, stop_reason) -> Dict[str, Any]:
+        self.manifest.set_status(status, stop_reason=stop_reason,
+                                 episodes_done=len(results),
+                                 partial=(status != "complete"))
+        return {"ok": status == "complete", "status": status,
+                "stop_reason": stop_reason,
+                "episodes": len(results), "manifest": self.manifest.data}
+
+
+# --------------------------------------------------------------------------
+# baseline promotion (a partial run is never promoted)
+# --------------------------------------------------------------------------
+
+def promote_baseline(*, run_status: str, comparison: Optional[dict],
+                     teardown_failure: bool = False) -> Dict[str, Any]:
+    """Promote a run to the versioned baseline only when it qualifies.
+
+    Requires a complete run, no teardown failure, and a comparison whose
+    admission allows apply.  A partial or interrupted run is refused.
+    """
+    reasons: List[str] = []
+    if run_status != "complete":
+        reasons.append("run-not-complete:%s" % run_status)
+    if teardown_failure:
+        reasons.append("teardown-failure")
+    if comparison is None:
+        reasons.append("no-comparison")
+    elif comparison.get("verdict") != "pass":
+        reasons.append("comparison-not-pass:%s" % comparison.get("verdict"))
+    elif not (comparison.get("admission") or {}).get("apply_allowed"):
+        reasons.append("admission-not-applied")
+    return {"promoted": not reasons, "reasons": reasons}
+
+
+# --------------------------------------------------------------------------
+# §6 tuner (report-only coordinate search; apply only with approval)
+# --------------------------------------------------------------------------
+
+def tuner_candidates(spec: dict) -> List[Dict[str, Any]]:
+    """The finite, deterministic coordinate-search candidate list.
+
+    One parameter at a time, deterministic order, at most the spec's knob count;
+    frozen knobs are never proposed.
+    """
+    params = spec["tuning"]["parameters"]
+    candidates: List[Dict[str, Any]] = []
+    for knob in TUNER_ELIGIBLE_KNOBS:
+        rail = params.get(knob)
+        if not rail:
+            continue
+        for value in rail["grid"]:
+            candidates.append({knob: value})
+    return candidates[: max(1, spec["budget"]["max_candidates"])]
+
+
+def tuner_plan(spec: dict) -> Dict[str, Any]:
+    """Reserve the screening and confirmation budgets before searching."""
+    candidates = tuner_candidates(spec)
+    alloc = plan_allocations(spec, len(candidates))
+    return {"candidates": candidates, "n_candidates": len(candidates),
+            "screening_episodes_per_arm":
+                spec["comparison"]["screening_episodes_per_arm"],
+            "confirmation_episodes_per_arm":
+                spec["comparison"]["confirmation_episodes_per_arm"],
+            "allocations": alloc,
+            "sweeps": min(2, max(1, len(candidates))),
+            "finite": True}
+
+
+def tuner_report(spec: dict, results: Sequence[dict]) -> Dict[str, Any]:
+    """Rank candidates by a deterministic objective; report-only."""
+    ranked = []
+    for item in results:
+        comp = item.get("comparison") or {}
+        ranked.append({
+            "candidate": item.get("candidate"),
+            "verdict": comp.get("verdict"),
+            "target": (comp.get("per_metric") or {}).get(
+                comp.get("target_metric", ""), {}).get("effect"),
+            "admission": (comp.get("admission") or {}).get("apply_allowed"),
+        })
+    ranked.sort(key=lambda r: (
+        0 if r["verdict"] == "pass" else 1,
+        -(r["target"] if isinstance(r["target"], (int, float)) else -1e9)))
+    return {"schema_version": M.TUNING_SCHEMA, "mode": spec["tuning"]["mode"],
+            "ranked": ranked, "report_only": True}
+
+
+def _config_overlay(values: Dict[str, Any]) -> Dict[str, Any]:
+    """A nonsecret overlay: only tuner knobs, never a credential reference."""
+    secret_keys = {"deepseek_key_file", "jev_key_file", "jev_accept_terms"}
+    return {k: v for k, v in values.items()
+            if k not in secret_keys and k in TUNER_ELIGIBLE_KNOBS}
+
+
+def apply_approved(spec: dict, *, candidate: dict, confirmation: dict,
+                   config_hash: str, current_config: dict,
+                   overlay_dir: str,
+                   approval_valid: Optional[bool] = None) -> Dict[str, Any]:
+    """Write a versioned nonsecret overlay -- only after every precondition.
+
+    Preconditions: fresh confirmation passed, admission allows apply, approval
+    id is valid (and, when supplied, not expired), the baseline config hash
+    matches, and every changed key/value is in its exact authorized grid.
+    Returns a rollback pointer; never rewrites a secret config file.
+    """
+    tuning = spec["tuning"]
+    reasons: List[str] = []
+    if tuning["mode"] != "apply-approved":
+        reasons.append("mode-not-apply-approved")
+    if approval_valid is False:
+        reasons.append("approval-invalid-or-expired")
+    if not tuning.get("approval_id"):
+        reasons.append("no-approval-id")
+    if (confirmation or {}).get("verdict") != "pass":
+        reasons.append("confirmation-not-pass")
+    if not (confirmation or {}).get("admission", {}).get("apply_allowed"):
+        reasons.append("admission-not-applied")
+    if tuning.get("expected_base_config_hash") != config_hash:
+        reasons.append("config-hash-mismatch")
+    # exact key/range compliance
+    for knob, value in (candidate or {}).items():
+        rail = tuning["parameters"].get(knob)
+        if knob not in TUNER_ELIGIBLE_KNOBS or not rail:
+            reasons.append("unauthorized-key:%s" % knob)
+            continue
+        if value not in rail["grid"]:
+            reasons.append("value-out-of-grid:%s=%r" % (knob, value))
+        if rail.get("min") is not None and value < rail["min"]:
+            reasons.append("value-below-rail:%s" % knob)
+        if rail.get("max") is not None and value > rail["max"]:
+            reasons.append("value-above-rail:%s" % knob)
+    if reasons:
+        return {"applied": False, "reasons": reasons}
+    merged = dict(current_config)
+    merged.update(candidate)
+    overlay = _config_overlay(merged)
+    version = int(spec["tuning"].get("overlay_version", 0)) + 1
+    os.makedirs(overlay_dir, mode=0o700, exist_ok=True)
+    path = os.path.join(overlay_dir, "config-overlay-v%d.json" % version)
+    write_json_atomic(path, {"schema_version": "config-overlay/1",
+                             "version": version,
+                             "approval_id": tuning["approval_id"],
+                             "base_config_hash": config_hash,
+                             "overlay": overlay})
+    pointer = os.path.join(overlay_dir, "active.json")
+    previous = None
+    if os.path.exists(pointer):
+        with open(pointer, "r", encoding="utf-8") as fh:
+            previous = json.load(fh).get("active")
+    write_json_atomic(pointer, {"active": path, "previous": previous,
+                                "version": version})
+    return {"applied": True, "overlay_path": path, "version": version,
+            "rollback": previous, "overlay": overlay}
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def _cmd_validate(args) -> int:
+    spec = load_spec(args.spec)
+    report = preflight(spec)
+    print(json.dumps({k: v for k, v in report.items() if k != "config"},
+                     indent=2, sort_keys=True, default=str))
+    return 0 if report["ok"] else 2
+
+
+def _cmd_score(args) -> int:
+    spec = load_spec(args.spec)
+    runner = BenchRunner(spec, args.out_dir or ".")
+    result = runner.run_dry()
+    print(json.dumps({"scorecards": len(result["scorecards"])}, indent=2))
+    return 0
+
+
+def _cmd_run(args) -> int:
+    spec = load_spec(args.spec)
+    out_dir = args.out_dir or ("bench-run-" + str(int(time.time())))
+    os.makedirs(out_dir, mode=0o700, exist_ok=True)
+    runner = BenchRunner(spec, out_dir)
+    result = runner.run()
+    print(json.dumps({k: v for k, v in result.items() if k != "scorecards"},
+                     indent=2, sort_keys=True, default=str))
+    return 0 if result.get("ok", True) else 1
+
+
+def _cmd_compare(args) -> int:
+    print("compare requires scored artifacts; see doc/agent-campaign-bench.md")
+    return 1
+
+
+def _cmd_tune(args) -> int:
+    spec = load_spec(args.spec)
+    print(json.dumps(tuner_plan(spec), indent=2, sort_keys=True))
+    return 0
+
+
+def _cmd_package(args) -> int:
+    print("package requires a run directory; see doc/agent-campaign-bench.md")
+    return 1
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    ap = argparse.ArgumentParser(prog="tools.agent.bench", description=__doc__)
+    sub = ap.add_subparsers(dest="command")
+    for name in ("validate", "run", "score", "compare", "tune", "package"):
+        p = sub.add_parser(name)
+        p.add_argument("spec", nargs="?")
+        p.add_argument("--out-dir", default=None)
+    args = ap.parse_args(argv)
+    handlers = {"validate": _cmd_validate, "run": _cmd_run,
+                "score": _cmd_score, "compare": _cmd_compare,
+                "tune": _cmd_tune, "package": _cmd_package}
+    handler = handlers.get(args.command)
+    if handler is None:
+        ap.print_help()
+        return 2
+    if args.command != "compare" and args.command != "package" and not \
+            args.spec:
+        print("error: a spec path is required", file=sys.stderr)
+        return 2
+    return handler(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
