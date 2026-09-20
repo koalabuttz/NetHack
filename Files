@@ -67,7 +67,7 @@ wizard3.lua   wizhelp
 doc:
 (files for all versions)
 agent-autoplay.md   agent-interface.md  agent-llm-quickstart.md
-agent-profile-v1.tsv  agent-reflex-upgrade-report.md
+agent-campaign-bench.md  agent-profile-v1.tsv  agent-reflex-upgrade-report.md
 agent-v1.schema.json
 Gbk-1pg-pfx.mn     Gbk-1pg-sfx.mn     Guidebook.mn       Guidebook.tex
 Guidebook.txt      config.nh          dlb.6              dlb.txt
@@ -594,6 +594,7 @@ native_prefix_probe.py                  reference_state.c
 reference_state.h   schema_check.py     spectate.py
 sysconf
 test_auto.py                 test_auto_candidates.py
+test_auto_bench.py           test_auto_bench_judge.py
 test_auto_forced_search.py   test_auto_instances.py
 test_auto_integration.py     test_auto_metrics.py
 test_auto_navigation.py      test_auto_providers.py
@@ -611,7 +612,8 @@ short.decisions.jsonl   short.wire.jsonl     startup.wire.jsonl
 tools/agent:
 (files for the autonomous play harness)
 .gitignore          __init__.py         __main__.py         arbitration.py
-budget.py           candidates.py       codec.py            controller.py
+bench.py            bench_judge.py      bench_metrics.py    budget.py
+candidates.py       codec.py            controller.py
 directives.py       evaluate.py         events.py           forced_search.py
 exploration_metrics.py              instances.py        navigation.py
 policy.py           protocol.py         providers.py        recording.py

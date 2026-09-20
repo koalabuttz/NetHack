@@ -144,6 +144,7 @@ The following are **proposed new paths**:
 | Trusted supervisor | `sys/unix/agent_runner.c` | Launch/reap/reset, descriptor/filesystem isolation, private diagnostics, limits, save tokens. |
 | Protocol/policy docs | `doc/agent-interface.md` | Wire schema, profile and LLM policy versions, callback disclosure table. |
 | Harness | `test/agent/…` | Standalone fixtures, scripted driver, transcript/replay tests, benchmarks. |
+| Campaign bench | `tools/agent/bench*.py`, `doc/agent-campaign-bench.md` | Observes and configures: scorecards, provenance/comparison, advisory Jev judge, postmortem packages, suggest-first tuner. See `doc/agent-campaign-bench.md`. |
 
 These are responsibility boundaries, not separate services. The engine remains single-threaded.
 

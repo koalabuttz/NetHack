@@ -54,6 +54,19 @@ cc -std=c99 -Iwin/agent -H -c win/agent/agent_protocol.c -o /dev/null
 
 prints only `win/agent/*.h` plus system headers.
 
+## Campaign bench smoke profile (per-change workflow)
+
+Any change to the agent tooling joins the correctness work with the offline
+bench smoke profile (no network, no credentials); see
+`doc/agent-campaign-bench.md` for the full guide:
+
+```sh
+python3 -m unittest discover -s test/agent -p 'test_auto*.py'   # correctness gate
+python3 test/agent/mutation_checks.py                           # mutation gate
+python3 -m tools.agent.bench validate bench-spec.json           # bench preflight
+python3 -m tools.agent.bench run bench-spec.json --out-dir /tmp/bench-smoke
+```
+
 ## What each fixture covers
 
 | File | Covers |
