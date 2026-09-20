@@ -629,9 +629,13 @@ without changing its lifecycle ownership:
   unreachable/failure path (earlier than or no later than the existing
   three-no-progress bound). The suppression **owner stays the edge evidence**,
   not the destination's long-lived service signature, so once the edge reopens
-  (positive relevant local change or a scope change) the target is legitimately
-  reacquirable — a permanent target-service failure would wrongly hide a
-  reopened route. Global map revision/time never reopens it.
+  the target is legitimately reacquirable — a permanent target-service failure
+  would wrongly hide a reopened route. **Under the currently recorded exit (b)
+  disposition** (the gray `#` vapor is indistinguishable from corridor ground,
+  so no local overlay token is observable) an instance/**scope reset is the only
+  reopening**: a positive local cloud/signature change reopens the edge only if
+  the operator-gated positive-reopening capability is later enabled from the
+  mandatory native-cloud trace. Global map revision/time never reopens it.
 - **Bounded search.** When no filtered destination is reachable the existing
   bounded search/recovery owns the turn, with its own per-site limits and the
   forced-search gates unchanged; no per-destination unbudgeted search loop is
