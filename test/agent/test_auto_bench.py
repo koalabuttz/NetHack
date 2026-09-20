@@ -3011,5 +3011,97 @@ class ArmAwareStrategyBudget(unittest.TestCase):
                 arm_cfg["fingerprint"])
 
 
+class CandidateOnlyStrategyBudget(unittest.TestCase):
+    """Round-5: a candidate-only run is charged for EVERY episode."""
+
+    def _spec(self, episodes, cap=8):
+        spec = _valid_spec(tier="live", episodes=episodes)
+        spec["provider_config_ref"] = {"reflex": "scripted",
+                                       "strategy": "deepseek",
+                                       "strategy_call_cap": cap}
+        spec["baseline_config_ref"] = None
+        spec["campaign_timeout_s"] = 100000.0
+        spec["budget"]["max_total_episodes"] = 1000
+        return spec
+
+    def test_candidate_only_counts_match_the_committed_runner_schedule(self):
+        for episodes in (4, 5):
+            spec = self._spec(episodes)
+            counts = B.scheduled_arm_counts(spec)
+            # no baseline arm exists -> every episode is a candidate episode
+            self.assertEqual(counts, {"baseline": 0, "candidate": episodes},
+                             episodes)
+            # ...which is exactly what the runner commits for ab=False
+            committed = B.precommit_record(
+                spec["comparison"], episodes=episodes,
+                arm_episodes=max(1, episodes // 2), ab=False)
+            self.assertEqual(committed["design"]["ab"], False)
+            self.assertEqual(counts,
+                             committed["design"]["expected_arm_counts"])
+            # demand is the FULL episodes x candidate cap, not the synthetic
+            # counterbalanced split (which would under-count)
+            cand, err = B.resolve_provider_config(spec)
+            self.assertIsNone(err)
+            self.assertEqual(
+                B.scheduled_strategy_demand(cand, None, counts), episodes * 8)
+            # the tuning plan still covers BOTH arms (tuning needs a baseline)
+            self.assertEqual(B.scheduled_arm_counts(spec, 6, tuning=True),
+                             {"baseline": 34, "candidate": 34})
+
+    def test_candidate_only_demand_boundary_fails_before_spawn(self):
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
+        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        spec = self._spec(5)
+        cand, err = B.resolve_provider_config(spec)
+        self.assertIsNone(err)
+        demand = 5 * 8          # 40, not the old synthetic 2x8 = 16
+        spec["budget"]["strategy_calls_total"] = demand - 1
+        self.assertIn("strategy demand", B.budget_preflight(spec, cand) or "")
+        report = B.preflight(spec)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["stage"], "budget")
+        launched = {"n": 0}
+
+        def fake_episode(config, paths, episode_dir, index, timeout):
+            launched["n"] += 1
+            return _meta(), episode_dir
+
+        runner = B.BenchRunner(spec, tmp)
+        runner.episode_runner = fake_episode
+        self.assertFalse(runner.run()["ok"])
+        self.assertEqual(launched["n"], 0)
+        # the exact demand is accepted
+        spec["budget"]["strategy_calls_total"] = demand
+        self.assertIsNone(B.budget_preflight(spec, cand))
+        self.assertTrue(B.preflight(spec)["ok"])
+
+    def test_candidate_only_string_cap_is_charged_per_episode(self):
+        # the finding's arithmetic: strategy on, cap 8, 5 episodes -> 40
+        spec = self._spec(5)
+        cand, _err = B.resolve_provider_config(spec)
+        counts = B.scheduled_arm_counts(spec)
+        self.assertEqual(counts["candidate"], 5)
+        self.assertEqual(B.scheduled_strategy_demand(cand, None, counts), 40)
+        spec["budget"]["strategy_calls_total"] = 16   # the old synthetic bound
+        self.assertIsNotNone(B.budget_preflight(spec, cand))
+
+    def test_genuine_ab_odd_counts_are_unchanged(self):
+        # regression guard: a real baseline arm keeps the counterbalanced split
+        spec = self._spec(5)
+        spec["baseline_config_ref"] = {"reflex": "scripted",
+                                       "strategy": "deepseek",
+                                       "strategy_call_cap": 8}
+        self.assertEqual(B.scheduled_arm_counts(spec),
+                         {"baseline": 3, "candidate": 2})
+        base, err = B.resolve_baseline_config(spec)
+        self.assertIsNone(err)
+        cand, _err = B.resolve_provider_config(spec)
+        self.assertEqual(
+            B.scheduled_strategy_demand(cand, base,
+                                        B.scheduled_arm_counts(spec)), 40)
+
+
 if __name__ == "__main__":
     unittest.main()

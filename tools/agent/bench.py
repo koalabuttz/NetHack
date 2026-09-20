@@ -412,14 +412,31 @@ def arm_strategy_demand(config, episodes: int) -> int:
     return max(0, int(episodes)) * max(1, cap)
 
 
-def scheduled_arm_counts(spec: dict, n_candidates: int = 0, *,
-                         tuning: bool = False) -> Dict[str, int]:
-    """The exact per-arm episode counts a plan schedules.
+#: Sentinel meaning "not supplied -- infer from the spec".
+_UNSET = object()
 
-    ``tuning=True`` is the full screening x candidates + confirmation plan
-    (each arm gets ``screen x candidates + confirmation`` episodes); otherwise
-    it is the ordinary campaign's **committed counterbalanced schedule**, so
-    both arms' counts come from the one schedule the runner executes.
+
+def scheduled_arm_counts(spec: dict, n_candidates: int = 0, *,
+                         tuning: bool = False,
+                         baseline_config: Any = _UNSET) -> Dict[str, int]:
+    """The exact per-arm episode counts the plan actually schedules.
+
+    Ordinary (``tuning=False``) counts mirror the schedule the **runner
+    executes**, which depends on whether a baseline arm exists:
+
+    * a genuine A/B run -> the committed counterbalanced ``episode_schedule``
+      counts;
+    * a **candidate-only** run (no baseline) -> ``{baseline: 0,
+      candidate: episodes}``, because ``precommit_record(..., ab=False)``
+      labels *every* episode candidate.  Counting the synthetic
+      counterbalanced labels here would under-count the real candidate demand.
+
+    ``tuning=True`` is the full screening x candidates + confirmation plan and
+    always covers **both** arms (tuning requires a baseline).
+
+    Whether a baseline exists is taken from ``baseline_config`` when supplied
+    (``None`` means candidate-only) and otherwise inferred from the spec's
+    ``baseline_config_ref``.
     """
     comp = spec["comparison"]
     screen = int(comp["screening_episodes_per_arm"])
@@ -427,6 +444,12 @@ def scheduled_arm_counts(spec: dict, n_candidates: int = 0, *,
     if tuning:
         each = screen * max(0, int(n_candidates)) + confirm
         return {"baseline": each, "candidate": each}
+    if baseline_config is _UNSET:
+        ab = spec.get("baseline_config_ref") is not None
+    else:
+        ab = baseline_config is not None
+    if not ab:
+        return {"baseline": 0, "candidate": int(spec["episodes"])}
     sched = M.episode_schedule(int(spec["episodes"]),
                                int(comp.get("resampling_seed", 0)))
     return {"baseline": sum(1 for e in sched if e["arm"] == "baseline"),
@@ -624,7 +647,7 @@ def effective_cost_mode(spec: dict, config) -> Tuple[str, bool, Optional[str]]:
 
 
 def budget_preflight(spec: dict, config,
-                     baseline_config: Optional[Any] = None) -> Optional[str]:
+                     baseline_config: Any = _UNSET) -> Optional[str]:
     """Reject an allocation plan that exceeds the declared limits.
 
     Every cap is compared **literally**, including zero: ``max_total_episodes =
@@ -634,7 +657,12 @@ def budget_preflight(spec: dict, config,
     Strategy demand is summed over **both arms** from their exact scheduled
     episode counts and each arm's own ``strategy_call_cap``, so a distinct
     baseline arm cannot pass preflight while its scheduled demand exceeds the
-    campaign's ``strategy_calls_total``.
+    campaign's ``strategy_calls_total`` -- and a **candidate-only** run is
+    charged for *every* episode on the candidate arm (the runner labels them all
+    candidate), never the synthetic counterbalanced split.
+
+    ``baseline_config`` is resolved from the spec when not supplied; a spec that
+    declares a baseline arm whose config cannot be resolved fails closed.
     """
     budget = spec["budget"]
     episodes = spec["episodes"]
@@ -652,11 +680,16 @@ def budget_preflight(spec: dict, config,
             return ("episodes (%d) exceed budget.judge_calls_total (%d): one "
                     "bundled dispatch per eligible episode (zero means zero)"
                     % (episodes, budget["judge_calls_total"]))
+    # resolve the baseline arm once (fail closed if a declared one is broken)
+    if baseline_config is _UNSET:
+        baseline_config, base_err = resolve_baseline_config(spec)
+        if base_err:
+            return "strategy demand cannot be verified: %s" % base_err
     # strategy demand across BOTH arms' scheduled episodes (zero is literal)
-    counts = scheduled_arm_counts(spec)
+    counts = scheduled_arm_counts(spec, baseline_config=baseline_config)
     demand = scheduled_strategy_demand(config, baseline_config, counts)
     if demand > budget["strategy_calls_total"]:
-        return ("strategy demand (%d over counterbalanced arms %s: baseline "
+        return ("strategy demand (%d over scheduled arms %s: baseline "
                 "x%d, candidate x%d) exceeds budget.strategy_calls_total (%d)"
                 % (demand, counts, counts.get("baseline", 0),
                    counts.get("candidate", 0), budget["strategy_calls_total"]))

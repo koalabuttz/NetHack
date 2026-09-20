@@ -146,10 +146,15 @@ An unresolvable config **fails closed** (`strategy-config-unresolvable`) rather
 than under-budgeting.
 
 Planning is **arm-aware**: strategy demand is summed over **both** arms from
-each arm's exact scheduled episode count and its own `strategy_call_cap` (a
-strategy-off arm contributes zero), for the ordinary campaign's counterbalanced
-schedule and for the full tuning allocation alike. A distinct baseline arm with
-a larger cap therefore cannot pass preflight while its scheduled demand exceeds
+each arm's exact *scheduled* episode count and its own `strategy_call_cap` (a
+strategy-off arm contributes zero). The ordinary campaign uses the schedule the
+runner actually executes — for a genuine A/B run the committed counterbalanced
+counts, and for a **candidate-only** run `{baseline: 0, candidate: episodes}`
+because the runner labels *every* episode candidate (a synthetic counterbalanced
+split would under-count the real candidate demand). The full tuning allocation
+always covers both arms (`screening × candidates + confirmation` each), since
+tuning requires a baseline. A distinct baseline arm with a larger cap therefore
+cannot pass preflight while its scheduled demand exceeds
 `strategy_calls_total`, and every manifest reservation records the
 `strategy_calls` of **that episode's scheduled arm config**, not the outer
 candidate's. Both arms are resolved before any spawn; if either arm's config
