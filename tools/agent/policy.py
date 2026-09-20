@@ -712,8 +712,13 @@ class ScriptedReflex(object):
         cur = self.targets.held()
         if cur is None or cur.serial != int(held_serial):
             return
+        # retirement records the site suppression under its exploration
+        # signature, so the unchanged site is not re-elected (no reacquisition)
         self._retire_owned(reason or "recovery",
-                           outcome=lifecycle_metrics.DEST_EXPIRED)
+                           outcome=lifecycle_metrics.DEST_EXPIRED,
+                           pos=cur.pos,
+                           signature=navigation.service_signature(
+                               self._terrain(mem), cur.pos))
 
     @staticmethod
     def _hero_moved(pre_hero, mem, observed_kind) -> bool:
@@ -780,11 +785,16 @@ class ScriptedReflex(object):
                     return
                 # the observation that justified acquisition already satisfied
                 # it: record reached instead of installing (plan 1.4).  A
-                # default one-hop acquisition emits a coherent acquired ->
-                # terminal pair with exactly one real attempt (plan §2A/§3);
-                # a directive-owned one settles through ``_settle_directive``.
+                # one-hop acquisition emits a coherent acquired -> terminal pair
+                # with exactly one real attempt (plan §2A/§3); a directive-owned
+                # one additionally settles its generation (item 4).
                 if source == navigation.SRC_DIRECTIVE:
                     self._note_serviced(mem, pos)
+                    serial = self.targets._serial + 1
+                    self._emit_destination_terminal(
+                        lifecycle_metrics.DEST_REACHED, reason or "reached",
+                        serial, purpose=purpose, source=source,
+                        generation=int(generation))
                     self._settle_directive("reached", generation, reason)
                     return
                 self._note_serviced(mem, pos)
@@ -842,10 +852,10 @@ class ScriptedReflex(object):
                 self.targets.set_phase(navigation.PHASE_INTERACTING)
                 return
             self._note_serviced(mem, pos)
-            self._retire_owned("reached", outcome=lifecycle_metrics.DEST_REACHED)
-            if cur.source == navigation.SRC_DIRECTIVE:
-                self._settle_directive("reached", cur.generation, reason,
-                                       serial=cur.serial)
+            # the owner emits the destination terminal for every source and
+            # settles a directive-owned generation (item 4)
+            self._retire_owned("reached", outcome=lifecycle_metrics.DEST_REACHED,
+                               settle_reason=reason)
             return
         # continue / interact
         self.targets.note_nav_attempt()
@@ -876,6 +886,8 @@ class ScriptedReflex(object):
                 self.targets.note_interact_attempt()
             if navigation.door_open(self._terrain(mem), pos):
                 self._note_serviced(mem, pos)
+                # the door-open branch retires through the owner, which settles a
+                # directive-owned generation too (item 4)
                 self._retire_owned("door-opened",
                                    outcome=lifecycle_metrics.DEST_REACHED)
                 return
@@ -884,10 +896,6 @@ class ScriptedReflex(object):
                 self._retire_owned("door-ineffective",
                                    outcome=lifecycle_metrics.DEST_FAILED,
                                    pos=cur.pos, signature=sig)
-                if cur.source == navigation.SRC_DIRECTIVE:
-                    self._settle_directive("failed", cur.generation,
-                                           "door-ineffective",
-                                           serial=cur.serial)
                 return
         if self.targets.stalled():
             held = self.targets.held()
@@ -897,9 +905,6 @@ class ScriptedReflex(object):
                     pos=held.pos,
                     signature=navigation.service_signature(
                         self._terrain(mem), held.pos))
-                if held.source == navigation.SRC_DIRECTIVE:
-                    self._settle_directive("failed", held.generation,
-                                           "stalled", serial=held.serial)
 
     def _commit_destination_failure(self, payload, tick, mem) -> None:
         """Settle an unresolved explicit destination (plan 1.5).
@@ -921,10 +926,8 @@ class ScriptedReflex(object):
                 else "directive-unresolved",
                 outcome=lifecycle_metrics.DEST_FAILED, pos=held.pos,
                 signature=navigation.service_signature(
-                    self._terrain(mem), held.pos))
-            if held.source == navigation.SRC_DIRECTIVE:
-                self._settle_directive("failed", held.generation, reason,
-                                       serial=held.serial)
+                    self._terrain(mem), held.pos),
+                settle_reason=reason)
         else:
             self._settle_directive("failed", generation, reason)
 
@@ -1455,11 +1458,9 @@ class ScriptedReflex(object):
             return
         if generation is not None and held.generation != int(generation):
             return
-        self._emit_destination_terminal(
-            lifecycle_metrics.DEST_EXPIRED, "directive_expired", held.serial,
-            purpose=held.purpose, source=held.source,
-            generation=held.generation)
-        self.targets.retire("directive-expired")
+        self._retire_owned("directive_expired",
+                           outcome=lifecycle_metrics.DEST_EXPIRED,
+                           settle_reason="directive_expired")
 
     def episode_close(self) -> None:
         """Emit the episode-close terminal for a held destination (plan §3).
@@ -1467,15 +1468,11 @@ class ScriptedReflex(object):
         Emitted *before* episode state is cleared, so a destination still held
         at episode end cannot silently vanish from the lifecycle stream.
         """
-        held = self.targets.held()
-        if held is None:
-            return
-        self._emit_destination_terminal(
-            lifecycle_metrics.DEST_EXPIRED, "episode_close", held.serial,
-            purpose=held.purpose, source=held.source,
-            generation=held.generation)
-        # clear it so a second close is a no-op (exactly one terminal)
-        self.targets.retire("episode-close")
+        # the owner emits exactly one terminal for every source and settles a
+        # directive-owned generation; clearing it makes a second close a no-op
+        self._retire_owned("episode_close",
+                           outcome=lifecycle_metrics.DEST_EXPIRED,
+                           settle_reason="episode_close")
 
     def _emit_destination_terminal(self, outcome, reason, serial, *,
                                    purpose=None, source=None, generation=None,
@@ -1498,27 +1495,33 @@ class ScriptedReflex(object):
         self.lifecycle.record(lifecycle_metrics.KIND_DESTINATION, outcome,
                               **fields)
 
-    def _retire_owned(self, reason, *, outcome=None, pos=None, signature=None):
-        """The single destination retirement owner (plan §3).
+    def _retire_owned(self, reason, *, outcome=None, pos=None, signature=None,
+                      settle_reason=None):
+        """The single destination retirement owner (plan §3, review item 4).
 
         Captures ``(instance, serial, source, purpose, generation)`` *before*
-        clearing state and emits exactly one terminal destination event for
-        every source.  A directive-owned destination's destination terminal is
-        emitted once by :meth:`_settle_directive` (the once-only settlement side
-        effect layered on top), so the owner does not double-emit for it; every
-        default destination is terminated here.  Returns the retired
-        commitment, or ``None`` when nothing was held.
+        clearing state and emits **exactly one** terminal destination event for
+        **every** source -- default and directive-owned alike.  A directive
+        settlement is then layered on as a separate, once-only side effect (it
+        records the directive-generation terminal and queues the book expiry)
+        and never owns or duplicates the destination terminal.  Settling here,
+        rather than in each caller, is what stops a directive-owned retirement
+        from being reasserted on the next unchanged command boundary.  Returns
+        the retired commitment, or ``None`` when nothing was held.
         """
         held = self.targets.held()
         if held is None:
             return None
         term = outcome or lifecycle_metrics.DEST_FAILED
-        directive = (held.source == navigation.SRC_DIRECTIVE)
         self.targets.retire(reason, pos=pos, signature=signature)
-        if not directive:
-            self._emit_destination_terminal(
-                term, reason, held.serial, purpose=held.purpose,
-                source=held.source, generation=held.generation)
+        self._emit_destination_terminal(
+            term, reason, held.serial, purpose=held.purpose,
+            source=held.source, generation=held.generation)
+        if held.source == navigation.SRC_DIRECTIVE:
+            self._settle_directive(
+                "reached" if term == lifecycle_metrics.DEST_REACHED
+                else "failed",
+                held.generation, settle_reason or reason, serial=held.serial)
         return held
 
     def _retire_cycle_owned(self, signature=None):
@@ -1526,37 +1529,39 @@ class ScriptedReflex(object):
 
         Cycle detection may *nominate* recovery, but the destination is
         invalidated here, at the reconciled observation fold, exactly once and
-        with a visible terminal for a default destination as well.
+        with a visible terminal for **every** source (review item 4).
         """
         held = self.targets.held()
         if held is None:
             self.targets.invalidate_cycle(signature)
             return None
-        directive = (held.source == navigation.SRC_DIRECTIVE)
         self.targets.invalidate_cycle(signature)
-        if not directive:
-            self._emit_destination_terminal(
-                lifecycle_metrics.DEST_EXPIRED, "cycle", held.serial,
-                purpose=held.purpose, source=held.source,
-                generation=held.generation)
+        self._emit_destination_terminal(
+            lifecycle_metrics.DEST_EXPIRED, "cycle", held.serial,
+            purpose=held.purpose, source=held.source,
+            generation=held.generation)
+        if held.source == navigation.SRC_DIRECTIVE:
+            # a directive-owned cycle termination settles its generation too,
+            # so the advice is not reasserted on the next command boundary
+            self._settle_directive("failed", held.generation, "cycle",
+                                   serial=held.serial)
         return held
 
     def _settle_directive(self, outcome, generation, reason, serial=None) -> None:
-        """Queue a directive-owned destination settlement (plan 1.5).
+        """Queue a directive-owned destination settlement (plan 1.5/item 4).
 
-        *serial* is the destination serial captured **before** the caller
-        retired the commitment, so a terminal event always names the
-        destination it terminated.
+        A *separate, once-only side effect*: it records the directive-generation
+        terminal and queues the book expiry.  It does **not** emit the
+        destination terminal -- that is owned solely by the retirement owner
+        (:meth:`_retire_owned` / :meth:`_retire_cycle_owned`), which emits it
+        for every source, so the terminal is never duplicated or omitted.
+        *serial* is retained for the callers that name the retired serial.
         """
         self.directive_settlement = (outcome, int(generation), str(reason))
         self.lifecycle.record(
             lifecycle_metrics.KIND_DIRECTIVE,
             lifecycle_metrics.DIR_TERMINAL, generation=int(generation),
             outcome_detail=outcome, reason=reason)
-        self._emit_destination_terminal(
-            lifecycle_metrics.DEST_REACHED if outcome == "reached"
-            else lifecycle_metrics.DEST_FAILED,
-            reason, serial)
 
     @staticmethod
     def _dest_payload(op, held, target=None, purpose=None, source=None,
@@ -2032,10 +2037,8 @@ class ScriptedReflex(object):
         self._retire_owned(
             "locked-door", outcome=lifecycle_metrics.DEST_FAILED,
             pos=held.pos, signature=self._door_failure_signature(mem,
-                                                                 held.pos))
-        if held.source == navigation.SRC_DIRECTIVE:
-            self._settle_directive("failed", held.generation,
-                                   "locked-door", serial=held.serial)
+                                                                 held.pos),
+            settle_reason="locked-door")
 
     def _fold_pickup_outcome(self, mem) -> None:
         """Classify one reconciled pickup attempt into an outcome (plan 3.3).
@@ -2117,15 +2120,15 @@ class ScriptedReflex(object):
                 self._note_serviced(mem, held.pos)
             else:
                 self.targets.note_serviced(held.pos, ())
-            serial = held.serial
-            self.targets.retire("collected")
-            self._settle_directive("reached", held.generation,
-                                   "pickup-success", serial=serial)
+            # the owner emits the destination terminal and settles the
+            # directive generation once (item 4)
+            self._retire_owned("collected",
+                               outcome=lifecycle_metrics.DEST_REACHED,
+                               settle_reason="pickup-success")
         else:
-            serial = held.serial
-            self.targets.retire("pickup-" + outcome)
-            self._settle_directive("failed", held.generation,
-                                   "pickup-" + outcome, serial=serial)
+            self._retire_owned("pickup-" + outcome,
+                               outcome=lifecycle_metrics.DEST_FAILED,
+                               settle_reason="pickup-" + outcome)
 
     def begin_instance(self, iid) -> None:
         """Start a fresh level-instance scope (plan 4.1 rule 6).

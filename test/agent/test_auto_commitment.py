@@ -828,6 +828,69 @@ class AttemptCounting(unittest.TestCase):
         self.assertEqual(mem.no_progress, np_before)
 
 
+class DirectiveTerminalOwner(unittest.TestCase):
+    """Item 4: the retirement owner emits for directive-owned sources too."""
+
+    def setUp(self):
+        self.ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+
+    def _terminals(self, serial):
+        return [e for e in self.ref.lifecycle.events
+                if e.get("kind") == "destination" and e.get("serial") == serial
+                and e.get("outcome") in ("reached", "failed", "expired",
+                                         "replaced")]
+
+    def _directive_settlements(self, generation):
+        return [e for e in self.ref.lifecycle.events
+                if e.get("kind") == "directive"
+                and e.get("outcome") == "terminal"
+                and e.get("generation") == generation]
+
+    def test_directive_owned_cycle_emits_one_terminal_and_settles_once(self):
+        cells = {(2, 10): FLOOR, (3, 10): FLOOR, (4, 10): FLOOR,
+                 (3, 9): FLOOR, (2, 9): WALL, (2, 11): WALL, (3, 11): WALL,
+                 (4, 9): WALL, (4, 11): WALL}
+        mem = nav_test.mem_with(cells, (3, 10))
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_EXPLORE_FRONTIER,
+                                pos=(2, 10), family=navigation.TFAM_FRONTIER,
+                                source=navigation.SRC_DIRECTIVE, generation=4)
+        serial = self.ref.targets.held().serial
+        for pos in [(3, 10), (2, 10), (3, 10), (2, 10), (3, 10)]:
+            mem.hero = pos
+            self.ref.note_observation(mem)
+        cand = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.ref.commit_effect(cand.proposed_effect, cand.semantic_label, 1,
+                               mem, observed_kind="moved",
+                               payload=cand.effect_payload, pre_hero=(3, 10))
+        # target cleared, exactly one destination terminal for the old serial,
+        # and the directive generation settled exactly once
+        self.assertIsNone(self.ref.targets.held())
+        self.assertEqual(len(self._terminals(serial)), 1)
+        self.assertEqual(len(self._directive_settlements(4)), 1)
+        self.assertEqual(self.ref.directive_settlement[1], 4)
+        # the retired site is suppressed: no reacquisition on the next boundary
+        self.assertTrue(self.ref.targets.failed((2, 10)))
+
+    def test_directive_owned_door_open_emits_one_terminal_and_settles_once(self):
+        mem = nav_test.mem_with({(3, 10): FLOOR, (4, 10): nav_test.OPEN,
+                                 (5, 10): FLOOR}, (4, 10))
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_OPEN_DOOR,
+                                pos=(4, 10), family=navigation.TFAM_DOOR,
+                                source=navigation.SRC_DIRECTIVE, generation=7)
+        serial = self.ref.targets.held().serial
+        payload = policy.ScriptedReflex._dest_payload(
+            "continue", self.ref.targets.held(), step=(0, 1))
+        self.ref.commit_effect("navigate", "navigate", 1, mem,
+                               observed_kind="moved", payload=payload,
+                               pre_hero=(4, 10))
+        self.assertIsNone(self.ref.targets.held())
+        self.assertEqual(len(self._terminals(serial)), 1)
+        self.assertEqual(len(self._directive_settlements(7)), 1)
+        self.assertEqual(self.ref.directive_settlement[0], "reached")
+
+
 class RecoveryRetirementBoundary(unittest.TestCase):
     """Item 2: retirement only at the reconciled recovery-effect boundary."""
 
