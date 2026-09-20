@@ -711,16 +711,14 @@ MUTATIONS = (
         "name": "mutation_bench_postmortem_reserve_not_forced",
         "file": "tools/agent/bench.py",
         "old": ("    if values.get(\"postmortem_reserve\", 0):\n"
-                "        return None, (\"postmortem_reserve must be 0 in a "
-                "bench campaign \"\n"
-                "                      \"(DeepSeek postmortems are "
-                "disabled)\")\n"
+                "        return {}, (\"postmortem_reserve must be 0 in a bench "
+                "campaign \"\n"
+                "                    \"(DeepSeek postmortems are disabled)\")\n"
                 "    values[\"postmortem_reserve\"] = 0"),
         "new": ("    if False:\n"
-                "        return None, (\"postmortem_reserve must be 0 in a "
-                "bench campaign \"\n"
-                "                      \"(DeepSeek postmortems are "
-                "disabled)\")"),
+                "        return {}, (\"postmortem_reserve must be 0 in a bench "
+                "campaign \"\n"
+                "                    \"(DeepSeek postmortems are disabled)\")"),
         "killer": ("test_auto_bench.PaidExposure."
                    "test_bench_forces_zero_postmortem_reserve"),
     },
@@ -790,7 +788,7 @@ MUTATIONS = (
     {
         "name": "mutation_bench_tuner_peeks_until_success",
         "file": "tools/agent/bench.py",
-        "old": ("            \"sweeps\": min(2, max(1, len(candidates))),"),
+        "old": ("            \"sweeps\": min(2, max(0, len(candidates))),"),
         "new": ("            \"sweeps\": len(candidates) + 5,"),
         "killer": ("test_auto_bench.TunerAndApply."
                    "test_tuner_finite_grid_and_reserved_confirmation_budget"),
