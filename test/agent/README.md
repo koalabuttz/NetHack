@@ -368,8 +368,10 @@ blind `y` is ever sent.
 cloud token in the wire. Phase 0 therefore takes exit (b): the disposition in
 `doc/agent-prompt-edge-cloud-disposition.json` records the indistinguishable
 encoding and enables conservative persistent suppression — a prompt-declined
-edge stays suppressed under unchanged evidence and reopens only on a positive
-relevant local change or a scope change, never on time, visits, global
-revisions or unrelated occupancy. A native `make -C test/agent native-cloud`
-probe exists for the operator-gated trace that is mandatory before any positive
-(cloud-disappearance) reopening claim.
+edge suppresses **regardless of any local signature change** (a terrain
+corridor/floor transition, an occupant appearing, a diagonal side-cell change,
+time, visits or a remote cell) and is reopened only by an instance/scope reset.
+Signature-based reopening exists behind the `positive_reopening_enabled`
+capability, which stays disabled until the native `make -C test/agent
+native-cloud` probe (or an operator-gated manual trace) is recorded — that
+trace is mandatory before any positive (cloud-disappearance) reopening claim.
