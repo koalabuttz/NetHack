@@ -54,6 +54,19 @@ TFAM_DOOR = "door"
 TFAM_FRONTIER = "frontier"
 TFAM_UNVISITED = "unvisited"
 
+# -- movement action classes (prompt-edge plan §D/§E) ----------------------
+#
+# A directed edge's learned prompt-declined evidence is keyed by *movement
+# action class*, so a normal-navigation decline does not suppress the same
+# edge for the emergency class (a sole legal escape must stay available).  The
+# class is a property of the navigation being performed, not of the edge, so a
+# :func:`one_dijkstra_steps` caller supplies it once (keyword-only).
+ACTION_NORMAL = "normal"          # destination acquire/continue + recovery
+ACTION_RECOVERY = "recovery"
+ACTION_EMERGENCY = "emergency"
+
+ACTION_CLASSES = (ACTION_NORMAL, ACTION_RECOVERY, ACTION_EMERGENCY)
+
 _DOOR_TERRAIN = (T_DOORWAY, T_OPEN_DOOR)
 
 
@@ -169,7 +182,8 @@ def _edge_cost(terrain: TerrainMemory, pos: Tuple[int, int],
 def one_dijkstra(terrain: TerrainMemory, hero: Tuple[int, int],
                  visits: Optional[Dict[Tuple[int, int], int]] = None,
                  failed: Optional[Dict[Tuple[int, int], int]] = None,
-                 deadline_check=None):
+                 deadline_check=None, *, edge_admissible=None,
+                 action_class: str = ACTION_NORMAL):
     """One Dijkstra from *hero* over known-safe legal edges (4.5).
 
     Returns ``(dist, first)`` where ``dist[pos]`` is the integer cost from the
@@ -177,16 +191,27 @@ def one_dijkstra(terrain: TerrainMemory, hero: Tuple[int, int],
     path to *pos*.  The hero itself is ``dist[hero] == 0`` with no first step.
     The traversal is bounded by *deadline_check* (a callable that may raise),
     so a single preparation cannot overrun the reflex allowance.
+
+    ``edge_admissible`` is the optional **pure and directed** predicate
+    ``edge_admissible(src, dst, action_class) -> bool`` (prompt-edge plan §E).
+    It is invoked *after* the geometric :func:`edge_legal` check at both the
+    root-neighbour seeding and every interior relaxation, and never reads or
+    mutates policy state.  ``None`` (the default) preserves the existing
+    behaviour exactly.  The parameter is **keyword-only** and appended after
+    ``deadline_check``, so a positional argument can never be silently
+    reinterpreted as the live deadline callback.
     """
-    dist, first, _steps = one_dijkstra_steps(terrain, hero, visits, failed,
-                                             deadline_check)
+    dist, first, _steps = one_dijkstra_steps(
+        terrain, hero, visits, failed, deadline_check,
+        edge_admissible=edge_admissible, action_class=action_class)
     return dist, first
 
 
 def one_dijkstra_steps(terrain: TerrainMemory, hero: Tuple[int, int],
                        visits: Optional[Dict[Tuple[int, int], int]] = None,
                        failed: Optional[Dict[Tuple[int, int], int]] = None,
-                       deadline_check=None):
+                       deadline_check=None, *, edge_admissible=None,
+                       action_class: str = ACTION_NORMAL):
     """One Dijkstra plus the **true edge count** to every reached cell (§2).
 
     Returns ``(dist, first, steps)``: like :func:`one_dijkstra`, plus
@@ -195,6 +220,11 @@ def one_dijkstra_steps(terrain: TerrainMemory, hero: Tuple[int, int],
     a hop count; this separate counter is what the total-attempt cap must use
     (review item 5), so two equal-length routes with different visit histories
     carry the same hop count while their weighted cost differs.
+
+    ``edge_admissible``/``action_class`` are keyword-only (see
+    :func:`one_dijkstra`): the pure directed predicate is consulted after
+    :func:`edge_legal` at both the seed and every interior relaxation, so a
+    forbidden edge is filtered throughout the graph, not only at the first hop.
     """
     visits = visits or {}
     failed = failed or {}
@@ -202,9 +232,18 @@ def one_dijkstra_steps(terrain: TerrainMemory, hero: Tuple[int, int],
     first: Dict[Tuple[int, int], Tuple[int, int]] = {}
     steps: Dict[Tuple[int, int], int] = {hero: 0}
     heap = []
+
+    def admit(a, b) -> bool:
+        if not edge_legal(terrain, a, b):
+            return False
+        if edge_admissible is not None \
+                and not edge_admissible(a, b, action_class):
+            return False
+        return True
+
     for step in DIRECTIONS:
         nb = (hero[0] + step[0], hero[1] + step[1])
-        if not edge_legal(terrain, hero, nb):
+        if not admit(hero, nb):
             continue
         c = _edge_cost(terrain, nb, visits, failed)
         if c < dist.get(nb, INF):
@@ -221,7 +260,7 @@ def one_dijkstra_steps(terrain: TerrainMemory, hero: Tuple[int, int],
         fstep = first[pos]
         for step in DIRECTIONS:
             nb = (pos[0] + step[0], pos[1] + step[1])
-            if not edge_legal(terrain, pos, nb):
+            if not admit(pos, nb):
                 continue
             nd = d + _edge_cost(terrain, nb, visits, failed)
             if nd < dist.get(nb, INF):
@@ -341,10 +380,17 @@ class NavPlan:
 def plan(terrain: TerrainMemory, hero: Tuple[int, int],
          visits: Optional[Dict[Tuple[int, int], int]] = None,
          failed: Optional[Dict[Tuple[int, int], int]] = None,
-         deadline_check=None) -> NavPlan:
-    """One Dijkstra and all-reachable-target enumeration (the 4.5 gate)."""
-    dist, first, steps = one_dijkstra_steps(terrain, hero, visits, failed,
-                                            deadline_check)
+         deadline_check=None, *, edge_admissible=None,
+         action_class: str = ACTION_NORMAL) -> NavPlan:
+    """One Dijkstra and all-reachable-target enumeration (the 4.5 gate).
+
+    ``edge_admissible``/``action_class`` are forwarded verbatim to
+    :func:`one_dijkstra_steps`, so every enumerated target is reached only
+    along edges the pure directed predicate admits (prompt-edge plan §E).
+    """
+    dist, first, steps = one_dijkstra_steps(
+        terrain, hero, visits, failed, deadline_check,
+        edge_admissible=edge_admissible, action_class=action_class)
     targets = enumerate_targets(terrain, hero, dist, first, visits, steps)
     return NavPlan(hero=hero, dist=dist, first=first, targets=targets)
 
