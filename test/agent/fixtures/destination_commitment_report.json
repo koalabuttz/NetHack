@@ -1,7 +1,7 @@
 {
  "commit_range": {
   "base": "56c0c45a0739b29a3173b08b343d5fc786a56712",
-  "head": "4ca7c716cd339f62c31478a4163ac5471b1c2b63"
+  "head": "dcc3627075372ebcc03007c16b79ef5d9faf6cef"
  },
  "commits": [
   {
@@ -263,6 +263,38 @@
   {
    "hash": "4ca7c716cd339f62c31478a4163ac5471b1c2b63",
    "subject": "agent: regenerate report at final head"
+  },
+  {
+   "hash": "341f7fd6d965ee35d7a2a8e54e255a61edeec9cb",
+   "subject": "agent: regenerate report at final head"
+  },
+  {
+   "hash": "db958fad4eec39b99066a0095f58ac7bc242a710",
+   "subject": "agent: revise prompt edge plan to rev 2"
+  },
+  {
+   "hash": "9a46132853d210d134e6a95f29f2c096fdd144db",
+   "subject": "agent: revise prompt edge plan to rev 3"
+  },
+  {
+   "hash": "ac05264e538553fcb1c197294a32b2952d0b986c",
+   "subject": "agent: pin vapor prompt-edge evidence"
+  },
+  {
+   "hash": "5f3961041b298da3112da326b10b2419ce1b51cb",
+   "subject": "agent: matched movement origin and accounting"
+  },
+  {
+   "hash": "a8f3449c7f3da3a64831b624f8a278a79964a8ff",
+   "subject": "agent: prompt-declined edge ledger"
+  },
+  {
+   "hash": "286c191d054146dbeb933607a23e93bf376951c6",
+   "subject": "agent: filter planning by declined edges"
+  },
+  {
+   "hash": "dcc3627075372ebcc03007c16b79ef5d9faf6cef",
+   "subject": "agent: parity, mutations and docs"
   }
  ],
  "gates": {
@@ -429,6 +461,71 @@
    "killer": "test_auto_recovery.Phase2BoundedRecovery.test_recovery_only_legal_reverse_is_not_trapped",
    "name": "mutation_reject_sole_legal_reverse",
    "status": "killed"
+  },
+  {
+   "killer": "test_auto_prompt_edge.LiveEvaluatorParity.test_live_evaluator_movement_prompt_accounting_and_ledger_parity",
+   "name": "mutation_restore_response_kind_only_filter",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_prompt_edge.MovementEntryRecognition.test_only_cloud_confirmations_are_recognized",
+   "name": "mutation_permit_every_yn_to_advance",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_prompt_edge.MatchedMovementAccounting.test_matched_movement_vapor_prompt_advances_stationary_once",
+   "name": "mutation_count_prompt_arrival_and_answer",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_prompt_edge.MovementOriginTaxonomy.test_movement_origin_operation_taxonomy_matrix",
+   "name": "mutation_infer_movement_from_raw_direction",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_prompt_edge.DeclineEvidence.test_prompt_decline_requires_matching_answer_send_and_resolution",
+   "name": "mutation_record_evidence_at_proposal_or_stale_n",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_prompt_edge.MovementOriginTaxonomy.test_movement_origin_dst_is_origin_edge_not_destination",
+   "name": "mutation_derive_dst_from_semantic_destination",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_prompt_edge.PromptEdgeSuppression.test_prompt_declined_edge_survives_prompt_absence_and_destination_reacquisition",
+   "name": "mutation_compare_stored_prompt_with_absent_command",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_prompt_edge.PromptEdgeSuppression.test_prompt_edge_reopens_on_positive_local_cloud_change",
+   "name": "mutation_omit_local_cloud_evidence",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_prompt_edge.PromptEdgeSuppression.test_prompt_edge_ignores_time_visits_remote_occupancy_and_occlusion",
+   "name": "mutation_reopen_on_remote_occupancy",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_prompt_edge.EdgeAdmissiblePredicate.test_forbidden_edge_filters_seed_and_interior",
+   "name": "mutation_filter_only_seed_edges",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_prompt_edge.DeclineEvidence.test_cloud_confirmation_declines_even_with_yes_native_default",
+   "name": "mutation_honor_yes_native_default_for_cloud",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_prompt_edge.PromptEdgeSuppression.test_prompt_ledger_overwrites_per_edge_and_clears_on_instance_reset",
+   "name": "mutation_keep_scoped_prompt_ledger_on_reset",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_prompt_edge.DeclineEvidence.test_prompt_decline_resolution_with_hero_progress_records_no_edge",
+   "name": "mutation_remove_unchanged_confirmed_hero_condition",
+   "status": "killed"
   }
  ],
  "pickup_shape_disposition": {
@@ -488,5 +585,5 @@
   ]
  },
  "schema_version": 1,
- "suite_count": 1165
+ "suite_count": 1203
 }
