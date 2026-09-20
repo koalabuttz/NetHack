@@ -2887,6 +2887,13 @@ class _EpisodeRunner(object):
             ordinal = self._emit("act", obj, need_key=self.pending_key,
                                  write_deadline=write_dl)
         except _TransportFailure:
+            # A failed/partial write arms nothing (plan 3.4 step 5): the
+            # selected-decision record is cleared too, so a write-failed
+            # candidate can never commit a destination or recovery effect.
+            self.selected_decision = None
+            self._selected_candidate = None
+            self._attempt_effect = None
+            self._attempt_payload = ()
             self._forced_on_write_failed(role)
             raise
         # requested/pending state mutates only after the complete send

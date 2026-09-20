@@ -877,6 +877,38 @@ class LiveEvaluatorParity(WireHarness):
         replay2.run()
         self.assertEqual(replay.decisions, replay2.decisions)
 
+    def test_live_replay_selected_effect_parity(self):
+        # AC4: the exact frozen *effect label* of the selected candidate agrees
+        # between the live controller's decision sidecar and the offline replay
+        # for the same wire.
+        from tools.agent import evaluate
+
+        recs = [self._rec(1, 1, t=100), self._rec(2, 2, t=101),
+                self._rec(3, 3, t=102), self._rec(4, None, t=103)]
+        scenario = b"".join([_line(HELLO)] + [_line(r) for r in recs]
+                            + [_line(CLOSED)])
+        lines = [ln + b"\n" for ln in scenario.split(b"\n") if ln]
+        self.run_scenario(scenario, max_ticks=200)
+        # the live decision sidecar carries the selected candidate's label in
+        # its additive diagnostics field
+        live = []
+        with open(os.path.join(self.dir, "ep-1.decisions.jsonl")) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                diag = json.loads(line).get("diagnostics") or {}
+                live.append(diag.get("semantic_label", ""))
+        replay = evaluate.ReplayPass(
+            lines, ProviderConfig(reflex="scripted", strategy="off",
+                                  max_ticks=200), "scripted", "off")
+        replay.run()
+        rg = [d.get("effect_label", "") for d in replay.decisions
+              if d.get("record") == "need"]
+        self.assertTrue(live)
+        self.assertEqual(len(live), len(rg))
+        self.assertEqual(live, rg)
+
     def test_shared_rejection_set_is_one_copy(self):
         # M21: the replay and the live controller use the same rejection logic
         rs = arbitration.RejectionSet()
@@ -1542,6 +1574,122 @@ class SelectedDecisionOwnership(JevAppliedCap):
         self.assertEqual(r._attempt_effect, chosen.proposed_effect)
         self.assertEqual(tuple(r._attempt_payload),
                          tuple(chosen.effect_payload))
+
+
+class SelectedEffectOwnership(JevAppliedCap):
+    """AC3: the exact selected candidate effect survives every path."""
+
+    def _runner(self, fake, cap=2, config=None):
+        r, rec, proc = super()._runner(fake, cap=cap, config=config)
+        r.terrain.merge({p: (".", "gray", 0, "none")
+                         for p in [(5, 5), (4, 5), (6, 5), (5, 4), (5, 6)]})
+        return r, rec, proc
+
+    def test_selected_candidate_effect_survives_all_fallback_reasons(self):
+        cases = [
+            ("paid-cap", _ChoiceJev(), 0),
+            ("timeout", _ChoiceJev(returns_none=True), 2),
+            ("rejected", _ChoiceJev(index=99), 2),
+            ("abstain", _ChoiceJev(abstain=True), 2),
+        ]
+        for name, fake, cap in cases:
+            r, rec, _ = self._runner(fake, cap=cap)
+            self._answer(r)
+            rec.finalize({})
+            scripted = r.reflex.last_candidate
+            self.assertIsNotNone(scripted, name)
+            # the frozen effect is the *selected* scripted candidate's, not a
+            # synthesized effect-less one
+            self.assertEqual(r._attempt_effect, scripted.proposed_effect, name)
+            self.assertEqual(tuple(r._attempt_payload),
+                             tuple(scripted.effect_payload), name)
+            self.assertIs(r.selected_decision["candidate"], scripted, name)
+        # unavailable paid tier
+        r, rec, _ = self._runner(_ChoiceJev())
+        r.reflex_provider.available = lambda cfg: providers.Availability(
+            False, "offline")
+        self._answer(r)
+        rec.finalize({})
+        scripted = r.reflex.last_candidate
+        self.assertEqual(r._attempt_effect, scripted.proposed_effect)
+        self.assertIs(r.selected_decision["candidate"], scripted)
+
+    def test_jev_accepts_different_action_non_scripted_candidate_and_commits_its_exact_payload(
+            self):
+        fake = _ChoiceJev(index=1)
+        r, rec, _ = self._runner(fake)
+        self._answer(r)
+        rec.finalize({})
+        table = r.reflex.last_prepared.table
+        chosen = table.ordered_candidates[1]
+        self.assertNotEqual(candidates.candidate_to_wire(chosen),
+                            candidates.candidate_to_wire(
+                                table.ordered_candidates[0]))
+        # the accepted member's exact candidate (identity) owns the effect
+        self.assertIs(r.selected_decision["candidate"], chosen)
+        self.assertEqual(r._attempt_effect, chosen.proposed_effect)
+        self.assertEqual(tuple(r._attempt_payload),
+                         tuple(chosen.effect_payload))
+
+    def test_stale_candidate_same_wire_from_other_table_is_rejected_by_identity(
+            self):
+        r, rec, _ = self._runner(_ChoiceJev())
+        wire = {"key": protocol.KEY_SEARCH}
+        stale = candidates.make_candidate(wire, "stale",
+                                          proposed_effect="stale-effect")
+        r.reflex.last_candidate = stale       # a stale table's candidate
+        r.selected_decision = {"candidate": candidates.make_candidate(
+            wire, "current", proposed_effect="record-effect")}
+        picked = r._selected_wire_candidate(wire)
+        # the selected-decision record's candidate wins by identity, never the
+        # stale same-wire candidate from another table
+        self.assertIsNot(picked, stale)
+        self.assertEqual(picked.proposed_effect, "record-effect")
+
+    def test_override_does_not_commit_discarded_destination(self):
+        r, rec, _ = self._runner(_ChoiceJev())
+        r._forced_override = lambda need, selected: (
+            {"key": protocol.KEY_SEARCH}, "forced search", "prefix")
+        self._answer(r)
+        rec.finalize({})
+        self.assertIsNone(r.selected_decision)
+        self.assertFalse(r._attempt_effect)
+        self.assertIsNone(r.reflex.targets.held())
+
+    def test_write_failure_commits_no_selected_destination_or_recovery_effect(
+            self):
+        r, rec, _ = self._runner(_ChoiceJev())
+
+        def boom(*a, **k):
+            raise controller._TransportFailure("partial write")
+
+        r._emit = boom
+        with self.assertRaises(controller._TransportFailure):
+            self._answer(r)
+        rec.finalize({})
+        self.assertIsNone(r.selected_decision)
+        self.assertIsNone(r._attempt_effect)
+        self.assertIsNone(r.reflex.targets.held())
+
+    def test_delivery_repair_preserves_effect_and_applied_token_once(self):
+        fake = _ChoiceJev()
+        r, rec, _ = self._runner(fake, cap=1)
+        self._answer(r)
+        first_effect = r._attempt_effect
+        first_payload = tuple(r._attempt_payload)
+        first_cand = r.selected_decision["candidate"]
+        self.assertEqual(r.ledger.reflex_applied, 1)
+        r._on_invalid({"code": "incomplete"})
+        self.assertIsNotNone(r._repair_send)
+        self._answer(r)
+        rec.finalize({})
+        # the repair resends the original logical selection: same effect/payload
+        self.assertEqual(r._attempt_effect, first_effect)
+        self.assertEqual(tuple(r._attempt_payload), first_payload)
+        self.assertIs(r.selected_decision["candidate"], first_cand)
+        # the applied token is charged exactly once and no second consultation
+        self.assertEqual(r.ledger.reflex_applied, 1)
+        self.assertEqual(fake.decides, 1)
 
 
 class DecisionDiagnostics(JevAppliedCap):

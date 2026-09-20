@@ -143,7 +143,8 @@ MUTATIONS = (
         "name": "mutation_apply_antibacktrack_to_committed_target",
         "file": "tools/agent/policy.py",
         "old": ("        if step is not None:\n"
-                "            payload = self._dest_payload(\"continue\", held)"),
+                "            payload = self._dest_payload(\"continue\", held, "
+                "step=step)"),
         "new": ("        if step is not None and not self._is_reverse(\n"
                 "                step, hero, self.recovery.previous_distinct):\n"
                 "            payload = self._dest_payload(\"continue\", held)"),

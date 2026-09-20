@@ -1254,6 +1254,12 @@ class ReplayPass(object):
             "rejected_attempts": rejected_actions,
             "rejected_count": len(rejected_actions),
             "agreement": agreement, "sent_ordinal": ordinal,
+            # Additive live/replay parity field (stall-recovery plan AC4): the
+            # exact frozen effect of the selected candidate, so a replay can be
+            # compared against the live selected-decision record.
+            "effect": (self._pending_effect[0] if self._pending_effect else ""),
+            "effect_label": (self._pending_effect[1]
+                             if self._pending_effect else ""),
             "boundaries": list(need.boundaries),
             "directives": [view.dset.to_dict()] if view.active else [],
         })

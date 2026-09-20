@@ -814,6 +814,69 @@ class AttemptCounting(unittest.TestCase):
         self.assertEqual(self.ref.targets.stall_attempts, before)
 
 
+class DoorAndRouteAccounting(unittest.TestCase):
+    """AC4: door interactions are counted only when the action targets the
+    door from an approach square, and the route cap uses the initial hops."""
+
+    def setUp(self):
+        self.ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+
+    def _door_mem(self):
+        return nav_test.mem_with({(3, 10): FLOOR, (4, 10): FLOOR,
+                                  (5, 10): DOOR, (6, 10): FLOOR}, (4, 10))
+
+    def test_move_to_door_approach_is_not_an_interaction(self):
+        mem = self._door_mem()
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_OPEN_DOOR,
+                                pos=(5, 10), family=navigation.TFAM_DOOR)
+        # the step moves the hero from (3,10) onto the approach (4,10), not onto
+        # the door cell: it is not a door interaction (§2A rule 6)
+        payload = policy.ScriptedReflex._dest_payload(
+            "continue", self.ref.targets.held(), step=(1, 0))
+        self.ref.commit_effect("navigate", "navigate", 1, mem,
+                               observed_kind="moved", payload=payload,
+                               pre_hero=(3, 10))
+        self.assertEqual(self.ref.targets.interact_attempts, 0)
+
+    def test_door_interaction_bound_counts_sent_interactions_only(self):
+        mem = self._door_mem()
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_OPEN_DOOR,
+                                pos=(5, 10), family=navigation.TFAM_DOOR)
+        # a move to the approach is not counted ...
+        approach = policy.ScriptedReflex._dest_payload(
+            "continue", self.ref.targets.held(), step=(1, 0))
+        self.ref.commit_effect("navigate", "navigate", 1, mem,
+                               observed_kind="moved", payload=approach,
+                               pre_hero=(3, 10))
+        self.assertEqual(self.ref.targets.interact_attempts, 0)
+        # ... but two real interactions from the approach into the door retire
+        for i in range(navigation.DOOR_INTERACT_MAX):
+            if self.ref.targets.held() is None:
+                break
+            payload = policy.ScriptedReflex._dest_payload(
+                "continue", self.ref.targets.held(), step=(1, 0))
+            self.ref.commit_effect("navigate", "navigate", i + 2, mem,
+                                   observed_kind="no-time", payload=payload,
+                                   pre_hero=(4, 10))
+        self.assertEqual(self.ref.targets.interact_attempts,
+                         navigation.DOOR_INTERACT_MAX)
+        self.assertIsNone(self.ref.targets.held())
+
+    def test_long_route_cap_uses_initial_hops(self):
+        # the initial hop count is carried into the total cap, not the default
+        st = navigation.CommitmentStore()
+        st.commit(instance_id=1, purpose=navigation.COMMIT_EXPLORE_FRONTIER,
+                  pos=(20, 10), family=navigation.TFAM_FRONTIER, hops=10)
+        self.assertEqual(
+            st.stall_cap,
+            max(navigation.STALL_TOTAL_MIN,
+                navigation.STALL_TOTAL_FACTOR * 10
+                + navigation.STALL_TOTAL_SLACK))
+        self.assertGreater(st.stall_cap, navigation.STALL_TOTAL_MIN)
+
+
 class Phase3EvidenceSplit(unittest.TestCase):
     """AC7: split evidence signatures and the door-refusal seam (§4/§Phase 3)."""
 

@@ -701,6 +701,9 @@ class ScriptedReflex(object):
         # caller.  It lets the door-interaction count require the action to
         # actually target the door from an approach square.
         dirdata = tuple(payload[11]) if len(payload) > 11 and payload[11] else ()
+        # The initial route hop count of a fresh acquisition (plan §2): carried
+        # into the total navigation cap rather than the default cap.
+        hops = payload[12] if len(payload) > 12 else None
         pos = (int(x), int(y))
         hero = mem.hero
         if op == "acquire":
@@ -736,7 +739,7 @@ class ScriptedReflex(object):
             self.targets.commit(instance_id=iid or self.instance_id,
                                 purpose=purpose, pos=pos, family=family,
                                 source=source, generation=int(generation),
-                                tick=tick, hero=mem.hero)
+                                tick=tick, hero=mem.hero, hops=hops)
             # §2A: a no-time acquisition (the hero did not move from the
             # frozen pre-send square) installs the target and counts as
             # no-progress attempt 1 of 3; a moved acquisition charges only the
@@ -1477,12 +1480,19 @@ class ScriptedReflex(object):
             source = source or navigation.SRC_DEFAULT
             generation = 0 if generation is None else int(generation)
             expected = -1
-        # The additive 12th field is the selected pre-send direction for a
-        # continuation (§2A rule 6); empty when the caller does not supply one.
+        # Additive 12th field: the selected pre-send direction for a
+        # continuation (§2A rule 6), empty when the caller does not supply one.
+        # Additive 13th field: the initial route hop count of a fresh
+        # acquisition (plan §2), derived from the target's Dijkstra cost.
+        hops = None
+        if held is None and target is not None \
+                and getattr(target, "cost", None):
+            hops = max(1, int(target.cost) // navigation.BASE_STEP)
         return ("dest", op, int(iid), purpose, int(pos[0]), int(pos[1]),
                 family, source, int(generation), int(expected),
                 str(reason or ""),
-                tuple(step) if step else ())
+                tuple(step) if step else (),
+                hops)
 
     def _directive_bears_destination(self) -> bool:
         """True when the active advice names or selects a destination (1.5)."""
