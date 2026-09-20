@@ -400,6 +400,65 @@ def config_fingerprint(config) -> Optional[str]:
     return M.sha256_json(payload)
 
 
+def arm_config_path(episode_dir: str) -> str:
+    """The per-episode, immutable **arm-config** file the parent writes."""
+    return os.path.join(episode_dir, "bench-arm-config.json")
+
+
+def arm_config_record(config, arm: str) -> Dict[str, Any]:
+    """The immutable arm-config record: the resolved values + expected hash."""
+    import dataclasses
+    try:
+        values = dataclasses.asdict(config)
+    except TypeError:
+        values = dict(getattr(config, "__dict__", {}))
+    return {"schema_version": "bench-arm-config/1", "arm": arm,
+            "values": values, "fingerprint": config_fingerprint(config)}
+
+
+def write_arm_config(episode_dir: str, config, arm: str) -> Dict[str, Any]:
+    """Persist the resolved arm config (and its hash) before the child spawns."""
+    record = arm_config_record(config, arm)
+    write_json_atomic(arm_config_path(episode_dir), record)
+    return record
+
+
+def load_arm_config(path: str, spec: dict
+                    ) -> Tuple[Optional[Any], Optional[str], Optional[str]]:
+    """Resolve the exact arm config the parent committed for this episode.
+
+    Returns ``(config, fingerprint, error)``.  The values are rebuilt through
+    the **same** ``ProviderConfig`` validation authority as normal preflight,
+    and the recomputed fingerprint must match the recorded one -- a swapped or
+    edited arm config is refused here, before any controller is constructed.
+    """
+    from . import providers
+    record = _read_json(path)
+    if not isinstance(record, dict) or not isinstance(record.get("values"),
+                                                      dict):
+        return None, None, "arm-config file is missing or malformed: %s" % path
+    values = dict(record["values"])
+    # bench policy: DeepSeek postmortems stay disabled for every arm
+    if values.get("postmortem_reserve", 0):
+        return None, None, ("arm config enables postmortem_reserve: %s" % path)
+    values["postmortem_reserve"] = 0
+    try:
+        config = providers.ProviderConfig(**values)
+    except TypeError as exc:
+        return None, None, "arm config: %s" % exc
+    problem = config.validate(episodes=spec["episodes"],
+                              episode_timeout=spec["episode_timeout_s"])
+    if problem:
+        return None, None, "arm config: %s" % problem
+    fingerprint = config_fingerprint(config)
+    expected = record.get("fingerprint")
+    if expected != fingerprint:
+        return None, fingerprint, ("arm-config fingerprint mismatch: "
+                                   "recorded %r, recomputed %r"
+                                   % (expected, fingerprint))
+    return config, fingerprint, None
+
+
 def jev_profile_conflict(config) -> Optional[str]:
     """Reject a live Jev profile whose caps would silently disable Jev.
 
@@ -458,6 +517,13 @@ def preflight(spec: dict) -> Dict[str, Any]:
         if base_err:
             return {"ok": False, "stage": "provider_config",
                     "error": base_err}
+        # an A/B experiment needs two genuinely DISTINCT arm configs: an equal
+        # fingerprint means the labels would lie, so it is refused up front.
+        if config_fingerprint(baseline_config) == config_fingerprint(config):
+            return {"ok": False, "stage": "ab-design",
+                    "error": ("baseline_config_ref resolves to the same config "
+                              "as the candidate: an A/B experiment requires "
+                              "distinct arm configs")}
     conflict = jev_profile_conflict(config)
     if conflict:
         return {"ok": False, "stage": "scope", "error": conflict}
@@ -1512,6 +1578,7 @@ def default_episode_command(runner, spec_path: str, episode_dir: str,
             "--spec", spec_path, "--episode-dir", episode_dir,
             "--timeout", str(timeout),
             "--root-ready", root_ready_path(episode_dir),
+            "--arm-config", arm_config_path(episode_dir),
             "--worker", paths.get("worker", ""),
             "--runner", paths.get("runner", ""),
             "--data", paths.get("data", "")]
@@ -1609,6 +1676,7 @@ class BenchRunner(object):
         self._observed_pairs: List[str] = []
         self._arm_config_hashes: Dict[str, str] = {}
         self._arm_configs: Dict[str, Any] = {}
+        self._arm_config_mismatches: List[Dict[str, Any]] = []
 
     def _spec_path(self) -> str:
         if self.spec_path is None:
@@ -1688,6 +1756,15 @@ class BenchRunner(object):
         requested = {"reflex": config.reflex, "strategy": config.strategy,
                      "judge": ("jev" if self.spec["judge"]["enabled"]
                                else "none")}
+        # requested-tier metadata is derived PER ARM from the arm's own config,
+        # so a baseline episode never reports the candidate's tiers.
+        requested_by_arm: Dict[str, Dict[str, Any]] = {}
+        for _arm, _cfg in self._arm_configs.items():
+            if _cfg is not None:
+                requested_by_arm[_arm] = {
+                    "reflex": _cfg.reflex, "strategy": _cfg.strategy,
+                    "judge": requested["judge"]}
+        self._arm_config_mismatches: List[Dict[str, Any]] = []
         self.manifest.set_status("running", tier=LIVE,
                                  requested_tiers=requested,
                                  ab=self._ab,
@@ -1749,9 +1826,23 @@ class BenchRunner(object):
                         "judge_dispatches": (1 if self.judge is not None
                                              else 0),
                     }})
-                result, episode_dir = self._run_one(arm_cfg, episode_dir, index)
+                result, episode_dir = self._run_one(arm_cfg, episode_dir, index,
+                                                    arm)
                 card, hashes, paths = self._seal_episode(
-                    episode_dir, index, result, requested)
+                    episode_dir, index, result,
+                    requested_by_arm.get(arm, requested))
+                # the child must have run EXACTLY the committed arm config
+                expected_cfg_hash = (self._pre_record["design"]
+                                     .get("expected_config_hashes", {})
+                                     .get(arm)) or arm_hashes.get(arm)
+                actual_cfg_hash = (result or {}).get("bench_config_hash") \
+                    if isinstance(result, dict) else None
+                if expected_cfg_hash and actual_cfg_hash and \
+                        actual_cfg_hash != expected_cfg_hash:
+                    self._arm_config_mismatches.append(
+                        {"episode": index, "arm": arm,
+                         "expected": expected_cfg_hash,
+                         "actual": actual_cfg_hash})
                 # Scheduling metadata (arm/pair/order) lives in the manifest and
                 # the scorecard envelope -- NEVER inside the immutable metric
                 # object, so the persisted scorecard stays an exact /2 card and
@@ -1782,6 +1873,8 @@ class BenchRunner(object):
         self._executed_schedule = observed_pairs
         self.manifest.data["executed_schedule"] = observed_pairs
         self.manifest.data["observed_config_hashes"] = self._arm_config_hashes
+        self.manifest.data["arm_config_mismatches"] = \
+            self._arm_config_mismatches
         self.manifest.flush()
         stop_reason = self.stop.stop_reason()
         status = "complete" if stop_reason is None else "partial"
@@ -1826,7 +1919,7 @@ class BenchRunner(object):
                                 "max_response_bytes"],
                             calls_total=calls_total, transport=transport)
 
-    def _run_one(self, config, episode_dir, index):
+    def _run_one(self, config, episode_dir, index, arm=None):
         os.makedirs(episode_dir, mode=0o700, exist_ok=True)
         if self.episode_runner is not None:
             # injected in-process runner (offline tests): no child process
@@ -1834,15 +1927,22 @@ class BenchRunner(object):
                 config, self._paths(), episode_dir, index,
                 self.spec["episode_timeout_s"])
             return result, episode_dir
-        return self._run_child(episode_dir, index)
+        return self._run_child(episode_dir, index, config, arm)
 
-    def _run_child(self, episode_dir, index):
+    def _run_child(self, episode_dir, index, arm_cfg=None, arm=None):
         """Launch the episode as a dedicated child/session, then supervise it.
 
         The captured PID/start-time/session/PGID are persisted *before* the
-        work runs, so a forced abort always has a validated root to reap.
+        work runs, so a forced abort always has a validated root to reap.  The
+        **resolved arm config** (and its fingerprint) is persisted to an
+        immutable per-episode file before the spawn, so the child runs exactly
+        the arm the schedule selected rather than re-resolving the candidate.
         """
         key = "ep-%d" % index
+        if arm_cfg is None:
+            arm_cfg = self._arm_configs.get(arm) or resolve_provider_config(
+                self.spec)[0]
+        write_arm_config(episode_dir, arm_cfg, arm or "candidate")
         argv = self.episode_command_factory(
             self, self._spec_path(), episode_dir, index,
             self.spec["episode_timeout_s"])
@@ -2106,6 +2206,10 @@ class BenchRunner(object):
             base_arm, cand_arm = baseline, list(cards)
         if not base_arm:
             return _refused("no-baseline", "inconclusive")
+        if getattr(self, "_arm_config_mismatches", None):
+            out = _refused("child-config-hash-mismatch", "not-comparable")
+            out["arm_config_mismatches"] = list(self._arm_config_mismatches)
+            return out
         policy = dict(self.spec["comparison"])
         policy["admission_margin"] = 0.0
         pre = getattr(self, "_pre_record", None) or precommit_record(
@@ -2744,19 +2848,37 @@ def _cmd_child(args) -> int:
     """Run exactly one controller episode in its own process/session."""
     from . import controller as C
     spec = load_spec(args.spec)
-    config, err = resolve_provider_config(spec)
-    if err:
-        print("error: %s" % err, file=sys.stderr)
-        return 2
+    arm_path = getattr(args, "arm_config", None)
+    arm = "candidate"
+    if arm_path and os.path.exists(arm_path):
+        # resolve EXACTLY the arm the parent committed, and verify its
+        # fingerprint before any controller is constructed.
+        arm = (_read_json(arm_path) or {}).get("arm", "candidate")
+        config, fingerprint, err = load_arm_config(arm_path, spec)
+        if err:
+            print("error: %s" % err, file=sys.stderr)
+            return 3
+    else:
+        # no arm-config file: a direct/manual child run resolves the candidate
+        config, err = resolve_provider_config(spec)
+        if err:
+            print("error: %s" % err, file=sys.stderr)
+            return 2
+        fingerprint = config_fingerprint(config)
     # Block until the parent has durably recorded our root identity, so a
     # forced abort always has a validated root to reap.
     ready = wait_for_root_ready(getattr(args, "root_ready", None),
                                 min(30.0, float(args.timeout or 30.0)))
+    if getattr(args, "root_ready", None) and not ready:
+        # the handshake is absent/invalid: do NOT authorize episode work.
+        print("error: root-ready handshake not observed", file=sys.stderr)
+        return 4
     os.makedirs(args.episode_dir, mode=0o700, exist_ok=True)
     try:
         write_json_atomic(os.path.join(args.episode_dir,
                                        "bench-handshake.json"),
-                          {"root_ready_observed": bool(ready)})
+                          {"root_ready_observed": bool(ready),
+                           "arm_config_fingerprint": fingerprint})
     except OSError:
         pass
     paths = {"worker": args.worker, "runner": args.runner, "data": args.data,
@@ -2775,11 +2897,16 @@ def _cmd_child(args) -> int:
     finally:
         handlers.restore()
     full = result_to_meta(results[0] if results else None)
+    # Record exactly which arm config this child ran, so the parent can verify
+    # it against the committed per-arm hash.
+    full["bench_config_hash"] = fingerprint
+    full["bench_arm"] = arm
     # an additive merge into the controller-written meta so the forced-search
     # evidence survives even when the parent only reads the meta sidecar.
     _child_meta_merge(args.episode_dir, 1, full)
     write_json_atomic(os.path.join(args.episode_dir, "bench-child.json"),
-                      {"ok": True, "result": full})
+                      {"ok": True, "result": full,
+                       "config_hash": fingerprint})
     return 0
 
 
@@ -2799,7 +2926,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                        default=M.DEFAULT_PACKAGE_MAX_BYTES)
     child = sub.add_parser("_child")
     for flag in ("--spec", "--worker", "--runner", "--data", "--sysconf",
-                 "--episode-dir", "--timeout", "--root-ready"):
+                 "--episode-dir", "--timeout", "--root-ready", "--arm-config"):
         child.add_argument(flag, required=flag in ("spec", "worker", "runner",
                                                    "data", "episode-dir"))
     args = ap.parse_args(argv)

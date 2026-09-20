@@ -1666,11 +1666,26 @@ class PrecommitScheduleRunner(unittest.TestCase):
         report = B.preflight(spec)
         self.assertFalse(report["ok"])
         self.assertEqual(report["stage"], "provider_config")
-        # a resolvable baseline config is reported with its hash
-        spec["baseline_config_ref"] = {"reflex": "scripted", "strategy": "off"}
+        # a resolvable but DISTINCT baseline config is reported with its hash
+        spec["baseline_config_ref"] = {"reflex": "scripted", "strategy": "off",
+                                       "max_ticks": 500}
         report = B.preflight(spec)
         self.assertTrue(report["ok"])
         self.assertTrue(report["baseline_config_hash"])
+
+    def test_equal_baseline_and_candidate_fingerprints_are_refused(self):
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
+        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
+        spec = _valid_spec(tier="live", episodes=2)
+        # an identical config under a different reference is NOT a distinct arm
+        spec["baseline_config_ref"] = {"reflex": "scripted", "strategy": "off"}
+        base_cfg, cand_cfg, err = B.resolve_arm_configs(spec)
+        self.assertIsNone(err)
+        self.assertEqual(B.config_fingerprint(base_cfg),
+                         B.config_fingerprint(cand_cfg))
+        report = B.preflight(spec)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["stage"], "ab-design")
 
     def test_observed_order_and_config_hash_mismatch_stay_not_comparable(self):
         spec = _valid_spec(tier="live", episodes=4)
@@ -2498,6 +2513,96 @@ class PostmortemHardCap(unittest.TestCase):
         written = json.load(open(pkg["written_to"]))
         self.assertEqual(written["package_error"], "budget-too-small")
         self.assertLessEqual(len(json.dumps(written).encode("utf-8")), 1024)
+
+
+class ArmConfigChildAB(unittest.TestCase):
+    """Finding #1: the production child runs the SCHEDULED arm config."""
+
+    def _fake_launcher(self, tmp):
+        path = os.path.join(tmp, "fake-launcher")
+        with open(path, "w") as fh:
+            fh.write("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def _ab_spec(self, tmp):
+        baseline = {"reflex": "scripted", "strategy": "off", "max_ticks": 500,
+                    "boundary_cooldown_ticks": 25}
+        spec = _valid_spec(tier="live", episodes=4,
+                           episode_timeout_s=8.0,
+                           campaign_timeout_s=120.0)
+        spec["provider_config_ref"] = {"reflex": "scripted", "strategy": "off",
+                                       "max_ticks": 2000,
+                                       "boundary_cooldown_ticks": 50}
+        spec["baseline_config_ref"] = baseline
+        spec["budget"]["max_total_episodes"] = 200
+        return spec, baseline
+
+    def test_real_child_runs_each_scheduled_arm_config(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        launcher = self._fake_launcher(tmp)
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
+        os.environ["BENCH_RUNNER"] = launcher
+        os.environ["BENCH_WORKER"] = launcher
+        os.environ["BENCH_DATA"] = tmp
+        for key in (B.VAPOR_CLOUD_ENV, "BENCH_RUNNER", "BENCH_WORKER",
+                    "BENCH_DATA"):
+            self.addCleanup(os.environ.pop, key, None)
+        spec, baseline = self._ab_spec(tmp)
+        runner = B.BenchRunner(spec, tmp)
+        out = runner.run()
+        self.assertTrue(out["ok"], out)
+        pre = json.load(open(os.path.join(tmp, "precommit.json")))
+        expected = pre["design"]["expected_config_hashes"]
+        self.assertNotEqual(expected["baseline"], expected["candidate"])
+        expected_ticks = {"baseline": 500, "candidate": 2000}
+        for entry in out["manifest"]["episodes"]:
+            idx, arm = entry["index"], entry["arm"]
+            ep_dir = entry["dir"]
+            # the immutable arm-config file the child consumed
+            arm_cfg = json.load(open(os.path.join(
+                ep_dir, "bench-arm-config.json")))
+            self.assertEqual(arm_cfg["arm"], arm)
+            self.assertEqual(arm_cfg["fingerprint"], expected[arm])
+            # the child reports exactly the committed config hash
+            child = json.load(open(os.path.join(ep_dir, "bench-child.json")))
+            self.assertEqual(child["config_hash"], expected[arm])
+            self.assertEqual(child["result"]["bench_arm"], arm)
+            # the persisted controller-safe config matches the SCHEDULED arm
+            meta = json.load(open(os.path.join(
+                ep_dir, "ep-%d.meta.json" % idx)))
+            self.assertEqual(meta["config"]["max_ticks"],
+                             expected_ticks[arm], (idx, arm))
+        self.assertEqual(out["manifest"]["observed_config_hashes"], expected)
+        self.assertFalse(out["manifest"].get("arm_config_mismatches"))
+        # an exact A/B design is accepted (no config/order mismatch)
+        self.assertTrue(out["comparison"]["precommit"]["ok"],
+                        out["comparison"]["precommit"]["reasons"])
+        self.assertTrue(out["comparison"]["same_run_experiment"])
+
+    def test_swapped_child_config_makes_the_run_not_comparable(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
+        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
+        spec, _baseline = self._ab_spec(tmp)
+        runner = B.BenchRunner(spec, tmp)
+
+        def fake_episode(config, paths, episode_dir, index, timeout):
+            # a child that reports a DIFFERENT config than its arm committed
+            meta = dict(_meta())
+            meta["bench_config_hash"] = "swapped-hash"
+            return meta, episode_dir
+
+        runner.episode_runner = fake_episode
+        out = runner.run()
+        self.assertTrue(out["comparison"]["refused"])
+        self.assertEqual(out["comparison"]["verdict"], "not-comparable")
+        self.assertEqual(out["comparison"]["refusal_reason"],
+                         "child-config-hash-mismatch")
+        self.assertFalse(out["comparison"]["admission"]["apply_allowed"])
+        self.assertTrue(out["manifest"]["arm_config_mismatches"])
 
 
 if __name__ == "__main__":
