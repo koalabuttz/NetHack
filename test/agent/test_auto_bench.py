@@ -2874,5 +2874,142 @@ class StrategyDemandFileBacked(unittest.TestCase):
         self.assertFalse(alloc["within_budget"])
 
 
+class ArmAwareStrategyBudget(unittest.TestCase):
+    """Round-4: strategy budget planning is arm-aware (baseline AND candidate)."""
+
+    def _ab_spec(self, tmp, baseline, candidate, episodes=5):
+        spec = _valid_spec(tier="live", episodes=episodes)
+        spec["provider_config_ref"] = dict(candidate)
+        spec["baseline_config_ref"] = dict(baseline)
+        spec["budget"]["max_total_episodes"] = 1000
+        spec["budget"]["strategy_calls_total"] = 0
+        return spec
+
+    def _cfg(self, spec):
+        cand, err = B.resolve_provider_config(spec)
+        self.assertIsNone(err)
+        base, err = B.resolve_baseline_config(spec)
+        self.assertIsNone(err)
+        return base, cand
+
+    def test_candidate_off_baseline_deepseek_demand_is_arm_aware(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
+        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
+        spec = self._ab_spec(tmp,
+                             {"reflex": "scripted", "strategy": "deepseek",
+                              "strategy_call_cap": 8},
+                             {"reflex": "scripted", "strategy": "off"})
+        counts = B.scheduled_arm_counts(spec)
+        self.assertEqual(counts, {"baseline": 3, "candidate": 2})
+        base, cand = self._cfg(spec)
+        # exact counterbalanced demand: 3 x 8 (baseline) + 2 x 0 (candidate off)
+        self.assertEqual(B.scheduled_strategy_demand(cand, base, counts), 24)
+        # 23 is insufficient -> rejected before spawn
+        spec["budget"]["strategy_calls_total"] = 23
+        self.assertIn("strategy demand",
+                      B.budget_preflight(spec, cand, base) or "")
+        report = B.preflight(spec)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["stage"], "budget")
+        launched = {"n": 0}
+
+        def fake_episode(config, paths, episode_dir, index, timeout):
+            launched["n"] += 1
+            return _meta(), episode_dir
+
+        runner = B.BenchRunner(spec, tmp)
+        runner.episode_runner = fake_episode
+        self.assertFalse(runner.run()["ok"])
+        self.assertEqual(launched["n"], 0)
+        # exactly 24 is accepted, and the full tuning demand is arm-aware too
+        spec["budget"]["strategy_calls_total"] = 24
+        self.assertIsNone(B.budget_preflight(spec, cand, base))
+        alloc = B.plan_allocations(spec, 6)
+        self.assertEqual(alloc["arm_episodes"], {"baseline": 34,
+                                                 "candidate": 34})
+        self.assertEqual(alloc["strategy_demand"], 34 * 8)
+
+    def test_baseline_cap_over_candidate_cap_and_reverse(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        counts = {"baseline": 3, "candidate": 2}
+        # (2) baseline cap > candidate cap: 3x8 + 2x2 = 28
+        spec = self._ab_spec(tmp,
+                             {"reflex": "scripted", "strategy": "deepseek",
+                              "strategy_call_cap": 8},
+                             {"reflex": "scripted", "strategy": "deepseek",
+                              "strategy_call_cap": 2})
+        base, cand = self._cfg(spec)
+        self.assertEqual(B.scheduled_strategy_demand(cand, base, counts), 28)
+        spec["budget"]["strategy_calls_total"] = 27
+        self.assertIn("strategy demand",
+                      B.budget_preflight(spec, cand, base) or "")
+        spec["budget"]["strategy_calls_total"] = 28
+        self.assertIsNone(B.budget_preflight(spec, cand, base))
+        self.assertEqual(B.plan_allocations(spec, 6)["strategy_demand"],
+                         34 * 8 + 34 * 2)
+        # (3) the reverse: 3x2 + 2x8 = 22
+        spec = self._ab_spec(tmp,
+                             {"reflex": "scripted", "strategy": "deepseek",
+                              "strategy_call_cap": 2},
+                             {"reflex": "scripted", "strategy": "deepseek",
+                              "strategy_call_cap": 8})
+        base, cand = self._cfg(spec)
+        self.assertEqual(B.scheduled_strategy_demand(cand, base, counts), 22)
+        spec["budget"]["strategy_calls_total"] = 21
+        self.assertIn("strategy demand",
+                      B.budget_preflight(spec, cand, base) or "")
+        spec["budget"]["strategy_calls_total"] = 22
+        self.assertIsNone(B.budget_preflight(spec, cand, base))
+        # the tuner plan is arm-aware for BOTH arms
+        spec["budget"]["strategy_calls_total"] = 1
+        self.assertTrue(any("strategy-budget" in r
+                            for r in B.tuning_preflight(spec)["reasons"]))
+
+    def test_reservations_record_each_episodes_scheduled_arm_demand(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        launcher = os.path.join(tmp, "fake-launcher")
+        with open(launcher, "w") as fh:
+            fh.write("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
+        os.chmod(launcher, 0o755)
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
+        os.environ["BENCH_RUNNER"] = launcher
+        os.environ["BENCH_WORKER"] = launcher
+        os.environ["BENCH_DATA"] = tmp
+        for key in (B.VAPOR_CLOUD_ENV, "BENCH_RUNNER", "BENCH_WORKER",
+                    "BENCH_DATA"):
+            self.addCleanup(os.environ.pop, key, None)
+        spec = self._ab_spec(tmp,
+                             {"reflex": "scripted", "strategy": "deepseek",
+                              "strategy_call_cap": 8},
+                             {"reflex": "scripted", "strategy": "deepseek",
+                              "strategy_call_cap": 2},
+                             episodes=4)
+        spec["episode_timeout_s"] = 8.0
+        spec["campaign_timeout_s"] = 120.0
+        spec["budget"]["strategy_calls_total"] = 1000
+        runner = B.BenchRunner(spec, tmp)
+        out = runner.run()
+        self.assertTrue(out["ok"], out)
+        reservations = {r["key"]: r for r in
+                        out["manifest"]["reservations"]}
+        self.assertEqual(len(reservations), 4)
+        for entry in out["manifest"]["episodes"]:
+            key, arm = "ep-%d" % entry["index"], entry["arm"]
+            arm_cfg = json.load(open(os.path.join(
+                entry["dir"], "bench-arm-config.json")))
+            persisted = arm_cfg["values"]
+            expected = (persisted["strategy_call_cap"]
+                        if persisted["strategy"] != "off" else 0)
+            self.assertEqual(reservations[key]["allocation"]["strategy_calls"],
+                             expected, (key, arm))
+            self.assertEqual(
+                reservations[key]["allocation"]["arm_config_fingerprint"],
+                arm_cfg["fingerprint"])
+
+
 if __name__ == "__main__":
     unittest.main()

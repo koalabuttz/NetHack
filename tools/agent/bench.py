@@ -367,25 +367,77 @@ def resolve_arm_configs(spec: dict
     genuinely distinct, separately referenced config) and is ``None`` for a
     candidate-only diagnostic run.
     """
-    from . import providers
     candidate, err = resolve_provider_config(spec)
     if err:
         return None, None, err
+    baseline, err = resolve_baseline_config(spec)
+    if err:
+        return None, None, err
+    return baseline, candidate, None
+
+
+def resolve_baseline_config(spec: dict) -> Tuple[Optional[Any], Optional[str]]:
+    """Resolve the baseline arm config (``None`` when the spec has none).
+
+    Returns ``(config, error)``; an unresolvable baseline reference is an error,
+    never a silent ``None`` (which would hide its strategy demand).
+    """
+    from . import providers
     ref = spec.get("baseline_config_ref")
     if ref is None:
-        return None, candidate, None
+        return None, None
     values, err = _config_values(ref)
     if err:
-        return None, None, "baseline %s" % err
+        return None, "baseline %s" % err
     try:
         baseline = providers.ProviderConfig(**values)
     except TypeError as exc:
-        return None, None, "baseline config: %s" % exc
+        return None, "baseline config: %s" % exc
     problem = baseline.validate(episodes=spec["episodes"],
                                 episode_timeout=spec["episode_timeout_s"])
     if problem:
-        return None, None, "baseline config: %s" % problem
-    return baseline, candidate, None
+        return None, "baseline config: %s" % problem
+    return baseline, None
+
+
+def arm_strategy_demand(config, episodes: int) -> int:
+    """The exact **scheduled** strategy demand for ONE arm over *episodes*.
+
+    A strategy-off arm -- or an absent arm config -- contributes **zero**: only
+    an arm that actually runs the strategy tier reserves strategy calls.
+    """
+    if config is None or getattr(config, "strategy", "off") == "off":
+        return 0
+    cap = int(getattr(config, "strategy_call_cap", 0) or 0)
+    return max(0, int(episodes)) * max(1, cap)
+
+
+def scheduled_arm_counts(spec: dict, n_candidates: int = 0, *,
+                         tuning: bool = False) -> Dict[str, int]:
+    """The exact per-arm episode counts a plan schedules.
+
+    ``tuning=True`` is the full screening x candidates + confirmation plan
+    (each arm gets ``screen x candidates + confirmation`` episodes); otherwise
+    it is the ordinary campaign's **committed counterbalanced schedule**, so
+    both arms' counts come from the one schedule the runner executes.
+    """
+    comp = spec["comparison"]
+    screen = int(comp["screening_episodes_per_arm"])
+    confirm = int(comp["confirmation_episodes_per_arm"])
+    if tuning:
+        each = screen * max(0, int(n_candidates)) + confirm
+        return {"baseline": each, "candidate": each}
+    sched = M.episode_schedule(int(spec["episodes"]),
+                               int(comp.get("resampling_seed", 0)))
+    return {"baseline": sum(1 for e in sched if e["arm"] == "baseline"),
+            "candidate": sum(1 for e in sched if e["arm"] == "candidate")}
+
+
+def scheduled_strategy_demand(candidate_config, baseline_config,
+                              counts: Dict[str, int]) -> int:
+    """The exact strategy demand summed over BOTH arms' scheduled episodes."""
+    return (arm_strategy_demand(baseline_config, counts.get("baseline", 0))
+            + arm_strategy_demand(candidate_config, counts.get("candidate", 0)))
 
 
 def config_fingerprint(config) -> Optional[str]:
@@ -527,7 +579,7 @@ def preflight(spec: dict) -> Dict[str, Any]:
     conflict = jev_profile_conflict(config)
     if conflict:
         return {"ok": False, "stage": "scope", "error": conflict}
-    problem = budget_preflight(spec, config)
+    problem = budget_preflight(spec, config, baseline_config)
     if problem:
         return {"ok": False, "stage": "budget", "error": problem}
     b = spec["budget"]
@@ -549,7 +601,8 @@ def preflight(spec: dict) -> Dict[str, Any]:
             "judge_transport": judge_transport,
             "baseline_config_hash": config_fingerprint(baseline_config),
             "allocations": plan_allocations(spec, spec["budget"][
-                "max_candidates"], config=config),
+                "max_candidates"], config=config,
+                baseline_config=baseline_config),
             "postmortem_reserve": config.postmortem_reserve}
 
 
@@ -570,12 +623,18 @@ def effective_cost_mode(spec: dict, config) -> Tuple[str, bool, Optional[str]]:
     return mode, unattended, None
 
 
-def budget_preflight(spec: dict, config) -> Optional[str]:
+def budget_preflight(spec: dict, config,
+                     baseline_config: Optional[Any] = None) -> Optional[str]:
     """Reject an allocation plan that exceeds the declared limits.
 
     Every cap is compared **literally**, including zero: ``max_total_episodes =
     0`` means zero episodes and ``strategy_calls_total = 0`` means zero strategy
     calls, never "unlimited".
+
+    Strategy demand is summed over **both arms** from their exact scheduled
+    episode counts and each arm's own ``strategy_call_cap``, so a distinct
+    baseline arm cannot pass preflight while its scheduled demand exceeds the
+    campaign's ``strategy_calls_total``.
     """
     budget = spec["budget"]
     episodes = spec["episodes"]
@@ -593,14 +652,14 @@ def budget_preflight(spec: dict, config) -> Optional[str]:
             return ("episodes (%d) exceed budget.judge_calls_total (%d): one "
                     "bundled dispatch per eligible episode (zero means zero)"
                     % (episodes, budget["judge_calls_total"]))
-    # strategy demand against the strategy-call budget (zero is literal)
-    if getattr(config, "strategy", "off") != "off":
-        cap = int(getattr(config, "strategy_call_cap", 0) or 0)
-        demand = episodes * max(1, cap)
-        if demand > budget["strategy_calls_total"]:
-            return ("strategy demand (%d = episodes x strategy_call_cap) "
-                    "exceeds budget.strategy_calls_total (%d)"
-                    % (demand, budget["strategy_calls_total"]))
+    # strategy demand across BOTH arms' scheduled episodes (zero is literal)
+    counts = scheduled_arm_counts(spec)
+    demand = scheduled_strategy_demand(config, baseline_config, counts)
+    if demand > budget["strategy_calls_total"]:
+        return ("strategy demand (%d over counterbalanced arms %s: baseline "
+                "x%d, candidate x%d) exceeds budget.strategy_calls_total (%d)"
+                % (demand, counts, counts.get("baseline", 0),
+                   counts.get("candidate", 0), budget["strategy_calls_total"]))
     return None
 
 
@@ -756,18 +815,21 @@ def precommit_record(comparison: dict, *, episodes: Optional[int] = None,
 # --------------------------------------------------------------------------
 
 def plan_allocations(spec: dict, n_candidates: int,
-                     config: Optional[Any] = None) -> Dict[str, Any]:
+                     config: Optional[Any] = None,
+                     baseline_config: Optional[Any] = None) -> Dict[str, Any]:
     """Reserve the whole campaign's episodes and judge calls up front.
 
     Every candidate is screened on ``screening_episodes_per_arm`` per arm, and
     the selected winner is confirmed on ``confirmation_episodes_per_arm`` per
     arm.  Judge calls are bounded at eligible episodes x request count.
 
-    Strategy demand is derived from the **validated** ``ProviderConfig`` -- the
-    same authority normal preflight uses -- so a **file-backed**
-    ``provider_config_ref`` contributes its real strategy demand instead of
-    being silently treated as "strategy off".  An unresolvable config fails
-    closed rather than under-budgeting.
+    Strategy demand is summed over **both arms** from their exact scheduled
+    episode counts and each arm's own ``strategy_call_cap``, read from the
+    **validated** ``ProviderConfig`` -- the same authority normal preflight
+    uses -- so a **file-backed** reference and a distinct **baseline** arm both
+    contribute their real demand instead of being silently treated as
+    "strategy off".  An unresolvable arm config fails closed rather than
+    under-budgeting.
     """
     comp = spec["comparison"]
     budget = spec["budget"]
@@ -779,6 +841,7 @@ def plan_allocations(spec: dict, n_candidates: int,
     confirmation_episodes = 2 * confirm
     total_episodes = screening_episodes + confirmation_episodes
     total_judges = judge_per_episode * total_episodes
+    counts = scheduled_arm_counts(spec, n_candidates, tuning=True)
     reasons: List[str] = []
     if n_candidates > budget["max_candidates"]:
         reasons.append("candidate-budget: %d > %d"
@@ -797,20 +860,23 @@ def plan_allocations(spec: dict, n_candidates: int,
         reasons.append("wall-budget: %g > %g"
                        % (total_episodes * float(spec["episode_timeout_s"]),
                           float(budget["max_total_wall_s"])))
-    # strategy demand across the whole tuning plan (zero budget is literal),
-    # read from the validated config so a file-backed reference is honoured.
+    # resolve BOTH arms from the validated config authority (fail closed)
     if config is None:
         config, cfg_err = resolve_provider_config(spec)
         if cfg_err:
-            # cannot prove the strategy demand is zero: fail closed.
             reasons.append("strategy-config-unresolvable: %s" % cfg_err)
             config = None
-    if config is not None and getattr(config, "strategy", "off") != "off":
-        cap = int(getattr(config, "strategy_call_cap", 0) or 0)
-        demand = total_episodes * max(1, cap)
-        if demand > budget["strategy_calls_total"]:
-            reasons.append("strategy-budget: %d > %d"
-                           % (demand, budget["strategy_calls_total"]))
+    if baseline_config is None and spec.get("baseline_config_ref") is not None:
+        baseline_config, base_err = resolve_baseline_config(spec)
+        if base_err:
+            reasons.append("strategy-config-unresolvable: %s" % base_err)
+            baseline_config = None
+    demand = scheduled_strategy_demand(config, baseline_config, counts)
+    if demand > budget["strategy_calls_total"]:
+        reasons.append("strategy-budget: %d > %d (baseline x%d, candidate x%d)"
+                       % (demand, budget["strategy_calls_total"],
+                          counts.get("baseline", 0),
+                          counts.get("candidate", 0)))
     return {
         "schema_version": "bench-allocations/1",
         "n_candidates": int(n_candidates),
@@ -821,6 +887,8 @@ def plan_allocations(spec: dict, n_candidates: int,
         "total_episodes": total_episodes,
         "judge_per_episode": judge_per_episode,
         "total_judge_calls": total_judges,
+        "arm_episodes": counts,
+        "strategy_demand": demand,
         "within_budget": not reasons,
         "reasons": reasons,
     }
@@ -1851,8 +1919,10 @@ class BenchRunner(object):
                     "pair": entry["pair"], "order": entry["order"],
                     "allocation": {
                         "episode_timeout_s": self.spec["episode_timeout_s"],
-                        "strategy_calls": int(getattr(
-                            config, "strategy_call_cap", 0) or 0),
+                        # the reservation records the SCHEDULED arm's demand,
+                        # never the outer candidate config's
+                        "strategy_calls": arm_strategy_demand(arm_cfg, 1),
+                        "arm_config_fingerprint": config_fingerprint(arm_cfg),
                         "judge_dispatches": (1 if self.judge is not None
                                              else 0),
                     }})

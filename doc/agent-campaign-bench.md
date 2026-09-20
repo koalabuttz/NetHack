@@ -145,6 +145,16 @@ preflight uses — so a **file-backed** `provider_config_ref` contributes its re
 An unresolvable config **fails closed** (`strategy-config-unresolvable`) rather
 than under-budgeting.
 
+Planning is **arm-aware**: strategy demand is summed over **both** arms from
+each arm's exact scheduled episode count and its own `strategy_call_cap` (a
+strategy-off arm contributes zero), for the ordinary campaign's counterbalanced
+schedule and for the full tuning allocation alike. A distinct baseline arm with
+a larger cap therefore cannot pass preflight while its scheduled demand exceeds
+`strategy_calls_total`, and every manifest reservation records the
+`strategy_calls` of **that episode's scheduled arm config**, not the outer
+candidate's. Both arms are resolved before any spawn; if either arm's config
+cannot be resolved, planning fails closed.
+
 The spec stores credential *references* only (`***_key_file` paths); the bench
 never copies a referenced secret into output.
 
