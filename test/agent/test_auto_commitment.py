@@ -129,10 +129,11 @@ class CommitmentLifecycle(unittest.TestCase):
         first_choice = navigation.resolve_destination(tm, (1, 10), dist, first,
                                                       None, store=st)
         self.assertIsNotNone(first_choice)
-        # service that waypoint: it must not be immediately re-elected
+        # service that waypoint: it must not be immediately re-elected (the
+        # split exploration-only service signature, §4)
         st.note_serviced(
             first_choice.pos,
-            navigation.local_evidence_signature(tm, first_choice.pos))
+            navigation.service_signature(tm, first_choice.pos))
         again = navigation.resolve_destination(tm, (1, 10), dist, first, None,
                                                store=st)
         self.assertNotEqual(again.pos, first_choice.pos)
@@ -356,9 +357,10 @@ class DefaultDestinationPool(unittest.TestCase):
                                                       None, store=st)
         self.assertEqual(first_choice.family, navigation.TFAM_FRONTIER)
         self.assertEqual(first_choice.pos, (6, 10))
+        # the serviced signature is the split *exploration* signature (§4)
         st.note_serviced(
             first_choice.pos,
-            navigation.local_evidence_signature(tm, first_choice.pos))
+            navigation.service_signature(tm, first_choice.pos))
         fallback = navigation.resolve_destination(tm, (1, 10), dist, first,
                                                   None, store=st)
         self.assertEqual(fallback.family, navigation.TFAM_UNVISITED)
@@ -810,6 +812,104 @@ class AttemptCounting(unittest.TestCase):
         self.ref.commit_effect("prompt", "prompt", 2, mem,
                                observed_kind="no-time", payload=())
         self.assertEqual(self.ref.targets.stall_attempts, before)
+
+
+class Phase3EvidenceSplit(unittest.TestCase):
+    """AC7: split evidence signatures and the door-refusal seam (§4/§Phase 3)."""
+
+    def setUp(self):
+        self.ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+
+    @staticmethod
+    def _say(mem, mid, text):
+        """Commit one message as the state fold would (ids retained, §4)."""
+        mem.messages.append(text)
+        mem.message_ids.append(mid)
+        mem.message_count += 1
+
+    def _door_mem(self):
+        return nav_test.mem_with({(3, 10): FLOOR, (4, 10): FLOOR,
+                                  (5, 10): DOOR, (6, 10): FLOOR}, (4, 10))
+
+    # -- door-refusal seam -------------------------------------------------
+
+    def test_stale_locked_message_does_not_fail_new_door(self):
+        mem = self._door_mem()
+        self._say(mem, 1, "The door is locked.")      # observed *before* arming
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_OPEN_DOOR,
+                                pos=(5, 10), family=navigation.TFAM_DOOR)
+        self.ref.arm_door_baseline(mem.message_count)
+        self.ref.note_observation(mem)
+        # the stale refusal binds to nothing: the newly armed door is held
+        self.assertIsNotNone(self.ref.targets.held())
+
+    def test_new_locked_message_fails_matching_door_once(self):
+        mem = self._door_mem()
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_OPEN_DOOR,
+                                pos=(5, 10), family=navigation.TFAM_DOOR)
+        serial = self.ref.targets.held().serial
+        self.ref.arm_door_baseline(mem.message_count)
+        self._say(mem, 2, "The door is locked.")      # newly observed after arming
+        self.ref.note_observation(mem)
+        self.assertIsNone(self.ref.targets.held())
+        terminals = [e for e in self.ref.lifecycle.events
+                     if e.get("kind") == "destination"
+                     and e.get("serial") == serial
+                     and e.get("outcome") in ("reached", "failed", "expired")]
+        self.assertEqual(len(terminals), 1)
+
+    # -- split evidence signatures ----------------------------------------
+
+    def test_serviced_frontier_ignores_transient_neighbor_occupancy(self):
+        tm = nav_test.terrain({(x, 10): FLOOR for x in range(1, 8)})
+        sig = navigation.service_signature(tm, (5, 10))
+        tm.occupancy[(5, 9)] = "monster"
+        self.assertEqual(navigation.service_signature(tm, (5, 10)), sig)
+
+    def test_unrelated_occupancy_movement_does_not_reopen_anything(self):
+        tm = nav_test.terrain({(x, 10): FLOOR for x in range(1, 8)})
+        st = navigation.CommitmentStore()
+        sig = navigation.service_signature(tm, (5, 10))
+        st.note_serviced((5, 10), sig)
+        tm.occupancy[(4, 10)] = "monster"
+        self.assertTrue(st.serviced_under_evidence(
+            (5, 10), navigation.service_signature(tm, (5, 10))))
+
+    def test_target_occupant_does_not_reopen_locked_door(self):
+        tm = nav_test.terrain({(4, 10): FLOOR, (5, 10): DOOR})
+        fsig = navigation.door_failure_signature(tm, (5, 10))
+        tm.occupancy[(4, 10)] = "monster"
+        self.assertEqual(navigation.door_failure_signature(tm, (5, 10)), fsig)
+
+    def test_locked_door_not_reenabled_by_neighbor_monster_motion(self):
+        tm = nav_test.terrain({(x, 10): FLOOR for x in range(1, 8)})
+        tm.terrain[(5, 10)] = navigation.T_CLOSED_DOOR
+        st = navigation.CommitmentStore()
+        st.note_failed((5, 10), navigation.door_failure_signature(tm, (5, 10)))
+        tm.occupancy[(3, 10)] = "monster"
+        self.assertTrue(st.failed_under_evidence(
+            (5, 10), navigation.door_failure_signature(tm, (5, 10))))
+
+    def test_blocked_edge_signature_reopens_when_blocker_leaves(self):
+        tm = nav_test.terrain({(3, 10): FLOOR, (4, 10): FLOOR})
+        s1 = navigation.blocked_edge_signature(tm, (3, 10), (4, 10))
+        tm.occupancy[(4, 10)] = "monster"             # the edge is blocked
+        self.assertNotEqual(navigation.blocked_edge_signature(
+            tm, (3, 10), (4, 10)), s1)
+        tm.occupancy.pop((4, 10))                     # the blocker leaves
+        self.assertEqual(navigation.blocked_edge_signature(
+            tm, (3, 10), (4, 10)), s1)
+
+    def test_diagonal_side_blocker_is_part_of_edge_signature(self):
+        tm = nav_test.terrain({(3, 10): FLOOR, (4, 11): FLOOR, (3, 11): FLOOR,
+                               (4, 10): WALL})
+        s1 = navigation.blocked_edge_signature(tm, (3, 10), (4, 11))
+        # a side cell of the diagonal edge (4,10) becomes occupied
+        tm.occupancy[(4, 10)] = "monster"
+        self.assertNotEqual(navigation.blocked_edge_signature(
+            tm, (3, 10), (4, 11)), s1)
 
 
 class DestinationTerminalOwner(unittest.TestCase):

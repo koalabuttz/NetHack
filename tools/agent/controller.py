@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from . import arbitration, candidates, forced_search, instances
+from . import navigation
 from . import protocol, recovery, recording
 from . import exploration_metrics
 from . import spectating
@@ -1688,6 +1689,17 @@ class _EpisodeRunner(object):
             self.instance.current() or 0, cand.proposed_effect)
         self.attempt_before = before
         self.attempts_armed += 1
+        # Bind door refusal to this attempt's message baseline (plan §4): the
+        # baseline is captured at the send boundary of a door-open candidate and
+        # cleared for every other attempt, so a stale locked message can never
+        # fail a newly acquired door.
+        arm_baseline = getattr(self.reflex, "arm_door_baseline", None)
+        if arm_baseline is not None:
+            payload = self._attempt_payload
+            purpose = (payload[3] if payload and payload[0] == "dest"
+                       else None)
+            arm_baseline(self.mem.message_count
+                         if purpose == navigation.COMMIT_OPEN_DOOR else None)
         if self._is_stair_action(self.attempt):
             self.instance.note_transition_sent(True)
 

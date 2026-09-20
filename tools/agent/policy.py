@@ -215,6 +215,11 @@ class ScriptedReflex(object):
         # template reads the same public evidence the decision itself did.
         self._pending_kind = ""
         self._conditions = ()
+        # The message baseline captured when a door-open candidate is *armed*
+        # (stall-recovery plan §4): refusal is classified only from messages
+        # committed after it, so a stale locked message can never fail a newly
+        # acquired door.  ``None`` means no door attempt was armed.
+        self.door_attempt_baseline = None
 
     # -- provider surface ------------------------------------------------
     def _check_deadline(self) -> None:
@@ -743,8 +748,7 @@ class ScriptedReflex(object):
                 self._retire_owned("door-opened",
                                    outcome=lifecycle_metrics.DEST_REACHED)
                 return
-            sig = navigation.local_evidence_signature(self._terrain(mem),
-                                                      cur.pos)
+            sig = self._door_failure_signature(mem, cur.pos)
             if self.targets.door_attempts_exhausted:
                 self._retire_owned("door-ineffective",
                                    outcome=lifecycle_metrics.DEST_FAILED,
@@ -760,7 +764,7 @@ class ScriptedReflex(object):
                 self._retire_owned(
                     "stalled", outcome=lifecycle_metrics.DEST_FAILED,
                     pos=held.pos,
-                    signature=navigation.local_evidence_signature(
+                    signature=navigation.service_signature(
                         self._terrain(mem), held.pos))
                 if held.source == navigation.SRC_DIRECTIVE:
                     self._settle_directive("failed", held.generation,
@@ -785,7 +789,7 @@ class ScriptedReflex(object):
                 "unreachable" if reason == "unreachable"
                 else "directive-unresolved",
                 outcome=lifecycle_metrics.DEST_FAILED, pos=held.pos,
-                signature=navigation.local_evidence_signature(
+                signature=navigation.service_signature(
                     self._terrain(mem), held.pos))
             if held.source == navigation.SRC_DIRECTIVE:
                 self._settle_directive("failed", held.generation, reason,
@@ -1194,9 +1198,19 @@ class ScriptedReflex(object):
                     if tuple(t.pos) == tuple(self.directives.target)]
         else:
             def ok(t):
-                sig = navigation.local_evidence_signature(terrain, t.pos)
-                return (not self.targets.serviced_under_evidence(t.pos, sig)
-                        and not self.targets.failed_under_evidence(t.pos, sig))
+                # Split evidence (§4): a successfully serviced site is
+                # suppressed under its exploration-only signature, and a closed
+                # door's failure under its target-bound door signature -- so a
+                # neighbouring creature's movement reopens neither.
+                pos = t.pos
+                serviced_sig = navigation.service_signature(terrain, pos)
+                failed_sig = (navigation.door_failure_signature(terrain, pos)
+                              if terrain.ter(pos) == instances.T_CLOSED_DOOR
+                              else serviced_sig)
+                return (not self.targets.serviced_under_evidence(
+                            pos, serviced_sig)
+                        and not self.targets.failed_under_evidence(
+                            pos, failed_sig))
 
             # The default destination pool (plan 1.2, AC2): reachable doors and
             # frontiers are committed before down-stairs; unvisited known cells
@@ -1723,8 +1737,7 @@ class ScriptedReflex(object):
             # invalidation is emitted through the one terminal owner, so a
             # default destination's cycle termination is visible too (§3).
             held = self.targets.held()
-            sig = (navigation.local_evidence_signature(self._terrain(mem),
-                                                       held.pos)
+            sig = (navigation.service_signature(self._terrain(mem), held.pos)
                    if held is not None else None)
             self._retire_cycle_owned(sig)
         self._fold_floor(mem)
@@ -1780,10 +1793,20 @@ class ScriptedReflex(object):
                     break
 
     def _note_serviced(self, mem, pos) -> None:
-        """Service a site under its current *local evidence* signature."""
+        """Service a site under its current *exploration* signature (§4).
+
+        The service signature excludes occupancy, time and visits, so a
+        serviced waypoint is reopened only by a genuine local exploration
+        change -- never by a neighbouring creature merely moving.
+        """
         self.targets.note_serviced(
             tuple(pos),
-            navigation.local_evidence_signature(self._terrain(mem), tuple(pos)))
+            navigation.service_signature(self._terrain(mem), tuple(pos)))
+
+    def _door_failure_signature(self, mem, pos) -> tuple:
+        """The target-bound door failure signature at *pos* (§4)."""
+        return navigation.door_failure_signature(self._terrain(mem),
+                                                 tuple(pos))
 
     def _unreachable_destination_candidate(self, held):
         """A frozen failure for a held destination with no route (plan 1.5)."""
@@ -1793,23 +1816,35 @@ class ScriptedReflex(object):
                           "the held destination is unreachable",
                           "dest-unresolved", effect_payload=payload)
 
+    def arm_door_baseline(self, mark) -> None:
+        """Capture the message baseline of an armed door-open attempt (§4).
+
+        Called by the controller at the *send* boundary of a door interaction;
+        ``None`` clears the binding for a non-door attempt.  :meth:`arm_door_
+        baseline` never mutates gameplay memory, so an unarmed/discarded
+        proposal leaves it untouched.
+        """
+        self.door_attempt_baseline = None if mark is None else int(mark)
+
     def _fold_door_outcome(self, mem) -> None:
-        """Retire a held door commitment on an explicit refusal (plan 1.5).
+        """Retire a held door commitment on an explicit refusal (plan 1.5/§4).
 
         Player-visible evidence only: a locked/refused door line fails the
         commitment immediately instead of the agent repeatedly trying it.
+        When a door interaction was armed, only messages committed *after* its
+        frozen baseline count, so a stale refusal can never fail a new door.
         """
         held = self.targets.held()
         if held is None or held.purpose != navigation.COMMIT_OPEN_DOOR:
             return
-        joined = " ".join(t.lower() for t in mem.recent_messages(6))
+        joined = " ".join(
+            t.lower() for t in mem.messages_since(self.door_attempt_baseline, 6))
         if any(k in joined for k in ("is locked", "it's locked", "locked door",
                                      "resists", "you cannot open")):
             self._retire_owned(
                 "locked-door", outcome=lifecycle_metrics.DEST_FAILED,
-                pos=held.pos,
-                signature=navigation.local_evidence_signature(
-                    self._terrain(mem), held.pos))
+                pos=held.pos, signature=self._door_failure_signature(mem,
+                                                                     held.pos))
             if held.source == navigation.SRC_DIRECTIVE:
                 self._settle_directive("failed", held.generation,
                                        "locked-door", serial=held.serial)

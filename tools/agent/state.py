@@ -494,6 +494,14 @@ class EpisodeMemory(object):
         self.rejected_food = 0
         self.failed_moves = 0
         self.messages: List[str] = []
+        # A monotonic count of *committed* messages (never trimmed), so a caller
+        # can capture a baseline mark and later read exactly the messages
+        # committed since it (stall-recovery plan §4 door-refusal seam).
+        self.message_count = 0
+        # The ids of the retained `messages`, kept parallel and trimmed with
+        # them, so a refusal can be bound to newly observed message ids rather
+        # than to a rescan of the whole recent window.
+        self.message_ids: List[int] = []
 
     def begin_instance(self, instance: Optional[int]) -> None:
         """Start a fresh level-instance scope with empty map-local memory."""
@@ -637,11 +645,34 @@ class EpisodeMemory(object):
             if e not in self.seen_msgs:
                 self.seen_msgs.add(e)
                 self.messages.append(text)
+                # The discarded message id is *retained* here (stall-recovery
+                # plan §4): the door-refusal seam compares the ids observed
+                # since the armed attempt's baseline, so an old refusal can
+                # never fail a newly acquired door.
+                if e is not None:
+                    self.message_ids.append(e)
+                self.message_count += 1
         if len(self.messages) > 200:
             self.messages = self.messages[-200:]
+            self.message_ids = self.message_ids[-200:]
 
     def recent_messages(self, n: int = 4) -> List[str]:
         return self.messages[-n:]
+
+    def messages_since(self, mark: Optional[int], n: int = 6) -> List[str]:
+        """The texts committed *after* the absolute baseline *mark* (plan §4).
+
+        A ``None`` mark means "no baseline was captured", so the caller keeps
+        its legacy recent-window view.  Otherwise only messages committed after
+        the mark are returned, so a refusal observed *before* an attempt was
+        armed can never be attributed to it.
+        """
+        if mark is None:
+            return self.recent_messages(n)
+        pending = self.message_count - int(mark)
+        if pending <= 0:
+            return []
+        return self.messages[-min(pending, len(self.messages)):][-n:]
 
     def tile(self, pos: Tuple[int, int]) -> str:
         cell = self.grid.get(pos)

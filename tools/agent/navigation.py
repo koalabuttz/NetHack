@@ -85,6 +85,53 @@ def local_evidence_signature(terrain: "TerrainMemory",
     return tuple(out)
 
 
+def service_signature(terrain: "TerrainMemory", pos: Tuple[int, int]) -> tuple:
+    """Target-relevant *exploration* evidence at *pos* (stall-recovery §4).
+
+    Classified terrain (including unknown/door state) at the site and its four
+    cardinals -- but **never** occupancy, time or visit counts.  A serviced
+    waypoint therefore reopens only on an actual exploration-relevant local
+    change, not because a monster wandered past it.
+    """
+    pos = tuple(pos)
+    out = [terrain.ter(pos)]
+    for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+        out.append(terrain.ter((pos[0] + dx, pos[1] + dy)))
+    return tuple(out)
+
+
+def door_failure_signature(terrain: "TerrainMemory", pos: Tuple[int, int],
+                           refusal: str = "") -> tuple:
+    """The target door's own terrain and its target-bound refusal evidence.
+
+    Never neighbouring occupancy (stall-recovery §4): a wandering nearby
+    monster must not reset an identical closed-door failure.
+    """
+    pos = tuple(pos)
+    return (terrain.ter(pos), str(refusal or ""))
+
+
+def blocked_edge_signature(terrain: "TerrainMemory", src: Tuple[int, int],
+                           dst: Tuple[int, int]) -> tuple:
+    """The exact failed edge/action and its legality-relevant cells (§4).
+
+    The destination's terrain and occupancy, plus -- for a diagonal edge -- the
+    two orthogonal side cells :func:`edge_legal` reads, so the edge reopens
+    only when that specific edge or its legality cells change, not on unrelated
+    occupancy movement elsewhere.
+    """
+    src = tuple(src)
+    dst = tuple(dst)
+    step = (dst[0] - src[0], dst[1] - src[1])
+    out = [terrain.ter(dst), terrain.occupant(dst)]
+    if step[0] != 0 and step[1] != 0:
+        side_a = (src[0] + step[0], src[1])
+        side_b = (src[0], src[1] + step[1])
+        out.extend([terrain.ter(side_a), terrain.occupant(side_a),
+                    terrain.ter(side_b), terrain.occupant(side_b)])
+    return tuple(out)
+
+
 def edge_legal(terrain: TerrainMemory, a: Tuple[int, int],
                b: Tuple[int, int]) -> bool:
     """True when a *known-safe* edge exists from *a* to *b* (4.5).
@@ -640,9 +687,18 @@ def resolve_destination(terrain: "TerrainMemory", hero: Tuple[int, int],
     store = store or CommitmentStore()
 
     def eligible(t):
-        sig = local_evidence_signature(terrain, t.pos)
-        return (not store.serviced_under_evidence(t.pos, sig)
-                and not store.failed_under_evidence(t.pos, sig))
+        # Split evidence (plan §4): successful servicing is suppressed under
+        # its exploration-only signature, while a door failure is suppressed
+        # under its target-bound door signature.  Neighbouring occupancy can
+        # reopen neither by itself.
+        pos = t.pos
+        serviced_sig = service_signature(terrain, pos)
+        if terrain.ter(pos) == T_CLOSED_DOOR:
+            failed_sig = door_failure_signature(terrain, pos)
+        else:
+            failed_sig = serviced_sig
+        return (not store.serviced_under_evidence(pos, serviced_sig)
+                and not store.failed_under_evidence(pos, failed_sig))
 
     chosen = None
     if directive_pos is not None:
@@ -785,7 +841,8 @@ __all__ = [
     "DIRECTIONS", "DIR_RANK", "BASE_STEP", "VISIT_PENALTY", "FAILED_PENALTY",
     "TFAM_STAIR", "TFAM_DOOR", "TFAM_FRONTIER", "TFAM_UNVISITED",
     "edge_legal", "one_dijkstra", "enumerate_targets", "is_frontier",
-    "door_open", "local_evidence_signature",
+    "door_open", "local_evidence_signature", "service_signature",
+    "door_failure_signature", "blocked_edge_signature",
     "Target", "NavPlan", "plan", "PersistedTarget", "TargetStore",
     "COMMIT_EXPLORE_FRONTIER", "COMMIT_EXPLORE_UNVISITED", "COMMIT_OPEN_DOOR",
     "COMMIT_COLLECT_ITEMS", "COMMIT_FLEE_UPSTAIRS", "COMMIT_STAIR",

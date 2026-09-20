@@ -48,7 +48,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import arbitration, candidates, instances, protocol, recording, state
+from . import arbitration, candidates, instances, navigation, protocol, \
+    recording, state
 from .budget import BudgetLedger
 from .codec import AssemblerLimit, ChunkError, IncrementalAssembler
 from .controller import (_EpisodeRunner, _classified_terrain,
@@ -1217,6 +1218,18 @@ class ReplayPass(object):
         ordinal = self._model_send(
             selected, gameplay=kind in ("command", "key", "direction"))
         if kind in ("command", "key", "direction"):
+            # Bind door refusal to this modeled attempt's message baseline
+            # (plan §4), exactly as the live controller does at its send
+            # boundary, so live/evaluator refusal classification agrees.
+            payload_tuple = tuple(getattr(cand, "effect_payload", ())) \
+                if matched and cand is not None else ()
+            purpose = (payload_tuple[3]
+                       if payload_tuple and payload_tuple[0] == "dest" else None)
+            arm_baseline = getattr(self.reflex, "arm_door_baseline", None)
+            if arm_baseline is not None:
+                arm_baseline(self.mem.message_count
+                             if purpose == navigation.COMMIT_OPEN_DOOR
+                             else None)
             if matched:
                 self._pending_effect = (
                     cand.proposed_effect, cand.semantic_label,
