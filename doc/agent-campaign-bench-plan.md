@@ -10,6 +10,91 @@
 
 Design produced by `architect:architect-campaign-bench`. Operator decisions baked in: deterministic metrics own the objective; Jev is the per-episode fuzzy judge (advisory); postmortem analysis is agent/subagent work, never DeepSeek; tuning stays inside operator-approved rails (suggest-first).
 
+## Implementation preflight record (Phase 1 — FROZEN)
+
+Pinned revision: **`41a9c7ae01fbdc58e3b3f70d5a660b6adb2c528a`** ("agent: qualify
+route reopening under exit b"). Every citation below was re-validated against
+this revision during implementation; line numbers that drifted from the design
+round are corrected here and the implementation binds to the **symbols**, not
+the numbers.
+
+**Interface validation (all present, semantics unchanged):**
+
+| Cited interface | Pinned location | Note |
+|---|---|---|
+| Campaign entry / loop | `controller.py:245` `Controller.run_campaign(episodes)` | calls `run_episode` per index, then `write_campaign_summary` |
+| Episode result / success | `controller.py:3515` `episode_ok` | operational success, **not** game victory (AC1) |
+| Reduced usage set | `controller.py:3587–3605` (not 3546–3564) | the `usage` block the scorecard copies verbatim |
+| Campaign summary | `controller.py:3609` `campaign_summary`, `:3673` `write_campaign_summary` | writes 0600 `campaign.json` |
+| Teardown | `controller.py:372` `_reap` | controller-owned launcher-session teardown |
+| Exploration | `exploration_metrics.py:238` `episode_metrics`, `:296` `campaign_metrics`, `:138–154` 15 fields | matches §2 exact field list |
+| Lifecycle | `lifecycle_metrics.py:150` `summarize_artifact`, `:244–287` keys | `None` = unavailable, never zero |
+| Mutation artifact | `mutation_checks.py:733` `_lifecycle_summary`, `:781` `--artifact` | delegate confirmed |
+| Jev transport | `providers.py:1468` `jev_endpoint`, `:1697–1707` request, `:534` `_WorkerSupervisor`, `worker.py:147` `run_job` | generic worker job protocol reusable |
+| Secret / env | `providers.py:791` `load_secret`, `:494` `worker_env` | credential references only |
+| Invalid codes | `protocol.py:33` `INVALID_CODES = ("schema","stale","kind","range","incomplete")` | enumerated for §2 taxonomy |
+| Outcome inference | `recording.py:329` `infer_outcome` → `death|starvation|ascension|unknown` | observational only |
+
+**Jev noul/score wire schema and billing — verified against primary TypeSafe
+documentation** (`docs.typesafe.ai/api.md`, `docs.typesafe.ai/models.md`,
+`docs.typesafe.ai/patterns/fan-out.md`, and the Cloudflare-hosted model page
+`developers.cloudflare.com/ai/models/typesafe/jev`):
+
+- **Endpoint** `POST https://api.typesafe.ai/v1/systemone`, `Authorization:
+  Bearer`, body `{state, model, questions}` — matches `JEV_OFFICIAL_BASE_URL`.
+- **Question types.** `noul` → answer `{type, noul}` where `noul` ∈ [0,1] (no
+  probabilities/confidence). `score` → answer `{type, score, legend,
+  probabilities, confidence}` where `score` is a **probability-weighted value
+  across the ordered `criteria` levels, and may land between levels**; its
+  scale is the **level-index scale `0 .. len(criteria)-1`** (2–10 levels), so
+  local 0–1 normalization is `score / (n_levels - 1)`. `choice` → `{type,
+  choice, probabilities, confidence}`. `noul`/`score` both accept optional
+  `criteria` (`noul`: `{true,false}`; `score`: ordered **array**).
+- **Response** `{model, answers:{<id>: Answer}, usage:{input_tokens,
+  output_tokens}}`; one answer per question keyed by the same id.
+- **Bundling.** Multi-question **bundled requests are supported and are the
+  documented fan-out pattern** ("send many questions in a single call"): the
+  Cloudflare Usage example carries `noul`+`choice`+`score` in one `questions`
+  map and returns all three answers. **Billing is per input token** — "Jev
+  ingests the `state` once and evaluates every question against it in
+  parallel"; the 64k budget covers `state` + all questions. One bundled request
+  is therefore billed as one call's `input_tokens` (cheaper than three, which
+  would each re-ingest the state).
+- **Tariff.** `$42/Btok = $0.042/Mtok`, **charged per input token; output
+  tokens are free** — this **confirms** the repository snapshot
+  (`budget.py:158–159`). The snapshot is now verified billing contract, not
+  mere repository evidence.
+
+**Go/no-go:** **GO — bundled branch (one request per judge evaluation).** The
+three judge questions (`degenerate_loop` noul, `exploration_productivity`
+score, `termination_sanity` noul) are sent in **one** `/systemone` request;
+`judge_calls_total` and per-episode eligibility count **one** dispatch; a
+response missing any of the three answers ids is **invalid** (a partial answer
+is never partially credited). The three-single-question accounting primitive is
+**also implemented and unit-tested** (`request_shape="single"`) so the branch
+is available if the contract regresses, but the **bundled branch's tests are
+the production-gating ones**.
+
+**Corrected cap/cost semantics (documented for the bench):**
+
+- `reflex_call_cap` bounds **applied** Jev decisions (complete sends of
+  unoverridden, locally valid proposals) — `budget.py:653–681`. It is **not** a
+  paid-call ceiling: rejected/skipped/abstained consultations still cost money.
+- **A token cap or a USD cap disables Jev dispatch outright**
+  (`budget.py:698–699`): the service-side token accounting is unknown, so no
+  strict spend bound exists under those caps. The bench never multiplies the
+  applied cap by a presumed per-call cost to claim a spend bound (AC5).
+- `estimated_usd` can be nonzero when DeepSeek prices are absent because it may
+  include **priced Jev** usage; unknown price and unknown exposure are tracked
+  separately and never merged into one asserted figure.
+- `postmortem_reserve` defaults to 1 and runs DeepSeek postmortems; **bench
+  forces it to 0** (AC6).
+
+**AC10 vapor-cloud prerequisite:** the caller's attestation is **not yet
+supplied**; `live_claims.measured` is `false` and the attestation is recorded
+as **pending-operator**. No live campaign is run in this implementation; the
+gate is enforced by `test_live_testing_gated_on_vapor_cloud_attestation`.
+
 ## Goal
 
 Build an artifact-first campaign bench around the existing agent tooling: run bounded campaigns, derive reproducible scorecards, compare behavior, request a cheap per-episode Jev second opinion, package regressions for coding-agent analysis, and suggest or narrowly apply approved parameter changes.
