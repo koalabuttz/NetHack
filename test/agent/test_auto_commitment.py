@@ -409,8 +409,15 @@ class CommittedBehaviour(unittest.TestCase):
                                 pos=(5, 10), family=navigation.TFAM_DOOR)
         self.assertEqual(self.ref.targets.held().purpose,
                          navigation.COMMIT_OPEN_DOOR)
+        # the door interaction is armed (baseline) and its response is locked
+        self.ref.arm_door_baseline(mem.message_count)
         mem.messages.append("The door is locked.")
-        self.ref.note_observation(mem)
+        mem.message_count += 1
+        payload = policy.ScriptedReflex._dest_payload(
+            "continue", self.ref.targets.held(), step=(1, 0))
+        self.ref.commit_effect("navigate", "navigate", 1, mem,
+                               observed_kind="no-time", payload=payload,
+                               pre_hero=(4, 10))
         self.assertIsNone(self.ref.targets.held())
         self.assertTrue(self.ref.targets.failed((5, 10)))
         # the next target progresses past the locked door
@@ -1081,6 +1088,13 @@ class Phase3EvidenceSplit(unittest.TestCase):
 
     # -- door-refusal seam -------------------------------------------------
 
+    def _continue_door(self, mem):
+        payload = policy.ScriptedReflex._dest_payload(
+            "continue", self.ref.targets.held(), step=(1, 0))
+        self.ref.commit_effect("navigate", "navigate", 1, mem,
+                               observed_kind="no-time", payload=payload,
+                               pre_hero=(4, 10))
+
     def test_stale_locked_message_does_not_fail_new_door(self):
         mem = self._door_mem()
         self._say(mem, 1, "The door is locked.")      # observed *before* arming
@@ -1088,7 +1102,8 @@ class Phase3EvidenceSplit(unittest.TestCase):
                                 purpose=navigation.COMMIT_OPEN_DOOR,
                                 pos=(5, 10), family=navigation.TFAM_DOOR)
         self.ref.arm_door_baseline(mem.message_count)
-        self.ref.note_observation(mem)
+        # the refusal is classified at the matched destination-effect reducer
+        self._continue_door(mem)
         # the stale refusal binds to nothing: the newly armed door is held
         self.assertIsNotNone(self.ref.targets.held())
 
@@ -1100,13 +1115,25 @@ class Phase3EvidenceSplit(unittest.TestCase):
         serial = self.ref.targets.held().serial
         self.ref.arm_door_baseline(mem.message_count)
         self._say(mem, 2, "The door is locked.")      # newly observed after arming
-        self.ref.note_observation(mem)
+        self._continue_door(mem)
         self.assertIsNone(self.ref.targets.held())
         terminals = [e for e in self.ref.lifecycle.events
                      if e.get("kind") == "destination"
                      and e.get("serial") == serial
                      and e.get("outcome") in ("reached", "failed", "expired")]
         self.assertEqual(len(terminals), 1)
+
+    def test_missing_baseline_is_no_matching_refusal_evidence(self):
+        # a destination held with no armed attempt has no baseline: a locked
+        # message must NOT be consumed from the general recent-message window
+        mem = self._door_mem()
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_OPEN_DOOR,
+                                pos=(5, 10), family=navigation.TFAM_DOOR)
+        self._say(mem, 1, "The door is locked.")
+        self.assertIsNone(getattr(self.ref, "door_attempt_baseline", None))
+        self._continue_door(mem)
+        self.assertIsNotNone(self.ref.targets.held())
 
     # -- split evidence signatures ----------------------------------------
 
@@ -1203,8 +1230,16 @@ class DestinationTerminalOwner(unittest.TestCase):
                                 purpose=navigation.COMMIT_OPEN_DOOR,
                                 pos=(5, 10), family=navigation.TFAM_DOOR)
         serial = self.ref.targets.held().serial
+        # the door interaction is armed and its locked response is classified at
+        # the matched destination-effect reducer (§4/item 3)
+        self.ref.arm_door_baseline(mem.message_count)
         mem.messages.append("The door is locked.")
-        self.ref.note_observation(mem)
+        mem.message_count += 1
+        payload = policy.ScriptedReflex._dest_payload(
+            "continue", self.ref.targets.held(), step=(1, 0))
+        self.ref.commit_effect("navigate", "navigate", 1, mem,
+                               observed_kind="no-time", payload=payload,
+                               pre_hero=(4, 10))
         self.assertEqual(len(self._terminals(serial)), 1, "locked")
 
         # cycle: the fold only nominates; the reconciled recovery effect retires

@@ -514,8 +514,16 @@ class Ep4LockedDoorStall(unittest.TestCase):
                                 purpose=navigation.COMMIT_OPEN_DOOR,
                                 pos=(5, 10), family=navigation.TFAM_DOOR)
         serial = self.ref.targets.held().serial
+        # the door interaction is armed (baseline at the send boundary) and its
+        # locked response is classified at the matched effect reducer (§4)
+        self.ref.arm_door_baseline(mem.message_count)
         mem.messages.append("The door is locked.")
-        self.ref.note_observation(mem)
+        mem.message_count += 1
+        payload = policy.ScriptedReflex._dest_payload(
+            "continue", self.ref.targets.held(), step=(1, 0))
+        self.ref.commit_effect("navigate", "navigate", 1, mem,
+                               observed_kind="no-time", payload=payload,
+                               pre_hero=(4, 10))
         self.assertIsNone(self.ref.targets.held())
         terminals = [e for e in self.ref.lifecycle.events
                      if e.get("kind") == "destination"

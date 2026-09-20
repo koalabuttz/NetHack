@@ -669,13 +669,14 @@ class EpisodeMemory(object):
     def messages_since(self, mark: Optional[int], n: int = 6) -> List[str]:
         """The texts committed *after* the absolute baseline *mark* (plan §4).
 
-        A ``None`` mark means "no baseline was captured", so the caller keeps
-        its legacy recent-window view.  Otherwise only messages committed after
-        the mark are returned, so a refusal observed *before* an attempt was
-        armed can never be attributed to it.
+        A ``None`` mark means "no baseline was captured" -- which is *no matching
+        refusal evidence*, never a licence to scan the general recent-message
+        window (review item 3).  Otherwise only messages committed after the
+        mark are returned, so a refusal observed *before* an attempt was armed
+        can never be attributed to it.
         """
         if mark is None:
-            return self.recent_messages(n)
+            return []
         pending = self.message_count - int(mark)
         if pending <= 0:
             return []

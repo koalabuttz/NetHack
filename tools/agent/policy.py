@@ -402,6 +402,10 @@ class ScriptedReflex(object):
         if payload and payload[0] == "dest":
             self._commit_destination(payload, tick, mem, pre_hero=pre_hero,
                                      observed_kind=observed_kind)
+            # The refusal is classified *after* the destination effect, so a
+            # fresh door acquisition whose first response is "This door is
+            # locked." is installed and failed on that same response (§4/item 3).
+            self._classify_door_refusal(mem)
             self.intent = ""
             return
         if payload and payload[0] == "recovery":
@@ -1916,7 +1920,10 @@ class ScriptedReflex(object):
         # destination nor spend its counters.
         self._fold_floor(mem)
         self._fold_pickup_outcome(mem)
-        self._fold_door_outcome(mem)
+        # Door refusal is NOT classified here: the pre-commit fold runs before
+        # the destination effect is applied, so a fresh door acquisition would
+        # not yet be installed.  It is classified at the matched reducer
+        # (commit_effect -> _classify_door_refusal) instead (§4/item 3).
         instance = getattr(mem, "instance", None)
         if instance is None:
             instance = self.instance_id
@@ -2000,28 +2007,35 @@ class ScriptedReflex(object):
         """
         self.door_attempt_baseline = None if mark is None else int(mark)
 
-    def _fold_door_outcome(self, mem) -> None:
-        """Retire a held door commitment on an explicit refusal (plan 1.5/§4).
+    def _classify_door_refusal(self, mem) -> None:
+        """Classify an explicit door refusal at the matched reducer (§4/item 3).
 
-        Player-visible evidence only: a locked/refused door line fails the
-        commitment immediately instead of the agent repeatedly trying it.
-        When a door interaction was armed, only messages committed *after* its
-        frozen baseline count, so a stale refusal can never fail a new door.
+        The refusal is consumed only from messages committed *after* the frozen
+        sent attempt's baseline, and only when a door is actually held at this
+        reconciled boundary.  A missing baseline means *no matching refusal
+        evidence* -- never a scan of the general recent-message window.  Running
+        here (after :meth:`_commit_destination`) means a fresh door acquisition
+        whose *first* response is "This door is locked." is installed and then
+        failed exactly once on that same response.
         """
+        baseline = getattr(self, "door_attempt_baseline", None)
+        if baseline is None:
+            return
         held = self.targets.held()
         if held is None or held.purpose != navigation.COMMIT_OPEN_DOOR:
             return
-        joined = " ".join(
-            t.lower() for t in mem.messages_since(self.door_attempt_baseline, 6))
-        if any(k in joined for k in ("is locked", "it's locked", "locked door",
-                                     "resists", "you cannot open")):
-            self._retire_owned(
-                "locked-door", outcome=lifecycle_metrics.DEST_FAILED,
-                pos=held.pos, signature=self._door_failure_signature(mem,
-                                                                     held.pos))
-            if held.source == navigation.SRC_DIRECTIVE:
-                self._settle_directive("failed", held.generation,
-                                       "locked-door", serial=held.serial)
+        joined = " ".join(t.lower() for t in mem.messages_since(baseline, 6))
+        if not any(k in joined for k in ("is locked", "it's locked",
+                                         "locked door", "resists",
+                                         "you cannot open")):
+            return
+        self._retire_owned(
+            "locked-door", outcome=lifecycle_metrics.DEST_FAILED,
+            pos=held.pos, signature=self._door_failure_signature(mem,
+                                                                 held.pos))
+        if held.source == navigation.SRC_DIRECTIVE:
+            self._settle_directive("failed", held.generation,
+                                   "locked-door", serial=held.serial)
 
     def _fold_pickup_outcome(self, mem) -> None:
         """Classify one reconciled pickup attempt into an outcome (plan 3.3).

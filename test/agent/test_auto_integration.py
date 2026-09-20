@@ -33,8 +33,8 @@ for _p in (_ROOT, _HERE):
         sys.path.insert(0, _p)
 
 from tools.agent import (arbitration, budget, candidates, controller,  # noqa: E402
-                         directives, forced_search, instances, policy,
-                         protocol, providers, recording, state)
+                         directives, forced_search, instances, navigation,
+                         policy, protocol, providers, recording, state)
 from tools.agent.providers import ProviderConfig, ReflexContext  # noqa: E402
 from test_auto import (CLOSED, HELLO, WireHarness, _line,  # noqa: E402
                        _parse_actions, hello, obs)
@@ -1578,6 +1578,103 @@ class SelectedDecisionOwnership(JevAppliedCap):
         self.assertEqual(r._attempt_effect, chosen.proposed_effect)
         self.assertEqual(tuple(r._attempt_payload),
                          tuple(chosen.effect_payload))
+
+
+class DoorRefusalSeam(WireHarness):
+    """Item 3: refusal is bound to the matched sent attempt's baseline."""
+
+    _DOOR_PAL = [[0, " ", "none", 0, "none"], [1, "@", "white", 0, "none"],
+                 [2, ".", "gray", 0, "none"], [3, "+", "brown", 0, "none"]]
+
+    def _rec(self, seq, need, msg=(), t=100):
+        rec = obs(seq, need, msg=msg,
+                  map_=[[10, 10, 1], [11, 10, 3], [12, 10, 2]],
+                  pal=self._DOOR_PAL)
+        rec["s"] = {"hitpoints": {"text": "10"},
+                    "hitpoints-max": {"text": "10"},
+                    "time": {"text": str(t)},
+                    "dungeon-level": {"text": "1"}}
+        return rec
+
+    @staticmethod
+    def _command_need(i):
+        return {"id": i, "kind": "command", "prompt": ""}
+
+    @staticmethod
+    def _door_acquire():
+        return policy.ScriptedReflex._dest_payload(
+            "acquire", None,
+            target=navigation.Target((11, 10), navigation.TFAM_DOOR, (1, 0), 0),
+            purpose=navigation.COMMIT_OPEN_DOOR,
+            source=navigation.SRC_DEFAULT)
+
+    def test_controller_fresh_door_acquisition_locked_response(self):
+        r = _runner()
+        apply_obs(r, self._rec(1, self._command_need(1)))
+        # the door acquisition is armed; the baseline is the messages so far
+        r.reflex.arm_door_baseline(r.mem.message_count)
+        payload = self._door_acquire()
+        # the *first* response to the fresh acquisition is the locked message
+        apply_obs(r, self._rec(2, self._command_need(2),
+                               msg=[{"e": 5,
+                                     "text": "This door is locked."}], t=101))
+        r.reflex.commit_effect("navigate", "navigate", r.tick, r.mem,
+                               observed_kind="no-time", payload=payload,
+                               pre_hero=(10, 10))
+        events = [e for e in r.reflex.lifecycle.events
+                  if e.get("kind") == "destination"]
+        acquired = [e for e in events if e.get("outcome") == "acquired"]
+        failed = [e for e in events if e.get("outcome") == "failed"]
+        self.assertEqual(len(acquired), 1)
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(acquired[0].get("serial"), failed[0].get("serial"))
+        self.assertIsNone(r.reflex.targets.held())
+
+    def test_controller_prior_locked_message_not_newly_consumed(self):
+        r = _runner()
+        # a locked message is observed *before* the next acquisition is armed
+        apply_obs(r, self._rec(1, self._command_need(1),
+                               msg=[{"e": 5,
+                                     "text": "This door is locked."}]))
+        r.reflex.arm_door_baseline(r.mem.message_count)
+        payload = self._door_acquire()
+        apply_obs(r, self._rec(2, self._command_need(2), t=101))
+        r.reflex.commit_effect("navigate", "navigate", r.tick, r.mem,
+                               observed_kind="no-time", payload=payload,
+                               pre_hero=(10, 10))
+        # the stale locked message is not newly consumed: the door is held
+        self.assertIsNotNone(r.reflex.targets.held())
+        self.assertEqual([e for e in r.reflex.lifecycle.events
+                          if e.get("outcome") == "failed"], [])
+
+    def test_evaluator_fresh_door_acquisition_locked_response(self):
+        from tools.agent import evaluate
+        recs = [self._rec(1, self._command_need(1), t=100),
+                self._rec(2, self._command_need(2),
+                          msg=[{"e": 5,
+                                "text": "This door is locked."}], t=101)]
+        wire = b"".join([_line(HELLO)] + [_line(r) for r in recs]
+                        + [_line(CLOSED)])
+        lines = [ln + b"\n" for ln in wire.split(b"\n") if ln]
+        replay = evaluate.ReplayPass(
+            lines, ProviderConfig(reflex="scripted", strategy="off",
+                                  max_ticks=200), "scripted", "off")
+        replay._feed_line(lines[0])            # hello
+        replay._feed_line(lines[1])            # obs1: the hero square is fixed
+        # the door acquisition is armed at the modeled send boundary: the
+        # baseline and the frozen effect travel with the attempt (§4/item 3)
+        replay.reflex.arm_door_baseline(replay.mem.message_count)
+        replay._pending_effect = ("navigate", "navigate", self._door_acquire())
+        replay._sent_before = {"hero": (10, 10), "time": 100, "dlvl": 1}
+        replay._feed_line(lines[2])            # obs2: locked response -> reducer
+        events = [e for e in replay.reflex.lifecycle.events
+                  if e.get("kind") == "destination"]
+        acquired = [e for e in events if e.get("outcome") == "acquired"]
+        failed = [e for e in events if e.get("outcome") == "failed"]
+        self.assertEqual(len(acquired), 1)
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(acquired[0].get("serial"), failed[0].get("serial"))
+        self.assertIsNone(replay.reflex.targets.held())
 
 
 class StationaryAccounting(WireHarness):
