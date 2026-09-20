@@ -158,17 +158,55 @@ class EpisodeMetrics(object):
 _GAMEPLAY_KINDS = ("command", "key", "direction")
 
 
-def attempts_from_actions(actions_path: str) -> Optional[int]:
-    """Count the sent *gameplay* acts in an ``ep-N.actions.jsonl`` sidecar.
+def _need_kinds_from_wire(wire_path: str) -> Dict[tuple, str]:
+    """``(seq, id) -> need kind`` for every need observed on the wire.
+
+    Used to classify a *legacy* actions sidecar whose rows predate the additive
+    ``need_kind`` field (review round 2).  A missing/unreadable wire yields an
+    empty map, so nothing is classified by guesswork.
+    """
+    out: Dict[tuple, str] = {}
+    if not wire_path or not os.path.exists(wire_path):
+        return out
+    with open(wire_path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            if '"need"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict) or rec.get("type") != "obs":
+                continue
+            need = rec.get("need")
+            if isinstance(need, dict):
+                out[(rec.get("seq"), need.get("id"))] = need.get("kind")
+    return out
+
+
+def attempts_from_actions(actions_path: str,
+                          wire_path: Optional[str] = None) -> Optional[int]:
+    """Count the *sent gameplay* acts in an ``ep-N.actions.jsonl`` sidecar.
 
     A zero-time command is still a sent attempt, so the recorded acts -- not
-    hero displacement -- are the correct attempt denominator (review item 6a).
-    Returns ``None`` when the path is absent/unreadable, so the caller can fall
-    back and flag the source rather than report a fabricated zero.
+    hero displacement -- are the correct attempt denominator (review items
+    6a and round-2).  Production rows carry the emit tag ``"act"`` as their
+    top-level ``kind`` (never the need kind), so a row counts only when:
+
+    * ``kind == "act"`` and ``status == "sent"`` (a write-failed act is not an
+      attempt), and
+    * the correlated need was gameplay -- taken from the additive ``need_kind``
+      field when present, else joined from the wire's need records.
+
+    Returns ``None`` when the sidecar is absent/unreadable *or* when no row can
+    be classified (a genuinely legacy sidecar), so the caller flags the
+    hero-displacement fallback rather than reporting a fabricated zero.
     """
     if not actions_path or not os.path.exists(actions_path):
         return None
+    joined = _need_kinds_from_wire(wire_path) if wire_path else {}
     n = 0
+    classified = 0
     with open(actions_path, "r", encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
@@ -178,8 +216,22 @@ def attempts_from_actions(actions_path: str) -> Optional[int]:
                 rec = json.loads(line)
             except ValueError:
                 continue
-            if isinstance(rec, dict) and rec.get("kind") in _GAMEPLAY_KINDS:
+            if not isinstance(rec, dict) or rec.get("kind") != "act" \
+                    or rec.get("status") != "sent":
+                continue
+            need_kind = rec.get("need_kind")
+            if need_kind is None:
+                need = rec.get("need")
+                key = ((need.get("seq"), need.get("id"))
+                       if isinstance(need, dict) else None)
+                need_kind = joined.get(key)
+            if need_kind is None:
+                continue
+            classified += 1
+            if need_kind in _GAMEPLAY_KINDS:
                 n += 1
+    if classified == 0:
+        return None                     # legacy/unclassifiable sidecar
     return n
 
 
@@ -218,7 +270,8 @@ def episode_metrics(wire_path: str, meta: Optional[dict] = None,
     # Resolve the attempt count (review item 6a): the sent-gameplay acts are the
     # true denominator (a zero-time command still counts); the hero-displacement
     # count is the flagged fallback, never a silent substitute.
-    from_actions = attempts_from_actions(actions_path) if actions_path else None
+    from_actions = (attempts_from_actions(actions_path, wire_path)
+                    if actions_path else None)
     if from_actions is not None:
         em.attempts = from_actions
         em.attempts_source = "actions"
@@ -252,9 +305,15 @@ def campaign_metrics(campaign_dir: str) -> dict:
         if os.path.exists(meta_path):
             with open(meta_path, "r", encoding="utf-8") as fh:
                 meta = json.load(fh)
+        # The production action sidecar beside the wire is consumed too (review
+        # round 2): without it the attempt count silently fell back to hero
+        # displacement in the controller's own campaign summary.
+        actions_path = os.path.join(campaign_dir, "ep-%s.actions.jsonl" % idx)
+        if not os.path.exists(actions_path):
+            actions_path = None
         episodes.append({"episode": idx,
                          **episode_metrics(os.path.join(campaign_dir, name),
-                                           meta)})
+                                           meta, actions_path)})
     return {"campaign_dir": campaign_dir, "episodes": episodes,
             "episode_count": len(episodes)}
 

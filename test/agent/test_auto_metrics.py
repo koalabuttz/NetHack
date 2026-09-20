@@ -678,16 +678,36 @@ class Phase4Reports(unittest.TestCase):
                           "skipped-unsupported", "cap-unavailable",
                           "unavailable", "timeout", "scripted", "other"})
 
+    @staticmethod
+    def _act_row(ordinal, need_kind, status="sent", seq=None, nid=None,
+                 need_kind_field=True):
+        """One *production-shaped* action row (mirrors record_action)."""
+        row = {"schema": 1, "ordinal": ordinal, "input_offset": 0,
+               "need": {"episode": 1, "seq": seq or ordinal,
+                        "id": nid or ordinal},
+               "kind": "act", "action": {"type": "act", "v": 1},
+               "status": status, "t": 0.0}
+        if need_kind_field:
+            row["need_kind"] = need_kind
+        return row
+
+    def _actions(self, path, rows):
+        with open(path, "w") as fh:
+            for row in rows:
+                fh.write(json.dumps(row) + "\n")
+
     def test_report_attempts_vs_time_advances_and_stationary_span(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "w.wire.jsonl")
             a = os.path.join(d, "w.actions.jsonl")
             # stationary for two frames, then one hero move
             self._wire(p, [((5, 5), 100), ((5, 5), 100), ((6, 5), 101)])
-            # two sent gameplay acts (one zero-time) plus a non-gameplay answer
-            with open(a, "w") as fh:
-                for kind in ("command", "command", "menu"):
-                    fh.write(json.dumps({"kind": kind}) + "\n")
+            # production-shaped rows: emit tag "act" + status + additive need_kind
+            self._actions(a, [
+                self._act_row(1, "command"),            # zero-time command
+                self._act_row(2, "command"),            # moving command
+                self._act_row(3, "menu"),               # non-gameplay answer
+            ])
             m = M.episode_metrics(p, actions_path=a)
         # the zero-time command still counts: two attempts from the actions
         # sidecar, while only one hero displacement and one time advance occurred
@@ -705,14 +725,80 @@ class Phase4Reports(unittest.TestCase):
         self.assertEqual(m["attempts_source"], "hero-displacement")
         self.assertEqual(m["attempts"], m["hero_displacements"])
 
-    def test_attempts_from_actions_counts_only_gameplay(self):
+    def test_attempts_from_actions_counts_only_sent_gameplay_acts(self):
         with tempfile.TemporaryDirectory() as d:
             a = os.path.join(d, "a.actions.jsonl")
-            with open(a, "w") as fh:
-                for kind in ("command", "key", "direction", "menu", "yn"):
-                    fh.write(json.dumps({"kind": kind}) + "\n")
+            self._actions(a, [
+                self._act_row(1, "command"),
+                self._act_row(2, "key"),
+                self._act_row(3, "direction"),
+                self._act_row(4, "menu"),                  # not gameplay
+                self._act_row(5, "yn"),                    # not gameplay
+                self._act_row(6, "command", status="write-failed"),
+                {"schema": 1, "kind": "get_page", "status": "sent",
+                 "need": {"episode": 1, "seq": 9, "id": 9}},  # not an act
+            ])
             self.assertEqual(M.attempts_from_actions(a), 3)
             self.assertIsNone(M.attempts_from_actions(os.path.join(d, "no")))
+
+    def test_attempts_from_actions_parses_production_fixture(self):
+        # the existing recording's action rows carry the emit tag "act" (never a
+        # need kind), so classification joins them to the wire's need records
+        wire = os.path.join(_FIX, "short.wire.jsonl")
+        actions = os.path.join(_FIX, "short.actions.jsonl")
+        # independently expected: 47 act/sent rows, 31 of them command needs
+        self.assertEqual(M.attempts_from_actions(actions, wire), 31)
+        # without the wire the additive need_kind is absent -> legacy -> None
+        self.assertIsNone(M.attempts_from_actions(actions))
+
+    def test_campaign_metrics_and_summary_consume_action_sidecars(self):
+        from tools.agent import controller
+        from tools.agent.providers import ProviderConfig
+        with tempfile.TemporaryDirectory() as d:
+            self._wire(os.path.join(d, "ep-1.wire.jsonl"),
+                       [((5, 5), 100), ((5, 5), 100), ((6, 5), 101)])
+            with open(os.path.join(d, "ep-1.meta.json"), "w") as fh:
+                json.dump({"ticks": 3, "needs": 3}, fh)
+            # one sent zero-time command, one sent moving command, one sent menu
+            # answer and one write-failed command -> exactly two attempts
+            self._actions(os.path.join(d, "ep-1.actions.jsonl"), [
+                self._act_row(1, "command"),
+                self._act_row(2, "command"),
+                self._act_row(3, "menu"),
+                self._act_row(4, "command", status="write-failed"),
+            ])
+            m = M.campaign_metrics(d)
+            ep = m["episodes"][0]
+            self.assertEqual(ep["attempts"], 2)
+            self.assertEqual(ep["attempts_source"], "actions")
+            self.assertEqual(ep["hero_displacements"], 1)
+            # the controller's own campaign summary carries the same values
+            path = controller.write_campaign_summary(
+                d, [controller.EpisodeResult(index=1)], ProviderConfig(), 1.0)
+            with open(path) as fh:
+                summary = json.load(fh)
+        written = summary["exploration"]["episodes"][0]
+        self.assertEqual(written["attempts"], 2)
+        self.assertEqual(written["attempts_source"], "actions")
+        self.assertEqual(written["hero_displacements"], 1)
+
+    def test_record_action_persists_additive_need_kind(self):
+        # the production writer persists the correlated need's kind additively
+        # (the top-level `kind` is the emit tag "act"/"get_page"/...)
+        from tools.agent import recording
+        with tempfile.TemporaryDirectory() as d:
+            rec = recording.EpisodeRecorder(d, 1)
+            rec.record_action(1, 0, protocol.NeedKey(1, 1, 1), "act",
+                              {"type": "act"}, "sent", need_kind="command")
+            rec.record_action(2, 0, protocol.NeedKey(1, 2, 2), "get_page",
+                              {"type": "get_page"}, "sent")
+            rec.finalize({})
+            with open(os.path.join(d, "ep-1.actions.jsonl")) as fh:
+                rows = [json.loads(line) for line in fh if line.strip()]
+        self.assertEqual(rows[0]["kind"], "act")
+        self.assertEqual(rows[0]["need_kind"], "command")
+        self.assertEqual(rows[1]["kind"], "get_page")
+        self.assertNotIn("need_kind", rows[1])
 
     def test_lifecycle_event_keeps_outer_envelope_schema(self):
         from tools.agent import events, lifecycle_metrics as LM

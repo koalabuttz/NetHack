@@ -586,10 +586,12 @@ class CycleRecoveryOwnership(WireHarness):
         sent = {}
         real_emit = r._emit
 
-        def capture(kind, obj, need_key=None, write_deadline=None):
+        def capture(kind, obj, need_key=None, write_deadline=None,
+                    need_kind=None):
             sent["obj"] = obj
             return real_emit(kind, obj, need_key=need_key,
-                             write_deadline=write_deadline)
+                             write_deadline=write_deadline,
+                             need_kind=need_kind)
 
         r._emit = capture
         r._answer_now(None)

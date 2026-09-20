@@ -225,12 +225,18 @@ class EpisodeRecorder(object):
             self.incomplete = True
 
     def record_action(self, ordinal, input_offset, need_key, kind, action,
-                      status):
+                      status, need_kind=None):
         obj = {"schema": SCHEMA_ACTIONS, "ordinal": ordinal,
                "input_offset": input_offset,
                "need": _need_key_obj(need_key), "kind": kind,
                "action": action,
                "status": status, "t": round(time.time() - self.started, 6)}
+        # Additive (review round 2): ``kind`` is the *emit tag* (act/get_page/
+        # ack_chunk), not the need kind, so the correlated need's kind is
+        # persisted alongside it.  A legacy sidecar without this field is
+        # classified by joining its ``need`` key to the wire's need records.
+        if need_kind is not None:
+            obj["need_kind"] = need_kind
         self.actions += 1
         if not self._acts.submit(_json_line(obj)):
             self.incomplete = True

@@ -1156,7 +1156,8 @@ class _EpisodeRunner(object):
                 self.rec.record_event(lifecycle_event(ev))
         self._note_recorder_health()
 
-    def _emit(self, kind, obj, need_key=None, write_deadline=None):
+    def _emit(self, kind, obj, need_key=None, write_deadline=None,
+              need_kind=None):
         """Write one outbound line and record it; return its ordinal.
 
         Every outbound line -- act, get_page, ack_chunk -- goes through here,
@@ -1172,11 +1173,12 @@ class _EpisodeRunner(object):
         except _TransportFailure:
             self.action_ordinal = ordinal
             self.rec.record_action(ordinal, offset, need_key, kind, obj,
-                                   "write-failed")
+                                   "write-failed", need_kind=need_kind)
             self._note_recorder_health()
             raise
         self.action_ordinal = ordinal
-        self.rec.record_action(ordinal, offset, need_key, kind, obj, "sent")
+        self.rec.record_action(ordinal, offset, need_key, kind, obj, "sent",
+                               need_kind=need_kind)
         self._note_recorder_health()
         return ordinal
 
@@ -2921,7 +2923,8 @@ class _EpisodeRunner(object):
         obj = protocol.make_act(self.pending_seq, need["id"], selected)
         try:
             ordinal = self._emit("act", obj, need_key=self.pending_key,
-                                 write_deadline=write_dl)
+                                 write_deadline=write_dl,
+                                 need_kind=need.get("kind"))
         except _TransportFailure:
             # A failed/partial write arms nothing (plan 3.4 step 5): the
             # selected-decision record is cleared too, so a write-failed
