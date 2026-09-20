@@ -307,5 +307,47 @@ class JudgeContract(unittest.TestCase):
             judge.evaluate(CARD, force=True)
 
 
+class RubricDispatch(unittest.TestCase):
+    """Item 6: the dispatched instructions are exactly the recorded rubric."""
+
+    def test_dispatched_rubric_matches_recorded_hash_and_differs(self):
+        seen = []
+
+        def transport(payload):
+            seen.append(payload)
+            return body()
+
+        r1 = "RUBRIC-ONE: rate the episode's exploration."
+        r2 = "RUBRIC-TWO: a deliberately different rubric text."
+        first = _judge(transport=transport, rubric=r1)
+        res1 = first.evaluate(CARD)
+        second = _judge(transport=transport, rubric=r2)
+        res2 = second.evaluate(CARD)
+        # payload bytes differ
+        p1 = json.dumps(seen[0], sort_keys=True)
+        p2 = json.dumps(seen[1], sort_keys=True)
+        self.assertNotEqual(p1, p2)
+        # each dispatched payload carries its own rubric text
+        self.assertIn(r1, p1)
+        self.assertNotIn(r2, p1)
+        self.assertIn(r2, p2)
+        # cache keys differ
+        self.assertNotEqual(res1["cache_key"], res2["cache_key"])
+        # each result's recorded rubric hash matches the dispatched text
+        self.assertEqual(res1["rubric_hash"], J.rubric_hash(r1))
+        self.assertEqual(res2["rubric_hash"], J.rubric_hash(r2))
+        self.assertNotEqual(res1["rubric_hash"], res2["rubric_hash"])
+
+    def test_build_questions_embeds_the_given_rubric_instance(self):
+        q = J.build_questions(rubric="CUSTOM-RUBRIC-TEXT")
+        for qid in ("degenerate_loop", "exploration_productivity",
+                    "termination_sanity"):
+            self.assertIn("CUSTOM-RUBRIC-TEXT", q[qid]["instructions"])
+        # the module constant is not used when a rubric is supplied
+        self.assertNotEqual(
+            J.rubric_hash("CUSTOM-RUBRIC-TEXT"),
+            J.rubric_hash(J.RUBRIC_TEXT))
+
+
 if __name__ == "__main__":
     unittest.main()

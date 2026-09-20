@@ -175,9 +175,15 @@ def judge_state(card: dict, *, max_bytes: int = 8 * 1024) -> Dict[str, Any]:
 # request construction
 # --------------------------------------------------------------------------
 
-def build_questions(criteria_levels: Sequence[str] = PRODUCTIVITY_LEVELS
-                    ) -> Dict[str, dict]:
-    instructions = JUDGE_INSTRUCTIONS_TEMPLATE % RUBRIC_TEXT
+def build_questions(criteria_levels: Sequence[str] = PRODUCTIVITY_LEVELS,
+                    rubric: str = RUBRIC_TEXT) -> Dict[str, dict]:
+    """The three typed judge questions, embedding the *given* rubric text.
+
+    The rubric is a parameter, not the module constant, so the dispatched
+    instructions are exactly the rubric instance whose hash/version the result
+    records.
+    """
+    instructions = JUDGE_INSTRUCTIONS_TEMPLATE % rubric
     return {
         "degenerate_loop": {"type": "noul", "instructions": instructions},
         "exploration_productivity": {
@@ -188,10 +194,10 @@ def build_questions(criteria_levels: Sequence[str] = PRODUCTIVITY_LEVELS
 
 
 def build_judge_payload(state: dict, model: str,
-                        criteria_levels: Sequence[str] = PRODUCTIVITY_LEVELS
-                        ) -> dict:
+                        criteria_levels: Sequence[str] = PRODUCTIVITY_LEVELS,
+                        rubric: str = RUBRIC_TEXT) -> dict:
     return {"state": state, "model": model,
-            "questions": build_questions(criteria_levels)}
+            "questions": build_questions(criteria_levels, rubric)}
 
 
 def rubric_hash(rubric: str = RUBRIC_TEXT) -> str:
@@ -565,7 +571,7 @@ class BenchJudge(object):
         """Dispatch the request(s); return ``(body, dispatches, prompt_bound)``."""
         if self.request_shape == "bundled":
             payload = build_judge_payload(state, self.model,
-                                          self.criteria_levels)
+                                          self.criteria_levels, self.rubric)
             return self._dispatch(payload), 1, prompt_bound(payload)
         # three independently budgeted single-question calls, merged.  A
         # partial failure stops the remaining calls and yields no body.
@@ -573,7 +579,7 @@ class BenchJudge(object):
         made = 0
         tokens = 0
         for qid, _primitive in JUDGE_QUESTIONS:
-            questions = build_questions(self.criteria_levels)
+            questions = build_questions(self.criteria_levels, self.rubric)
             payload = {"state": state, "model": self.model,
                        "questions": {qid: questions[qid]}}
             made += 1
