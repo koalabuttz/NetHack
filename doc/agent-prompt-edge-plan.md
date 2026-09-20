@@ -1,6 +1,8 @@
-# Prompt-declined edge learning plan (Revision 2 — DRAFT, pending plan review)
+# Prompt-declined edge learning plan (Revision 3 — DRAFT, pending plan review)
 
 > **Round-1 plan-review provenance.** Review verdict: **REVISE — 3 High + 2 Medium + 1 Low, all addressed**; the root-cause audit is confirmed. Changes: (1) a pure `movement_origin_from_selected(candidate, need_kind, source_instance, pre_hero, attempt_key)` transport seam with an explicit accepted/rejected operation-class taxonomy, an optional internal-only `matched_movement_prompt`/`prompt_origin` field on `providers.ReflexContext` populated in live and evaluator, `providers.py` added to Phase 1's files, and a parameterized operation-taxonomy test (§A, §Phases Phase 1, AC2); (2) explicit replacement of `_escape`'s raw-grid movement selection/routing with classified `TerrainMemory` + `navigation.edge_legal` + the same immutable blocked-edge view, with a defined alternate-legal-edge fallback and four named tests (§E, §Phases Phase 3, AC4/AC5); (3) an executable Phase 0 cloud-encoding gate — a native `make -C test/agent native-cloud` probe or an explicit native-vs-operator-manual disposition — with a rewritten Phase 0 exit and a disposition test (§Phases Phase 0, §D, Risks, AC5); (4) an exact append-only/keyword-only edge-predicate API and predicate contract with five unit tests (§E, AC5); (5) an AC2 hero-progress suppression test plus its killing mutation (§Acceptance Criteria, §Mutation checks); (6) normalized plan headings, a compact AC1–AC5 → exact named-test table under Test Strategy, and the Phase 0 "only remaining gate" statement. Sections not named here are retained verbatim from the draft.
+
+> **Round-2 plan-review provenance.** Review verdict: **APPROVE WITH FIXES — 4 Medium, 1 Low, all addressed** in this revision. Changes: (1) one exact emergency fallback order in §E — (1) legal emergency edges not suppressed for the emergency class, preferred retreat first; (2) other legal emergency edges; (3) if no such edge exists, a sole geometrically legal edge suppressed only by a normal-navigation prompt record remains eligible as an emergency-class move; (4) stairs; (5) safe rest; (6) search — with prompt-declined records keyed by directed edge + movement action class and the blocked-edge view queried per action class, so emergency-class moves do not inherit normal-navigation suppression for the sole-edge case (§E, §D, `test_sole_legal_reverse_remains_available_to_emergency`); (2) a syntactically keyword-only API — `one_dijkstra_steps(..., deadline_check=None, *, edge_admissible=None)` and matching `one_dijkstra`/`plan` signatures, preserving positional `deadline_check` compatibility and adding `test_edge_admissible_is_keyword_only` (§E, AC5); (3) a new Phase 1 need-validation ordering substep — validate the complete need shape before movement-prompt recognition, then reconcile → commit memory once → note observation → commit the original effect → install the outstanding need, with the later duplicate `protocol.validate_need` made idempotent or removed, plus `test_malformed_cloud_prompt_creates_no_accounting_or_context` (§Phases Phase 1, AC1); (4) the mandated execute-agent review loop against the actual diff and AC1–AC5 plus the inherited Choice/cache, pickup, and forced-search contracts (§Review Strategy); (5) heading renames to `## Implementation Plan` and `## Risks, Blockers, and Required Decisions`, with an explicit statement that no blocker remains beyond the mandatory Phase 0 native/manual disposition (§Implementation Plan, §Risks, Blockers, and Required Decisions). Sections not named here are retained verbatim from Revision 2.
 
 Design produced by `architect:architect-vapor-loop` from the live-campaign freeze diagnosis ("Step into that vapor cloud?" answered 'n' 1,484×). Follow-up to `doc/agent-stall-recovery-plan.md` (§2A matched-attempt accounting and blocked-edge ledger), `doc/agent-destination-commitment-plan.md`, `doc/agent-jev-gate-nav-plan.md`.
 
@@ -121,7 +123,7 @@ The original movement effect is not replayed when the answer resolves: this avoi
 
 ### D. Typed, scoped edge evidence and reopening
 
-Extend blocked_edges values rather than inventing an independent destination blacklist. Retain recovery-failure semantics and add a typed `prompt-declined` reason. Key is the directed `(instance,src,dst[,movement_action_class])`; plain normal movement may retain the current three-part key because adjacent src/dst determines its action. Do not merge this with door-interaction or forced-prefix actions.
+Extend blocked_edges values rather than inventing an independent destination blacklist. Retain recovery-failure semantics and add a typed `prompt-declined` reason. Key is the directed edge plus **movement action class** — `(instance, src, dst, movement_action_class)`; plain normal movement may retain the current three-part key because adjacent src/dst determines its action. The blocked-edge view is **queried per action class**, so a normal-navigation prompt record does not suppress the same edge for the emergency class (§E). Do not merge this with door-interaction or forced-prefix actions.
 
 A prompt-declined record contains:
 - current `blocked_edge_signature` components;
@@ -139,13 +141,24 @@ For recovery failures preserve the existing signature/reset semantics. For promp
 
 ### E. Route/destination/recovery integration
 
-Add an optional pure edge-admissibility predicate (or equivalent immutable forbidden-edge view) to `navigation.plan`, `one_dijkstra`, and `one_dijkstra_steps`. The API is **append-only and keyword-only**: extend the signatures as `one_dijkstra_steps(..., deadline_check=None, edge_admissible=None)` (with matching additions to `one_dijkstra` and `plan`), and require every caller to pass the new arguments **by keyword**. Never insert a positional parameter before the existing `deadline_check`, which would silently reinterpret the live deadline callback. Predicate contract: **pure and directed** — `edge_admissible(src, dst, action_class)` — invoked **after** the geometric `edge_legal` check, at **both** root-neighbor seeding and every interior relaxation; being pure, it must not read or mutate policy state during a plan. `None` (the default) lets existing callers retain current behavior; policy supplies its scoped blocked-edge lookup. Preserve one-Dijkstra computation, weighted costs, true hop counts, deadline checks, and tie ordering.
+Add an optional pure edge-admissibility predicate (or equivalent immutable forbidden-edge view) to `navigation.plan`, `one_dijkstra`, and `one_dijkstra_steps`. The API is **append-only and syntactically keyword-only**: extend the signatures as `one_dijkstra_steps(..., deadline_check=None, *, edge_admissible=None)` (with matching `one_dijkstra`/`plan` signatures), placing `edge_admissible` after a bare `*` so it can only be passed by keyword. The existing positional `deadline_check` stays compatible; callers pass `edge_admissible` only by keyword, and never insert a positional parameter before `deadline_check`, which would silently reinterpret the live deadline callback. Predicate contract: **pure and directed** — `edge_admissible(src, dst, action_class)` — invoked **after** the geometric `edge_legal` check, at **both** root-neighbor seeding and every interior relaxation; being pure, it must not read or mutate policy state during a plan. `None` (the default) lets existing callers retain current behavior; policy supplies its scoped blocked-edge lookup. Preserve one-Dijkstra computation, weighted costs, true hop counts, deadline checks, and tie ordering.
 
 Both held routing and target acquisition consume the same filtered dist/first maps. Consequently a longer valid route to the same held destination wins over retiring it; other destinations cannot repeatedly cross the blocked edge. Audit direct movement candidates and the already-filtered recovery/alternate paths for bypasses. Preserve emergency precedence; a known declined normal edge is not a useful emergency retry, so prefer another legal emergency move without promoting navigation above emergency handling. Do not alter unrelated emergency actions.
 
-**Replace `_escape`'s movement selection/routing (Phase 3).** The emergency escape path currently selects and routes movement with raw `mem.known_passable` plus the legacy `_first_step` Dijkstra (`policy.py:2291-2312,2386-2422`). Replace that selection/routing with the classified `TerrainMemory`, `navigation.edge_legal`, and the **same immutable blocked-edge view** used by ordinary planning, while keeping the emergency branch **first** in policy precedence. Delete `_first_step` if no caller remains after the replacement. Define the fallback when the geometrically preferred emergency edge is declined: choose **another legal emergency edge**, then fall back to the existing stair/rest/search behavior. Never promote ordinary navigation above emergency handling, and never let a declined normal edge suppress a sole legal emergency move.
+**Replace `_escape`'s movement selection/routing (Phase 3).** The emergency escape path currently selects and routes movement with raw `mem.known_passable` plus the legacy `_first_step` Dijkstra (`policy.py:2291-2312,2386-2422`). Replace that selection/routing with the classified `TerrainMemory`, `navigation.edge_legal`, and the **same immutable blocked-edge view** used by ordinary planning, while keeping the emergency branch **first** in policy precedence. Delete `_first_step` if no caller remains after the replacement.
 
-Named tests: emergency/route — `test_declined_emergency_edge_uses_alternate_legal_escape`, `test_blocked_interior_edge_on_route_to_upstairs_is_filtered`, `test_sole_legal_reverse_remains_available_to_emergency`, `test_emergency_singleton_precedence_unchanged_by_edge_filter`; edge-predicate API — `test_forbidden_edge_default_preserves_dist_first_steps`, `test_forbidden_edge_filters_seed_and_interior`, `test_forbidden_edge_alternate_route_keeps_true_hops`, `test_forbidden_edge_preserves_equal_cost_tie_order`, `test_forbidden_edge_still_checks_deadline`.
+**Emergency fallback order (exact).** When the emergency branch is active, select the emergency move in exactly this order:
+
+1. legal emergency edges **not suppressed for the emergency class**, preferred retreat first (a move away from the threat precedes a lateral/forward one when both are legal);
+2. other legal emergency edges (any remaining legal step the emergency class accepts, including non-preferred ones);
+3. if no such edge exists, a **sole geometrically legal edge** suppressed **only** by a normal-navigation prompt record remains **eligible as an emergency-class move**;
+4. stairs;
+5. safe rest;
+6. search.
+
+**Action-class keying.** Prompt-declined records are keyed by **directed edge + movement action class**, and the blocked-edge view is **queried per action class**. Emergency-class moves therefore do **not** inherit normal-navigation suppression for the sole-edge case (step 3): a normal-navigation prompt record suppresses the edge for normal/destination navigation only, while the emergency class still sees it as legal and may use it as the only surviving escape. Never promote ordinary navigation above emergency handling, and never let a declined normal edge suppress a sole legal emergency move for the emergency class.
+
+Named tests: emergency/route — `test_declined_emergency_edge_uses_alternate_legal_escape`, `test_blocked_interior_edge_on_route_to_upstairs_is_filtered`, `test_sole_legal_reverse_remains_available_to_emergency`, `test_emergency_singleton_precedence_unchanged_by_edge_filter`; edge-predicate API — `test_forbidden_edge_default_preserves_dist_first_steps`, `test_forbidden_edge_filters_seed_and_interior`, `test_forbidden_edge_alternate_route_keeps_true_hops`, `test_forbidden_edge_preserves_equal_cost_tie_order`, `test_forbidden_edge_still_checks_deadline`, `test_edge_admissible_is_keyword_only`.
 
 When no alternate held route exists, retire via the existing frozen unreachable/failure path and single terminal owner, earlier than or no later than the existing three-no-progress bound. Do not wait for three more cloud prompts. Crucially, distinguish route-only unreachability from a serviced/failed target: keep edge evidence as the suppression owner, or bind any route-failure target record to the relevant route evidence. A permanent target service-signature failure would stop legitimate reacquisition after the cloud clears. Do not use global map revision to reopen it.
 
@@ -157,7 +170,7 @@ No Choice wire shape, criteria order, confidence gate, Jev eligibility, cache/re
 
 Expose minimal diagnostic reason data through existing recording paths: originating movement identity, prompt-bound stationary increment, decline evidence recorded, suppressed edge, evidence reopening, and route-unreachable disposition. These are observational diagnostics, not a new event ownership layer. Keep old recordings readable; avoid presentation/schema changes unless existing recording contracts actually require them.
 
-## Phased Implementation Plan
+## Implementation Plan
 
 ### Phase 0 — Pin failing evidence and contracts
 
@@ -175,6 +188,16 @@ Exit: implementer can demonstrate the original regression and either (a) positiv
 
 Affected verified files: `tools/agent/arbitration.py`, `candidates.py`, `controller.py`, `evaluate.py`, and `providers.py` (the optional, internal-only `matched_movement_prompt`/`prompt_origin` context field of §A); `state.py` only if a narrowly required public evidence field is missing. Preserve EpisodeMemory.commit API where possible. Add explicit safe cloud-prompt handling in `policy.py` before native default handling.
 
+**Need-validation ordering (explicit substep, live + evaluator).** Today the live path reads only `frame_need.kind` and reconciles/commits at `controller.py:1405-1413`, while the full `protocol.validate_need(need)` runs later at `controller.py:1451-1455`; the evaluator mirrors this. Restructure both to:
+
+1. extract the current need;
+2. **validate its complete shape** (full `protocol.validate_need(need)`) **before** movement-prompt recognition, so a malformed need cannot create accounting or a pending prompt context;
+3. derive/capture the matched movement prompt while the attempt and the selected origin are still available;
+4. reconcile → **commit memory once** → note observation → commit the original effect;
+5. finally install the outstanding need.
+
+Make the later duplicate `protocol.validate_need(need)` call **idempotent or remove it**, and apply the same ordering in the evaluator. A malformed cloud-shaped need must fail complete protocol validation before any stationary increment or pending-context creation.
+
 Exit: exact once-only count at prompt arrival; unrelated prompts excluded; no send/reconciliation/applied-token ownership regressions.
 
 ### Phase 2 — Confirmed decline ledger
@@ -185,7 +208,7 @@ Exit: declined edge learned exactly once after real answer resolution, neither p
 
 ### Phase 3 — Planning and destination integration
 
-Affected files: `navigation.py`, `policy.py`. Filter all Dijkstra edges; reuse maps for held/default/directive routing; avoid target-service poisoning and unbudgeted unreachable searches; preserve emergency and forced-search gates. **Explicitly replace `_escape`'s movement selection/routing** — currently raw `mem.known_passable` plus the legacy `_first_step` Dijkstra (`policy.py:2291-2312,2386-2422`) — with the classified `TerrainMemory`, `navigation.edge_legal`, and the same immutable blocked-edge view, keeping the emergency branch first; delete `_first_step` if no caller remains. When the geometrically preferred emergency edge is declined, choose another legal emergency edge, then the existing stair/rest/search behavior; never promote ordinary navigation above emergency handling and never let a declined normal edge suppress a sole legal emergency move.
+Affected files: `navigation.py`, `policy.py`. Filter all Dijkstra edges; reuse maps for held/default/directive routing; avoid target-service poisoning and unbudgeted unreachable searches; preserve emergency and forced-search gates. **Explicitly replace `_escape`'s movement selection/routing** — currently raw `mem.known_passable` plus the legacy `_first_step` Dijkstra (`policy.py:2291-2312,2386-2422`) — with the classified `TerrainMemory`, `navigation.edge_legal`, and the same immutable blocked-edge view, keeping the emergency branch first; delete `_first_step` if no caller remains. When the geometrically preferred emergency edge is declined, choose another legal emergency edge, then the existing stair/rest/search behavior, following §E's exact emergency fallback order; never promote ordinary navigation above emergency handling and never let a declined normal edge suppress a sole legal emergency move for the emergency class (§E action-class keying).
 
 Exit: route-around retains a valid commitment where possible; shared blocked edge cannot recur through new serials; no-route fixture reaches bounded recovery/exhaustion rather than cloud-looping.
 
@@ -200,6 +223,7 @@ AC1 — Matched accounting is exact and narrow.
 - `test_unrelated_yn_and_interaction_direction_do_not_advance_stationary`: eat, quit, startup, inventory, open/zap direction and unmatched frames.
 - `test_prompt_replay_unknown_hero_and_instance_change_do_not_double_count`.
 - `test_prompt_bound_attempts_compose_with_stationary_thresholds_3_6_10`: parameterize starting stages 2/5/9 and verify next genuine decision follows existing recovery precedence.
+- `test_malformed_cloud_prompt_creates_no_accounting_or_context`: a malformed cloud-shaped `yn` need fails complete protocol validation before movement-prompt recognition, so **no** stationary count and **no** pending prompt context is created before the protocol failure; live/evaluator parity.
 
 AC2 — Edge evidence belongs to the actual declined movement.
 - `test_declined_movement_records_origin_edge_not_destination_or_answer`.
@@ -232,7 +256,8 @@ AC5 — Live/evaluator and standing contracts remain aligned.
 - `test_sole_legal_reverse_remains_available_to_emergency`: a sole legal reverse step is never suppressed for emergency escape by a declined normal edge.
 - `test_emergency_singleton_precedence_unchanged_by_edge_filter`: edge filtering does not promote ordinary navigation above emergency handling.
 - `test_cloud_encoding_disposition_is_native_or_manual`: the cloud-encoding gate is dispositioned explicitly — either the native `native-cloud` probe passes, or an operator-gated manual trace is recorded for the affected element(s); no shape is silently skipped.
-- `test_forbidden_edge_default_preserves_dist_first_steps`: `edge_admissible=None` reproduces the existing dist/first maps exactly.
+- `test_forbidden_edge_default_preserves_dist_first_steps`: `edge_admissible=None` reproduces the existing dist/first maps exactly, and asserts the keyword-only signature (passing `edge_admissible` positionally raises `TypeError`).
+- `test_edge_admissible_is_keyword_only`: `one_dijkstra_steps(..., deadline_check=..., edge_admissible=...)` succeeds while a positional `edge_admissible` (e.g. `one_dijkstra_steps(..., False, predicate)`) raises `TypeError`; the same holds for `one_dijkstra` and `plan`.
 - `test_forbidden_edge_filters_seed_and_interior`: a predicate edge is excluded at both root seeding and interior relaxation.
 - `test_forbidden_edge_alternate_route_keeps_true_hops`: an alternate route keeps true hop counts and weighted costs.
 - `test_forbidden_edge_preserves_equal_cost_tie_order`: equal-cost tie ordering is unchanged under a predicate.
@@ -245,11 +270,11 @@ All names are proposed exact tests in verified suites; the compact map below tie
 
 | AC | Named tests |
 |---|---|
-| AC1 | `test_matched_movement_vapor_prompt_advances_stationary_once`, `test_unrelated_yn_and_interaction_direction_do_not_advance_stationary`, `test_prompt_replay_unknown_hero_and_instance_change_do_not_double_count`, `test_prompt_bound_attempts_compose_with_stationary_thresholds_3_6_10` |
+| AC1 | `test_matched_movement_vapor_prompt_advances_stationary_once`, `test_unrelated_yn_and_interaction_direction_do_not_advance_stationary`, `test_prompt_replay_unknown_hero_and_instance_change_do_not_double_count`, `test_prompt_bound_attempts_compose_with_stationary_thresholds_3_6_10`, `test_malformed_cloud_prompt_creates_no_accounting_or_context` |
 | AC2 | `test_declined_movement_records_origin_edge_not_destination_or_answer`, `test_prompt_decline_requires_matching_answer_send_and_resolution`, `test_prompt_answer_does_not_reapply_destination_or_applied_token`, `test_cloud_confirmation_declines_even_with_yes_native_default`, `test_movement_origin_operation_taxonomy_matrix`, `test_prompt_decline_resolution_with_hero_progress_records_no_edge` |
 | AC3 | `test_prompt_declined_edge_survives_prompt_absence_and_destination_reacquisition`, `test_prompt_edge_reopens_on_positive_local_cloud_change`, `test_prompt_edge_ignores_time_visits_remote_occupancy_and_occlusion`, `test_prompt_edge_signature_preserves_diagonal_side_evidence`, `test_prompt_ledger_overwrites_per_edge_and_clears_on_instance_reset`, `test_route_only_failure_does_not_permanently_suppress_target_after_reopen` |
 | AC4 | `test_vapor_cloud_loop_routes_around_with_held_destination`, `test_vapor_cloud_loop_filters_interior_dijkstra_edges`, `test_blocked_interior_edge_on_route_to_upstairs_is_filtered`, `test_vapor_cloud_loop_all_routes_blocked_enters_bounded_recovery`, `test_vapor_prompt_destination_attempts_respect_three_attempt_bound` |
-| AC5 | `test_live_evaluator_movement_prompt_accounting_and_ledger_parity`, `test_capped_scripted_vapor_decline_retains_effect_ownership`, `test_prompt_edge_route_filter_preserves_emergency_and_pickup_precedence`, `test_declined_emergency_edge_uses_alternate_legal_escape`, `test_sole_legal_reverse_remains_available_to_emergency`, `test_emergency_singleton_precedence_unchanged_by_edge_filter`, `test_cloud_encoding_disposition_is_native_or_manual`, `test_forbidden_edge_default_preserves_dist_first_steps`, `test_forbidden_edge_filters_seed_and_interior`, `test_forbidden_edge_alternate_route_keeps_true_hops`, `test_forbidden_edge_preserves_equal_cost_tie_order`, `test_forbidden_edge_still_checks_deadline`, plus the existing Choice criteria/index/N, strategy frozen-bytes/block-order, selected-candidate identity, delivery-repair, applied-cap, pickup ownership, and forced-search gate suites |
+| AC5 | `test_live_evaluator_movement_prompt_accounting_and_ledger_parity`, `test_capped_scripted_vapor_decline_retains_effect_ownership`, `test_prompt_edge_route_filter_preserves_emergency_and_pickup_precedence`, `test_declined_emergency_edge_uses_alternate_legal_escape`, `test_sole_legal_reverse_remains_available_to_emergency`, `test_emergency_singleton_precedence_unchanged_by_edge_filter`, `test_cloud_encoding_disposition_is_native_or_manual`, `test_forbidden_edge_default_preserves_dist_first_steps`, `test_forbidden_edge_filters_seed_and_interior`, `test_forbidden_edge_alternate_route_keeps_true_hops`, `test_forbidden_edge_preserves_equal_cost_tie_order`, `test_forbidden_edge_still_checks_deadline`, `test_edge_admissible_is_keyword_only`, plus the existing Choice criteria/index/N, strategy frozen-bytes/block-order, selected-candidate identity, delivery-repair, applied-cap, pickup ownership, and forced-search gate suites |
 
 ### Mutation checks
 
@@ -270,7 +295,7 @@ Require each mutation to be killed, not merely executed:
 
 ## Review Strategy
 
-After implementation/testing, obtain the project's prescribed independent review, address findings and rerun relevant tests/mutations before an operator-approved live smoke run. No review or validation is claimed as performed here.
+After all automatable tests and mutation checks pass, the **execute agent** dispatches an **independent reviewer** against the **actual diff** and AC1–AC5 plus the inherited Choice/cache, pickup, and forced-search contracts. The execute agent fixes or explicitly rebuts every reviewer finding, reruns the affected tests, and redispatches review after Critical/Important fixes until none remain or an operator decision is required. Obtain this review and rerun relevant tests/mutations before an operator-approved bounded live smoke run. No review or validation is claimed as performed here.
 
 ## Documentation Strategy
 
@@ -278,7 +303,9 @@ Amend `doc/agent-stall-recovery-plan.md` §2A introductory exclusion, table row 
 
 Update `doc/agent-destination-commitment-plan.md` for rerouting, route-only failure reopening and exact lifecycle ownership; update `doc/agent-jev-gate-nav-plan.md` to state that command-only Jev/singleton behavior is unchanged and yn movement interruption is handled locally. Document exact fixture bounds, supported prompt recognizers and conservative uncertainty behavior in `test/agent/README.md`. Do not change presentation version merely for internal accounting.
 
-## Risks and Decisions
+## Risks, Blockers, and Required Decisions
+
+**No blocker remains beyond the mandatory Phase 0 native/manual disposition.** That disposition gates only *positive reopening* claims; the conservative-suppression execution path (Phase 0 exit (b)) is a complete, non-blocking implementation route. No phase is blocked by it, and no other blocker or required decision is outstanding.
 
 - Main risk is wrong attribution: direction-shaped interactions and arbitrary yn prompts are not movement. Bind origin need, exact selected operation, attempt identity and answer need together.
 - Public overlay observability is the remaining implementation-sensitive question. Source confirms engine semantics, but actual wire cloud token/visibility has not been inspected here. Phase 0 must pin it. If unavailable, conservative suppression is preferable to inventing cloud disappearance.
