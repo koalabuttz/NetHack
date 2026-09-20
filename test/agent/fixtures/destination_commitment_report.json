@@ -1,40 +1,40 @@
 {
  "commit_range": {
   "base": "56c0c45a0739b29a3173b08b343d5fc786a56712",
-  "head": "5cccee7453db65e03e0a773b6f5dedb1aee5c70c"
+  "head": "5a3d0b6d07f7e9e8e275b2f0208bbc17e15a01b3"
  },
  "commits": [
   {
-   "hash": "5cccee7453db65e03e0a773b6f5dedb1aee5c70c",
-   "subject": "agent: evaluator cancels rejected pickup freeze"
+   "hash": "5a3d0b6d07f7e9e8e275b2f0208bbc17e15a01b3",
+   "subject": "agent: phase 4 diagnostics, gates, docs"
   },
   {
-   "hash": "1b0a5b1d8cfaeec82f0a054a56cfd8218ff05c08",
+   "hash": "14ceba219e4f6917223c8d91d7cc8fe8f0c0a71a",
+   "subject": "agent: evidence-signature split + door-refusal seam"
+  },
+  {
+   "hash": "4166319439ffc251f46da01bfc9005cc44560b54",
+   "subject": "agent: shared bounded recovery + terminal owner"
+  },
+  {
+   "hash": "0aab0d0c497ec7b1d33f26f56c4c6a4ded11f3fe",
+   "subject": "agent: selected-decision effect ownership + 2A"
+  },
+  {
+   "hash": "82a5728f6dcb7fb9b178afbce614cc4ab0241f19",
+   "subject": "agent: phase 0 stall-recovery failure fixtures"
+  },
+  {
+   "hash": "4bd31455c56b33f10253f6af98cc39681440ea24",
+   "subject": "agent: revise stall recovery plan to rev 3"
+  },
+  {
+   "hash": "5b8c914a5e020a14946369c35ff13e5c6ba16c43",
+   "subject": "agent: revise stall recovery plan to rev 2"
+  },
+  {
+   "hash": "578927d85e02104e20ffd2594784799bd1e08be3",
    "subject": "agent: regenerate report at final head"
-  },
-  {
-   "hash": "e801e038d361533c5e82778982214f5148ae8ff2",
-   "subject": "agent: acquire on-square collect at pickup send"
-  },
-  {
-   "hash": "6c85539c264408c234348043cc13a12768e24332",
-   "subject": "agent: regenerate report at final head"
-  },
-  {
-   "hash": "718138b195571740b33190a3faff70e43abc593c",
-   "subject": "agent: incremental lifecycle sidecar and events"
-  },
-  {
-   "hash": "26787feea7de47ab4d3843b99e3a5725befbb439",
-   "subject": "agent: repair-safe pickup attempt identity"
-  },
-  {
-   "hash": "fb4ae178479c1b98a3d62f5a85ae5d360da4f722",
-   "subject": "agent: regenerate report at final head"
-  },
-  {
-   "hash": "183247ea8c96b9d8e9d28f029ca20bad1bf31568",
-   "subject": "agent: persist lifecycle stream to the sidecar"
   }
  ],
  "gates": {
@@ -68,11 +68,12 @@
   "directive_executions": null,
   "directive_override_execution_rate": null,
   "directive_unresolved_or_expired_before_action": null,
+  "legacy_stream": false,
   "pickup_attempts": null,
   "pickup_outcomes": null,
   "pickup_repeated_sites": null,
   "pickup_unresolved_inspections": null,
-  "schema_version": 1,
+  "schema_version": 2,
   "target_reach_rate": null,
   "terminal_reasons": null
  },
@@ -195,5 +196,5 @@
   ]
  },
  "schema_version": 1,
- "suite_count": 1032
+ "suite_count": 1096
 }
