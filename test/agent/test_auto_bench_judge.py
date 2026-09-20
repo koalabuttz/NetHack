@@ -25,7 +25,7 @@ from tools.agent import bench_metrics as M   # noqa: E402
 
 
 CARD = {
-    "schema_version": "episode-scorecard/1",
+    "schema_version": "episode-scorecard/2",
     "episode_id": "ep-1",
     "integrity": {"status": "complete", "recording_complete": True,
                   "operational_ok": True},

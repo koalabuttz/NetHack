@@ -15,7 +15,7 @@ Modules:
 | Path | Responsibility |
 |---|---|
 | `tools/agent/bench.py` | `bench-spec/1` validation, CLI, one-episode runner, stop policy, budget planning, ownership-isolated forced abort, suggest-first tuner |
-| `tools/agent/bench_metrics.py` | `episode-scorecard/1`, provenance manifest, comparison engine, termination-safety admission, postmortem packages |
+| `tools/agent/bench_metrics.py` | `episode-scorecard/2`, provenance manifest, comparison engine, termination-safety admission, postmortem packages |
 | `tools/agent/bench_judge.py` | typed advisory Jev judge over the public worker transport |
 | `test/agent/test_auto_bench.py` | offline bench tests (metrics, comparison, runner, tuner) |
 | `test/agent/test_auto_bench_judge.py` | offline judge tests |
@@ -66,12 +66,30 @@ and any attempt to enable DeepSeek postmortems. `postmortem_reserve` is
 The spec stores credential *references* only (`***_key_file` paths); the bench
 never copies a referenced secret into output.
 
-## Scorecard contract (`episode-scorecard/1`)
+## Scorecard contract (`episode-scorecard/2`)
 
 Sections: `schema_version`, `episode_id`, `provenance_id`, `source_hashes`,
 `integrity`, `terminal_class`, `termination`, `activity`, `exploration`,
 `lifecycle`, `reflex`, `forced_search`, `usage`, `invalids`, `gates`,
 `availability`.
+
+**Documented `/2` extras (bench-owned, absent from `/1`).** The schema was
+bumped deliberately from `/1` to add three top-level sections that carry the
+deterministic gate evidence the comparison and postmortem consume:
+
+* `terminal_class` — the episode's class from the exact precedence table.
+* `invalids` — the split taxonomy (`available`/`reason`, native codes by code,
+  resolved/unresolved `incomplete`, local validation fallbacks, `hard_failure`).
+* `gates` — the per-episode gate evidence (`integrity_ok`, `operational_ok`,
+  `operational_integrity_failure`, `invalid_evidence_available`,
+  `forced_search_evidence_available`, `evidence_available`,
+  `uncleared_forced_search`, `prohibited_postmortem`, `postmortem_reserve`,
+  `postmortem_dispatched`, `hard_failure`).
+
+`validate_scorecard_shape()` enforces the **exact** top-level and per-section
+key sets: an extra field is a deviation, and a missing field is a deviation
+unless the `availability` map explicitly accounts for it (a metric absent
+*without* an availability reason is a gap, never silently accepted).
 
 * `integrity.status` is `complete|partial|missing|invalid`. A **torn sidecar
   marks `partial` even when the lifecycle summarizer still produced output**:

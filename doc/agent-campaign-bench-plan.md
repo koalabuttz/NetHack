@@ -170,7 +170,10 @@ A bench manifest lists scheduled/completed/interrupted episodes, episode artifac
 
 ### 2. Scorecard contract
 
-`episode-scorecard/1` has exactly these sections:
+`episode-scorecard/2` has exactly these sections (the implementation bumped the
+schema from `/1` to `/2`, adding the bench-owned `terminal_class`, `invalids`
+and `gates` sections — see `doc/agent-campaign-bench.md` for the documented
+extras, enforced exactly by `validate_scorecard_shape()`):
 - `schema_version`, `episode_id`, `provenance_id`, `source_hashes`.
 - `integrity`: `status` (`complete|partial|missing|invalid`), `reasons`, `recording_complete`, `operational_ok`, `requested_tiers`, `observed_tiers`.
 - `termination`: `stop_reason`, `outcome`, `closed`, `returncode`, `protocol_failure`, `failure_reason`, `forced_kill`, `unanswered`.

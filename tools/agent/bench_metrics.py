@@ -13,7 +13,7 @@ The four contracts it implements, matching the approved plan's sections:
   by commit-id inequality: a deterministic-domain difference is
   ``not-comparable``, an advisory (judge) difference only forces rejudgment,
   and reported-only metadata never blocks a comparison.
-* **§2 scorecard** -- ``episode-scorecard/1`` with the exact section/field set,
+* **§2 scorecard** -- ``episode-scorecard/2`` with the exact section/field set,
   an integrity status, and an ``availability`` map that records *why* a metric
   is unavailable (a genuine zero stays a measured zero).
 * **§3 comparison** -- an unpaired, precommitted, counterbalanced comparison
@@ -32,7 +32,13 @@ import random
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-SCORECARD_SCHEMA = "episode-scorecard/1"
+#: Scorecard schema.  Bumped deliberately to ``/2``: it adds three
+#: bench-owned top-level sections (``terminal_class``, ``invalids``, ``gates``)
+#: that carry the deterministic gate evidence the comparison and postmortem
+#: consume.  ``/1`` had none of them; the extras are documented in
+#: ``doc/agent-campaign-bench.md`` and enforced exactly by
+#: :func:`validate_scorecard_shape`.
+SCORECARD_SCHEMA = "episode-scorecard/2"
 PROVENANCE_SCHEMA = "provenance-manifest/1"
 COMPARISON_SCHEMA = "comparison/1"
 POSTMORTEM_SCHEMA = "postmortem-package/1"
@@ -112,6 +118,47 @@ ACTIVITY_FIELDS = ("ticks", "needs", "actions", "invalids", "boundaries",
 TERMINATION_FIELDS = ("stop_reason", "outcome", "closed", "returncode",
                       "protocol_failure", "failure_reason", "forced_kill",
                       "unanswered")
+
+#: The exact top-level key set of a ``episode-scorecard/2``.
+SCORECARD_TOP_FIELDS = ("schema_version", "episode_id", "provenance_id",
+                        "source_hashes", "integrity", "terminal_class",
+                        "termination", "activity", "exploration", "lifecycle",
+                        "reflex", "forced_search", "usage", "invalids", "gates",
+                        "availability")
+INTEGRITY_FIELDS = ("status", "reasons", "recording_complete", "operational_ok",
+                    "requested_tiers", "observed_tiers")
+INVALID_FIELDS = ("available", "reason", "native_by_code",
+                  "native_non_incomplete", "incomplete_seen",
+                  "incomplete_resolved", "incomplete_unresolved",
+                  "local_validation_fallbacks", "hard_failure")
+GATE_FIELDS = ("integrity_ok", "operational_ok",
+               "operational_integrity_failure", "invalid_hard_failure",
+               "invalid_evidence_available", "forced_search_evidence_available",
+               "evidence_available", "uncleared_forced_search",
+               "prohibited_postmortem", "postmortem_reserve",
+               "postmortem_dispatched", "hard_failure")
+USAGE_SECTION_FIELDS = (tuple(USAGE_REDUCED_KEYS) + tuple(USAGE_EXTRA_KEYS)
+                        + ("providers",) + tuple(USAGE_BENCH_KEYS))
+EXPLORATION_SECTION_FIELDS = (tuple(EXPLORATION_FIELDS)
+                              + ("entered_per_100_attempts",))
+#: Section -> its exact allowed key set (``availability``/``source_hashes`` are
+#: free-form and checked only for being objects).
+SCORECARD_SECTION_FIELDS = {
+    "integrity": INTEGRITY_FIELDS,
+    "termination": TERMINATION_FIELDS,
+    "activity": ACTIVITY_FIELDS,
+    "exploration": EXPLORATION_SECTION_FIELDS,
+    "lifecycle": LIFECYCLE_FIELDS,
+    "reflex": REFLEX_FIELDS,
+    "forced_search": FORCED_SEARCH_FIELDS,
+    "usage": USAGE_SECTION_FIELDS,
+    "invalids": INVALID_FIELDS,
+    "gates": GATE_FIELDS,
+}
+VALID_TERMINAL_CLASSES = ("adverse-early", "horizon-completion",
+                          "operational-integrity-failure",
+                          "excluded-from-comparison", "ascension",
+                          "adverse-unknown", "unrecognized-never-benign")
 
 #: Availability reasons -- the closed vocabulary the plan enumerates.
 AVAIL_LEGACY = "legacy"
@@ -679,7 +726,7 @@ def build_scorecard(*, episode_id: str, provenance_id: Optional[str],
                     requested_tiers: Optional[dict] = None,
                     deadline_classification: str = "horizon-completion",
                     ) -> Dict[str, Any]:
-    """Build one ``episode-scorecard/1`` from already-written artifacts."""
+    """Build one ``episode-scorecard/2`` from already-written artifacts."""
     from . import exploration_metrics
     meta = dict(meta or {})
     budget = dict(budget or {})
@@ -757,9 +804,20 @@ def build_scorecard(*, episode_id: str, provenance_id: Optional[str],
         avail["lifecycle"] = AVAIL_MISSING
 
     # -- reflex / forced search ------------------------------------------
-    reflex = _copy_available(budget.get("reflex") if isinstance(budget, dict)
-                             else None, REFLEX_FIELDS, "reflex", avail,
+    reflex_src = budget.get("reflex") if isinstance(budget, dict) else None
+    reflex = _copy_available(reflex_src, REFLEX_FIELDS, "reflex", avail,
                              AVAIL_LEGACY)
+    # The native per-episode ledger names the accepted-consultation count
+    # ``successful``; the scorecard's field is ``accepted``.  Map it at this
+    # campaign-summary boundary so ``accepted`` is a measured value, never an
+    # availability error, when the producer reported one.
+    if isinstance(reflex_src, dict):
+        if "accepted" in reflex_src:
+            reflex["accepted"] = reflex_src["accepted"]
+            avail.pop("reflex.accepted", None)
+        elif "successful" in reflex_src:
+            reflex["accepted"] = reflex_src["successful"]
+            avail.pop("reflex.accepted", None)
     if forced_search is None:
         forced_search = {}
     forced = {}
@@ -840,32 +898,45 @@ def build_scorecard(*, episode_id: str, provenance_id: Optional[str],
 
 
 def validate_scorecard_shape(card: dict) -> List[str]:
-    """Return the list of schema deviations (empty when the shape is exact)."""
+    """Return the schema deviations (empty when the ``/2`` shape is exact).
+
+    Checks the **exact** top-level key set and every section's exact key set:
+    an extra field is a deviation, and a missing field is a deviation unless
+    the scorecard's ``availability`` map explicitly accounts for it (a metric
+    absent *without* an availability reason is a gap, never silently accepted).
+    """
     problems: List[str] = []
+    if not isinstance(card, dict):
+        return ["not-an-object"]
     if card.get("schema_version") != SCORECARD_SCHEMA:
         problems.append("schema_version")
-    for section in ("integrity", "termination", "activity", "exploration",
-                    "lifecycle", "reflex", "forced_search", "usage",
-                    "availability"):
-        if not isinstance(card.get(section), dict):
+    top = set(card)
+    if top != set(SCORECARD_TOP_FIELDS):
+        extra = sorted(top - set(SCORECARD_TOP_FIELDS))
+        missing = sorted(set(SCORECARD_TOP_FIELDS) - top)
+        if extra:
+            problems.append("top-extra:%s" % extra)
+        if missing:
+            problems.append("top-missing:%s" % missing)
+    avail = card.get("availability")
+    if not isinstance(avail, dict):
+        avail = {}
+        problems.append("missing-section:availability")
+    for section, allowed in sorted(SCORECARD_SECTION_FIELDS.items()):
+        node = card.get(section)
+        if not isinstance(node, dict):
             problems.append("missing-section:%s" % section)
-    want_explore = set(EXPLORATION_FIELDS) | {"entered_per_100_attempts"}
-    got_explore = set((card.get("exploration") or {}).keys())
-    if want_explore != got_explore:
-        problems.append("exploration-fields:%s"
-                        % sorted(want_explore ^ got_explore))
-    want_life = set(LIFECYCLE_FIELDS)
-    got_life = set((card.get("lifecycle") or {}).keys())
-    if not want_life <= got_life:
-        problems.append("lifecycle-missing:%s" % sorted(want_life - got_life))
-    for field in REFLEX_FIELDS:
-        key = "reflex.%s" % field
-        if field not in (card.get("reflex") or {}) and key not in \
-                (card.get("availability") or {}):
-            problems.append("reflex-unaccounted:%s" % field)
-    if card.get("terminal_class") not in (
-            ADVERSE_EARLY, HORIZON_COMPLETION, OPERATIONAL_FAILURE, EXCLUDED,
-            ASCENSION, ADVERSE_UNKNOWN, UNRECOGNIZED):
+            continue
+        extra = sorted(set(node) - set(allowed))
+        if extra:
+            problems.append("%s-extra:%s" % (section, extra))
+        for key in allowed:
+            if key not in node and ("%s.%s" % (section, key)) not in avail \
+                    and section not in avail:
+                problems.append("%s-unaccounted:%s" % (section, key))
+    if not isinstance(card.get("source_hashes"), dict):
+        problems.append("source_hashes")
+    if card.get("terminal_class") not in VALID_TERMINAL_CLASSES:
         problems.append("terminal_class")
     return problems
 

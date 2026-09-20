@@ -210,7 +210,7 @@ class ScorecardContract(unittest.TestCase):
         card = M.build_scorecard(
             episode_id="ep-1", provenance_id="p", meta=_meta(),
             budget=_budget(), wire_path=_SHORT, actions_path=_ACTIONS)
-        self.assertEqual(card["schema_version"], "episode-scorecard/1")
+        self.assertEqual(card["schema_version"], "episode-scorecard/2")
         self.assertEqual(M.validate_scorecard_shape(card), [])
         want = set(M.EXPLORATION_FIELDS) | {"entered_per_100_attempts"}
         self.assertEqual(set(card["exploration"]), want)
@@ -1623,6 +1623,63 @@ class PostmortemBoundedness(unittest.TestCase):
                          [i["episode_id"] for i in second])
         self.assertEqual(first[0]["episode_id"], "bad")
         self.assertEqual(first[-1]["episode_id"], "calm")
+
+
+class ScorecardSchemaExactness(unittest.TestCase):
+    """Finding #9: exact ``/2`` schema; no unaccounted/extra fields."""
+
+    def _card(self):
+        return M.build_scorecard(
+            episode_id="ep-1", provenance_id="p", meta=_meta(),
+            budget=_budget(), wire_path=_SHORT, actions_path=_ACTIONS)
+
+    def test_native_successful_maps_to_accepted_without_availability_error(
+            self):
+        budget = _budget(reflex={"applied": 1, "paid_dispatched": 2,
+                                 "successful": 3, "rejected": 0,
+                                 "fallback": 0, "timeout": 0, "invalid": 0,
+                                 "low_confidence": 0})
+        card = M.build_scorecard(
+            episode_id="ep-1", provenance_id="p", meta=_meta(), budget=budget,
+            wire_path=_SHORT, actions_path=_ACTIONS)
+        self.assertEqual(card["reflex"]["accepted"], 3)
+        self.assertNotIn("reflex.accepted", card["availability"])
+        self.assertEqual(M.validate_scorecard_shape(card), [])
+
+    def test_extra_section_field_fails_validation(self):
+        card = self._card()
+        for section in sorted(M.SCORECARD_SECTION_FIELDS):
+            bad = json.loads(json.dumps(card))
+            bad[section]["__extra__"] = 1
+            problems = M.validate_scorecard_shape(bad)
+            self.assertTrue(any(p.startswith("%s-extra:" % section)
+                                for p in problems), section)
+
+    def test_missing_section_field_fails_without_availability(self):
+        card = self._card()
+        for section, allowed in sorted(M.SCORECARD_SECTION_FIELDS.items()):
+            bad = json.loads(json.dumps(card))
+            key = allowed[0]
+            del bad[section][key]
+            bad["availability"].pop("%s.%s" % (section, key), None)
+            bad["availability"].pop(section, None)
+            problems = M.validate_scorecard_shape(bad)
+            self.assertTrue(any(p.startswith("%s-unaccounted:" % section)
+                                for p in problems), (section, key))
+
+    def test_extra_or_missing_top_level_field_fails(self):
+        card = self._card()
+        extra = json.loads(json.dumps(card))
+        extra["surprise"] = 1
+        self.assertTrue(any(p.startswith("top-extra:")
+                            for p in M.validate_scorecard_shape(extra)))
+        missing = json.loads(json.dumps(card))
+        del missing["gates"]
+        self.assertTrue(any(p.startswith("top-missing:")
+                            for p in M.validate_scorecard_shape(missing)))
+        # the /2 extras are present and documented
+        for field in ("terminal_class", "invalids", "gates"):
+            self.assertIn(field, card)
 
 
 if __name__ == "__main__":
