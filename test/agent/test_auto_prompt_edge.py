@@ -291,6 +291,46 @@ class MovementOriginTaxonomy(unittest.TestCase):
             acquire, "command", 7, None, self.KEY))
 
 
+class PromptContinuity(unittest.TestCase):
+    """Round-2 F1: continuity uses the stable request identity, not full seq."""
+
+    def _pending(self):
+        origin = arbitration.movement_origin_from_selected(
+            _nav_candidate(payload=("dest", "acquire", 7, "x", 11, 10,
+                                    "frontier", "default", 0, -1, "")),
+            "command", 7, (10, 10), ((1, 1, 1), "t", "c", 1))
+        return arbitration.matched_movement_prompt(
+            origin, {"kind": "yn", "id": 2, "prompt": fx.VAPOR_PROMPT},
+            7, (10, 10), protocol.NeedKey(1, 2, 2))
+
+    def test_same_id_newer_seq_is_the_same_request(self):
+        pending = self._pending()
+        self.assertEqual(arbitration.prompt_request_identity(
+            protocol.NeedKey(1, 2, 2)), (1, 2))
+        self.assertEqual(arbitration.prompt_request_identity(
+            protocol.NeedKey(1, 9, 2)), (1, 2))
+        # same episode + id + prompt text, newer seq: still a re-presentation
+        self.assertTrue(arbitration.is_representation_of(
+            pending, protocol.NeedKey(1, 9, 2), fx.VAPOR_PROMPT))
+        # a different prompt id is a replacement
+        self.assertFalse(arbitration.is_representation_of(
+            pending, protocol.NeedKey(1, 3, 3), fx.VAPOR_PROMPT))
+        # a different episode is not the same request
+        self.assertFalse(arbitration.is_representation_of(
+            pending, protocol.NeedKey(2, 3, 2), fx.VAPOR_PROMPT))
+        # whitespace/case normalization only; a materially different prompt is
+        # not the same confirmation
+        self.assertTrue(arbitration.is_representation_of(
+            pending, protocol.NeedKey(1, 4, 2),
+            "  STEP INTO   THAT VAPOR CLOUD? "))
+        self.assertFalse(arbitration.is_representation_of(
+            pending, protocol.NeedKey(1, 4, 2),
+            "Step into that poison gas cloud?"))
+        # an incomplete key is never a representation
+        self.assertFalse(arbitration.is_representation_of(pending, (), ""))
+        self.assertIsNone(arbitration.prompt_request_identity(()))
+
+
 class MovementEntryRecognition(unittest.TestCase):
     def test_only_cloud_confirmations_are_recognized(self):
         self.assertTrue(arbitration.is_movement_entry_confirmation(
@@ -1104,6 +1144,138 @@ class LiveEvaluatorParity(unittest.TestCase):
         # re-acquisition through the blocked edge
         for a in acts[2:]:
             self.assertNotEqual(a["action"], {"key": KEY_EAST}, a)
+
+    def test_re_presented_same_id_prompt_stays_bound_live_and_replay(self):
+        # Round-2 review F1: a legitimately re-presented identical cloud prompt
+        # (same id, newer seq) must keep the bound decline transaction -- the
+        # stable request identity, not full-seq equality, decides continuity
+        recs = [_rec(1, _cmd(1), _MAP_TRAP, 100),
+                _rec(2, _yn_need(2), _MAP_TRAP, 100),
+                _rec(3, _yn_need(2), _MAP_TRAP, 100),   # same id, newer seq
+                _rec(4, _cmd(4), _MAP_TRAP, 102)]       # the successor
+        live, _r, _p = self._live()
+        replay = evaluate.ReplayPass(
+            [], ProviderConfig(reflex="scripted", strategy="off",
+                               max_ticks=200), "scripted", "off")
+        replay.invalids_by_key = {}
+        replay.mem.inventory.refresh([], 0, 0)
+        replay._feed_line(_line(hello()))
+        first_ordinal = None
+        for frame in recs:
+            live._on_obs(frame)
+            live._answer_now(None)
+            replay._feed_line(_line(frame))
+            self.assertEqual(self._snap(live), self._snap(replay),
+                             "frame seq %s" % frame["seq"])
+            if frame["seq"] == 2:
+                # armed, bound, counted exactly once
+                self.assertIsNotNone(live.reflex.pending_prompt)
+                self.assertTrue(live.reflex.pending_prompt.answer_sent)
+                first_ordinal = live.reflex.pending_prompt.answer_ordinal
+                self.assertEqual(live.mem.no_progress, 1)
+            if frame["seq"] == 3:
+                # the same-id re-presentation stays bound: no second stationary
+                # count, no ledger write, and the original accounting unchanged
+                self.assertIsNotNone(live.reflex.pending_prompt)
+                self.assertTrue(live.reflex.pending_prompt.answer_sent)
+                self.assertEqual(live.reflex.pending_prompt.answer_ordinal,
+                                 first_ordinal)
+                self.assertEqual(live.mem.no_progress, 1)
+                self.assertEqual(live.reflex.prompt_declined_edges, {})
+        # the eventual non-cloud successor writes exactly once
+        self.assertEqual(len(live.reflex.prompt_declined_edges), 1)
+        self.assertIsNone(live.reflex.pending_prompt)
+        self.assertIsNone(live.reflex.prompt_origin)
+
+    def test_re_presented_different_prompt_id_discards_live_and_replay(self):
+        # Round-2 review F1: a cloud confirmation with a *different* prompt id is
+        # a replacement, discarded without writing
+        recs = [_rec(1, _cmd(1), _MAP_TRAP, 100),
+                _rec(2, _yn_need(2), _MAP_TRAP, 100),
+                _rec(3, _yn_need(3), _MAP_TRAP, 101),   # different id
+                _rec(4, _cmd(4), _MAP_TRAP, 102)]
+        live, _r, _p = self._live()
+        replay = evaluate.ReplayPass(
+            [], ProviderConfig(reflex="scripted", strategy="off",
+                               max_ticks=200), "scripted", "off")
+        replay.invalids_by_key = {}
+        replay.mem.inventory.refresh([], 0, 0)
+        replay._feed_line(_line(hello()))
+        for frame in recs:
+            live._on_obs(frame)
+            live._answer_now(None)
+            replay._feed_line(_line(frame))
+            self.assertEqual(self._snap(live), self._snap(replay),
+                             "frame seq %s" % frame["seq"])
+            if frame["seq"] == 3:
+                self.assertIsNone(live.reflex.pending_prompt)
+        self.assertEqual(live.reflex.prompt_declined_edges, {})
+        self.assertEqual(live.mem.no_progress, 1)
+
+    def test_evaluator_invalid_clears_prompt_transaction_like_live(self):
+        # Round-2 review F2: an `invalid` in the replay must clear the pending
+        # prompt context exactly as the live controller does, so a stale bound
+        # answer can never resolve against a later non-cloud observation
+        recs = [_rec(1, _cmd(1), _MAP_TRAP, 100),
+                _rec(2, _yn_need(2), _MAP_TRAP, 100)]
+        live, _r, _p = self._live()
+        replay = evaluate.ReplayPass(
+            [], ProviderConfig(reflex="scripted", strategy="off",
+                               max_ticks=200), "scripted", "off")
+        replay.invalids_by_key = {}
+        replay.mem.inventory.refresh([], 0, 0)
+        replay._feed_line(_line(hello()))
+        for frame in recs:
+            live._on_obs(frame)
+            live._answer_now(None)                 # sends the `n` decline
+            replay._feed_line(_line(frame))
+        self.assertTrue(live.reflex.pending_prompt.answer_sent)
+        self.assertTrue(replay.reflex.pending_prompt.answer_sent)
+        # both paths clear on the same invalid
+        invalid = _line({"v": 1, "ch": "control", "type": "invalid",
+                         "code": "kind"})
+        live._on_invalid({"type": "invalid", "code": "kind"})
+        replay._feed_line(invalid)
+        self.assertIsNone(live.reflex.pending_prompt)
+        self.assertIsNone(replay.reflex.pending_prompt)
+        self.assertIsNone(live.reflex.prompt_origin)
+        self.assertIsNone(replay.reflex.prompt_origin)
+        self.assertEqual(live.reflex.prompt_declined_edges, {})
+        self.assertEqual(replay.reflex.prompt_declined_edges, {})
+        # a later non-cloud observation writes no false evidence in either path
+        live._on_obs(_rec(4, _cmd(4), _MAP_TRAP, 102))
+        live._answer_now(None)
+        replay._feed_line(_line(_rec(4, _cmd(4), _MAP_TRAP, 102)))
+        self.assertEqual(live.reflex.prompt_declined_edges, {})
+        self.assertEqual(replay.reflex.prompt_declined_edges, {})
+
+    def test_evaluator_close_clears_prompt_transaction_and_seam(self):
+        # Round-2 review F2: closing the episode clears the pending context and
+        # both context-seam fields in the replay as well as live
+        recs = [_rec(1, _cmd(1), _MAP_TRAP, 100),
+                _rec(2, _yn_need(2), _MAP_TRAP, 100)]
+        live, _r, _p = self._live()
+        replay = evaluate.ReplayPass(
+            [], ProviderConfig(reflex="scripted", strategy="off",
+                               max_ticks=200), "scripted", "off")
+        replay.invalids_by_key = {}
+        replay.mem.inventory.refresh([], 0, 0)
+        replay._feed_line(_line(hello()))
+        for frame in recs:
+            live._on_obs(frame)
+            live._answer_now(None)
+            replay._feed_line(_line(frame))
+        self.assertIsNotNone(replay.reflex.pending_prompt)
+        self.assertIsNotNone(replay.reflex.prompt_origin)
+        replay._feed_line(_line({"v": 1, "ch": "control", "type": "closed"}))
+        live._on_closed({"type": "closed"})
+        for x in (live, replay):
+            self.assertIsNone(x.reflex.pending_prompt, x)
+            self.assertIsNone(x.reflex.prompt_origin, x)
+        # the live context seam is also None after close
+        ctx = live._reflex_context(_cmd(9), 0.0)
+        self.assertIsNone(ctx.prompt_origin)
+        self.assertIsNone(ctx.matched_movement_prompt)
 
     def test_real_live_invalid_clears_then_retry_rebinds(self):
         # review F1: an `invalid` after a sent answer discards the pending

@@ -1814,12 +1814,15 @@ class _EpisodeRunner(object):
     def _resolve_pending_prompt(self, frame_need, frame_key):
         """Confirm a decline iff the post-answer observation proves it (§C).
 
-        The bound send identity (decline byte + response NeedKey) is required.
-        A frame that re-presents the *same* confirmation keeps the context (no
-        double count and no write); an unrelated replacement cloud prompt
-        discards the context without writing; any other post-answer frame is
-        the expected successor, so the decline is confirmed only for an
-        unchanged reconciled hero in the same instance.
+        The bound send identity (decline byte + exact response NeedKey) is
+        required for the *write*.  Continuity of a re-presented confirmation is
+        judged on the **stable request identity** (episode + prompt id) plus the
+        normalized prompt text, never on full-sequence equality -- a same-id
+        re-presentation carries a newer ``seq``, so it keeps the context (no
+        double count and no write); a different prompt id discards the context
+        without writing; any other post-answer frame is the expected successor,
+        so the decline is confirmed only for an unchanged reconciled hero in the
+        same instance.
         """
         resolve = getattr(self.reflex, "resolve_prompt_decline", None)
         pending = getattr(self.reflex, "pending_prompt", None)
@@ -1830,10 +1833,10 @@ class _EpisodeRunner(object):
                  and arbitration.is_movement_entry_confirmation(
                      frame_need.get("prompt") or ""))
         if cloud:
-            if frame_key is not None and \
-                    tuple(frame_key) == tuple(pending.response_need_key):
-                return                  # re-presented: keep waiting
-            self._clear_pending_prompt()  # unrelated replacement: discard
+            if arbitration.is_representation_of(
+                    pending, frame_key, frame_need.get("prompt") or ""):
+                return                  # same confirmation re-presented
+            self._clear_pending_prompt()  # a different prompt id: discard
             return
         resolve(self.mem, self.instance.current(), self._resolved_hero, True)
         self._clear_pending_prompt()

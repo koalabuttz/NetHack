@@ -814,11 +814,14 @@ class ScriptedReflex(object):
         p = self._pending_prompt
         if p is None:
             return
+        if p.answer_sent:
+            # The original accounting is frozen: a later or re-presented answer
+            # never re-binds and never clears the bound decline transaction
+            # (§C successor continuity).
+            return
         if not arbitration.answer_binds_to_prompt(p, need_key, answer_byte):
             self._pending_prompt = None
             self._prompt_origin = None
-            return
-        if p.answer_sent:
             return
         self._pending_prompt = _dc_replace(
             p, answer_sent=True, answer_ordinal=int(ordinal),
@@ -2660,6 +2663,10 @@ class ScriptedReflex(object):
     def on_closed(self):
         self.intent = ""
         self.quitting = True
+        # A closed episode discards the bounded pending movement-confirmation
+        # context (and its origin edge), so no seam value survives the close and
+        # a stale decline can never resolve afterwards (round-2 review F2).
+        self.clear_pending_prompt()
 
 
 def _manhattan(a, b):

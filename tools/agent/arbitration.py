@@ -468,6 +468,45 @@ def matched_movement_prompt(origin, response_need, instance, confirmed_hero,
         response_need_key=candidates.normalize_need_key(response_need_key))
 
 
+def prompt_request_identity(need_key):
+    """The stable request identity ``(episode, prompt id)`` of a need key (§C).
+
+    ``NeedKey`` is ``(episode, seq, id)`` and ``_on_obs`` requires monotonically
+    *increasing* ``seq``, so a legitimately re-presented identical confirmation
+    (same prompt ``id``, newer ``seq``) has a different full key.  The
+    *continuity* check therefore uses this stable identity -- episode plus
+    prompt id -- never full-sequence equality.  ``None`` when the key is not a
+    complete ``(episode, seq, id)``.
+    """
+    parts = candidates.normalize_need_key(need_key)
+    if len(parts) != 3:
+        return None
+    return (parts[0], parts[2])
+
+
+def normalize_prompt_text(prompt_text) -> str:
+    """Case/whitespace normalization of a prompt for continuity comparison."""
+    return " ".join(str(prompt_text or "").lower().split())
+
+
+def is_representation_of(pending, frame_key, frame_prompt) -> bool:
+    """True when a cloud frame *re-presents* the same confirmation request (§C).
+
+    Continuity requires the stable request identity (episode + prompt id) and
+    the normalized prompt text to match.  Full-sequence equality is deliberately
+    **not** used: a same-id re-presentation carries a newer ``seq``.
+    """
+    if pending is None:
+        return False
+    identity = prompt_request_identity(frame_key)
+    if identity is None:
+        return False
+    if identity != prompt_request_identity(pending.response_need_key):
+        return False
+    return normalize_prompt_text(frame_prompt) \
+        == normalize_prompt_text(pending.prompt_text)
+
+
 def answer_binds_to_prompt(pending, need_key, answer_byte) -> bool:
     """True iff a sent answer is the *decline* of this exact confirmation (§C).
 
@@ -535,4 +574,6 @@ __all__ = [
     "movement_origin_from_selected",
     "is_movement_entry_confirmation", "matched_movement_prompt",
     "prompt_decline_confirmed", "answer_binds_to_prompt", "set_dir_keys",
+    "prompt_request_identity", "normalize_prompt_text",
+    "is_representation_of",
 ]

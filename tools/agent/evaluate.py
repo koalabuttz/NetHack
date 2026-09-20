@@ -848,6 +848,12 @@ class ReplayPass(object):
         # as a terminal non-repair rejection (it has no delivery-repair branch),
         # so the freeze is always cancelled here rather than re-armed.
         self.reflex.cancel_pickup()
+        # Round-2 review F2: an `invalid` discards the pending prompt context
+        # too, exactly as the live controller does -- the confirmation must be
+        # re-matched by a fresh arrival, so a stale bound answer can never
+        # resolve against a later non-cloud observation and falsely write
+        # prompt-declined evidence in replay.
+        self.reflex.clear_pending_prompt()
         # It is recorded as its own decision row, and -- when the attempt it
         # rejected is known -- that rejected action is labelled here, distinct
         # from the accepted ground truth.  The invalid count for this NeedKey
@@ -911,6 +917,9 @@ class ReplayPass(object):
         self._sent_action = None
         self._sent_stair = False
         self._sent_before = None
+        # Round-2 review F2: closing the episode discards the pending prompt
+        # context (and its origin), exactly as the live close path does.
+        self.reflex.clear_pending_prompt()
         detected = self.mem.boundary.check(self.mem.status, closed=True)
         self.ledger.note_boundary("detected", len(detected))
         self._note_detected(detected)
@@ -1361,7 +1370,12 @@ class ReplayPass(object):
             response_need_key=(frame_key or ())))
 
     def _resolve_pending_prompt(self, frame_need, frame_key):
-        """Confirm a decline iff the post-answer observation proves it (§C)."""
+        """Confirm a decline iff the post-answer observation proves it (§C).
+
+        Mirrors the live controller exactly: continuity of a re-presented
+        confirmation uses the stable request identity (episode + prompt id) plus
+        the normalized prompt text, never full-sequence equality.
+        """
         resolve = getattr(self.reflex, "resolve_prompt_decline", None)
         pending = getattr(self.reflex, "pending_prompt", None)
         if resolve is None or pending is None or not pending.answer_sent:
@@ -1371,8 +1385,8 @@ class ReplayPass(object):
                  and arbitration.is_movement_entry_confirmation(
                      frame_need.get("prompt") or ""))
         if cloud:
-            if frame_key is not None and \
-                    tuple(frame_key) == tuple(pending.response_need_key):
+            if arbitration.is_representation_of(
+                    pending, frame_key, frame_need.get("prompt") or ""):
                 return
             self.reflex.clear_pending_prompt()
             return
