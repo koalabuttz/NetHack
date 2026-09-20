@@ -1224,6 +1224,8 @@ class BenchRunner(object):
         self.judge = None
         self._prov = None
         self.spec_path = spec_path
+        self._package_max_excerpts = M.DEFAULT_PACKAGE_MAX_EXCERPTS
+        self._package_max_bytes = M.DEFAULT_PACKAGE_MAX_BYTES
 
     def _spec_path(self) -> str:
         if self.spec_path is None:
@@ -1624,10 +1626,12 @@ class BenchRunner(object):
             verdict in ("fail", "inconclusive") or comparison.get("refused")
         if not needs:
             return None
-        excerpt_paths = {}
-        anchors = {}
+        excerpt_paths: Dict[str, str] = {}
+        anchors: Dict[str, int] = {}
+        selection = M.select_evidence(cards, limit=self._package_max_excerpts)
+        selected_ids = {i["episode_id"] for i in selection}
         for card in cards:
-            if not card["gates"]["hard_failure"]:
+            if card["episode_id"] not in selected_ids:
                 continue
             name = card["episode_id"]
             wire = os.path.join(self.out_dir, name, name + ".wire.jsonl")
@@ -1647,6 +1651,9 @@ class BenchRunner(object):
             artifact_paths={c["episode_id"]: os.path.join(
                 self.out_dir, c["episode_id"]) for c in cards},
             excerpt_paths=excerpt_paths, excerpt_anchors=anchors,
+            evidence_selection=selection,
+            package_max_bytes=self._package_max_bytes,
+            package_max_excerpts=self._package_max_excerpts,
             spec_ref=self.spec.get("name"))
         return pkg.get("written_to")
 
@@ -2046,18 +2053,24 @@ def _cmd_package(args) -> int:
     cards = list((loaded or {}).get("candidate")
                  or (loaded or {}).get("cards") or [])
     comparison = _read_json(os.path.join(run_dir, "comparison.json"))
+    selection = M.select_evidence(cards, limit=args.max_excerpts)
     excerpt_paths: Dict[str, str] = {}
+    anchors: Dict[str, int] = {}
     artifact_paths: Dict[str, str] = {}
-    for card in cards:
-        name = card.get("episode_id")
-        if not name:
-            continue
+    for item in selection:
+        name = item["episode_id"]
         ep_dir = os.path.join(run_dir, name)
+        if not os.path.isdir(ep_dir):
+            continue
         artifact_paths[name] = ep_dir
+        anchor = item.get("anchor")
         for label in ("wire", "decisions", "events", "actions"):
             path = os.path.join(ep_dir, "%s.%s.jsonl" % (name, label))
             if os.path.exists(path):
-                excerpt_paths["%s.%s" % (name, label)] = path
+                key = "%s.%s" % (name, label)
+                excerpt_paths[key] = path
+                if anchor is not None and label in ("wire", "decisions"):
+                    anchors[key] = anchor
     pkg = M.build_postmortem_package(
         out_dir=run_dir,
         failure_kind=args.failure_kind or "operator-requested",
@@ -2065,9 +2078,15 @@ def _cmd_package(args) -> int:
                              for g, v in (c.get("gates") or {}).items()
                              if v is True and g.endswith("hard_failure")}),
         comparison=comparison, scorecards=cards,
-        artifact_paths=artifact_paths, excerpt_paths=excerpt_paths)
+        artifact_paths=artifact_paths, excerpt_paths=excerpt_paths,
+        excerpt_anchors=anchors, evidence_selection=selection,
+        package_max_bytes=args.package_max_bytes,
+        package_max_excerpts=args.max_excerpts)
     print(json.dumps({"written": pkg.get("written_to"),
-                      "excerpts": sorted(pkg["excerpts"])},
+                      "excerpts": sorted(pkg["excerpts"]),
+                      "evidence": [i["episode_id"] for i in selection],
+                      "omitted": pkg.get("omitted", []),
+                      "budget": pkg.get("budget")},
                      indent=2, sort_keys=True))
     return 0
 
@@ -2101,6 +2120,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         p.add_argument("--run-dir", default=None)
         p.add_argument("--baseline-dir", default=None)
         p.add_argument("--failure-kind", default=None)
+        p.add_argument("--max-excerpts", type=int,
+                       default=M.DEFAULT_PACKAGE_MAX_EXCERPTS)
+        p.add_argument("--package-max-bytes", type=int,
+                       default=M.DEFAULT_PACKAGE_MAX_BYTES)
     child = sub.add_parser("_child")
     for flag in ("--spec", "--worker", "--runner", "--data", "--sysconf",
                  "--episode-dir", "--timeout"):

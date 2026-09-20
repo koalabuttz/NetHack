@@ -1526,5 +1526,104 @@ class PrecommitScheduleRunner(unittest.TestCase):
         self.assertTrue(pre["hash"])
 
 
+class PostmortemBoundedness(unittest.TestCase):
+    """Finding #8: bounded, streamed, checksummed postmortem packaging."""
+
+    def _big_jsonl(self, tmp, name, nlines, payload=200):
+        path = os.path.join(tmp, name)
+        with open(path, "w") as fh:
+            for i in range(nlines):
+                fh.write(json.dumps({"seq": i, "tick": i * 3, "eid": i,
+                                     "pad": "x" * payload}) + "\n")
+        return path
+
+    def test_bounded_excerpt_streams_multimegabyte_source_under_cap(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = self._big_jsonl(tmp, "big.wire.jsonl", 12000, payload=200)
+        size = os.path.getsize(path)
+        self.assertGreater(size, 2 * 1024 * 1024)     # multi-megabyte source
+        cap = 64 * 1024
+        ex = M.bounded_excerpt(path, max_lines=10, max_bytes=2048,
+                               max_input_bytes=cap)
+        self.assertTrue(ex["available"])
+        self.assertTrue(ex["input_truncated"])
+        self.assertFalse(ex["omissions_exact"])
+        self.assertTrue(ex["omitted_at_least"])
+        self.assertLessEqual(len("\n".join(ex["lines"]).encode("utf-8")), 2048)
+        self.assertLessEqual(len(ex["lines"]), 10)
+        # the source was streamed: far fewer lines were scanned than exist
+        self.assertLess(ex["lines_scanned"], 12000)
+        # peak read is bounded by the input cap (plus one line)
+        self.assertLess(ex["lines_scanned"] * 220, cap + 4096)
+        # checksum is computed from the whole source, not read whole into mem
+        self.assertEqual(ex["checksum"], M.sha256_file(path))
+
+    def test_bounded_excerpt_includes_tick_and_event_ranges(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "ep.wire.jsonl")
+        with open(path, "w") as fh:
+            for i in range(50):
+                fh.write(json.dumps({"seq": i, "tick": 100 + i}) + "\n")
+        ex = M.bounded_excerpt(path, around_line=20, max_lines=8)
+        # start = 20 - 8//2 = 16 -> lines 17..24 -> seq 16..23
+        self.assertEqual(ex["tick_range"], [116, 123])
+        self.assertEqual(ex["event_range"], [16, 23])
+        self.assertIsNotNone(ex["line_range"])
+        self.assertGreater(ex["omitted_before"], 0)
+        self.assertGreater(ex["omitted_after"], 0)
+
+    def test_package_budget_trims_oversized_sections_with_explicit_omissions(
+            self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        paths = {("ep-%d.wire" % i): self._big_jsonl(
+            tmp, "ep-%d.wire.jsonl" % i, 4000, payload=400) for i in range(6)}
+        pkg = M.build_postmortem_package(
+            failure_kind="hard-failure", failed_gates=["integrity"],
+            excerpt_paths=paths,
+            package_max_bytes=32 * 1024, package_max_excerpts=3)
+        self.assertTrue(pkg["budget"]["within_budget"], pkg["budget"])
+        self.assertLessEqual(len(json.dumps(pkg).encode("utf-8")), 32 * 1024)
+        self.assertLessEqual(len(pkg["excerpts"]), 3)
+        self.assertTrue(pkg["omitted"])
+        reasons = {o["reason"] for o in pkg["omitted"]}
+        self.assertTrue(reasons & {"excerpt-count-budget",
+                                   "package-byte-budget"})
+
+    def test_package_checksums_recomputed_from_sources_not_supplied(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        a = self._big_jsonl(tmp, "a.wire.jsonl", 10)
+        package = M.build_postmortem_package(
+            failure_kind="x", excerpt_paths={"a.wire": a},
+            artifact_paths={"ep-a": a},
+            source_checksums={"ep-a": "deadbeef"})   # caller-supplied, wrong
+        real = M.sha256_file(a)
+        self.assertEqual(package["source_checksums"]["ep-a"], real)
+        self.assertEqual(package["source_checksums"]["excerpt:a.wire"], real)
+        # the bogus supplied value is recorded, never silently trusted
+        self.assertIn("ep-a", package["source_checksum_mismatches"])
+
+    def test_select_evidence_is_deterministic_and_worst_first(self):
+        cards = [
+            {"episode_id": "calm", "gates": {}, "terminal_class":
+             M.HORIZON_COMPLETION, "exploration": {"longest_loop_span": 1}},
+            {"episode_id": "bad", "gates": {"hard_failure": True},
+             "terminal_class": M.ADVERSE_EARLY,
+             "exploration": {"longest_loop_span": 9}},
+            {"episode_id": "loop", "gates": {},
+             "terminal_class": M.HORIZON_COMPLETION,
+             "exploration": {"longest_loop_span": 20}},
+        ]
+        first = M.select_evidence(cards, limit=3)
+        second = M.select_evidence(list(reversed(cards)), limit=3)
+        self.assertEqual([i["episode_id"] for i in first],
+                         [i["episode_id"] for i in second])
+        self.assertEqual(first[0]["episode_id"], "bad")
+        self.assertEqual(first[-1]["episode_id"], "calm")
+
+
 if __name__ == "__main__":
     unittest.main()
