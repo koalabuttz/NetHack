@@ -1056,13 +1056,15 @@ def expected_arm_counts(design: dict) -> Dict[str, int]:
 
 def check_precommit(design: Optional[dict], *, recorded_hash: Optional[str],
                     base_n: int, cand_n: int,
-                    observed_schedule: Optional[Sequence[str]] = None
+                    observed_schedule: Optional[Sequence[str]] = None,
+                    observed_config_hashes: Optional[Dict[str, str]] = None
                     ) -> Dict[str, Any]:
     """Verify the observed run matches the committed design exactly.
 
     Returns ``{"ok": bool, "reasons": [...], "expected_arm_counts": ...}``.
     A tampered ``recorded_hash``, an arm count that differs (10/11 or 11/11
-    against a committed 10/10), or a differing order all make the comparison
+    against a committed 10/10), a differing order, or a per-arm **config hash**
+    that does not match the committed expected hash all make the comparison
     rejectable.
     """
     reasons: List[str] = []
@@ -1078,9 +1080,16 @@ def check_precommit(design: Optional[dict], *, recorded_hash: Optional[str],
     if observed_schedule is not None and \
             list(observed_schedule) != list(design.get("schedule") or []):
         reasons.append("order-mismatch")
+    expected_cfg = design.get("expected_config_hashes")
+    if observed_config_hashes is not None and isinstance(expected_cfg, dict):
+        for arm, expected in sorted(expected_cfg.items()):
+            if expected is not None and \
+                    observed_config_hashes.get(arm) != expected:
+                reasons.append("config-hash-mismatch:%s" % arm)
     return {"ok": not reasons, "reasons": reasons,
             "expected_arm_counts": want,
-            "committed_schedule_hash": design.get("schedule_hash")}
+            "committed_schedule_hash": design.get("schedule_hash"),
+            "expected_config_hashes": expected_cfg}
 
 
 def _quantile(sorted_vals: Sequence[float], q: float) -> float:
@@ -1211,14 +1220,15 @@ def compare_arms(base_cards: Sequence[dict], cand_cards: Sequence[dict],
                  config_diff: Optional[dict] = None,
                  precommit_design: Optional[dict] = None,
                  precommit_hash: Optional[str] = None,
-                 observed_schedule: Optional[Sequence[str]] = None
+                 observed_schedule: Optional[Sequence[str]] = None,
+                 observed_config_hashes: Optional[Dict[str, str]] = None
                  ) -> Dict[str, Any]:
     """The single comparison engine for A/B and candidate-vs-baseline.
 
-    When a committed ``precommit_design`` is supplied, the observed arm counts
-    and (if given) the observed order must match it **exactly** -- a committed
-    10/arm rejects 10/11 and 11/11, and a tampered ``precommit_hash`` rejects
-    outright.
+    When a committed ``precommit_design`` is supplied, the observed arm counts,
+    order, and (if given) per-arm config hashes must match it **exactly** -- a
+    committed 10/arm rejects 10/11 and 11/11, a tampered ``precommit_hash``
+    rejects outright, and a mismatched per-arm config hash is not-comparable.
     """
     target = policy.get("target_metric", DEFAULT_TARGET)
     min_improvement = float(policy.get("min_improvement", 0.0))
@@ -1285,7 +1295,8 @@ def compare_arms(base_cards: Sequence[dict], cand_cards: Sequence[dict],
     reasons: List[str] = []
     design = check_precommit(precommit_design, recorded_hash=precommit_hash,
                              base_n=len(base_list), cand_n=len(cand_list),
-                             observed_schedule=observed_schedule)
+                             observed_schedule=observed_schedule,
+                             observed_config_hashes=observed_config_hashes)
     if precommit_design is not None and not design["ok"]:
         verdict = "not-comparable"
         reasons.extend("precommit:" + r for r in design["reasons"])

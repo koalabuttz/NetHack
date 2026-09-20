@@ -50,6 +50,7 @@ def _valid_spec(**over):
         "campaign_timeout_s": 300.0,
         "replay_inputs": [_SHORT],
         "baseline_ref": None,
+        "baseline_config_ref": None,
         "budget": {
             "strategy_calls_total": 0, "judge_calls_total": 0,
             "max_total_episodes": 8, "max_candidates": 6,
@@ -1521,6 +1522,9 @@ class PrecommitScheduleRunner(unittest.TestCase):
     def test_production_runner_executes_counterbalanced_order(self):
         spec = _valid_spec(tier="live", episodes=4)
         spec["comparison"]["resampling_seed"] = 3
+        # a genuinely distinct baseline config makes this an A/B experiment
+        spec["baseline_config_ref"] = {"reflex": "scripted", "strategy": "off",
+                                       "strategy_call_cap": 4}
         os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
         self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         tmp = tempfile.mkdtemp()
@@ -1546,7 +1550,82 @@ class PrecommitScheduleRunner(unittest.TestCase):
         # the committed schedule is persisted before results and hashed
         pre = json.load(open(os.path.join(tmp, "precommit.json")))
         self.assertEqual(pre["design"]["episode_schedule"], expected)
-        self.assertTrue(pre["hash"])
+        # distinct config hashes by arm, committed before results
+        hashes = {e["arm"]: e["config_hash"] for e in
+                  out["manifest"]["episodes"]}
+        self.assertNotEqual(hashes["baseline"], hashes["candidate"])
+        self.assertEqual(pre["design"]["expected_config_hashes"], hashes)
+        # the observed pair order equals the committed pair schedule, and the
+        # comparison accepted the design (no order/config mismatch)
+        self.assertEqual(out["manifest"]["executed_schedule"],
+                         pre["design"]["schedule"])
+        self.assertTrue(out["comparison"]["precommit"]["ok"],
+                        out["comparison"]["precommit"]["reasons"])
+        self.assertTrue(out["comparison"]["same_run_experiment"])
+        self.assertTrue(out["comparison"]["provenance"]["comparable"])
+
+    def test_candidate_only_run_does_not_fabricate_baseline_labels(self):
+        spec = _valid_spec(tier="live", episodes=4)
+        spec["comparison"]["resampling_seed"] = 3
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
+        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+
+        def fake_episode(config, paths, episode_dir, index, timeout):
+            return _meta(), episode_dir
+
+        runner = B.BenchRunner(spec, tmp)
+        runner.episode_runner = fake_episode
+        out = runner.run()
+        # no baseline config -> every episode is a candidate; no baseline label
+        arms = [e["arm"] for e in out["manifest"]["episodes"]]
+        self.assertEqual(arms, ["candidate"] * 4)
+        pre = json.load(open(os.path.join(tmp, "precommit.json")))
+        self.assertFalse(pre["design"]["ab"])
+        self.assertEqual(pre["design"]["expected_arm_counts"]["baseline"], 0)
+        self.assertNotIn("expected_config_hashes", pre["design"])
+        self.assertFalse(out["comparison"]["same_run_experiment"])
+
+    def test_observed_order_and_config_hash_mismatch_stay_not_comparable(self):
+        spec = _valid_spec(tier="live", episodes=4)
+        spec["comparison"]["resampling_seed"] = 3
+        spec["baseline_config_ref"] = {"reflex": "scripted", "strategy": "off",
+                                       "strategy_call_cap": 4}
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
+        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+
+        def fake_episode(config, paths, episode_dir, index, timeout):
+            return _meta(), episode_dir
+
+        runner = B.BenchRunner(spec, tmp)
+        runner.episode_runner = fake_episode
+        runner.run()
+        pre = json.load(open(os.path.join(tmp, "precommit.json")))
+        design, h = pre["design"], pre["hash"]
+        base = _arm(2, entered=10.0)
+        cand = _arm(2, entered=30.0)
+        policy = _policy()
+        # an edited observed order is not-comparable
+        wrong = [("BA" if x == "AB" else "AB") for x in design["schedule"]]
+        self.assertNotEqual(wrong, design["schedule"])
+        r = M.compare_arms(base, cand, policy, base_provenance=_prov(),
+                           cand_provenance=_prov(), precommit_design=design,
+                           precommit_hash=h, observed_schedule=wrong)
+        self.assertEqual(r["verdict"], "not-comparable")
+        # a mismatched per-arm config hash is not-comparable
+        r = M.compare_arms(
+            base, cand, policy, base_provenance=_prov(),
+            cand_provenance=_prov(), precommit_design=design,
+            precommit_hash=h, observed_schedule=design["schedule"],
+            observed_config_hashes={"baseline": "nope",
+                                    "candidate": design[
+                                        "expected_config_hashes"]["candidate"]})
+        self.assertEqual(r["verdict"], "not-comparable")
+        self.assertTrue(any("config-hash-mismatch" in x
+                            for x in r["reasons"]))
 
 
 class PostmortemBoundedness(unittest.TestCase):

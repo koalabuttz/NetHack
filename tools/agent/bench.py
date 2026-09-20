@@ -43,8 +43,8 @@ COST_MODES = ("priced-bound", "call-bounded", "operator-approved-unknown")
 SPEC_TOP_KEYS = (
     "schema_version", "name", "tier", "profile", "provider_config_ref",
     "overrides", "episodes", "episode_timeout_s", "campaign_timeout_s",
-    "replay_inputs", "baseline_ref", "budget", "judge", "comparison",
-    "tuning",
+    "replay_inputs", "baseline_ref", "baseline_config_ref", "budget", "judge",
+    "comparison", "tuning",
 )
 BUDGET_KEYS = ("strategy_calls_total", "judge_calls_total",
                "max_total_episodes", "max_candidates", "max_total_wall_s",
@@ -130,6 +130,10 @@ def validate_spec(spec: dict) -> Optional[str]:
             return "%s must be a positive finite number" % key
     if not isinstance(spec.get("provider_config_ref"), (str, dict)):
         return "provider_config_ref must be a string or object reference"
+    if spec.get("baseline_config_ref") is not None and not isinstance(
+            spec["baseline_config_ref"], (str, dict)):
+        return ("baseline_config_ref must be null, a string or an object "
+                "reference")
     if not isinstance(spec.get("overrides"), dict):
         return "overrides must be an object"
     bad = [k for k in spec["overrides"] if k not in OVERRIDABLE_KNOBS]
@@ -306,28 +310,13 @@ def resolve_provider_config(spec: dict, *, base: Optional[dict] = None
     authority -- so an impossible cap is rejected before any spawn.
     """
     from . import providers
-    ref = spec["provider_config_ref"]
-    values: Dict[str, Any] = {}
-    if isinstance(ref, dict):
-        values.update(ref)
-    elif isinstance(ref, str) and os.path.exists(ref):
-        with open(ref, "r", encoding="utf-8") as fh:
-            loaded = json.load(fh)
-        if not isinstance(loaded, dict):
-            return None, "provider_config_ref file must contain an object"
-        values.update(loaded)
+    values, err = _config_values(spec["provider_config_ref"],
+                                 spec.get("overrides"))
+    if err:
+        return None, err
     if base:
         values.update(base)
-    values.update(spec.get("overrides") or {})
-    # Bench policy: no DeepSeek postmortems, ever.  Reject an explicit attempt
-    # to enable them rather than silently clamping.
-    if values.get("postmortem_reserve", 0):
-        return None, ("postmortem_reserve must be 0 in a bench campaign "
-                      "(DeepSeek postmortems are disabled)")
-    values["postmortem_reserve"] = 0
-    unknown = [k for k in values if k not in OVERRIDABLE_KNOBS]
-    if unknown:
-        return None, "provider config has unknown knob %r" % unknown[0]
+        values["postmortem_reserve"] = 0
     try:
         config = providers.ProviderConfig(**values)
     except TypeError as exc:
@@ -337,6 +326,78 @@ def resolve_provider_config(spec: dict, *, base: Optional[dict] = None
     if problem:
         return None, problem
     return config, None
+
+
+def _config_values(ref, overrides: Optional[dict] = None
+                   ) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Merge a config reference (dict or JSON path) with allowlisted overrides.
+
+    Bench policy is applied here too: DeepSeek postmortems are rejected rather
+    than silently clamped, and an unknown knob is refused.
+    """
+    values: Dict[str, Any] = {}
+    if isinstance(ref, dict):
+        values.update(ref)
+    elif isinstance(ref, str) and os.path.exists(ref):
+        loaded = _read_json(ref)
+        if not isinstance(loaded, dict):
+            return {}, "config reference file must contain an object"
+        values.update(loaded)
+    elif isinstance(ref, str) and ref:
+        return {}, "config reference path does not exist: %s" % ref
+    if overrides:
+        values.update(overrides)
+    if values.get("postmortem_reserve", 0):
+        return {}, ("postmortem_reserve must be 0 in a bench campaign "
+                    "(DeepSeek postmortems are disabled)")
+    values["postmortem_reserve"] = 0
+    unknown = [k for k in values if k not in OVERRIDABLE_KNOBS]
+    if unknown:
+        return {}, "provider config has unknown knob %r" % unknown[0]
+    return values, None
+
+
+def resolve_arm_configs(spec: dict
+                        ) -> Tuple[Optional[Any], Optional[Any],
+                                   Optional[str]]:
+    """Resolve ``(baseline_config, candidate_config, error)`` for an A/B run.
+
+    The candidate is the spec's ``provider_config_ref`` + ``overrides``; the
+    baseline comes from the explicit ``baseline_config_ref`` when present (a
+    genuinely distinct, separately referenced config) and is ``None`` for a
+    candidate-only diagnostic run.
+    """
+    from . import providers
+    candidate, err = resolve_provider_config(spec)
+    if err:
+        return None, None, err
+    ref = spec.get("baseline_config_ref")
+    if ref is None:
+        return None, candidate, None
+    values, err = _config_values(ref)
+    if err:
+        return None, None, "baseline %s" % err
+    try:
+        baseline = providers.ProviderConfig(**values)
+    except TypeError as exc:
+        return None, None, "baseline config: %s" % exc
+    problem = baseline.validate(episodes=spec["episodes"],
+                                episode_timeout=spec["episode_timeout_s"])
+    if problem:
+        return None, None, "baseline config: %s" % problem
+    return baseline, candidate, None
+
+
+def config_fingerprint(config) -> Optional[str]:
+    """A deterministic hash of a resolved config (references, not secrets)."""
+    if config is None:
+        return None
+    import dataclasses
+    try:
+        payload = dataclasses.asdict(config)
+    except TypeError:
+        payload = dict(getattr(config, "__dict__", {}))
+    return M.sha256_json(payload)
 
 
 def jev_profile_conflict(config) -> Optional[str]:
@@ -574,28 +635,44 @@ def assert_precommitted(pre: dict, comparison: dict) -> None:
 
 
 def precommit_record(comparison: dict, *, episodes: Optional[int] = None,
-                     arm_episodes: Optional[int] = None) -> Dict[str, Any]:
+                     arm_episodes: Optional[int] = None,
+                     config_hashes: Optional[Dict[str, str]] = None,
+                     ab: bool = True) -> Dict[str, Any]:
     """A hashable precommit record, persisted before any result exists.
 
-    It commits the comparison **policy** *and* the exact balanced counter-
-    balanced schedule (built from ``arm_episodes``, defaulting to the spec's
-    ``confirmation_episodes_per_arm``).  The recorded ``hash`` covers the whole
-    design, so editing either the policy or the schedule is detectable.
+    It commits the comparison **policy**, the exact balanced counter-balanced
+    schedule (built from ``arm_episodes``), the **per-arm config hashes** and
+    the arm mode.  ``ab=False`` marks a candidate-only diagnostic run, whose
+    committed schedule has no fabricated baseline labels.  The recorded
+    ``hash`` covers the whole design, so editing the policy, the schedule or an
+    expected config hash is detectable.
     """
     policy = precommit(comparison)
+    seed = int(comparison.get("resampling_seed", 0))
     if arm_episodes is None:
         arm_episodes = int(comparison.get("confirmation_episodes_per_arm", 0)
                            or 0)
     design = M.precommit_design(comparison, arm_episodes=int(arm_episodes))
+    design["ab"] = bool(ab)
     if episodes is not None:
-        design["total_episodes"] = int(episodes)
-        sched = M.episode_schedule(int(episodes),
-                                   int(comparison.get("resampling_seed", 0)))
+        total = int(episodes)
+        if ab:
+            sched = M.episode_schedule(total, seed)
+            design["schedule"] = M.pair_schedule(total // 2, seed)
+        else:
+            sched = [{"pair": i + 1, "order": "B", "arm": "candidate"}
+                     for i in range(total)]
+            design["schedule"] = ["B"] * total
+        design["schedule_hash"] = M.schedule_hash(design["schedule"])
+        design["schedule_counts"] = M.schedule_counts(design["schedule"])
+        design["total_episodes"] = total
         design["episode_schedule"] = sched
         design["expected_arm_counts"] = {
             "baseline": sum(1 for e in sched if e["arm"] == "baseline"),
             "candidate": sum(1 for e in sched if e["arm"] == "candidate"),
         }
+    if config_hashes:
+        design["expected_config_hashes"] = dict(config_hashes)
     return {"schema_version": "bench-precommit/1",
             "policy": policy, "design": design,
             "hash": M.design_hash(design)}
@@ -1434,6 +1511,10 @@ class BenchRunner(object):
         #: OUT of the immutable scorecard object.
         self._arms: Dict[str, Dict[str, Any]] = {}
         self._judge_preflight_error: Optional[str] = None
+        self._ab = True
+        self._observed_pairs: List[str] = []
+        self._arm_config_hashes: Dict[str, str] = {}
+        self._arm_configs: Dict[str, Any] = {}
 
     def _spec_path(self) -> str:
         if self.spec_path is None:
@@ -1495,21 +1576,39 @@ class BenchRunner(object):
                                      error=pre["error"])
             return {"ok": False, "error": pre["error"], "stage": pre["stage"]}
         config = pre["config"]
+        baseline_config, candidate_config, arm_err = resolve_arm_configs(
+            self.spec)
+        if arm_err:
+            self.manifest.set_status("rejected", stage="provider_config",
+                                     error=arm_err)
+            return {"ok": False, "error": arm_err,
+                    "stage": "provider_config"}
+        # A genuinely distinct baseline config makes this an A/B experiment;
+        # without one the run is candidate-only (no fabricated baseline label).
+        self._ab = baseline_config is not None
+        self._arm_configs = {"baseline": baseline_config,
+                             "candidate": candidate_config}
+        arm_hashes = {"baseline": config_fingerprint(baseline_config),
+                      "candidate": config_fingerprint(candidate_config)}
+        self._arm_config_hashes: Dict[str, str] = {}
         requested = {"reflex": config.reflex, "strategy": config.strategy,
                      "judge": ("jev" if self.spec["judge"]["enabled"]
                                else "none")}
         self.manifest.set_status("running", tier=LIVE,
                                  requested_tiers=requested,
+                                 ab=self._ab,
+                                 arm_config_hashes=arm_hashes,
                                  cost_mode=pre.get("effective_cost_mode"),
                                  unattended_apply_allowed=pre.get(
                                      "unattended_apply_allowed"))
         self._unattended = bool(pre.get("unattended_apply_allowed", True))
-        # Precommit the comparison design BEFORE any result exists: the policy
-        # AND the exact balanced AB/BA schedule the runner will execute.
+        # Precommit the comparison design BEFORE any result exists: the policy,
+        # the exact schedule, and the per-arm config hashes.
         planned = self.spec["episodes"]
         self._pre_record = precommit_record(
             self.spec["comparison"], episodes=planned,
-            arm_episodes=max(1, planned // 2))
+            arm_episodes=max(1, planned // 2),
+            config_hashes=(arm_hashes if self._ab else None), ab=self._ab)
         self._pre_record_hash = self._pre_record["hash"]
         self._schedule = list(self._pre_record["design"]["episode_schedule"])
         self._write_run_artifact("precommit.json", self._pre_record)
@@ -1518,7 +1617,10 @@ class BenchRunner(object):
         results: List[Tuple[int, Any, str]] = []
         cards: List[dict] = []
         judge_results: List[dict] = []
-        executed_schedule: List[str] = []
+        # The observed schedule is recorded ONCE per pair (the committed
+        # representation), never appended per episode.
+        observed_pairs: List[str] = []
+        last_pair = None
         index = 0
         with signal_handlers(
                 self.stop,
@@ -1535,9 +1637,10 @@ class BenchRunner(object):
                 index += 1
                 entry = self._schedule[index - 1]
                 arm = entry["arm"]
-                executed_schedule.append(
-                    entry["order"] if len(entry["order"]) == 2
-                    else ("AB" if arm == "baseline" else "BA"))
+                arm_cfg = self._arm_configs.get(arm) or config
+                if entry["pair"] != last_pair:
+                    observed_pairs.append(entry["order"])
+                    last_pair = entry["pair"]
                 episode_dir = os.path.join(self.out_dir, "ep-%d" % index)
                 # reserve the WHOLE next episode's approved allocation BEFORE
                 # launching it (the per-episode caps reset, so a later episode
@@ -1552,7 +1655,7 @@ class BenchRunner(object):
                         "judge_dispatches": (1 if self.judge is not None
                                              else 0),
                     }})
-                result, episode_dir = self._run_one(config, episode_dir, index)
+                result, episode_dir = self._run_one(arm_cfg, episode_dir, index)
                 card, hashes, paths = self._seal_episode(
                     episode_dir, index, result, requested)
                 # Scheduling metadata (arm/pair/order) lives in the manifest and
@@ -1562,12 +1665,15 @@ class BenchRunner(object):
                 self._arms[card["episode_id"]] = {
                     "arm": arm, "pair": entry["pair"],
                     "order": entry["order"]}
+                self._arm_config_hashes.setdefault(
+                    arm, config_fingerprint(arm_cfg))
                 cards.append(card)
                 results.append((index, result, episode_dir))
                 self.manifest.settle("ep-%d" % index, "completed")
                 self.manifest.add_episode({
                     "index": index, "dir": episode_dir, "arm": arm,
                     "pair": entry["pair"], "order": entry["order"],
+                    "config_hash": config_fingerprint(arm_cfg),
                     "scorecard_hash": M.sha256_bytes(
                         M.pretty_scorecard(card).encode("utf-8")),
                     "source_hashes": hashes,
@@ -1578,8 +1684,10 @@ class BenchRunner(object):
                 judged = self._judge_episode(card, index)
                 if judged is not None:
                     judge_results.append(judged)
-        self._executed_schedule = executed_schedule
-        self.manifest.data["executed_schedule"] = executed_schedule
+        self._observed_pairs = observed_pairs
+        self._executed_schedule = observed_pairs
+        self.manifest.data["executed_schedule"] = observed_pairs
+        self.manifest.data["observed_config_hashes"] = self._arm_config_hashes
         self.manifest.flush()
         stop_reason = self.stop.stop_reason()
         status = "complete" if stop_reason is None else "partial"
@@ -1869,12 +1977,16 @@ class BenchRunner(object):
                 "manifest": self.manifest.data}
 
     def _compare(self, cards: List[dict], live: dict) -> Dict[str, Any]:
-        if not live["ok"]:
+        def _refused(reason: str, verdict: str) -> Dict[str, Any]:
             return {"schema_version": M.COMPARISON_SCHEMA, "refused": True,
-                    "refusal_reason": "live-tier-validation-failed",
-                    "live_validation": live,
+                    "refusal_reason": reason,
                     "admission": {"apply_allowed": False},
-                    "verdict": "not-comparable"}
+                    "verdict": verdict, "same_run_experiment": False,
+                    "arm_config_hashes": getattr(self, "_arm_config_hashes", {})}
+        if not live["ok"]:
+            out = _refused("live-tier-validation-failed", "not-comparable")
+            out["live_validation"] = live
+            return out
         baseline = self._baseline_cards()
         arms = getattr(self, "_arms", {})
         by_arm_base = [c for c in cards
@@ -1891,22 +2003,28 @@ class BenchRunner(object):
         else:
             base_arm, cand_arm = baseline, list(cards)
         if not base_arm:
-            return {"schema_version": M.COMPARISON_SCHEMA, "refused": True,
-                    "refusal_reason": "no-baseline",
-                    "admission": {"apply_allowed": False},
-                    "verdict": "inconclusive"}
+            return _refused("no-baseline", "inconclusive")
         policy = dict(self.spec["comparison"])
         policy["admission_margin"] = 0.0
         pre = getattr(self, "_pre_record", None) or precommit_record(
             self.spec["comparison"], episodes=self.spec["episodes"],
-            arm_episodes=max(1, self.spec["episodes"] // 2))
+            arm_episodes=max(1, self.spec["episodes"] // 2),
+            ab=getattr(self, "_ab", True))
+        # For a same-run experiment BOTH arms share this run's deterministic
+        # provenance; only an external-baseline comparison uses the baseline's
+        # own manifest.
+        same_run = bool(by_arm_base and by_arm_cand)
+        base_prov = self._prov if same_run else None
         result = M.compare_arms(
             base_arm, cand_arm, policy,
-            base_provenance=None, cand_provenance=self._prov,
+            base_provenance=base_prov, cand_provenance=self._prov,
             precommit_design=pre.get("design"),
             precommit_hash=pre.get("hash"),
-            observed_schedule=getattr(self, "_executed_schedule", None))
+            observed_schedule=getattr(self, "_observed_pairs", None),
+            observed_config_hashes=getattr(self, "_arm_config_hashes", None))
         result["design"] = pre
+        result["arm_config_hashes"] = getattr(self, "_arm_config_hashes", {})
+        result["same_run_experiment"] = same_run
         if not getattr(self, "_unattended", True):
             # an unknown-exposure (unstrict) run never permits unattended apply
             result.setdefault("admission", {})["apply_allowed"] = False
