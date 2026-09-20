@@ -1033,6 +1033,38 @@ class Phase3Progression(unittest.TestCase):
                                                visits, store=st)
         self.assertEqual(third.family, navigation.TFAM_STAIR)
 
+    def test_post_service_reacquisition_emits_one_reopen(self):
+        # review item 6b: a previously serviced site re-acquired under a changed
+        # service signature emits an explicit site-level reopen fact
+        cells = {(x, 10): FLOOR for x in range(1, 8)}
+        mem = nav_test.mem_with(cells, (1, 10))
+        tgt = navigation.Target((6, 10), navigation.TFAM_FRONTIER, (1, 0), 0)
+        sig0 = navigation.service_signature(self.ref._terrain(mem), (6, 10))
+        self.ref.targets.note_serviced((6, 10), sig0)
+
+        def acquire(tick):
+            payload = policy.ScriptedReflex._dest_payload(
+                "acquire", None, target=tgt,
+                purpose=navigation.COMMIT_EXPLORE_FRONTIER)
+            self.ref.commit_effect("navigate", "navigate", tick, mem,
+                                   observed_kind="moved", payload=payload,
+                                   pre_hero=(1, 10))
+
+        def reopens():
+            return [e for e in self.ref.lifecycle.events
+                    if e.get("outcome") == "reopened"]
+
+        # unchanged evidence: re-acquisition is NOT a reopen
+        acquire(1)
+        self.assertEqual(reopens(), [])
+        self.ref.targets.retire("reselect")
+        # the local exploration evidence changes, then the site is re-acquired
+        mem.grid[(6, 9)] = WALL
+        acquire(2)
+        self.assertEqual(len(reopens()), 1)
+        self.assertEqual(reopens()[0].get("reason"),
+                         "service-signature-changed")
+
     def test_reacquisition_preserves_previous_distinct_and_strict_margin(self):
         mem = nav_test.mem_with({(x, 10): FLOOR for x in range(2, 9)}, (5, 10))
         self.ref.recovery.previous_distinct = (4, 10)

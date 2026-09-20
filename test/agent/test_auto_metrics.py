@@ -681,13 +681,38 @@ class Phase4Reports(unittest.TestCase):
     def test_report_attempts_vs_time_advances_and_stationary_span(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "w.wire.jsonl")
-            self._wire(p, [((5, 5), 100), ((6, 5), 100), ((7, 5), 101),
-                           ((7, 5), 101), ((7, 5), 101)])
-            m = M.episode_metrics(p)
-        # two hero moves are two attempts; only one displayed-time advance
+            a = os.path.join(d, "w.actions.jsonl")
+            # stationary for two frames, then one hero move
+            self._wire(p, [((5, 5), 100), ((5, 5), 100), ((6, 5), 101)])
+            # two sent gameplay acts (one zero-time) plus a non-gameplay answer
+            with open(a, "w") as fh:
+                for kind in ("command", "command", "menu"):
+                    fh.write(json.dumps({"kind": kind}) + "\n")
+            m = M.episode_metrics(p, actions_path=a)
+        # the zero-time command still counts: two attempts from the actions
+        # sidecar, while only one hero displacement and one time advance occurred
         self.assertEqual(m["attempts"], 2)
+        self.assertEqual(m["attempts_source"], "actions")
+        self.assertEqual(m["hero_displacements"], 1)
         self.assertEqual(m["time_advances"], 1)
-        self.assertEqual(m["stationary_span_max"], 2)
+        self.assertEqual(m["stationary_span_max"], 1)
+
+    def test_report_attempt_fallback_is_flagged_not_silent(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "w.wire.jsonl")
+            self._wire(p, [((5, 5), 100), ((6, 5), 101)])
+            m = M.episode_metrics(p)          # no actions sidecar supplied
+        self.assertEqual(m["attempts_source"], "hero-displacement")
+        self.assertEqual(m["attempts"], m["hero_displacements"])
+
+    def test_attempts_from_actions_counts_only_gameplay(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.actions.jsonl")
+            with open(a, "w") as fh:
+                for kind in ("command", "key", "direction", "menu", "yn"):
+                    fh.write(json.dumps({"kind": kind}) + "\n")
+            self.assertEqual(M.attempts_from_actions(a), 3)
+            self.assertIsNone(M.attempts_from_actions(os.path.join(d, "no")))
 
     def test_report_coverage_excludes_teardown(self):
         with tempfile.TemporaryDirectory() as d:
@@ -703,19 +728,35 @@ class Phase4Reports(unittest.TestCase):
 
     def test_report_terminal_completeness_and_serviced_reopens(self):
         from tools.agent import lifecycle_metrics as LM
+        # an ordinary replacement at a different site (a serial switch) is NOT
+        # a serviced-site reopen
         rec = LM.LifecycleRecorder()
         rec.record(LM.KIND_DESTINATION, LM.DEST_ACQUIRED, serial=1)
-        rec.record(LM.KIND_DESTINATION, LM.DEST_ACTION, serial=1)
         rec.record(LM.KIND_DESTINATION, LM.DEST_REACHED, serial=1,
                    reason="reached")
-        rec.record(LM.KIND_DESTINATION, LM.DEST_ACQUIRED, serial=2)  # open
+        rec.record(LM.KIND_DESTINATION, LM.DEST_ACQUIRED, serial=2)
+        rec.record(LM.KIND_DESTINATION, LM.DEST_REPLACED, serial=2,
+                   reason="replaced", replacement_serial=3)
         rec.record(LM.KIND_DESTINATION, LM.DEST_ACQUIRED, serial=3)
-        rec.record(LM.KIND_DESTINATION, LM.DEST_REPLACED, serial=3,
-                   reason="replaced", replacement_serial=4)
         s = rec.summarize()
-        # three acquired serials; 1 and 3 carry a terminal, 2 does not
+        self.assertEqual(s["serviced_reopens"], 0)
+        # the replacement pair is validated separately via serial ->
+        # replacement_serial, never conflated with a reopen
+        self.assertEqual(s["replacement_pairs"], 1)
+        self.assertEqual(s["unexplained_replacements"], 0)
+        # three acquired serials; 1 and 2 carry a terminal, 3 does not
         self.assertAlmostEqual(s["terminal_completeness"], 2.0 / 3.0)
-        self.assertEqual(s["serviced_reopens"], 1)
+        # ... a post-service reacquisition under changed evidence is one reopen
+        rec.record(LM.KIND_DESTINATION, LM.DEST_REOPENED, serial=4,
+                   reason="service-signature-changed")
+        s2 = rec.summarize()
+        self.assertEqual(s2["serviced_reopens"], 1)
+        # a replacement lacking a replacement_serial is flagged, not paired
+        rec.record(LM.KIND_DESTINATION, LM.DEST_REPLACED, serial=5,
+                   reason="replaced")
+        s3 = rec.summarize()
+        self.assertEqual(s3["unexplained_replacements"], 1)
+        self.assertEqual(s3["replacement_pairs"], 1)
 
 
 class ValidationReport(unittest.TestCase):

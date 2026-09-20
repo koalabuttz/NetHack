@@ -813,6 +813,20 @@ class ScriptedReflex(object):
                     and cur.purpose == purpose and cur.instance_id == iid):
                 return                      # idempotent: already committed
             replaced = cur is not None
+            # Emit the explicit site-level *reopen* fact (review item 6): the
+            # target was previously serviced and is being re-acquired under a
+            # different service signature.  This is deliberately distinct from
+            # the serial `replaced` terminal, which is only a replacement.
+            prev_sig = self.targets.serviced_signature(pos)
+            if prev_sig is not None:
+                now_sig = navigation.service_signature(self._terrain(mem), pos)
+                if tuple(prev_sig) != tuple(now_sig):
+                    self.lifecycle.record(
+                        lifecycle_metrics.KIND_DESTINATION,
+                        lifecycle_metrics.DEST_REOPENED,
+                        serial=self.targets._serial + 1, purpose=purpose,
+                        source=source, generation=int(generation),
+                        reason="service-signature-changed")
             self.targets.commit(instance_id=iid or self.instance_id,
                                 purpose=purpose, pos=pos, family=family,
                                 source=source, generation=int(generation),

@@ -29,6 +29,10 @@ DEST_REACHED = "reached"
 DEST_FAILED = "failed"
 DEST_EXPIRED = "expired"
 DEST_ACTION = "action"
+#: An explicit site-level fact (review item 6): a *previously serviced* site was
+#: re-acquired under a changed service signature.  Distinct from `replaced`,
+#: which is only a serial replacement (and can be an ordinary switch elsewhere).
+DEST_REOPENED = "reopened"
 
 # Pickup lifecycle outcomes.
 PICKUP_OFFERED = "offered"
@@ -242,10 +246,21 @@ def summarize(events: Optional[Iterable[dict]]) -> Dict[str, Any]:
         "legacy_stream": legacy_stream,
         "available": bool(dest or pick or direc),
         "terminal_completeness": completeness,
-        # serviced-site reopens: a superseded serial's replacement is the one
-        # destination record that evidences a re-acquisition of a serviced or
-        # parked site (the site-level reopen rule lives in navigation).
-        "serviced_reopens": len(switches) if dest else None,
+        # serviced-site reopens (review item 6): an explicit site-level fact --
+        # a previously *serviced* site re-acquired under a changed service
+        # signature -- never conflated with a serial replacement.
+        "serviced_reopens": (len([e for e in dest
+                                  if e.get("outcome") == DEST_REOPENED])
+                             if dest else None),
+        # Replacement switch pairs are validated separately: the count of
+        # `replaced` terminals carrying a `replacement_serial` (the sole input
+        # to switch pairing), and any replacement lacking it (unexplained).
+        "replacement_pairs": (len([e for e in switches
+                                   if e.get("replacement_serial") is not None])
+                              if dest else None),
+        "unexplained_replacements": (len([e for e in switches
+                                          if e.get("replacement_serial")
+                                          is None]) if dest else None),
         "commitment_length_median": (_percentile(lengths, 0.5)
                                      if lengths else None),
         "commitment_length_p90": (_percentile(lengths, 0.9)
@@ -276,6 +291,7 @@ __all__ = [
     "SCHEMA_VERSION", "KIND_DESTINATION", "KIND_PICKUP", "KIND_DIRECTIVE",
     "DEST_ACQUIRED", "DEST_REPLACED", "DEST_SUSPENDED", "DEST_RESUMED",
     "DEST_REACHED", "DEST_FAILED", "DEST_EXPIRED", "DEST_ACTION",
+    "DEST_REOPENED",
     "PICKUP_OFFERED", "PICKUP_DECLINED", "PICKUP_ATTEMPTED", "PICKUP_SUCCEEDED",
     "PICKUP_NO_ITEMS", "PICKUP_CANCELED", "PICKUP_REFUSED", "PICKUP_UNKNOWN",
     "DIR_ELIGIBLE", "DIR_RESOLVED", "DIR_FIRST_ACTION", "DIR_TERMINAL",

@@ -68,9 +68,15 @@ class EpisodeMetrics(object):
         self.loop_spans: List[int] = []
         self._last_fp = None
         self._run = 0
-        # AC9: recovered attempts vs displayed-time advances, and the maximum
-        # stationary span (a run of identical hero squares).
+        # AC9: attempts vs displayed-time advances, and the maximum stationary
+        # span (a run of identical hero squares).  ``attempts`` is the sent
+        # *gameplay* attempt count: it is filled from the actions sidecar when
+        # one is supplied (so a zero-time command still counts, review item 6a)
+        # and otherwise falls back to the hero-displacement count, which is
+        # reported separately and flagged via ``attempts_source``.
         self.attempts = 0
+        self.attempts_source = "hero-displacement"
+        self.hero_displacements = 0
         self.stationary_span = 0
         self.teardown_frames = 0
         self._prev_hero = None
@@ -86,7 +92,10 @@ class EpisodeMetrics(object):
         hero = hero_of(snap)
         if hero is not None:
             if self._prev_hero is not None and hero != self._prev_hero:
-                self.attempts += 1
+                # a *displacement* is not the attempt count (a zero-time command
+                # is an attempt with no displacement); tracked separately and
+                # resolved to ``attempts`` by the caller
+                self.hero_displacements += 1
             if hero == self._prev_hero:
                 self._stat_run += 1
                 if self._stat_run > self.stationary_span:
@@ -136,6 +145,8 @@ class EpisodeMetrics(object):
             "displayed_turns": turns,
             "time_advances": self.time_advances,
             "attempts": self.attempts,
+            "attempts_source": self.attempts_source,
+            "hero_displacements": self.hero_displacements,
             "stationary_span_max": self.stationary_span,
             "longest_loop_span": self.loop_span,
             "loop_spans_ge_2": sum(1 for s in self.loop_spans if s >= 2),
@@ -143,7 +154,37 @@ class EpisodeMetrics(object):
         }
 
 
-def episode_metrics(wire_path: str, meta: Optional[dict] = None) -> dict:
+#: Need kinds whose answer is a gameplay *attempt* (command/key/direction).
+_GAMEPLAY_KINDS = ("command", "key", "direction")
+
+
+def attempts_from_actions(actions_path: str) -> Optional[int]:
+    """Count the sent *gameplay* acts in an ``ep-N.actions.jsonl`` sidecar.
+
+    A zero-time command is still a sent attempt, so the recorded acts -- not
+    hero displacement -- are the correct attempt denominator (review item 6a).
+    Returns ``None`` when the path is absent/unreadable, so the caller can fall
+    back and flag the source rather than report a fabricated zero.
+    """
+    if not actions_path or not os.path.exists(actions_path):
+        return None
+    n = 0
+    with open(actions_path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and rec.get("kind") in _GAMEPLAY_KINDS:
+                n += 1
+    return n
+
+
+def episode_metrics(wire_path: str, meta: Optional[dict] = None,
+                    actions_path: Optional[str] = None) -> dict:
     """Stream one ``.wire.jsonl`` recording into a metrics dict.
 
     Coverage excludes *teardown*: once the episode's ``closed`` record is seen,
@@ -174,6 +215,16 @@ def episode_metrics(wire_path: str, meta: Optional[dict] = None) -> dict:
             except protocol.ProtocolError:
                 continue
             em.fold(snap)
+    # Resolve the attempt count (review item 6a): the sent-gameplay acts are the
+    # true denominator (a zero-time command still counts); the hero-displacement
+    # count is the flagged fallback, never a silent substitute.
+    from_actions = attempts_from_actions(actions_path) if actions_path else None
+    if from_actions is not None:
+        em.attempts = from_actions
+        em.attempts_source = "actions"
+    else:
+        em.attempts = em.hero_displacements
+        em.attempts_source = "hero-displacement"
     out = em.finish()
     if meta:
         out.update({
