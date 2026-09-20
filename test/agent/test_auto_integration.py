@@ -95,8 +95,12 @@ def _runner():
 def apply_obs(r, rec):
     """Reconcile then commit one observation, exactly like ``_on_obs``."""
     staged = r.mem.stage(snap_of(rec))
+    frame_kind = (rec.get("need") or {}).get("kind")
     r._reconcile_observation(staged)
-    r.mem.commit(staged, hero=r._resolved_hero)
+    r.mem.commit(staged, hero=r._resolved_hero,
+                 advance_stationary=bool(
+                     r._matched_gameplay_attempt
+                     and frame_kind in ("command", "key", "direction")))
     note = getattr(r.reflex, "note_observation", None)
     if note is not None:
         note(r.mem)
@@ -1574,6 +1578,93 @@ class SelectedDecisionOwnership(JevAppliedCap):
         self.assertEqual(r._attempt_effect, chosen.proposed_effect)
         self.assertEqual(tuple(r._attempt_payload),
                          tuple(chosen.effect_payload))
+
+
+class StationaryAccounting(WireHarness):
+    """§2A: only matched gameplay frames advance the stationary stage."""
+
+    def _rec(self, seq, need, hero=(10, 10), t=100):
+        rec = obs(seq, need, map_=[[hero[0], hero[1], 2]], pal=PAL)
+        rec["s"] = {"hitpoints": {"text": "10"},
+                    "hitpoints-max": {"text": "10"},
+                    "time": {"text": str(t)},
+                    "dungeon-level": {"text": "1"}}
+        return rec
+
+    @staticmethod
+    def _command_need(i):
+        return {"id": i, "kind": "command", "prompt": ""}
+
+    @staticmethod
+    def _yn_need(i):
+        return {"id": i, "kind": "yn", "prompt": "Continue?", "choices": None,
+                "default": None, "numeric": False}
+
+    @staticmethod
+    def _menu_need(i):
+        return {"id": i, "kind": "menu", "menu": "m", "mode": "one",
+                "content": "c", "pages": 1}
+
+    def _arm(self, r):
+        """Arm a real matched gameplay SentAttempt at the hero square."""
+        key = protocol.NeedKey(1, 2, 1)
+        table = candidates.build_table(
+            key, 1, [candidates.make_candidate({"key": protocol.KEY_SEARCH},
+                                               "search")])
+        cand = table.ordered_candidates[0]
+        r.attempt = candidates.make_sent_attempt(
+            key, table, cand, 1, "fp", ((10, 10),), r.instance.current() or 0)
+        r.attempt_before = {"hero": (10, 10), "time": 100, "dlvl": 1}
+
+    def test_prompt_and_menu_frames_do_not_advance_stationary(self):
+        r = _runner()
+        # frame 1: a command need with no in-flight attempt -> not matched
+        apply_obs(r, self._rec(1, self._command_need(1), t=100))
+        self.assertEqual(r.mem.no_progress, 0)
+        # frame 2: the command's own matched response (gameplay frame, moved
+        # time) advances the counter once
+        self._arm(r)
+        apply_obs(r, self._rec(2, self._command_need(2), t=101))
+        self.assertEqual(r.mem.no_progress, 1)
+        # frames 3 and 4: two prompt/menu frames at the same hero, no in-flight
+        # attempt -> the stationary counter is untouched
+        apply_obs(r, self._rec(3, self._yn_need(3), t=102))
+        apply_obs(r, self._rec(4, self._menu_need(4), t=103))
+        self.assertEqual(r.mem.no_progress, 1)
+        # the visit folding is preserved across every frame
+        self.assertGreaterEqual(r.mem.visits[(10, 10)], 4)
+
+    def test_unmatched_observation_does_not_advance_stationary(self):
+        r = _runner()
+        apply_obs(r, self._rec(1, self._command_need(1), t=100))
+        # three command frames with no in-flight attempt: unmatched
+        for i in (2, 3, 4):
+            apply_obs(r, self._rec(i, self._command_need(i), t=100 + i))
+        self.assertEqual(r.mem.no_progress, 0)
+
+    def test_matched_gameplay_attempt_advances_stationary(self):
+        r = _runner()
+        apply_obs(r, self._rec(1, self._command_need(1), t=100))
+        self._arm(r)
+        apply_obs(r, self._rec(2, self._command_need(2), t=101))
+        self.assertEqual(r.mem.no_progress, 1)
+
+    def test_evaluator_prompt_frames_do_not_advance_stationary(self):
+        from tools.agent import evaluate
+        recs = [self._rec(1, self._command_need(1), t=100),
+                self._rec(2, self._yn_need(2), t=101),
+                self._rec(3, self._menu_need(3), t=102),
+                self._rec(4, self._command_need(4), t=103)]
+        wire = b"".join([_line(HELLO)] + [_line(r) for r in recs]
+                        + [_line(CLOSED)])
+        lines = [ln + b"\n" for ln in wire.split(b"\n") if ln]
+        replay = evaluate.ReplayPass(
+            lines, ProviderConfig(reflex="scripted", strategy="off",
+                                  max_ticks=200), "scripted", "off")
+        replay.run()
+        # the evaluator mirrors the live rule: no matched gameplay frame here,
+        # so the stationary counter is never advanced
+        self.assertEqual(replay.mem.no_progress, 0)
 
 
 class SelectedEffectOwnership(JevAppliedCap):

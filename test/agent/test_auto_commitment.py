@@ -812,6 +812,13 @@ class AttemptCounting(unittest.TestCase):
         self.ref.commit_effect("prompt", "prompt", 2, mem,
                                observed_kind="no-time", payload=())
         self.assertEqual(self.ref.targets.stall_attempts, before)
+        # the matched-gameplay rule is enforced at the memory fold too (review
+        # item 1 / §2A): a non-gameplay observation at the same hero folds the
+        # visit but never advances the stationary counter
+        np_before = mem.no_progress
+        mem.commit(mem.stage(protocol.Snapshot()), hero=(1, 10),
+                   advance_stationary=False)
+        self.assertEqual(mem.no_progress, np_before)
 
 
 class Phase3Progression(unittest.TestCase):

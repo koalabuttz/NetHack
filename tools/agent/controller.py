@@ -695,6 +695,9 @@ class _EpisodeRunner(object):
         self._attempt_effect = None
         self._attempt_label = ""
         self._attempt_kind = ""
+        # True only when the current observation reconciles a matched gameplay
+        # attempt (plan §2A); set per observation by _reconcile_observation.
+        self._matched_gameplay_attempt = False
         # The frozen payload of a non-command effect awaiting its reconciled
         # observation (the observed inventory rows, tick and game time).
         self._attempt_payload = ()
@@ -1387,8 +1390,18 @@ class _EpisodeRunner(object):
         # Parse is not commit: the temporary presentation is reconciled
         # against the single in-flight SentAttempt BEFORE hero/level/map
         # memory commits (plan 3.4).  Then memory is committed exactly once.
+        # Only a matched *gameplay* frame advances the stationary 3/6/10 stage
+        # (plan §2A): a prompt/menu/inventory frame folds the hero/visit but
+        # never the stationary counter.
+        frame_need = rec.get("need")
+        frame_kind = (frame_need.get("kind")
+                      if isinstance(frame_need, dict) else None)
         self._reconcile_observation(staged)
-        self.mem.commit(staged, hero=self._resolved_hero)
+        self.mem.commit(
+            staged, hero=self._resolved_hero,
+            advance_stationary=bool(
+                self._matched_gameplay_attempt
+                and frame_kind in ("command", "key", "direction")))
         # The committed observation is folded once into the reflex's bounded
         # recovery/refusal/food evidence (plan 5.1/5.2).  This is the *only*
         # place that mutation happens, so candidate construction and proposal
@@ -1481,6 +1494,10 @@ class _EpisodeRunner(object):
         # §2A): the acquisition/continuation baseline the reconciled effect is
         # compared against.  Captured before ``attempt_before`` is cleared.
         self._attempt_pre_hero = before.get("hero")
+        # True only when this observation reconciles a *matched* in-flight
+        # gameplay attempt: only such an observation may advance the stationary
+        # stage (§2A).  A prompt/menu/unmatched frame leaves the counter alone.
+        self._matched_gameplay_attempt = attempt is not None
         kind = None
         ordinal = None
         if attempt is not None:

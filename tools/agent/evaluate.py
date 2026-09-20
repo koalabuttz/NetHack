@@ -514,6 +514,9 @@ class ReplayPass(object):
         self._sent_stair = False
         self._pending_effect = None
         self._last_observed_kind = ""
+        # True only when the current observation reconciles a matched gameplay
+        # send (plan §2A), mirroring the live controller.
+        self._matched_gameplay = False
         # The modeled sent ordinal (plan 6.2/3.5).  Every need's answer is
         # one act, and an invalid retry is a second act, so this counts
         # exactly what the live controller's ``action_ordinal`` counts: the
@@ -628,8 +631,15 @@ class ReplayPass(object):
         # modeled sent action first, then memory commits exactly once, then
         # the committed observation is folded into the recovery evidence and
         # the frozen effect of the modeled send is committed.
+        frame_need = rec.get("need")
+        frame_kind = (frame_need.get("kind")
+                      if isinstance(frame_need, dict) else None)
         self._reconcile(staged)
-        self.mem.commit(staged, hero=self._resolved_hero)
+        self.mem.commit(
+            staged, hero=self._resolved_hero,
+            advance_stationary=bool(
+                self._matched_gameplay
+                and frame_kind in ("command", "key", "direction")))
         self.reflex.note_observation(self.mem)
         self._commit_effect()
         # a new obs supersedes any need still awaiting pages: that need was
@@ -715,6 +725,9 @@ class ReplayPass(object):
         self.observation_generation += 1
         at_cells = tuple(staged.hero_cells)
         before = self._sent_before or {}
+        # Only a matched *gameplay* send advances the stationary stage (§2A); a
+        # prompt/menu/unmatched frame folds hero/visit but leaves the counter.
+        self._matched_gameplay = bool(before)
         kind = ""
         signals = []
         if before.get("dlvl") is not None \

@@ -614,8 +614,8 @@ class EpisodeMemory(object):
             status=parse_status(snap), messages=tuple(messages),
             hero_cells=tuple(sorted(hero_cells)))
 
-    def commit(self, staged: "StagedObservation",
-               hero=DERIVED_HERO) -> None:
+    def commit(self, staged: "StagedObservation", hero=DERIVED_HERO,
+               advance_stationary: bool = True) -> None:
         """Fold a staged observation into durable memory (the one commit).
 
         *hero* is the reconciled confirmed singleton the controller resolved
@@ -634,7 +634,14 @@ class EpisodeMemory(object):
         self.hero = hero
         if hero is not None:
             if hero == self.last_hero:
-                self.no_progress += 1
+                # Only a *matched gameplay attempt* advances the stationary
+                # 3/6/10 stage (stall-recovery plan §2A): a prompt, menu,
+                # inventory or unmatched observation at the same hero folds the
+                # hero/visit but must not advance the stationary counter, and
+                # must not spend a destination stall budget.  The visit/map
+                # folding below is preserved for every observation.
+                if advance_stationary:
+                    self.no_progress += 1
             else:
                 self.no_progress = 0
                 self.searches_since_progress = 0
