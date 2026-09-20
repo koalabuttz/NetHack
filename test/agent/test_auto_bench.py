@@ -1698,5 +1698,146 @@ class ScorecardSchemaExactness(unittest.TestCase):
             self.assertIn(field, card)
 
 
+class MultiEpisodeChildWorkflow(unittest.TestCase):
+    """Finding #1: the real ``_child`` path works for episodes 2+ and
+    serializes the complete EpisodeResult evidence."""
+
+    def _fake_launcher(self, tmp):
+        path = os.path.join(tmp, "fake-launcher")
+        with open(path, "w") as fh:
+            fh.write("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def test_child_path_remaps_artifacts_and_records_forced_search(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        launcher = self._fake_launcher(tmp)
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
+        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
+        os.environ["BENCH_RUNNER"] = launcher
+        os.environ["BENCH_WORKER"] = launcher
+        os.environ["BENCH_DATA"] = tmp
+        for key in ("BENCH_RUNNER", "BENCH_WORKER", "BENCH_DATA"):
+            self.addCleanup(os.environ.pop, key, None)
+        spec = _valid_spec(tier="live", episodes=3,
+                           episode_timeout_s=8.0,
+                           campaign_timeout_s=120.0)
+        spec["budget"]["max_total_episodes"] = 100
+        runner = B.BenchRunner(spec, tmp)
+        out = runner.run()
+
+        # >= 3 episodes actually ran through the real child path
+        self.assertGreaterEqual(len(out["manifest"]["episodes"]), 3)
+        for entry in out["manifest"]["episodes"]:
+            idx = entry["index"]
+            # the child wrote ep-1.*; the parent remapped to ep-<global index>
+            self.assertTrue(os.path.exists(os.path.join(
+                entry["dir"], "ep-%d.wire.jsonl" % idx)), entry)
+            for label in ("meta", "wire", "actions", "decisions", "events"):
+                self.assertTrue(entry["source_hashes"].get(label),
+                                (idx, label, entry["source_hashes"]))
+            if idx != 1:
+                # the local ep-1.* was remapped away for episodes 2+
+                self.assertFalse(os.path.exists(os.path.join(
+                    entry["dir"], "ep-1.wire.jsonl")), idx)
+        # every scorecard carries *measured* forced-search counters
+        self.assertEqual(len(out["scorecards"]), 3)
+        for card in out["scorecards"]:
+            forced = card["forced_search"]
+            for field in ("activations", "suffixes", "successes", "cancels",
+                          "denials", "trapped", "uncleared"):
+                self.assertIsInstance(forced[field], int, (card["episode_id"],
+                                                           field))
+            self.assertNotIn("forced_search.activations",
+                             card["availability"])
+            self.assertEqual(M.validate_scorecard_shape(card), [])
+
+    def test_child_meta_merge_is_additive_and_keeps_controller_values(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        meta_path = os.path.join(tmp, "ep-1.meta.json")
+        with open(meta_path, "w") as fh:
+            json.dump({"stop_reason": "tick-cap-graceful-quit",
+                       "ticks": 7, "controllers": "value"}, fh)
+        B._child_meta_merge(tmp, 1, {
+            "stop_reason": "closed",           # must NOT overwrite
+            "ticks": 7,
+            "forced_search": {"activations": 0, "uncleared": 0},
+            "forced_activations": 0, "forced_uncleared": 0,
+            "needs": 3,                        # a new key -> added
+        })
+        with open(meta_path) as fh:
+            merged = json.load(fh)
+        self.assertEqual(merged["stop_reason"], "tick-cap-graceful-quit")
+        self.assertEqual(merged["ticks"], 7)
+        self.assertEqual(merged["needs"], 3)
+        self.assertEqual(merged["forced_search"], {"activations": 0,
+                                                   "uncleared": 0})
+        self.assertEqual(merged["forced_activations"], 0)
+
+    def test_result_to_meta_and_forced_search_accept_mappings(self):
+        class _R(object):
+            stop_reason = "closed"
+            outcome = "death"
+            budget = {}
+        for f in B.FORCED_SEARCH_FIELDS:
+            setattr(_R, "forced_" + f, 0)
+        meta = B.result_to_meta(_R())
+        self.assertEqual(meta["stop_reason"], "closed")
+        self.assertEqual(meta["forced_search"]["uncleared"], 0)
+        # a mapping result is not silently dropped
+        self.assertEqual(B.forced_search_of(
+            {"forced_search": {"activations": 2, "uncleared": 1}}),
+            {"activations": 2, "suffixes": None, "successes": None,
+             "cancels": None, "denials": None, "trapped": None,
+             "uncleared": 1})
+        self.assertIsNone(B.forced_search_of({}))
+
+
+class ScorecardEnvelope(unittest.TestCase):
+    """Finding #8: the runner never mutates the immutable /2 scorecard."""
+
+    def test_full_runner_scorecards_validate_and_hashes_recompute(self):
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
+        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        spec = _valid_spec(tier="live", episodes=4)
+        spec["budget"]["max_total_episodes"] = 100
+        runner = B.BenchRunner(spec, tmp)
+
+        def fake_runner(config, paths, episode_dir, index, timeout):
+            os.makedirs(episode_dir, exist_ok=True)
+            with open(os.path.join(episode_dir,
+                                   "ep-%d.meta.json" % index), "w") as fh:
+                json.dump(_meta(), fh)
+            return _meta(), episode_dir
+
+        runner.episode_runner = fake_runner
+        out = runner.run()
+        self.assertEqual(len(out["scorecards"]), 4)
+        for card in out["scorecards"]:
+            # the card is an exact /2 object with no scheduling metadata
+            self.assertEqual(M.validate_scorecard_shape(card), [])
+            self.assertNotIn("arm", card)
+            self.assertNotIn("pair", card)
+        # every manifest hash recomputes from the exact persisted object
+        by_id = {c["episode_id"]: c for c in out["scorecards"]}
+        for entry in out["manifest"]["episodes"]:
+            card = by_id["ep-%d" % entry["index"]]
+            self.assertEqual(
+                entry["scorecard_hash"],
+                M.sha256_bytes(M.pretty_scorecard(card).encode("utf-8")))
+        # the envelope carries the scheduling metadata instead
+        envelope = json.load(open(os.path.join(tmp, "scorecards.json")))
+        self.assertEqual(len(envelope["arms"]), 4)
+        for meta in envelope["arms"].values():
+            self.assertIn(meta["arm"], ("baseline", "candidate"))
+            self.assertIn("pair", meta)
+            self.assertIn("order", meta)
+        self.assertEqual(len(envelope["schedule"]), 4)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -934,6 +934,70 @@ class signal_handlers(object):
             self.on_forced()
 
 
+class ChildCancelHandlers(object):
+    """Bench-owned SIGINT/SIGTERM handling inside a child episode process.
+
+    The graceful path is primary.  The default disposition for SIGINT/SIGTERM
+    kills the child immediately, so ``run_episode``'s ``finally`` (the
+    controller-owned ``_reap``) never runs and the launcher/worker session
+    leaks.  These handlers **do not terminate**: they record the request, write
+    a durable acknowledgment, and let the bounded episode finish so the
+    controller reaches its own ``finally`` teardown.  No controller change is
+    required.
+    """
+
+    def __init__(self, cancel: Optional[Callable[[], Any]] = None,
+                 ack_path: Optional[str] = None):
+        self.cancel = cancel if callable(cancel) else None
+        self.ack_path = ack_path
+        self.signals: List[int] = []
+        self._saved: Dict[int, Any] = {}
+
+    def install(self) -> "ChildCancelHandlers":
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                self._saved[sig] = signal.getsignal(sig)
+                signal.signal(sig, self._handle)
+            except (ValueError, OSError):
+                pass
+        return self
+
+    def restore(self) -> None:
+        for sig, handler in list(self._saved.items()):
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                pass
+        self._saved.clear()
+
+    def acknowledged(self) -> bool:
+        return bool(self.signals)
+
+    def _handle(self, signum, frame):  # noqa: ARG002
+        self.signals.append(int(signum))
+        if self.ack_path:
+            try:
+                write_json_atomic(self.ack_path,
+                                  {"acknowledged": True,
+                                   "signals": list(self.signals),
+                                   "stop_requested": True})
+            except OSError:
+                pass
+        if self.cancel is not None:
+            try:
+                self.cancel()
+            except Exception:  # noqa: BLE001 - cancellation is best-effort
+                pass
+        # deliberately do NOT raise: the episode continues to its ``finally``
+
+
+def install_child_cancel_handlers(cancel: Optional[Callable[[], Any]] = None,
+                                  ack_path: Optional[str] = None
+                                  ) -> ChildCancelHandlers:
+    """Install (and return) the child's graceful cancel handlers."""
+    return ChildCancelHandlers(cancel, ack_path).install()
+
+
 # --------------------------------------------------------------------------
 # manifest (atomic updates)
 # --------------------------------------------------------------------------
@@ -1028,44 +1092,113 @@ def source_hashes_of(paths: Dict[str, str]) -> Dict[str, str]:
     return out
 
 
+#: The ``EpisodeResult`` fields the bench materializes into the child meta and
+#: the scorecard.  The forced-search counters are part of the *required*
+#: evidence, so they are listed explicitly rather than left to ``hasattr``
+#: guesswork.
+EPISODE_RESULT_FIELDS = (
+    "stop_reason", "outcome", "closed", "eof", "forced_kill",
+    "teardown_failure", "unanswered", "recorder_failed", "protocol_failure",
+    "failure_reason", "ticks", "needs", "invalids", "actions", "returncode",
+    "recording_complete", "boundaries", "strategy_calls", "directives_applied",
+    "budget", "reflex_timeouts", "timed_out",
+)
+FORCED_SEARCH_FIELDS = ("activations", "suffixes", "successes", "cancels",
+                        "denials", "trapped", "uncleared")
+
+
+def _forced_of_mapping(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Forced-search counters from a mapping (``forced_search`` or ``forced_*``)."""
+    nested = obj.get("forced_search")
+    if isinstance(nested, dict):
+        counters = {f: nested.get(f) for f in FORCED_SEARCH_FIELDS}
+        if any(v is not None for v in counters.values()):
+            return counters
+    counters = {f: obj.get("forced_" + f) for f in FORCED_SEARCH_FIELDS}
+    if any(v is not None for v in counters.values()):
+        return counters
+    return None
+
+
 def result_to_meta(result: Any) -> Dict[str, Any]:
-    """Normalize an EpisodeResult (or mapping) into the meta shape."""
+    """Normalize an EpisodeResult (or mapping) into the complete meta shape.
+
+    Every required ``EpisodeResult`` field is materialized, **including all
+    forced-search counters** (and a nested ``forced_search`` block) so a
+    downstream scorecard sees measured values -- a genuine zero included --
+    rather than an *unavailable* gap.  A mapping is passed through and only
+    augmented with the forced-search block when it lacks one.
+    """
     if result is None:
         return {}
     if isinstance(result, dict):
-        return dict(result)
-    fields = ("stop_reason", "outcome", "closed", "eof", "forced_kill",
-              "teardown_failure", "unanswered", "recorder_failed",
-              "protocol_failure", "failure_reason", "ticks", "needs",
-              "invalids", "actions", "returncode", "recording_complete",
-              "boundaries", "strategy_calls", "directives_applied", "budget")
-    meta = {}
-    for name in fields:
+        meta = dict(result)
+        forced = _forced_of_mapping(meta)
+        if forced is not None:
+            meta.setdefault("forced_search", forced)
+        meta.setdefault("game_outcome", meta.get("outcome"))
+        return meta
+    meta: Dict[str, Any] = {}
+    for name in EPISODE_RESULT_FIELDS:
         if hasattr(result, name):
             meta[name] = getattr(result, name)
+    forced = {}
+    for field in FORCED_SEARCH_FIELDS:
+        value = getattr(result, "forced_" + field, None)
+        meta["forced_" + field] = value
+        forced[field] = value
+    meta["forced_search"] = forced
     meta.setdefault("game_outcome", meta.get("outcome"))
     return meta
 
 
 def forced_search_of(result: Any) -> Optional[Dict[str, Any]]:
-    """The forced-search counters from an EpisodeResult, or ``None``.
+    """The forced-search counters from an EpisodeResult **or a mapping**.
 
     ``None`` means the source carries no forced-search evidence, which the
-    gate treats as *unavailable* rather than as a measured zero.
+    gate treats as *unavailable* rather than as a measured zero.  A mapping
+    (the shape the child serializes) is accepted as well as an object, so the
+    evidence is not silently dropped at the process boundary.
     """
-    if result is None or not all(
-            hasattr(result, "forced_" + f) for f in
-            ("activations", "uncleared")):
+    if result is None:
         return None
-    return {
-        "activations": getattr(result, "forced_activations", None),
-        "suffixes": getattr(result, "forced_suffixes", None),
-        "successes": getattr(result, "forced_successes", None),
-        "cancels": getattr(result, "forced_cancels", None),
-        "denials": getattr(result, "forced_denials", None),
-        "trapped": getattr(result, "forced_trapped", None),
-        "uncleared": getattr(result, "forced_uncleared", None),
-    }
+    if isinstance(result, dict):
+        return _forced_of_mapping(result)
+    if not all(hasattr(result, "forced_" + f) for f in FORCED_SEARCH_FIELDS):
+        return None
+    return {f: getattr(result, "forced_" + f, None)
+            for f in FORCED_SEARCH_FIELDS}
+
+
+#: The per-episode artifact suffixes the recorder writes.
+_EPISODE_ARTIFACT_SUFFIXES = ("wire.jsonl", "actions.jsonl", "decisions.jsonl",
+                              "events.jsonl", "meta.json")
+
+
+def remap_child_artifacts(episode_dir: str, index: int,
+                          local_index: int = 1) -> List[Tuple[str, str]]:
+    """Rename the child's local ``ep-<local>.*`` artifacts to ``ep-<index>.*``.
+
+    The controller is invoked with ``run_campaign(1)`` inside the isolated
+    episode directory, so the child always writes ``ep-1.*``; the parent's
+    artifact convention is the *global* index.  Remapping here keeps one
+    convention everywhere -- without it, episodes 2+ look missing.  Existing
+    destination files are never overwritten (the collision is reported by
+    returning the ``(src, dst)`` pair unmoved).  Returns the applied renames.
+    """
+    if int(index) == int(local_index):
+        return []
+    applied: List[Tuple[str, str]] = []
+    for suffix in _EPISODE_ARTIFACT_SUFFIXES:
+        src = os.path.join(episode_dir, "ep-%d.%s" % (local_index, suffix))
+        dst = os.path.join(episode_dir, "ep-%d.%s" % (index, suffix))
+        if not os.path.exists(src):
+            continue
+        if os.path.exists(dst):
+            continue
+        os.replace(src, dst)
+        applied.append((src, dst))
+    return applied
 
 
 class Manifest(object):
@@ -1235,6 +1368,9 @@ class BenchRunner(object):
         self.spec_path = spec_path
         self._package_max_excerpts = M.DEFAULT_PACKAGE_MAX_EXCERPTS
         self._package_max_bytes = M.DEFAULT_PACKAGE_MAX_BYTES
+        #: episode_id -> {"arm","pair","order"}; scheduling metadata is kept
+        #: OUT of the immutable scorecard object.
+        self._arms: Dict[str, Dict[str, Any]] = {}
 
     def _spec_path(self) -> str:
         if self.spec_path is None:
@@ -1356,7 +1492,13 @@ class BenchRunner(object):
                 result, episode_dir = self._run_one(config, episode_dir, index)
                 card, hashes, paths = self._seal_episode(
                     episode_dir, index, result, requested)
-                card["arm"] = arm
+                # Scheduling metadata (arm/pair/order) lives in the manifest and
+                # the scorecard envelope -- NEVER inside the immutable metric
+                # object, so the persisted scorecard stays an exact /2 card and
+                # its hash recomputes from the exact bytes.
+                self._arms[card["episode_id"]] = {
+                    "arm": arm, "pair": entry["pair"],
+                    "order": entry["order"]}
                 cards.append(card)
                 results.append((index, result, episode_dir))
                 self.manifest.settle("ep-%d" % index, "completed")
@@ -1434,10 +1576,18 @@ class BenchRunner(object):
             proc.wait(timeout=2.0)
         except Exception:  # noqa: BLE001
             pass
+        # The child ran ``run_campaign(1)`` inside its own dir, so it wrote
+        # ``ep-1.*``; remap to the global index *before* sealing so episodes
+        # 2+ are not seen as missing.
+        remapped = remap_child_artifacts(episode_dir, index)
         result = None
         child = _read_json(os.path.join(episode_dir, "bench-child.json"))
         if child:
             result = child.get("result")
+        if remapped:
+            self.manifest.data.setdefault("artifact_remaps", []).append(
+                {"episode": index, "count": len(remapped)})
+            self.manifest.flush()
         return result, episode_dir
 
     def _supervise(self, key, proc, identity) -> None:
@@ -1446,10 +1596,15 @@ class BenchRunner(object):
         The wall deadline is enforced **asynchronously during** the episode: a
         second stop request, a campaign/`campaign_timeout_s` deadline or the
         episode timeout aborts the captured tree immediately rather than being
-        noticed only between episodes.
+        noticed only between episodes.  The first (graceful) stop is relayed as
+        SIGTERM and the child's durable cancellation acknowledgment is awaited
+        within the grace window.
         """
+        episode_dir = os.path.join(self.out_dir, key)
+        ack_path = os.path.join(episode_dir, "bench-cancel.json")
         deadline = time.monotonic() + self.spec["episode_timeout_s"]
         grace_deadline = None
+        acked = False
         while True:
             if proc.poll() is not None:
                 return
@@ -1468,6 +1623,12 @@ class BenchRunner(object):
                 except (OSError, ProcessLookupError):
                     pass
                 grace_deadline = time.monotonic() + self.grace
+            if grace_deadline is not None and not acked and \
+                    os.path.exists(ack_path):
+                acked = True
+                self.manifest.data.setdefault("cancel_acks", []).append(
+                    {"episode": key, "acknowledged": True})
+                self.manifest.flush()
             if grace_deadline is not None and time.monotonic() >= grace_deadline:
                 self._abort_handle(key, proc, identity, "graceful-stop-timeout")
                 return
@@ -1489,11 +1650,19 @@ class BenchRunner(object):
 
     def _seal_episode(self, episode_dir: str, index: int, result: Any,
                       requested: dict) -> Tuple[dict, dict, dict]:
-        """Hash the artifacts and build/store the immutable scorecard."""
+        """Hash the artifacts and build/store the immutable scorecard.
+
+        The forced-search evidence is taken from the child result *or* the
+        persisted meta (whichever carries it), so a genuine zero is a measured
+        value while a genuinely absent source stays unavailable.  The exact
+        scorecard shape is validated **before** the card is returned, so a
+        malformed card can never be sealed as if it were complete.
+        """
         paths = episode_artifact_paths(episode_dir, index)
-        meta = _read_json(paths["meta"])
-        if not meta:
-            meta = result_to_meta(result)
+        meta = _read_json(paths["meta"]) or result_to_meta(result)
+        forced = forced_search_of(result) or forced_search_of(meta)
+        if forced is not None:
+            meta["forced_search"] = forced
         decisions = _read_jsonl(paths["decisions"])
         hashes = source_hashes_of(paths)
         budget = meta.get("budget") if isinstance(meta.get("budget"), dict) \
@@ -1503,9 +1672,17 @@ class BenchRunner(object):
             source_hashes=hashes, meta=meta, budget=budget or {},
             wire_path=paths["wire"], actions_path=paths["actions"],
             events_path=paths["events"], decisions=decisions,
-            forced_search=forced_search_of(result), requested_tiers=requested,
+            forced_search=forced, requested_tiers=requested,
             deadline_classification=self.spec["comparison"][
                 "deadline_classification"])
+        problems = M.validate_scorecard_shape(card)
+        if problems:
+            # record the deviation without adding a new schema field: a reason
+            # and an availability note, and force the hard-failure gate.
+            card["integrity"]["reasons"].append(
+                "bench-schema-problems:%s" % ",".join(problems))
+            card["availability"]["bench.schema_problems"] = ",".join(problems)
+            card["gates"]["hard_failure"] = True
         return card, hashes, paths
 
     def _judge_episode(self, card: dict, index: int) -> Optional[dict]:
@@ -1559,11 +1736,19 @@ class BenchRunner(object):
                     judge_results: Sequence[dict]) -> Dict[str, Any]:
         """Comparison, postmortem packaging and tuner stages after the loop."""
         live = self._live_validation(cards)
-        scorecards_path = self._write_run_artifact("scorecards.json", {
+        # The scorecard envelope carries the scheduling metadata; the cards
+        # themselves stay exact, immutable /2 objects whose hash recomputes.
+        envelope = {
             "schema_version": "bench-scorecards/1",
             "candidate": cards,
+            "arms": dict(getattr(self, "_arms", {})),
+            "schedule": getattr(self, "_executed_schedule", None),
+            "committed_schedule": (
+                (getattr(self, "_pre_record", {}) or {}).get("design", {})
+                .get("episode_schedule")),
             "precommit": precommit_record(self.spec["comparison"]),
-        })
+        }
+        scorecards_path = self._write_run_artifact("scorecards.json", envelope)
         comparison = self._compare(cards, live)
         comparison_path = self._write_run_artifact("comparison.json",
                                                    comparison)
@@ -1591,8 +1776,13 @@ class BenchRunner(object):
                     "admission": {"apply_allowed": False},
                     "verdict": "not-comparable"}
         baseline = self._baseline_cards()
-        by_arm_base = [c for c in cards if c.get("arm") == "baseline"]
-        by_arm_cand = [c for c in cards if c.get("arm") == "candidate"]
+        arms = getattr(self, "_arms", {})
+        by_arm_base = [c for c in cards
+                       if arms.get(c.get("episode_id"), {}).get("arm")
+                       == "baseline"]
+        by_arm_cand = [c for c in cards
+                       if arms.get(c.get("episode_id"), {}).get("arm")
+                       == "candidate"]
         if by_arm_base and by_arm_cand:
             # an interleaved A/B run carries both arms in this run
             base_arm, cand_arm = by_arm_base, by_arm_cand
@@ -2100,6 +2290,28 @@ def _cmd_package(args) -> int:
     return 0
 
 
+def _child_meta_merge(episode_dir: str, local_index: int, full: dict) -> None:
+    """Additively merge the bench's complete evidence into the child meta.
+
+    The controller's own meta omits the forced-search counters; the bench adds
+    them (and any other missing required field) as **new keys only**, never
+    overwriting a controller-written value.
+    """
+    path = os.path.join(episode_dir, "ep-%d.meta.json" % local_index)
+    meta = _read_json(path)
+    if not isinstance(meta, dict):
+        return
+    changed = False
+    for key, value in full.items():
+        if key in ("forced_search",) or key.startswith("forced_") \
+                or key not in meta:
+            if meta.get(key) != value:
+                meta[key] = value
+                changed = True
+    if changed:
+        write_json_atomic(path, meta)
+
+
 def _cmd_child(args) -> int:
     """Run exactly one controller episode in its own process/session."""
     from . import controller as C
@@ -2112,10 +2324,23 @@ def _cmd_child(args) -> int:
              "sysconf": args.sysconf or None}
     ctl = C.Controller(config, C.ControllerPaths(**paths), args.episode_dir,
                        episode_timeout=args.timeout)
-    results = ctl.run_campaign(1)
-    result = result_to_meta(results[0] if results else None)
+    # The graceful path is primary: a SIGINT/SIGTERM requests controller
+    # cancellation so ``run_episode`` reaches its own ``finally`` teardown
+    # instead of being killed mid-flight.
+    cancel = getattr(ctl, "request_cancel", None) or getattr(
+        ctl, "cancel", None)
+    handlers = install_child_cancel_handlers(
+        cancel, ack_path=os.path.join(args.episode_dir, "bench-cancel.json"))
+    try:
+        results = ctl.run_campaign(1)
+    finally:
+        handlers.restore()
+    full = result_to_meta(results[0] if results else None)
+    # an additive merge into the controller-written meta so the forced-search
+    # evidence survives even when the parent only reads the meta sidecar.
+    _child_meta_merge(args.episode_dir, 1, full)
     write_json_atomic(os.path.join(args.episode_dir, "bench-child.json"),
-                      {"ok": True, "result": result})
+                      {"ok": True, "result": full})
     return 0
 
 
