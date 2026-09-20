@@ -1,7 +1,7 @@
 {
  "commit_range": {
   "base": "56c0c45a0739b29a3173b08b343d5fc786a56712",
-  "head": "dcc3627075372ebcc03007c16b79ef5d9faf6cef"
+  "head": "b83d56e5d2cde2522c33dabf4d19461a65b9a71e"
  },
  "commits": [
   {
@@ -295,6 +295,30 @@
   {
    "hash": "dcc3627075372ebcc03007c16b79ef5d9faf6cef",
    "subject": "agent: parity, mutations and docs"
+  },
+  {
+   "hash": "c8aa770ba37e056a08ae0f3360fcc038fc93e8ba",
+   "subject": "agent: regenerate validation report"
+  },
+  {
+   "hash": "8405ba916a7e073f03430c8c09965af8a0502cc4",
+   "subject": "agent: reuse dest-purpose helper"
+  },
+  {
+   "hash": "3496a1e1d818c670136f205a7d325776cbfef366",
+   "subject": "agent: revise campaign bench plan to rev 2"
+  },
+  {
+   "hash": "c2963a7053461bdca01dc6fbe5306d667556f6b0",
+   "subject": "agent: revise campaign bench plan to rev 3"
+  },
+  {
+   "hash": "71b2a746cd7aa3ebd2c366e641e33e74d126912c",
+   "subject": "agent: revise campaign bench plan to rev 4"
+  },
+  {
+   "hash": "b83d56e5d2cde2522c33dabf4d19461a65b9a71e",
+   "subject": "agent: revise campaign bench plan to rev 5"
   }
  ],
  "gates": {
@@ -498,13 +522,23 @@
    "status": "killed"
   },
   {
-   "killer": "test_auto_prompt_edge.PromptEdgeSuppression.test_prompt_edge_reopens_on_positive_local_cloud_change",
-   "name": "mutation_omit_local_cloud_evidence",
+   "killer": "test_auto_prompt_edge.PromptEdgeSuppression.test_exit_b_suppression_survives_local_signature_changes",
+   "name": "mutation_use_signature_reopening_under_exit_b",
    "status": "killed"
   },
   {
-   "killer": "test_auto_prompt_edge.PromptEdgeSuppression.test_prompt_edge_ignores_time_visits_remote_occupancy_and_occlusion",
-   "name": "mutation_reopen_on_remote_occupancy",
+   "killer": "test_auto_recovery.Phase2EdgeFailureAndExhaustion.test_failed_route_reopens_after_blocker_leaves",
+   "name": "mutation_recovery_edge_never_reopens",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_prompt_edge.MatchedMovementAccounting.test_answer_binding_requires_exact_response_key_and_n_byte",
+   "name": "mutation_bind_any_yn_answer",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_prompt_edge.EmergencyFallback.test_emergency_step_three_both_records_are_not_retried",
+   "name": "mutation_emergency_step_three_ignores_emergency_record",
    "status": "killed"
   },
   {
@@ -585,5 +619,5 @@
   ]
  },
  "schema_version": 1,
- "suite_count": 1203
+ "suite_count": 1213
 }

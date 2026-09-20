@@ -469,6 +469,8 @@ MUTATIONS = (
         "file": "tools/agent/policy.py",
         "old": ("        if rec is None:\n"
                 "            return False\n"
+                "        if not self.positive_reopening_enabled:\n"
+                "            return True\n"
                 "        return rec[0] == navigation.blocked_edge_signature(\n"
                 "            terrain, tuple(src), tuple(dst))"),
         "new": ("        if rec is None:\n"
@@ -479,29 +481,76 @@ MUTATIONS = (
                    "destination_reacquisition"),
     },
     {
-        "name": "mutation_omit_local_cloud_evidence",
+        # plan mutation 8 ("omit local cloud evidence / reopen on revisions")
+        # retargeted: under exit (b) the disposition disables signature-based
+        # reopening, so the demonstrable mutation is forcing that path on.
+        "name": "mutation_use_signature_reopening_under_exit_b",
         "file": "tools/agent/policy.py",
-        "old": ("        if rec is None:\n"
-                "            return False\n"
+        "old": ("        if not self.positive_reopening_enabled:\n"
+                "            return True\n"
                 "        return rec[0] == navigation.blocked_edge_signature(\n"
                 "            terrain, tuple(src), tuple(dst))"),
-        "new": ("        if rec is None:\n"
-                "            return False\n"
-                "        return True"),
+        "new": ("        return rec[0] == navigation.blocked_edge_signature(\n"
+                "            terrain, tuple(src), tuple(dst))"),
         "killer": ("test_auto_prompt_edge.PromptEdgeSuppression."
-                   "test_prompt_edge_reopens_on_positive_local_cloud_change"),
+                   "test_exit_b_suppression_survives_local_signature_changes"),
     },
     {
-        "name": "mutation_reopen_on_remote_occupancy",
-        "file": "tools/agent/navigation.py",
-        "old": ("    out = [terrain.ter(dst), terrain.occupant(dst)]\n"
-                "    if step[0] != 0 and step[1] != 0:"),
-        "new": ("    out = [terrain.ter(dst), terrain.occupant(dst),\n"
-                "           terrain.occupant((dst[0] + 1, dst[1]))]\n"
-                "    if step[0] != 0 and step[1] != 0:"),
-        "killer": ("test_auto_prompt_edge.PromptEdgeSuppression."
-                   "test_prompt_edge_ignores_time_visits_remote_occupancy_and_"
-                   "occlusion"),
+        # retargeted from the prompt-side remote-occupancy mutation (invisible
+        # under exit (b)) to the recovery ledger that still compares signatures.
+        "name": "mutation_recovery_edge_never_reopens",
+        "file": "tools/agent/policy.py",
+        "old": ("        stored = self.blocked_edges.get(key)\n"
+                "        if stored is None:\n"
+                "            return False\n"
+                "        return stored == navigation.blocked_edge_signature("),
+        "new": ("        stored = self.blocked_edges.get(key)\n"
+                "        if stored is None:\n"
+                "            return False\n"
+                "        return True\n"
+                "        return navigation.blocked_edge_signature("),
+        "killer": ("test_auto_recovery.Phase2EdgeFailureAndExhaustion."
+                   "test_failed_route_reopens_after_blocker_leaves"),
+    },
+    {
+        "name": "mutation_bind_any_yn_answer",
+        "file": "tools/agent/arbitration.py",
+        "old": ("    if pending is None:\n"
+                "        return False\n"
+                "    if candidates.normalize_need_key(need_key) \\\n"
+                "            != candidates.normalize_need_key("
+                "pending.response_need_key):\n"
+                "        return False\n"
+                "    if answer_byte is None:\n"
+                "        return False\n"
+                "    return int(answer_byte) == DECLINE_BYTE"),
+        "new": "    return pending is not None",
+        "killer": ("test_auto_prompt_edge.MatchedMovementAccounting."
+                   "test_answer_binding_requires_exact_response_key_and_n_"
+                   "byte"),
+    },
+    {
+        "name": "mutation_emergency_step_three_ignores_emergency_record",
+        "file": "tools/agent/policy.py",
+        "old": ("            normal_only = (\n"
+                "                self._prompt_edge_suppressed(terrain, hero, "
+                "dest,\n"
+                "                                             "
+                "navigation.ACTION_NORMAL)\n"
+                "                and not self._prompt_edge_suppressed(\n"
+                "                    terrain, hero, dest, "
+                "navigation.ACTION_EMERGENCY)\n"
+                "                and not self._edge_blocked(terrain, hero, "
+                "dest))"),
+        "new": ("            normal_only = (\n"
+                "                self._prompt_edge_suppressed(terrain, hero, "
+                "dest,\n"
+                "                                             "
+                "navigation.ACTION_NORMAL)\n"
+                "                and not self._edge_blocked(terrain, hero, "
+                "dest))"),
+        "killer": ("test_auto_prompt_edge.EmergencyFallback."
+                   "test_emergency_step_three_both_records_are_not_retried"),
     },
     {
         "name": "mutation_filter_only_seed_edges",
