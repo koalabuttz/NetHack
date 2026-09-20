@@ -722,3 +722,24 @@ No changes to NetHack C gameplay, candidate action vocabulary, DeepSeek prompts/
 6. The existing random fallback's known-passable check is weaker than explicit edge legality. Keep the safe cycle branch narrowly tested; do not make unrelated random-walk behavior changes without coverage.
 7. An operator-owned campaign summarizer was not located. Compatibility with external tooling remains a handoff check, especially cap interpretation and exact reason-string parsing.
 8. No files were written, commands executed, dependencies installed, or tests run during this design. All validation actions above are implementation requirements; the campaign and 805-test baseline are caller-supplied evidence.
+
+## Prompt-edge amendment (Rev 3)
+
+The prompt-edge plan (`doc/agent-prompt-edge-plan.md`) leaves this plan's
+navigation rules unchanged and handles the movement-blocking confirmation
+**locally**:
+
+- The command-only Jev/singleton behaviour, criteria order, confidence gate,
+  retained index/N, cache/history bytes and applied-cap semantics are unchanged.
+  The only `providers.ReflexContext` addition is the optional, internal-only
+  `prompt_origin`/`matched_movement_prompt` field, which `providers` and
+  presentation never consume, render or serialize.
+- A `yn` movement interruption is handled in the reflex's `_yn` before native
+  default handling (a recognized cloud confirmation is always declined), and
+  the emergency branch keeps its first-place precedence; its movement selection
+  now uses the classified terrain, `navigation.edge_legal` and the same
+  immutable blocked-edge view, so a declined normal edge can never suppress a
+  sole legal emergency move.
+- No dangerous-action permission is broadened: cloud refusal never authorizes
+  `m`-prefixed entry, and the forced-search gates are unchanged. Named tests:
+  `test_prompt_edge_route_filter_preserves_emergency_and_pickup_precedence`, `test_sole_legal_reverse_remains_available_to_emergency`, `test_cloud_confirmation_declines_even_with_yes_native_default`.

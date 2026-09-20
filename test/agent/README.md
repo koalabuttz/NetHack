@@ -345,3 +345,31 @@ make -C test/agent sentinel \
   integration.
 * A same-user test runner is a convenience harness, not a secure evaluation
   deployment.
+
+## Prompt-declined edge fixtures and prompt recognizers
+
+`stall_recovery_fixtures.py` carries the prompt-edge plan's vapor-cloud
+geometry (Phase 0): a hero whose corridor's only outbound edge crosses a gray
+`#` vapor cell, with a route-around variant, a two-frontier variant that shares
+the one edge, and the plain trapped variant. The precise bounds are small and
+hand-built from public state (a 5x3 grid); the plan's fixture action caps are
+the *existing* configured search/quit budgets, not an arbitrary large cap.
+
+The only supported blocking-movement prompt recognizer is the source-verified
+engine confirmation `%s into that %s cloud?` (`src/hack.c:2542`) — "vapor
+cloud" or "poison gas cloud", matched case/whitespace-insensitively via
+`arbitration.is_movement_entry_confirmation`. It is deliberately narrow: every
+other `yn` (eat, quit, startup, inventory, capacity) and every
+interaction-direction frame is excluded. The decline branch is always `n`, so no
+blind `y` is ever sent.
+
+**Conservative uncertainty.** A gray `#` vapor cell classifies to
+`T_CORRIDOR`, indistinguishable from corridor ground, so there is no observable
+cloud token in the wire. Phase 0 therefore takes exit (b): the disposition in
+`doc/agent-prompt-edge-cloud-disposition.json` records the indistinguishable
+encoding and enables conservative persistent suppression — a prompt-declined
+edge stays suppressed under unchanged evidence and reopens only on a positive
+relevant local change or a scope change, never on time, visits, global
+revisions or unrelated occupancy. A native `make -C test/agent native-cloud`
+probe exists for the operator-gated trace that is mandatory before any positive
+(cloud-disappearance) reopening claim.

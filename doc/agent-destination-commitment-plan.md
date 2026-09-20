@@ -614,3 +614,25 @@ This section records how the contracts in this plan are **actually realised** in
   retires a destination or spends destination counters; ordinary emergency,
   hunger and inventory interruptions suspend/revalidate rather than consume
   navigation stalls.
+
+## Prompt-edge amendment (Rev 3)
+
+The prompt-edge plan (`doc/agent-prompt-edge-plan.md`) extends this design
+without changing its lifecycle ownership:
+
+- **Rerouting.** A held destination is re-routed through the same filtered
+  Dijkstra maps, so a longer valid route around a declined edge wins over
+  retiring the destination; a held target is not re-elected or dropped merely
+  because one edge is prompt-blocked.
+- **Route-only failure reopening.** When no alternate route exists the
+  destination retires through the existing single terminal owner and frozen
+  unreachable/failure path (earlier than or no later than the existing
+  three-no-progress bound). The suppression **owner stays the edge evidence**,
+  not the destination's long-lived service signature, so once the edge reopens
+  (positive relevant local change or a scope change) the target is legitimately
+  reacquirable — a permanent target-service failure would wrongly hide a
+  reopened route. Global map revision/time never reopens it.
+- **Bounded search.** When no filtered destination is reachable the existing
+  bounded search/recovery owns the turn, with its own per-site limits and the
+  forced-search gates unchanged; no per-destination unbudgeted search loop is
+  introduced. Named tests: `test_route_only_failure_does_not_permanently_suppress_target_after_reopen`, `test_vapor_cloud_loop_all_routes_blocked_enters_bounded_recovery`, `test_vapor_cloud_loop_routes_around_with_held_destination`.

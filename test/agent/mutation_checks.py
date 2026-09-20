@@ -382,6 +382,179 @@ MUTATIONS = (
         "killer": ("test_auto_recovery.Phase2BoundedRecovery."
                    "test_recovery_only_legal_reverse_is_not_trapped"),
     },
+    # -- prompt-edge plan (Rev 3) mutations ------------------------------
+    {
+        "name": "mutation_restore_response_kind_only_filter",
+        "file": "tools/agent/controller.py",
+        "old": ("                (self._matched_gameplay_attempt\n"
+                "                 and frame_kind in (\"command\", \"key\", "
+                "\"direction\"))\n"
+                "                or matched_prompt))"),
+        "new": ("                (self._matched_gameplay_attempt\n"
+                "                 and frame_kind in (\"command\", \"key\", "
+                "\"direction\"))))"),
+        "killer": ("test_auto_prompt_edge.LiveEvaluatorParity."
+                   "test_live_evaluator_movement_prompt_accounting_and_"
+                   "ledger_parity"),
+    },
+    {
+        "name": "mutation_permit_every_yn_to_advance",
+        "file": "tools/agent/arbitration.py",
+        "old": ("    low = \" \".join(str(prompt_text).lower().split())\n"
+                "    return (\"into that \" in low and "
+                "low.rstrip().endswith(\"cloud?\")\n"
+                "            and (\"vapor cloud\" in low or \"poison gas "
+                "cloud\" in low))"),
+        "new": ("    low = \" \".join(str(prompt_text).lower().split())\n"
+                "    return True"),
+        "killer": ("test_auto_prompt_edge.MovementEntryRecognition."
+                   "test_only_cloud_confirmations_are_recognized"),
+    },
+    {
+        "name": "mutation_count_prompt_arrival_and_answer",
+        "file": "tools/agent/policy.py",
+        "old": ("        if self._pending_prompt is not None:\n"
+                "            return False\n"
+                "        pending = arbitration.matched_movement_prompt("),
+        "new": "        pending = arbitration.matched_movement_prompt(",
+        "killer": ("test_auto_prompt_edge.MatchedMovementAccounting."
+                   "test_matched_movement_vapor_prompt_advances_stationary_"
+                   "once"),
+    },
+    {
+        "name": "mutation_infer_movement_from_raw_direction",
+        "file": "tools/agent/arbitration.py",
+        "old": ("    label = getattr(candidate, \"semantic_label\", \"\")\n"
+                "    if not label or label in _REJECTED_MOVEMENT_LABELS:\n"
+                "        return None\n"
+                "    op = _ACCEPTED_MOVEMENT_OPS.get(label)\n"
+                "    if op is None:\n"
+                "        return None"),
+        "new": ("    label = getattr(candidate, \"semantic_label\", \"\")\n"
+                "    op = _ACCEPTED_MOVEMENT_OPS.get(label,\n"
+                "                                     (\"destination\", \"normal\"))"),
+        "killer": ("test_auto_prompt_edge.MovementOriginTaxonomy."
+                   "test_movement_origin_operation_taxonomy_matrix"),
+    },
+    {
+        "name": "mutation_record_evidence_at_proposal_or_stale_n",
+        "file": "tools/agent/policy.py",
+        "old": ("        p = self._pending_prompt\n"
+                "        if not arbitration.prompt_decline_confirmed(\n"
+                "                p, instance, confirmed_hero, dismissed):\n"
+                "            return False"),
+        "new": ("        p = self._pending_prompt\n"
+                "        if p is None:\n"
+                "            return False"),
+        "killer": ("test_auto_prompt_edge.DeclineEvidence."
+                   "test_prompt_decline_requires_matching_answer_send_and_"
+                   "resolution"),
+    },
+    {
+        "name": "mutation_derive_dst_from_semantic_destination",
+        "file": "tools/agent/arbitration.py",
+        "old": ("    src = (int(pre_hero[0]), int(pre_hero[1]))\n"
+                "    dst = (src[0] + delta[0], src[1] + delta[1])"),
+        "new": ("    src = (int(pre_hero[0]), int(pre_hero[1]))\n"
+                "    _p = getattr(candidate, \"effect_payload\", ()) or ()\n"
+                "    if len(_p) >= 6 and _p[0] == \"dest\":\n"
+                "        dst = (int(_p[4]), int(_p[5]))\n"
+                "    else:\n"
+                "        dst = (src[0] + delta[0], src[1] + delta[1])"),
+        "killer": ("test_auto_prompt_edge.MovementOriginTaxonomy."
+                   "test_movement_origin_dst_is_origin_edge_not_destination"),
+    },
+    {
+        "name": "mutation_compare_stored_prompt_with_absent_command",
+        "file": "tools/agent/policy.py",
+        "old": ("        if rec is None:\n"
+                "            return False\n"
+                "        return rec[0] == navigation.blocked_edge_signature(\n"
+                "            terrain, tuple(src), tuple(dst))"),
+        "new": ("        if rec is None:\n"
+                "            return False\n"
+                "        return False"),
+        "killer": ("test_auto_prompt_edge.PromptEdgeSuppression."
+                   "test_prompt_declined_edge_survives_prompt_absence_and_"
+                   "destination_reacquisition"),
+    },
+    {
+        "name": "mutation_omit_local_cloud_evidence",
+        "file": "tools/agent/policy.py",
+        "old": ("        if rec is None:\n"
+                "            return False\n"
+                "        return rec[0] == navigation.blocked_edge_signature(\n"
+                "            terrain, tuple(src), tuple(dst))"),
+        "new": ("        if rec is None:\n"
+                "            return False\n"
+                "        return True"),
+        "killer": ("test_auto_prompt_edge.PromptEdgeSuppression."
+                   "test_prompt_edge_reopens_on_positive_local_cloud_change"),
+    },
+    {
+        "name": "mutation_reopen_on_remote_occupancy",
+        "file": "tools/agent/navigation.py",
+        "old": ("    out = [terrain.ter(dst), terrain.occupant(dst)]\n"
+                "    if step[0] != 0 and step[1] != 0:"),
+        "new": ("    out = [terrain.ter(dst), terrain.occupant(dst),\n"
+                "           terrain.occupant((dst[0] + 1, dst[1]))]\n"
+                "    if step[0] != 0 and step[1] != 0:"),
+        "killer": ("test_auto_prompt_edge.PromptEdgeSuppression."
+                   "test_prompt_edge_ignores_time_visits_remote_occupancy_and_"
+                   "occlusion"),
+    },
+    {
+        "name": "mutation_filter_only_seed_edges",
+        "file": "tools/agent/navigation.py",
+        "old": ("            if not admit(pos, nb):\n"
+                "                continue\n"
+                "            nd = d + _edge_cost(terrain, nb, visits, "
+                "failed)"),
+        "new": ("            if not edge_legal(terrain, pos, nb):\n"
+                "                continue\n"
+                "            nd = d + _edge_cost(terrain, nb, visits, "
+                "failed)"),
+        "killer": ("test_auto_prompt_edge.EdgeAdmissiblePredicate."
+                   "test_forbidden_edge_filters_seed_and_interior"),
+    },
+    {
+        "name": "mutation_honor_yes_native_default_for_cloud",
+        "file": "tools/agent/policy.py",
+        "old": ("        if arbitration.is_movement_entry_confirmation("
+                "prompt):\n"
+                "            return {\"yn\": KEY.KEY_N}, \"decline cloud "
+                "entry\", \"prompt\", ()"),
+        "new": ("        if False and "
+                "arbitration.is_movement_entry_confirmation(prompt):\n"
+                "            return {\"yn\": KEY.KEY_N}, \"decline cloud "
+                "entry\", \"prompt\", ()"),
+        "killer": ("test_auto_prompt_edge.DeclineEvidence."
+                   "test_cloud_confirmation_declines_even_with_yes_native_"
+                   "default"),
+    },
+    {
+        "name": "mutation_keep_scoped_prompt_ledger_on_reset",
+        "file": "tools/agent/policy.py",
+        "old": ("        self.blocked_edges = {}\n"
+                "        self.prompt_declined_edges = {}\n"
+                "        self.clear_pending_prompt()"),
+        "new": ("        self.blocked_edges = {}\n"
+                "        self.clear_pending_prompt()"),
+        "killer": ("test_auto_prompt_edge.PromptEdgeSuppression."
+                   "test_prompt_ledger_overwrites_per_edge_and_clears_on_"
+                   "instance_reset"),
+    },
+    {
+        "name": "mutation_remove_unchanged_confirmed_hero_condition",
+        "file": "tools/agent/arbitration.py",
+        "old": ("    if hero is None or tuple(hero) != tuple(pending.src):\n"
+                "        return False\n"
+                "    return True"),
+        "new": "    return True",
+        "killer": ("test_auto_prompt_edge.DeclineEvidence."
+                   "test_prompt_decline_resolution_with_hero_progress_records_"
+                   "no_edge"),
+    },
 )
 
 #: The plan's remaining named mutations whose killer tests are not
