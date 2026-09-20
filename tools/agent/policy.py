@@ -220,6 +220,11 @@ class ScriptedReflex(object):
         # committed after it, so a stale locked message can never fail a newly
         # acquired door.  ``None`` means no door attempt was armed.
         self.door_attempt_baseline = None
+        # The scoped failed-edge ledger (plan §1/§4): keyed by
+        # ``(instance_id, src, dst)`` -> the edge's blocked signature.  A
+        # zero-time failure of a selected recovery move suppresses that edge
+        # under unchanged evidence; a change to the edge's signature reopens it.
+        self.blocked_edges = {}
 
     # -- provider surface ------------------------------------------------
     def _check_deadline(self) -> None:
@@ -397,6 +402,15 @@ class ScriptedReflex(object):
         if payload and payload[0] == "dest":
             self._commit_destination(payload, tick, mem, pre_hero=pre_hero,
                                      observed_kind=observed_kind)
+            self.intent = ""
+            return
+        if payload and payload[0] == "recovery":
+            # A selected *and reconciled* recovery move records its scoped edge
+            # outcome (plan §1/§4); nothing else is committed from it.
+            self._note_recovery_outcome(payload[1], observed_kind, mem,
+                                        pre_hero)
+            self.intent = ""
+            return
         self.intent = ""
         no_time = (observed_kind == "no-time")
         if effect == "quit":
@@ -608,6 +622,47 @@ class ScriptedReflex(object):
         self.pickup_generation = self.pickup_pending["generation"]
 
     @staticmethod
+    def _door_interaction_targets(pre_hero, hero, door_pos, dirdata) -> bool:
+        """True only when the pre-send action targets the door (§2A rule 6).
+
+        With a known selected pre-send direction (a policy-built continuation),
+        the action must step from an *approach* square (Chebyshev 1 of the door)
+        exactly onto the door cell; merely ending a move adjacent to the door is
+        not an interaction.  A payload carrying no direction -- a legacy/direct
+        unit caller -- keeps the legacy adjacency test so those callers are
+        unaffected.
+        """
+        dp = tuple(door_pos)
+        if not dirdata:
+            return hero is not None and recovery.chebyshev(hero, dp) <= 1
+        if pre_hero is None:
+            return False
+        ph = tuple(pre_hero)
+        if recovery.chebyshev(ph, dp) != 1:
+            return False
+        return (ph[0] + int(dirdata[0]), ph[1] + int(dirdata[1])) == dp
+
+    def _note_recovery_outcome(self, step, observed_kind, mem,
+                               pre_hero) -> None:
+        """Record one *selected and reconciled* recovery move's edge outcome.
+
+        A zero-time failure becomes scoped edge/action failure evidence keyed by
+        ``(instance, src, dst)`` so unchanged evidence cannot select that edge
+        forever (§1); a move that advanced clears it.  Only a recovery move that
+        was actually selected, sent and reconciled reaches here.
+        """
+        if not step or pre_hero is None:
+            return
+        src = tuple(pre_hero)
+        dst = (src[0] + int(step[0]), src[1] + int(step[1]))
+        key = (self.instance_id, src, dst)
+        if observed_kind in ("no-time", "stationary-time-advanced"):
+            self.blocked_edges[key] = navigation.blocked_edge_signature(
+                self._terrain(mem), src, dst)
+        else:
+            self.blocked_edges.pop(key, None)
+
+    @staticmethod
     def _hero_moved(pre_hero, mem, observed_kind) -> bool:
         """True when the reconciled hero advanced from the frozen pre-send
         square (stall-recovery plan §2A).
@@ -633,13 +688,19 @@ class ScriptedReflex(object):
         """
         if not payload or payload[0] != "dest":
             return
-        if len(payload) >= 11:
+        vals = tuple(payload[:11])
+        if len(vals) >= 11:
             (_tag, op, iid, purpose, x, y, family, source, generation,
-             expected, reason) = payload
+             expected, reason) = vals
         else:
             (_tag, op, iid, purpose, x, y, family, source, generation,
-             expected) = payload
+             expected) = vals
             reason = ""
+        # Additive selected pre-send direction (§2A rule 6): present on a
+        # continuation candidate built by the policy, empty for a legacy/direct
+        # caller.  It lets the door-interaction count require the action to
+        # actually target the door from an approach square.
+        dirdata = tuple(payload[11]) if len(payload) > 11 and payload[11] else ()
         pos = (int(x), int(y))
         hero = mem.hero
         if op == "acquire":
@@ -741,7 +802,7 @@ class ScriptedReflex(object):
                     and self.floor.budget_available(ev)):
                 self.floor.note_declined(ev)
         if cur.purpose == navigation.COMMIT_OPEN_DOOR:
-            if hero is not None and recovery.chebyshev(hero, pos) <= 1:
+            if self._door_interaction_targets(pre_hero, hero, cur.pos, dirdata):
                 self.targets.note_interact_attempt()
             if navigation.door_open(self._terrain(mem), pos):
                 self._note_serviced(mem, pos)
@@ -1149,7 +1210,7 @@ class ScriptedReflex(object):
         step, terminal, reason = navigation.route_held_destination(
             held, terrain, hero, plan.dist, plan.first)
         if step is not None:
-            payload = self._dest_payload("continue", held)
+            payload = self._dest_payload("continue", held, step=step)
             return self._cand({"key": KEY.DIR_KEYS[step]}, "navigate",
                               _NAV_FAMILY[held.family], 0, reason, "navigate",
                               direction=step,
@@ -1395,7 +1456,7 @@ class ScriptedReflex(object):
 
     @staticmethod
     def _dest_payload(op, held, target=None, purpose=None, source=None,
-                      generation=None, reason=None):
+                      generation=None, reason=None, step=None):
         """The frozen destination effect payload (plan 1.4).
         Binds the operation (``acquire``/``continue``/``arrive``), the level
         instance, the semantic destination coordinate and family, the source
@@ -1416,9 +1477,12 @@ class ScriptedReflex(object):
             source = source or navigation.SRC_DEFAULT
             generation = 0 if generation is None else int(generation)
             expected = -1
+        # The additive 12th field is the selected pre-send direction for a
+        # continuation (§2A rule 6); empty when the caller does not supply one.
         return ("dest", op, int(iid), purpose, int(pos[0]), int(pos[1]),
                 family, source, int(generation), int(expected),
-                str(reason or ""))
+                str(reason or ""),
+                tuple(step) if step else ())
 
     def _directive_bears_destination(self) -> bool:
         """True when the active advice names or selects a destination (1.5)."""
@@ -1600,7 +1664,8 @@ class ScriptedReflex(object):
             return (self._cand(
                 {"key": KEY.DIR_KEYS[step]}, "recovery-step", "recovery", 0,
                 why, "recovery",
-                direction=step, direction_rank=navigation.DIR_RANK[step]),)
+                direction=step, direction_rank=navigation.DIR_RANK[step],
+                effect_payload=("recovery", tuple(step))),)
         # No legal movement exists: a *bounded* ordinary search first (its own
         # per-site budget still caps it), and only once that is refused or
         # exhausted does the bounded search-fallback / forced-search / trapped
@@ -1627,6 +1692,14 @@ class ScriptedReflex(object):
             if not navigation.edge_legal(terrain, hero, dest):
                 continue
             if state.monster_cell(mem.tile(dest), hero, dest):
+                continue
+            # Skip an edge whose scoped failure still holds under the *same*
+            # blocked-edge signature (plan §1/§4): unchanged evidence cannot
+            # select a zero-time-failed recovery edge forever, while a change
+            # to that edge's legality/occupancy signature reopens it.
+            key = (self.instance_id, tuple(hero), dest)
+            sig = navigation.blocked_edge_signature(terrain, hero, dest)
+            if self.blocked_edges.get(key) == sig:
                 continue
             reversing = self._is_reverse(step, hero, previous)
             options.append((0 if not reversing else 1,
@@ -1959,6 +2032,8 @@ class ScriptedReflex(object):
         self.instance_id = int(iid or 0)
         self.recovery = recovery.RecoveryState()
         self.food = recovery.FoodNegatives()
+        # A fresh level-instance scope clears the scoped failed-edge ledger.
+        self.blocked_edges = {}
         # A fresh level-instance scope clears the commitment and the scoped
         # serviced/failed ledgers (plan 1.5 "Level instance change").
         self.targets.reset()
