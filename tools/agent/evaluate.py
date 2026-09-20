@@ -519,6 +519,12 @@ class ReplayPass(object):
         # ordinals stay aligned with the recording instead of collapsing a
         # rejected attempt into its predecessor.
         self._sent_ordinal = 0
+        # The exact candidate the final selection resolved to (stall-recovery
+        # plan §2), mirroring the live controller's selected-decision record:
+        # populated equally by scripted selection and an accepted non-scripted
+        # (Jev) choice, and cleared by a substitution.  The frozen effect is
+        # taken from here, never re-derived from the wire action.
+        self._selected_candidate = None
 
     # -- provider construction ------------------------------------------
     def _build_reflex(self, name):
@@ -785,9 +791,13 @@ class ReplayPass(object):
         if self._pending_effect is None:
             return
         effect, label, payload = self._pending_effect
+        # The frozen pre-send hero square of the modeled attempt is the
+        # acquisition/continuation baseline (stall-recovery plan §2A), exactly
+        # as the live controller passes it.
+        pre_hero = (self._sent_before or {}).get("hero")
         self.reflex.commit_effect(effect, label, self.tick, self.mem,
                                   observed_kind=self._last_observed_kind,
-                                  payload=payload)
+                                  payload=payload, pre_hero=pre_hero)
         self._pending_effect = None
 
     def _on_invalid(self, rec) -> None:
@@ -1123,6 +1133,9 @@ class ReplayPass(object):
         if need is None or need.decided:
             return
         need.decided = True
+        # The selected-decision record is rebuilt for this decision only (plan
+        # §2): a stale candidate can never arm this effect.
+        self._selected_candidate = None
         rows = []
         for k in range(need.declared_pages):
             rows.extend(need.delivered_pages.get(k, []))
@@ -1155,6 +1168,8 @@ class ReplayPass(object):
             selected = safe_fallback(need.need)
             fallback = True
             reason = "%s (%s)" % (reason, err) if err else reason
+            # a substitution is not the selected candidate (plan §2)
+            self._selected_candidate = None
         else:
             selected = proposal
 
@@ -1191,7 +1206,9 @@ class ReplayPass(object):
         self._sent_stair = False
         self._sent_before = None
         kind = need.need.get("kind")
-        cand = getattr(self.reflex, "last_candidate", None)
+        # The exact selected candidate -- scripted or accepted Jev alike --
+        # owns the frozen effect; the wire action only proves agreement (§2).
+        cand = self._selected_candidate
         matched = (cand is not None
                    and candidates.candidate_to_wire(cand) == selected)
         # Every need's answer is one act, so it takes the next sent ordinal --
@@ -1266,8 +1283,13 @@ class ReplayPass(object):
             res = self.provider.decide(ctx, 0.0)
             if res is None:
                 self.ledger.reflex_fallback += 1
+                self._selected_candidate = None
                 return None, "controller", "reflex returned no result", True
             self.ledger.reflex_successful += 1
+            # The scripted decision populates the selected-decision record
+            # exactly as an accepted Jev choice does (plan §2).
+            self._selected_candidate = getattr(self.reflex, "last_candidate",
+                                               None)
             return res.action, res.provider or "scripted", res.reason, False
         # jev (or any other paid reflex)
         scripted = self.reflex.fallback(ctx)
@@ -1275,10 +1297,12 @@ class ReplayPass(object):
         avail = self.provider.available(self.config)
         if not avail.enabled:
             self.ledger.reflex_fallback += 1
+            self._selected_candidate = self._scripted_candidate_for(fb_action)
             return (fb_action, "scripted",
                     "jev unavailable: %s" % avail.reason, True)
         if not self.allow_network:
             self.ledger.reflex_fallback += 1
+            self._selected_candidate = self._scripted_candidate_for(fb_action)
             return (fb_action, "scripted",
                     "jev not evaluated offline", True)
         res = self.provider.decide(
@@ -1288,9 +1312,26 @@ class ReplayPass(object):
         if res is None or res.action is None:
             self.ledger.reflex_fallback += 1
             why = (res.reason if res is not None else None) or "no answer"
+            self._selected_candidate = self._scripted_candidate_for(fb_action)
             return (fb_action, "scripted", "jev fallback: %s" % why, True)
         self.ledger.reflex_successful += 1
+        # The accepted member owns the frozen effect (plan §2): use the
+        # provider-exposed candidate when it has one, else the reflex's
+        # retained candidate only when its wire action is exactly the sent one.
+        self._selected_candidate = (
+            getattr(res, "candidate", None)
+            or self._scripted_candidate_for(res.action))
         return res.action, res.provider or "jev", res.reason, False
+
+    def _scripted_candidate_for(self, action):
+        """The reflex's retained candidate when its wire action matches."""
+        cand = getattr(self.reflex, "last_candidate", None)
+        try:
+            if cand is not None and candidates.candidate_to_wire(cand) == action:
+                return cand
+        except Exception:                    # noqa: BLE001 - defensive
+            return None
+        return None
 
     def _precondition_state(self) -> PreconditionState:
         st = self.mem.status

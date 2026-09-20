@@ -730,6 +730,88 @@ class CommittedBehaviour(unittest.TestCase):
         self.assertEqual(self.ref.directive_settlement[0], "failed")
 
 
+class AttemptCounting(unittest.TestCase):
+    """§2A: matched gameplay attempts advance the stationary stage exactly."""
+
+    def setUp(self):
+        self.ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+
+    def _cells(self):
+        return {(x, 10): FLOOR for x in range(1, 8)}
+
+    def _acquire(self, mem, kind="moved", pre_hero=(1, 10)):
+        cand = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.ref.commit_effect(cand.proposed_effect, cand.semantic_label, 1,
+                               mem, observed_kind=kind,
+                               payload=cand.effect_payload, pre_hero=pre_hero)
+        return cand
+
+    def test_first_no_time_acquisition_is_attempt_one_of_three(self):
+        mem = nav_test.mem_with(self._cells(), (1, 10))
+        self._acquire(mem, kind="no-time", pre_hero=(1, 10))
+        self.assertIsNotNone(self.ref.targets.held())
+        # a no-time acquisition is no-progress attempt 1 of 3, seeded from the
+        # hero baseline -- never from the target position
+        self.assertEqual(self.ref.targets.stall_attempts, 1)
+        self.assertEqual(self.ref.targets.progress_pos, (1, 10))
+
+    def test_acquisition_no_time_is_not_progress(self):
+        mem = nav_test.mem_with(self._cells(), (1, 10))
+        cand = self._acquire(mem, kind="no-time", pre_hero=(1, 10))
+        held = self.ref.targets.held()
+        # the target was installed but not serviced or reached
+        self.assertFalse(self.ref.targets.serviced(held.pos))
+        self.assertEqual(self.ref.targets.stall_attempts, 1)
+
+    def test_moved_acquisition_starts_progress_from_reconciled_hero(self):
+        cells = self._cells()
+        mem = nav_test.mem_with(cells, (2, 10))
+        # a moved acquisition: the reconciled hero advanced from the pre-send
+        # square, so stall progress restarts from it and no attempt is charged
+        mem.hero = (2, 10)
+        pre = (1, 10)
+        cand = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.ref.commit_effect(cand.proposed_effect, cand.semantic_label, 1,
+                               mem, observed_kind="moved",
+                               payload=cand.effect_payload, pre_hero=pre)
+        self.assertEqual(self.ref.targets.stall_attempts, 0)
+        self.assertEqual(self.ref.targets.progress_pos, (2, 10))
+
+    def test_cap_exhausted_held_destination_retires_at_three_zero_time_attempts(
+            self):
+        mem = nav_test.mem_with(self._cells(), (1, 10))
+        # a moved acquisition: pre-send (1,10) -> reconciled (2,10)
+        mem.hero = (2, 10)
+        cand = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.ref.commit_effect(cand.proposed_effect, cand.semantic_label, 1,
+                               mem, observed_kind="moved",
+                               payload=cand.effect_payload, pre_hero=(1, 10))
+        self.assertEqual(self.ref.targets.stall_attempts, 0)
+        retired_after = None
+        for i in range(1, 5):
+            if self.ref.targets.held() is None:
+                break
+            payload = policy.ScriptedReflex._dest_payload(
+                "continue", self.ref.targets.held())
+            self.ref.commit_effect("navigate", "navigate", 2, mem,
+                                   observed_kind="no-time", payload=payload,
+                                   pre_hero=(2, 10))
+            if self.ref.targets.held() is None:
+                retired_after = i
+        self.assertEqual(retired_after, 3,
+                         "three reconciled zero-time continuations must retire")
+
+    def test_prompt_observations_do_not_advance_stationary_stage(self):
+        mem = nav_test.mem_with(self._cells(), (1, 10))
+        self._acquire(mem, kind="moved", pre_hero=(1, 10))
+        before = self.ref.targets.stall_attempts
+        # a prompt/menu decision carries no destination payload and spends no
+        # destination counter
+        self.ref.commit_effect("prompt", "prompt", 2, mem,
+                               observed_kind="no-time", payload=())
+        self.assertEqual(self.ref.targets.stall_attempts, before)
+
+
 class DefaultTerminalAccounting(unittest.TestCase):
     """AC2: every acquired destination has exactly one visible terminal.
 

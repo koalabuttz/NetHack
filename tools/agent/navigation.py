@@ -489,6 +489,7 @@ class CommitmentStore(object):
                approach: Optional[Tuple[int, int]] = None,
                expected_serial: Optional[int] = None,
                hops: Optional[int] = None,
+               hero: Optional[Tuple[int, int]] = None,
                phase: str = PHASE_TRAVELLING) -> bool:
         """Install a new commitment (compare-and-apply).
 
@@ -496,6 +497,11 @@ class CommitmentStore(object):
         is given and the active serial has changed since the proposal was
         frozen, the effect is stale and is dropped.  ``None`` means "fresh
         acquisition" and always installs.
+
+        ``hero`` is the reconciled hero square of the acquisition's own
+        observation; route progress is seeded from it -- never from the
+        destination position -- so the first genuinely no-progress
+        continuation is counted rather than masked (stall-recovery plan §2A).
         """
         if expected_serial is not None:
             cur = self.current
@@ -512,7 +518,10 @@ class CommitmentStore(object):
         self.stall_attempts = 0
         self.interact_attempts = 0
         self.total_attempts = 0
-        self.progress_pos = tuple(pos)
+        # Seed route progress from the hero baseline, never the destination
+        # position: seeding at the target made the first no-progress
+        # continuation look like progress (plan §2A off-by-one).
+        self.progress_pos = (tuple(hero) if hero is not None else tuple(pos))
         self.last_progress_tick = int(tick)
         if hops is not None:
             self.set_stall_cap(hops)

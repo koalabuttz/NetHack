@@ -358,7 +358,7 @@ class ScriptedReflex(object):
                            "pickup-menu-cancel", "pickup-refuse")
 
     def commit_effect(self, effect, semantic_label, tick, mem,
-                      observed_kind="", payload=()) -> None:
+                      observed_kind="", payload=(), pre_hero=None) -> None:
         """Commit one *selected, sent and reconciled* effect (plan 3.1).
 
         This is the single mutation point for reflex-local gameplay/recovery
@@ -390,7 +390,8 @@ class ScriptedReflex(object):
             self._commit_pickup(payload, tick, mem)
             return
         if payload and payload[0] == "dest":
-            self._commit_destination(payload, tick, mem)
+            self._commit_destination(payload, tick, mem, pre_hero=pre_hero,
+                                     observed_kind=observed_kind)
         self.intent = ""
         no_time = (observed_kind == "no-time")
         if effect == "quit":
@@ -601,7 +602,21 @@ class ScriptedReflex(object):
                                       else tuple(init_sig))
         self.pickup_generation = self.pickup_pending["generation"]
 
-    def _commit_destination(self, payload, tick, mem) -> None:
+    @staticmethod
+    def _hero_moved(pre_hero, mem, observed_kind) -> bool:
+        """True when the reconciled hero advanced from the frozen pre-send
+        square (stall-recovery plan §2A).
+
+        Prefers the exact frozen-vs-reconciled comparison; a direct caller
+        without a pre-send baseline falls back to the reconciled outcome kind,
+        so a ``moved`` acquisition stays a moved acquisition.
+        """
+        if pre_hero is not None and mem.hero is not None:
+            return tuple(mem.hero) != tuple(pre_hero)
+        return observed_kind == "moved"
+
+    def _commit_destination(self, payload, tick, mem, pre_hero=None,
+                            observed_kind="") -> None:
         """Apply one frozen destination effect (compare-and-apply, plan 1.4).
 
         Reached only through :meth:`commit_effect`, i.e. only after a complete
@@ -655,7 +670,13 @@ class ScriptedReflex(object):
             self.targets.commit(instance_id=iid or self.instance_id,
                                 purpose=purpose, pos=pos, family=family,
                                 source=source, generation=int(generation),
-                                tick=tick)
+                                tick=tick, hero=mem.hero)
+            # §2A: a no-time acquisition (the hero did not move from the
+            # frozen pre-send square) installs the target and counts as
+            # no-progress attempt 1 of 3; a moved acquisition charges only the
+            # route cap and starts stall progress from the reconciled hero.
+            if not self._hero_moved(pre_hero, mem, observed_kind):
+                self.targets.note_nav_attempt()
             serial = self.targets.held().serial
             self.lifecycle.record(
                 lifecycle_metrics.KIND_DESTINATION,

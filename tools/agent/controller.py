@@ -702,6 +702,16 @@ class _EpisodeRunner(object):
         self.reconciliations = 0
         self._last_candidate = None
         self._last_table_id = ""
+        # The controller-owned selected-decision record (stall-recovery plan
+        # §2).  The *exact* candidate the final selection resolved to -- the
+        # prepared table/need identity, the action actually sent and the
+        # applied token when the send was an accepted, unoverridden Jev choice.
+        # Scripted selection and an accepted Jev selection populate it equally;
+        # a final substitution or forced override replaces/clears it, so the
+        # frozen attempt effect can never be silently taken from the scripted
+        # winner's wire action (the accepted-Jev effect-ownership defect).
+        self.selected_decision = None
+        self._selected_candidate = None
         # Wave-5 controller-owned dangerous two-send transaction (plan 5.4).
         # The episode activation budget persists across instances; the single
         # live transaction spans the prefix need and the exact following
@@ -1393,7 +1403,8 @@ class _EpisodeRunner(object):
             self.reflex.commit_effect(
                 self._attempt_effect, self._attempt_label, self.tick,
                 self.mem, observed_kind=self._attempt_kind,
-                payload=self._attempt_payload)
+                payload=self._attempt_payload,
+                pre_hero=getattr(self, "_attempt_pre_hero", None))
             self._settle_directive_destination()
         self._attempt_effect = None
         self._attempt_label = ""
@@ -1458,6 +1469,10 @@ class _EpisodeRunner(object):
         at_cells = tuple(staged.hero_cells)
         attempt = self.attempt
         before = self.attempt_before or {}
+        # The frozen pre-send hero square of this attempt (stall-recovery plan
+        # §2A): the acquisition/continuation baseline the reconciled effect is
+        # compared against.  Captured before ``attempt_before`` is cleared.
+        self._attempt_pre_hero = before.get("hero")
         kind = None
         ordinal = None
         if attempt is not None:
@@ -1618,6 +1633,28 @@ class _EpisodeRunner(object):
         delta = (nt - bt) if (bt is not None and nt is not None) else None
         return arbitration.classify_outcome(same, resolved, delta)
 
+    def _selected_wire_candidate(self, selected):
+        """The exact selected candidate whose wire action is *selected* (§2).
+
+        The authoritative source is the controller-owned selected-decision
+        record populated by :meth:`_decide_scripted`/:meth:`_decide_jev`; the
+        reflex's retained ``last_candidate`` is only a fallback for a direct
+        caller that never went through the record.  A local substitution or a
+        forced override clears the record, so a discarded proposal can never
+        arm its own effect.  When no matching candidate exists the caller
+        synthesizes a deterministic effect-less ``sent`` candidate.
+        """
+        record = getattr(self, "selected_decision", None)
+        cand = record.get("candidate") if record else None
+        if cand is None:
+            cand = getattr(self.reflex, "last_candidate", None)
+        try:
+            matches = (cand is not None
+                       and candidates.candidate_to_wire(cand) == selected)
+        except Exception:                    # noqa: BLE001 - defensive
+            matches = False
+        return cand if matches else None
+
     def _arm_attempt(self, ordinal, selected):
         """Create the single frozen SentAttempt for a successful send.
 
@@ -1630,15 +1667,13 @@ class _EpisodeRunner(object):
         before = {"hero": self.mem.hero, "time": self.mem.status.time,
                   "dlvl": self.mem.status.dlvl}
         prepared = getattr(self.reflex, "last_prepared", None)
-        self._last_table_id = \
-            prepared.table_id if prepared is not None else ""
-        cand = getattr(self.reflex, "last_candidate", None)
-        try:
-            matches = (cand is not None
-                       and candidates.candidate_to_wire(cand) == selected)
-        except Exception:                    # noqa: BLE001 - defensive
-            matches = False
-        if not matches:
+        record = getattr(self, "selected_decision", None) or {}
+        table_id = record.get("table_id")
+        self._last_table_id = (table_id if table_id else
+                               (prepared.table_id
+                                if prepared is not None else ""))
+        cand = self._selected_wire_candidate(selected)
+        if cand is None:
             cand = candidates.make_candidate(selected, "sent")
         # Freeze the candidate's proposed effect on the attempt; it is
         # committed only after the reconciled observation (plan 3.1).
@@ -1667,13 +1702,8 @@ class _EpisodeRunner(object):
         is applied by :meth:`ScriptedReflex.commit_effect` at the next
         reconciled observation (plan 3.1).
         """
-        cand = getattr(self.reflex, "last_candidate", None)
-        try:
-            matches = (cand is not None
-                       and candidates.candidate_to_wire(cand) == selected)
-        except Exception:                    # noqa: BLE001 - defensive
-            matches = False
-        if not matches or not getattr(cand, "proposed_effect", ""):
+        cand = self._selected_wire_candidate(selected)
+        if cand is None or not getattr(cand, "proposed_effect", ""):
             return
         self._attempt_effect = cand.proposed_effect
         self._attempt_label = cand.semantic_label
@@ -2768,6 +2798,36 @@ class _EpisodeRunner(object):
                 self._resolve_selection(need, proposal, provider, reason, low)
         else:
             role = ""
+            # A delivery repair resends the frozen validated action of the
+            # *original* decision: it retains that decision's logical selection
+            # (its accepted candidate), so the effect and idempotence identity
+            # are preserved rather than re-derived from the wire (plan §2).
+            if provider == "jev":
+                self._selected_candidate = (self._last_jev_send or {}).get(
+                    "candidate")
+        # Freeze the exact selected candidate for this send (plan §2).  The
+        # action actually sent and the tracked candidate must agree, or the
+        # record is cleared -- a substitution or forced override already
+        # cleared ``_selected_candidate``, so a discarded proposal never arms
+        # its own effect.
+        chosen = self._selected_candidate
+        try:
+            chosen_matches = (chosen is not None
+                              and candidates.candidate_to_wire(chosen)
+                              == selected)
+        except Exception:                    # noqa: BLE001 - defensive
+            chosen_matches = False
+        prepared_now = getattr(self.reflex, "last_prepared", None)
+        table_now = getattr(prepared_now, "table", None)
+        self.selected_decision = None if not chosen_matches else {
+            "candidate": chosen,
+            "table_id": getattr(prepared_now, "table_id", ""),
+            "table_version": getattr(table_now, "table_version", None),
+            "need_id": need.get("id"), "need_key": self.pending_key,
+            "action": dict(selected) if isinstance(selected, dict)
+            else selected,
+            "applied_token": applied_token,
+        }
         self._note_low_conf(low)
         view = self.book.view(self.tick, self.mem.status.dlvl,
                               self._precondition_state(),
@@ -2831,6 +2891,9 @@ class _EpisodeRunner(object):
             self.ledger.note_reflex_applied(applied_token)
             self._last_jev_send = {
                 "action": selected, "token": applied_token,
+                # The original decision's accepted candidate, so a delivery
+                # repair retains the same logical selection (plan §2).
+                "candidate": chosen,
                 "need_id": need.get("id"), "need_key": self.pending_key,
                 "ordinal": ordinal,
                 "table_id": getattr(prepared, "table_id", ""),
@@ -2866,12 +2929,16 @@ class _EpisodeRunner(object):
             sel_reason = ("no proposal (%s): safe fallback"
                           % (reason or "none"))
             low = True
+            # A structural fallback is not the selected candidate: clear the
+            # record so the discarded proposal can never arm its own effect.
+            self._selected_candidate = None
         else:
             err = protocol.validate_action(need, proposal)
             if err:
                 selected = self._safe_fallback(need)
                 sel_reason = "validation fallback: %s" % err
                 low = True
+                self._selected_candidate = None
             else:
                 selected = proposal
                 sel_reason = reason
@@ -2897,6 +2964,9 @@ class _EpisodeRunner(object):
             low = (role == "trap")
             # a forced override is controller-owned, not an applied Jev choice
             applied_token = None
+            # The override replaces the selection: the discarded proposal's
+            # candidate must not remain the record's selected candidate.
+            self._selected_candidate = None
         return selected, sel_reason, role, provider, low, applied_token
 
     def _decide(self, need, need_deadline=None):
@@ -2918,6 +2988,10 @@ class _EpisodeRunner(object):
         self._applied_token = None
         self._applied_table_id = ""
         self._applied_table_version = None
+        # The selected-decision record is rebuilt for this decision only: a
+        # stale candidate from a previous decision can never arm this effect.
+        self._selected_candidate = None
+        self.selected_decision = None
         if self.force_fallback:
             self.ledger.reflex_fallback += 1
             return (self._safe_fallback(need), "controller",
@@ -3015,6 +3089,9 @@ class _EpisodeRunner(object):
             return (None, "controller", "reflex returned no result",
                     latency, {}, True)
         self.ledger.reflex_successful += 1
+        # The scripted decision populates the selected-decision record exactly
+        # as an accepted Jev choice does (plan §2).
+        self._selected_candidate = getattr(self.reflex, "last_candidate", None)
         return (res.action, res.provider or "scripted", res.reason, latency,
                 res.usage, False)
 
@@ -3034,6 +3111,11 @@ class _EpisodeRunner(object):
         ctx.prepared = prepared
         scripted = self.reflex.decide(ctx)
         fallback_action = scripted.action if scripted is not None else None
+        # Every paid-tier fallback (unavailable, capped, skipped, rejected,
+        # timed out, no answer) selects the *scripted* candidate, so the
+        # selected-decision record starts there and is replaced with the
+        # accepted member on the acceptance path below.
+        self._selected_candidate = getattr(self.reflex, "last_candidate", None)
         if not self.rec_healthy:
             # A recorder that has already failed this episode disables all
             # paid dispatch (Wave-1 graceful-stop policy).  Checked *before*
@@ -3131,6 +3213,9 @@ class _EpisodeRunner(object):
         # prepared identity is authoritative for the whole repair lifecycle.
         self._applied_table_id = prepared.table.table_id
         self._applied_table_version = prepared.table.table_version
+        # The accepted member -- not the scripted winner -- owns the frozen
+        # effect from here (plan §2): its exact candidate is the selected one.
+        self._selected_candidate = outcome.candidate
         accepted_reason = ("jev choice: %s" % outcome.reason
                            if outcome.reason else "jev choice")
         return (candidates.candidate_to_wire(outcome.candidate), "jev",
