@@ -64,6 +64,41 @@ Scheduling metadata (`arm`, `pair`, `order`, `config_hash`) lives in the
 the immutable `/2` scorecard object, whose hash therefore recomputes from the
 exact persisted bytes.
 
+**Each child runs the SCHEDULED arm config.** The parent writes an immutable
+per-episode `bench-arm-config.json` (the fully resolved `ProviderConfig` values
+plus their fingerprint) *before* the spawn and passes `--arm-config` to the
+`_child` entry point. The child rebuilds the config through the same
+`ProviderConfig.validate` authority, verifies the recomputed fingerprint equals
+the recorded one (a swapped, edited or missing arm config is refused with a
+nonzero exit **before any controller is constructed**), and reports its config
+hash in `bench-child.json`. The parent cross-checks that hash against the
+committed `expected_config_hashes[arm]`; any mismatch makes the whole run
+**not-comparable** (`child-config-hash-mismatch`) before apply. Requested-tier
+metadata is derived per arm, and an A/B run whose baseline and candidate
+fingerprints are equal is refused at preflight (`stage: "ab-design"`) because
+the labels would lie.
+
+### Handshake, stop and teardown
+
+* The parent writes the **root-ready token** only after the captured root
+  identity (PID/start-time/session/PGID) is durably recorded; the child blocks
+  on that token and **exits nonzero if it is absent** — no episode work starts
+  without a validated ready token.
+* A **capture failure or a ready-token write failure is fatal**: no token is
+  written, the child is reaped without being authorized to run, the episode is
+  recorded as a `spawn-failure` teardown failure, and the run's final status is
+  never relabelled as a clean completion.
+* The child's SIGINT/SIGTERM handler writes the durable cancellation
+  acknowledgment and then **raises a bench-owned `BenchCancelled` in the main
+  thread**, so the controller's own `finally` teardown runs: the current episode
+  is *aborted with controller-owned reaping* (the launcher session is torn down
+  by the controller), not completed. Graceful means exactly that; the parent
+  escalates only after its bounded grace window.
+* The owned `/proc` walk enumerates children **strictly**: an unreadable stat
+  entry inside the owned walk is fatal, so an unreadable owned descendant can
+  never be silently omitted from the walk (unrelated-process enumeration may
+  still skip).
+
 ## Spec schema (`bench-spec/1`)
 
 Exact top-level fields: `schema_version`, `name`, `tier`
@@ -102,6 +137,13 @@ duration) is checked against every cap by `tuning_preflight()` and by the `tune`
 command, which refuses the plan **before any child or worker is spawned** and
 writes no tuning report. `max_total_wall_s = 0` is the one exception: it is the
 documented "unset" sentinel for a duration cap.
+
+Allocation planning (including the complete tuning plan's strategy demand) is
+computed from the **validated** `ProviderConfig` — the same authority normal
+preflight uses — so a **file-backed** `provider_config_ref` contributes its real
+`strategy_call_cap` demand instead of being silently treated as "strategy off".
+An unresolvable config **fails closed** (`strategy-config-unresolvable`) rather
+than under-budgeting.
 
 The spec stores credential *references* only (`***_key_file` paths); the bench
 never copies a referenced secret into output.
