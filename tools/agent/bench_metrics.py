@@ -1575,41 +1575,137 @@ def select_evidence(cards: Sequence[dict], *, limit: int =
     return ranked[: max(0, int(limit))]
 
 
+def directory_manifest(path: str, max_files: int = 4096
+                       ) -> Dict[str, str]:
+    """A deterministic ``relative path -> sha256`` manifest of a directory."""
+    entries: Dict[str, str] = {}
+    if os.path.isdir(path):
+        for root, dirs, files in os.walk(path):
+            dirs.sort()
+            for name in sorted(files):
+                full = os.path.join(root, name)
+                digest = sha256_file(full)
+                if digest is not None:
+                    entries[os.path.relpath(full, path)] = digest
+                if len(entries) >= max_files:
+                    return entries
+    elif os.path.isfile(path):
+        digest = sha256_file(path)
+        if digest is not None:
+            entries[os.path.basename(path)] = digest
+    return entries
+
+
+def directory_manifest_hash(path: str) -> Optional[str]:
+    """A deterministic hash of a directory's file manifest (or ``None``)."""
+    manifest = directory_manifest(path)
+    return sha256_json(manifest) if manifest else None
+
+
+def _bounded_json(value: Any, max_bytes: int) -> Tuple[Any, bool, int]:
+    """A bounded rendering of *value*: the value, or a bounded summary.
+
+    Returns ``(value, truncated, original_bytes)``.  Deterministic: the summary
+    records the type and size, never a random sample.
+    """
+    encoded = json.dumps(value, sort_keys=True, default=str).encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value, False, len(encoded)
+    summary = {
+        "summarized": True,
+        "original_bytes": len(encoded),
+        "kind": type(value).__name__,
+    }
+    if isinstance(value, (list, tuple)):
+        summary["length"] = len(value)
+        head = list(value)[:3]
+        if len(json.dumps(head, sort_keys=True, default=str).encode("utf-8")) \
+                <= max_bytes:
+            summary["head"] = head
+    elif isinstance(value, dict):
+        summary["keys"] = sorted(value)[:24]
+    else:
+        summary["preview"] = str(value)[:256]
+    return summary, True, len(encoded)
+
+
 def _apply_package_budget(package: dict, *, max_bytes: int,
                           max_excerpts: int) -> Dict[str, Any]:
-    """Enforce the overall package byte/count budget with explicit omissions."""
+    """Enforce the overall package byte/count budget with explicit omissions.
+
+    Every **variable-size** section is eligible for deterministic omission or
+    summarization -- excerpts, comparison, mutation report, provenance, config
+    diff, evidence lists, judge answers, scorecards and the task/spec text --
+    so the serialized package is always at or below the cap.  If even the
+    minimal manifest cannot fit, ``within_budget`` is ``False`` and the caller
+    writes a bounded failure record instead.
+    """
     omitted: List[Dict[str, Any]] = []
-    excerpts = package.get("excerpts") or {}
-    # cap the excerpt count deterministically (sorted names)
-    names = sorted(excerpts)
-    for name in names[max_excerpts:]:
-        omitted.append({"kind": "excerpt", "name": name,
-                        "reason": "excerpt-count-budget"})
-        excerpts.pop(name, None)
-    # trim the largest excerpts until the serialized package fits
-    def size():
-        return len(json.dumps(package, sort_keys=True).encode("utf-8"))
-    guard = 0
-    while size() > max_bytes and excerpts and guard < 1000:
-        guard += 1
-        biggest = max(sorted(excerpts), key=lambda n: len(
-            json.dumps(excerpts[n]).encode("utf-8")))
+
+    def size() -> int:
+        return len(json.dumps(package, sort_keys=True,
+                              default=str).encode("utf-8"))
+
+    def drop_excerpts() -> None:
+        excerpts = package.get("excerpts") or {}
+        for name in sorted(excerpts)[max_excerpts:]:
+            omitted.append({"kind": "excerpt", "name": name,
+                            "reason": "excerpt-count-budget"})
+            excerpts.pop(name, None)
+
+    def drop_biggest_excerpt() -> bool:
+        excerpts = package.get("excerpts") or {}
+        if not excerpts:
+            return False
+        biggest = max(sorted(excerpts),
+                      key=lambda n: len(json.dumps(excerpts[n]).encode()))
         dropped = excerpts.pop(biggest)
         omitted.append({"kind": "excerpt", "name": biggest,
                         "reason": "package-byte-budget",
                         "omitted_total": dropped.get("omitted_total")})
-    # if still over, drop advisory judge answers and then scorecards
-    if size() > max_bytes:
-        ja = package.get("judge_answers") or {}
-        if ja.get("answers"):
-            kept = len(ja["answers"])
-            ja["answers"] = []
-            omitted.append({"kind": "judge_answers", "omitted_count": kept,
-                            "reason": "package-byte-budget"})
-    if size() > max_bytes and package.get("scorecards"):
-        kept = len(package["scorecards"])
-        package["scorecards"] = []
-        omitted.append({"kind": "scorecards", "omitted_count": kept,
+        return True
+
+    # 1. the excerpt count cap (deterministic order)
+    drop_excerpts()
+    # 2. shrink excerpts until they fit
+    guard = 0
+    while size() > max_bytes and drop_biggest_excerpt() and guard < 1000:
+        guard += 1
+    # 3. summarize the remaining variable-size sections, largest first
+    ladder = (
+        ("comparison_slice", 2048),
+        ("mutation_report", 2048),
+        ("provenance", 2048),
+        ("config_diff", 1024),
+        ("scorecards", 4096),
+        ("judge_answers", 2048),
+        ("evidence_selection", 1024),
+    )
+    for key, cap in ladder:
+        if size() <= max_bytes:
+            break
+        if key in package and package[key] not in (None, {}, []):
+            bounded, truncated, original = _bounded_json(package[key], cap)
+            package[key] = bounded
+            if truncated:
+                omitted.append({"kind": key, "reason": "package-byte-budget",
+                                "original_bytes": original})
+    # 4. the task text and spec ref are last (still bounded, still framed)
+    for key, cap in (("task", 2048), ("spec_ref", 256)):
+        if size() <= max_bytes:
+            break
+        if package.get(key):
+            bounded, truncated, original = _bounded_json(package[key], cap)
+            package[key] = bounded
+            if truncated:
+                omitted.append({"kind": key, "reason": "package-byte-budget",
+                                "original_bytes": original})
+    # 5. availability reasons for omitted sources are kept, but the raw
+    #    artifact-path map may be summarized too.
+    if size() > max_bytes and package.get("artifact_paths"):
+        kept = len(package["artifact_paths"])
+        package["artifact_paths"] = {"__summarized__": True, "count": kept}
+        omitted.append({"kind": "artifact_paths", "omitted_count": kept,
                         "reason": "package-byte-budget"})
     package["omitted"] = omitted
     package["budget"] = {"max_bytes": max_bytes,
@@ -1617,6 +1713,24 @@ def _apply_package_budget(package: dict, *, max_bytes: int,
                          "final_bytes": size(),
                          "within_budget": size() <= max_bytes}
     return package
+
+
+def package_failure_record(*, failure_kind: str, max_bytes: int,
+                           attempted_bytes: int,
+                           failed_gates: Sequence[str] = (),
+                           spec_ref: Optional[str] = None) -> Dict[str, Any]:
+    """The bounded record written when even a minimal package cannot fit."""
+    return {
+        "schema_version": POSTMORTEM_SCHEMA,
+        "failure_kind": failure_kind,
+        "failed_gates": list(failed_gates),
+        "spec_ref": spec_ref,
+        "package_error": "budget-too-small",
+        "budget": {"max_bytes": max_bytes, "attempted_bytes": attempted_bytes,
+                   "within_budget": False},
+        "omitted": [{"kind": "all-sections",
+                     "reason": "minimal-manifest-exceeds-budget"}],
+    }
 
 
 def build_agent_task(*, failure_kind: str, gates: Sequence[str],
@@ -1682,17 +1796,28 @@ def build_postmortem_package(*, out_dir: Optional[str] = None,
             path, around_line=anchors.get(name), max_lines=max_lines,
             max_bytes=max_bytes, max_input_bytes=max_input_bytes)
     # checksums are computed directly from every referenced source, never
-    # trusted from the caller.
+    # trusted from the caller.  A **directory** reference gets a deterministic
+    # directory-manifest hash (there is no single file to hash).
     computed: Dict[str, str] = {}
+    source_kinds: Dict[str, str] = {}
     for label, path in sorted(dict(artifact_paths or {}).items()):
-        if isinstance(path, str) and os.path.isfile(path):
+        if not isinstance(path, str):
+            continue
+        if os.path.isfile(path):
             digest = sha256_file(path)
             if digest:
                 computed[label] = digest
+                source_kinds[label] = "file"
+        elif os.path.isdir(path):
+            digest = directory_manifest_hash(path)
+            if digest:
+                computed[label] = digest
+                source_kinds[label] = "directory-manifest"
     for label, path in sorted(excerpt_paths.items()):
         digest = excerpts[label].get("checksum")
         if digest:
             computed["excerpt:" + label] = digest
+            source_kinds["excerpt:" + label] = "file"
     supplied = dict(source_checksums or {})
     mismatch = sorted(k for k in supplied
                       if k in computed and supplied[k] != computed[k])
@@ -1714,6 +1839,7 @@ def build_postmortem_package(*, out_dir: Optional[str] = None,
         "source_checksums": computed,
         "source_checksums_supplied": supplied,
         "source_checksum_mismatches": mismatch,
+        "source_kinds": source_kinds,
         "scorecards": list(scorecards),
         "comparison_slice": comparison,
         "judge_answers": advisory,
@@ -1728,6 +1854,13 @@ def build_postmortem_package(*, out_dir: Optional[str] = None,
     }
     package = _apply_package_budget(package, max_bytes=package_max_bytes,
                                     max_excerpts=package_max_excerpts)
+    if not package["budget"]["within_budget"]:
+        # even the minimal manifest cannot fit: REFUSE to write an oversized
+        # package, and write a bounded failure record instead.
+        package = package_failure_record(
+            failure_kind=failure_kind, max_bytes=package_max_bytes,
+            attempted_bytes=package["budget"]["final_bytes"],
+            failed_gates=failed_gates, spec_ref=spec_ref)
     if out_dir:
         package["written_to"] = _write_package(out_dir, package)
     return package

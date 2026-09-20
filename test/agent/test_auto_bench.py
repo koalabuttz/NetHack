@@ -2404,5 +2404,87 @@ class LiteralZeroAndTuningBudget(unittest.TestCase):
         self.assertTrue(B.tuning_preflight(fresh())["ok"])
 
 
+class PostmortemHardCap(unittest.TestCase):
+    """Finding #7: every variable-size section is hard-capped."""
+
+    def _big(self, nbytes, key="blob"):
+        return {key: "x" * nbytes}
+
+    def test_each_non_excerpt_section_is_bounded_independently(self):
+        sections = {
+            "comparison_slice": ("comparison",
+                                 {"per_metric": self._big(20000)}),
+            "mutation_report": ("mutation_report",
+                                {"mutations": [self._big(500)
+                                               for _ in range(40)]}),
+            "provenance": ("provenance", {"deterministic": self._big(20000)}),
+            "config_diff": ("config_diff", {"before": self._big(20000)}),
+            "scorecards": ("scorecards",
+                           [{"episode_id": "e%d" % i, "blob": "y" * 4000}
+                            for i in range(6)]),
+            "judge_answers": ("judge_answers",
+                              [{"blob": "z" * 4000} for _ in range(6)]),
+            "evidence_selection": ("evidence_selection",
+                                   [{"episode_id": "e%d" % i, "blob": "w" * 800}
+                                    for i in range(20)]),
+        }
+        for key, (kwarg, value) in sections.items():
+            cap = 8 * 1024
+            pkg = M.build_postmortem_package(
+                failure_kind="hard-failure", package_max_bytes=cap,
+                package_max_excerpts=2, **{kwarg: value})
+            serialized = len(json.dumps(pkg, sort_keys=True, default=str)
+                             .encode("utf-8"))
+            self.assertLessEqual(serialized, cap, key)
+            self.assertTrue(pkg["budget"]["within_budget"], (key, pkg["budget"]))
+            self.assertTrue(any(o["kind"] == key for o in pkg["omitted"]),
+                            (key, pkg["omitted"]))
+
+    def test_directory_reference_gets_a_deterministic_manifest_hash(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        ep_dir = os.path.join(tmp, "ep-1")
+        os.makedirs(ep_dir)
+        with open(os.path.join(ep_dir, "ep-1.meta.json"), "w") as fh:
+            fh.write("{}")
+        with open(os.path.join(ep_dir, "ep-1.wire.jsonl"), "w") as fh:
+            fh.write('{"i":0}\n')
+        pkg = M.build_postmortem_package(
+            failure_kind="x", artifact_paths={"ep-1": ep_dir})
+        self.assertEqual(pkg["source_kinds"]["ep-1"], "directory-manifest")
+        self.assertEqual(pkg["source_checksums"]["ep-1"],
+                         M.directory_manifest_hash(ep_dir))
+        # deterministic across calls
+        self.assertEqual(M.directory_manifest_hash(ep_dir),
+                         M.directory_manifest_hash(ep_dir))
+
+    def test_too_small_budget_writes_a_bounded_failure_record(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        big = {("ep-%d.wire" % i): None for i in range(4)}
+        paths = {}
+        for i in range(4):
+            p = os.path.join(tmp, "ep-%d.wire.jsonl" % i)
+            with open(p, "w") as fh:
+                for j in range(500):
+                    fh.write(json.dumps({"i": j, "pad": "q" * 200}) + "\n")
+            paths["ep-%d.wire" % i] = p
+        del big
+        pkg = M.build_postmortem_package(
+            out_dir=tmp, failure_kind="hard-failure",
+            failed_gates=["integrity"], excerpt_paths=paths,
+            package_max_bytes=256, package_max_excerpts=1)
+        self.assertFalse(pkg["budget"]["within_budget"])
+        self.assertEqual(pkg.get("package_error"), "budget-too-small")
+        # the record itself is bounded and carries no variable-size content
+        self.assertLessEqual(len(json.dumps(pkg).encode("utf-8")), 1024)
+        self.assertNotIn("excerpts", pkg)
+        self.assertNotIn("scorecards", pkg)
+        # the on-disk record is bounded too
+        written = json.load(open(pkg["written_to"]))
+        self.assertEqual(written["package_error"], "budget-too-small")
+        self.assertLessEqual(len(json.dumps(written).encode("utf-8")), 1024)
+
+
 if __name__ == "__main__":
     unittest.main()

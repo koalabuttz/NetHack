@@ -45,7 +45,24 @@ call and reports `judge_behavior: "not-evaluated"`. Enabling the paid judge is
 allowed only for an explicit live tier, and a live tier additionally requires
 the caller's vapor-cloud attestation (see **AC10** below) — the value
 `BENCH_VAPOR_CLOUD_ATTESTED` must equal the exact token
-`vapor-cloud-fix-landed-and-tested`; any other non-empty value is refused.
+`vapor-cloud-fix-landed-and-tested` (any other non-empty value is refused).
+
+### Episodes and artifacts
+
+Each episode runs in its own isolated directory via a dedicated
+`run_campaign(1)` child, so the controller always writes `ep-1.*` **inside the
+episode directory**; the parent then **remaps** those local artifacts to
+`ep-<global index>.*`, so episodes 2+ are not seen as missing. The child
+serializes the **complete** `EpisodeResult` evidence — every field *including
+all forced-search counters* — into `bench-child.json` and additively into the
+episode meta (the controller's own meta omits them), so a scorecard carries
+*measured* forced-search values (a genuine zero included) rather than an
+unavailable gap.
+
+Scheduling metadata (`arm`, `pair`, `order`, `config_hash`) lives in the
+`manifest.json` entries and the `scorecards.json` **envelope** — never inside
+the immutable `/2` scorecard object, whose hash therefore recomputes from the
+exact persisted bytes.
 
 ## Spec schema (`bench-spec/1`)
 
@@ -75,6 +92,16 @@ Validation rejects unknown knobs, non-finite values, impossible caps, a
 screening tier, both exposure minima zero (there must be a predeclared floor),
 and any attempt to enable DeepSeek postmortems. `postmortem_reserve` is
 **forced to 0** in every bench campaign.
+
+**Every campaign cap is literal, including zero.** `max_total_episodes = 0`
+means zero episodes, `judge_calls_total = 0` means zero judge calls, and
+`strategy_calls_total = 0` with the strategy tier on means zero strategy calls —
+none of them means "unlimited". The **complete** tuning allocation (screening ×
+candidates + confirmation, its judge calls, its strategy demand and its
+duration) is checked against every cap by `tuning_preflight()` and by the `tune`
+command, which refuses the plan **before any child or worker is spawned** and
+writes no tuning report. `max_total_wall_s = 0` is the one exception: it is the
+documented "unset" sentinel for a duration cap.
 
 The spec stores credential *references* only (`***_key_file` paths); the bench
 never copies a referenced secret into output.
@@ -165,17 +192,22 @@ decision/reason, config diff and provenance differences.
   sample count or resampling policy are forbidden — abandon and re-precut
   instead (`bench.assert_precommitted`). **4 episodes/arm is unconditionally
   diagnostic-only** and never authorizes apply.
-* **Interleaving and the precommitted design.** The run commits a
-  `precommit.json` **before any result exists** containing the comparison
-  policy *and* the exact **balanced** counterbalanced schedule
-  (`episode_schedule`): every full pair runs one baseline and one candidate
-  episode in a seeded AB/BA order, so the AB and BA counts differ by at most 1
-  and both orders occur whenever there are ≥ 2 pairs. The runner executes that
-  committed schedule. The comparison then requires the observed **arm counts**
-  and **order** to match the committed design exactly — a committed 10/arm
-  rejects 10/11 *and* 11/11, an edited design is caught by its hash
-  (`precommit-hash-mismatch`), and only an exact 10/10 with the committed order
-  may apply.
+* **Interleaving, distinct arm configs and the precommitted design.** The run
+  commits a `precommit.json` **before any result exists** containing the
+  comparison policy, the exact **balanced** counterbalanced schedule
+  (`episode_schedule`), the **per-arm config hashes** and the arm mode. An A/B
+  run requires an explicit `baseline_config_ref` (a genuinely distinct,
+  separately referenced config); each scheduled episode runs *its own arm's*
+  config, so the arm labels are true. Without a baseline config the run is
+  **candidate-only** — no baseline label is fabricated — and the comparison
+  falls back to the external `baseline_ref` scorecards. The observed order is
+  recorded **once per pair** (the committed representation), both arms of a
+  same-run experiment share this run's deterministic provenance, and the
+  comparison requires the observed arm counts, order and per-arm config hashes
+  to match the committed design exactly — a committed 10/arm rejects 10/11
+  *and* 11/11, an edited schedule is caught by its hash
+  (`precommit-hash-mismatch`), a changed config is caught by
+  (`config-hash-mismatch:<arm>`), and only an exact 10/10 may apply.
 * **Unpaired bootstrap** intervals over episode-level metrics at a fixed seed
   and resample count, with simultaneous guardrail coverage (Bonferroni).
 * **attempts_source admission.** Admission and apply require
@@ -272,6 +304,14 @@ rejudgment. Cache hits are reported separately from dispatched calls.
 **Policy: advisory-with-flags only.** Flags select postmortem packages; they
 never contribute to the objective, veto acceptance, or change the rails.
 
+**Dispatch.** The default judge is built over the **public worker transport**
+(`make_worker_transport`): the resolved `BENCH_WORKER` executable, the credential
+reference and base URL, the configured deadline and response cap. A
+judge-enabled preflight that cannot resolve the worker or a key reference is
+**refused** (`stage: "judge"`) before any episode launches, and a required
+dispatch that cannot be constructed is a preflight error — never a silent
+zero-dispatch advisory downgrade.
+
 ## Postmortem packages (AC12)
 
 On a hard failure, behavioral regression/inconclusive result, or advisory judge
@@ -296,13 +336,20 @@ Boundedness and evidence integrity are enforced, not aspirational:
 * excerpts carry the **line range**, `omitted_before`/`omitted_after`, and the
   **tick range** / **event range** of the kept records when present;
 * the whole package is held inside an explicit **byte/count budget**
-  (`DEFAULT_PACKAGE_MAX_BYTES`, `DEFAULT_PACKAGE_MAX_EXCERPTS`); oversized or
-  excess excerpts are dropped **deterministically** and recorded in
-  `omitted` with their reason;
-* `source_checksums` are **recomputed from every referenced source**
-  (`artifact_paths` and each excerpt's file) — a caller-supplied checksum is
-  retained only as `source_checksums_supplied` and any disagreement is listed
-  in `source_checksum_mismatches`;
+  (`DEFAULT_PACKAGE_MAX_BYTES`, `DEFAULT_PACKAGE_MAX_EXCERPTS`). **Every
+  variable-size section** — excerpts, comparison slice, mutation report,
+  provenance, config diff, evidence lists, judge answers, scorecards, the task
+  text and the artifact-path map — is eligible for deterministic omission or
+  summarization, and each omission is recorded in `omitted` with its reason. If
+  even a minimal manifest cannot fit, the bench **refuses to write an oversized
+  package** and writes a bounded `package_error: "budget-too-small"` record
+  instead;
+* `source_checksums` are **recomputed from every referenced source** — a file
+  by its sha256 and a **directory** by a deterministic
+  `directory_manifest_hash` (relative-path → sha256, `source_kinds` records
+  which). A caller-supplied checksum is retained only as
+  `source_checksums_supplied` and any disagreement is listed in
+  `source_checksum_mismatches`;
 * which episodes are excerpted is chosen by the deterministic
   `select_evidence()` ranking (fault reasons, then largest loop span, then
   episode id) — never by iteration order.
@@ -362,12 +409,32 @@ The bench admits **no new episodes or judges**. A second interrupt or the total
 deadline triggers the forced path: a bench-owned, **ownership-isolated**
 `/proc` PPID-recursion walk that launches the episode root in a dedicated
 session, captures PID/start-time/session/PGID, signals a process group only when
-its validated membership belongs to the captured episode tree, keeps the root
-alive while re-walking to catch children spawned during the walk, reaps the root
-last, and verifies no captured identity survives. It **never** `killpg`s the
-supervisor's own group. A permission or identity-validation failure sets
-`teardown_failure` / partial status, marks the run non-success, blocks baseline
-promotion, and fails AC7 even when cleanup continues best-effort.
+its validated membership belongs to the captured episode tree **and does not
+contain the root**, keeps the root alive while re-walking to catch children
+spawned during the walk, reaps the root last, and verifies no captured identity
+survives. A descendant that inherits the dedicated root's PGID is therefore
+signalled **individually** until root-last, so the root can never be killed by a
+group signal early. It **never** `killpg`s the supervisor's own group.
+
+Fail-closed guarantees (AC7):
+
+* `ProcReader.identity()` distinguishes genuine disappearance (ENOENT → `None`)
+  from a **permission, I/O or parse failure**, which raises `ProcError`; a
+  `getpgid` permission failure is likewise fatal, never a silent `-1`;
+* `_alive()` **fails closed**: a verification exception records a teardown
+  failure and treats the process as still alive;
+* a permission or identity-validation failure sets `teardown_failure` / partial
+  status, marks the run non-success, blocks baseline promotion, and fails AC7
+  even when cleanup continues best-effort.
+
+Graceful cancellation is the primary path: the parent writes the **root-ready
+handshake** only after the captured root identity is durably recorded, and the
+child **blocks on that handshake** before starting the (expensive) episode work;
+the child installs bench-owned SIGINT/SIGTERM handlers that record a durable
+cancellation acknowledgment and let the bounded episode reach the controller's
+own `finally` instead of dying mid-flight. The parent relays the first
+(graceful) stop as SIGTERM and awaits that acknowledgment within the grace
+window.
 
 Residual limits are documented: an inherent race window and PID reuse (identity
 and start time are validated before signalling).
