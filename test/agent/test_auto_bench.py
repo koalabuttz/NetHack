@@ -2797,5 +2797,82 @@ class RealChildCancellation(unittest.TestCase):
         self.assertTrue(gone, "launcher %d still alive" % launcher_pid)
 
 
+class StrategyDemandFileBacked(unittest.TestCase):
+    """Finding #3: a file-backed config contributes its real strategy demand."""
+
+    def _specs(self, tmp):
+        """An inline and a file-backed spec with IDENTICAL config content."""
+        content = {"reflex": "scripted", "strategy": "deepseek",
+                   "strategy_call_cap": 8}
+        ref_path = os.path.join(tmp, "provider-config.json")
+        with open(ref_path, "w") as fh:
+            json.dump(content, fh)
+        inline = _valid_spec(tier="live", episodes=2)
+        inline["provider_config_ref"] = dict(content)
+        inline["campaign_timeout_s"] = 100000.0
+        fileb = _valid_spec(tier="live", episodes=2)
+        fileb["provider_config_ref"] = ref_path
+        fileb["campaign_timeout_s"] = 100000.0
+        return inline, fileb
+
+    def test_allocations_are_identical_for_inline_and_file_backed(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        inline, fileb = self._specs(tmp)
+        for spec in (inline, fileb):
+            spec["budget"]["max_total_episodes"] = 1000
+            # strategy demand = total episodes x cap, far over this budget
+            spec["budget"]["strategy_calls_total"] = 100
+        a_inline = B.plan_allocations(inline, 6)
+        a_file = B.plan_allocations(fileb, 6)
+        # the file-backed config's strategy demand is COUNTED, not skipped
+        self.assertTrue(any("strategy-budget" in r
+                            for r in a_inline["reasons"]), a_inline)
+        self.assertEqual(a_file["reasons"], a_inline["reasons"])
+        self.assertEqual(a_file["within_budget"], a_inline["within_budget"])
+        self.assertFalse(a_file["within_budget"])
+        # and an adequate strategy budget passes for BOTH
+        for spec in (inline, fileb):
+            spec["budget"]["strategy_calls_total"] = 100000
+        self.assertTrue(B.plan_allocations(inline, 6)["within_budget"])
+        self.assertTrue(B.plan_allocations(fileb, 6)["within_budget"])
+
+    def test_tuning_preflight_identical_for_inline_and_file_backed(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        inline, fileb = self._specs(tmp)
+        for spec in (inline, fileb):
+            spec["budget"]["max_total_episodes"] = 1000
+            spec["budget"]["strategy_calls_total"] = 100
+        pre_inline = B.tuning_preflight(inline)
+        pre_file = B.tuning_preflight(fileb)
+        self.assertFalse(pre_inline["ok"])
+        self.assertFalse(pre_file["ok"])
+        self.assertEqual(pre_file["reasons"], pre_inline["reasons"])
+        self.assertTrue(any("strategy-budget" in r
+                            for r in pre_file["reasons"]), pre_file)
+        # a strategy tier enabled ONLY in the referenced file is still counted
+        content = {"reflex": "scripted", "strategy": "deepseek",
+                   "strategy_call_cap": 8}
+        only_file = os.path.join(tmp, "only-strategy.json")
+        with open(only_file, "w") as fh:
+            json.dump(content, fh)
+        spec = _valid_spec(tier="live", episodes=2)
+        spec["provider_config_ref"] = only_file
+        spec["campaign_timeout_s"] = 100000.0
+        spec["budget"]["max_total_episodes"] = 1000
+        spec["budget"]["strategy_calls_total"] = 1
+        self.assertTrue(any("strategy-budget" in r
+                            for r in B.tuning_preflight(spec)["reasons"]))
+
+    def test_unresolvable_config_fails_closed_in_allocations(self):
+        spec = _valid_spec(tier="live", episodes=2)
+        spec["provider_config_ref"] = "/nope/missing-config.json"
+        alloc = B.plan_allocations(spec, 6)
+        self.assertTrue(any("strategy-config-unresolvable" in r
+                            for r in alloc["reasons"]), alloc)
+        self.assertFalse(alloc["within_budget"])
+
+
 if __name__ == "__main__":
     unittest.main()

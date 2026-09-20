@@ -549,7 +549,7 @@ def preflight(spec: dict) -> Dict[str, Any]:
             "judge_transport": judge_transport,
             "baseline_config_hash": config_fingerprint(baseline_config),
             "allocations": plan_allocations(spec, spec["budget"][
-                "max_candidates"]),
+                "max_candidates"], config=config),
             "postmortem_reserve": config.postmortem_reserve}
 
 
@@ -755,12 +755,19 @@ def precommit_record(comparison: dict, *, episodes: Optional[int] = None,
 # budget planning
 # --------------------------------------------------------------------------
 
-def plan_allocations(spec: dict, n_candidates: int) -> Dict[str, Any]:
+def plan_allocations(spec: dict, n_candidates: int,
+                     config: Optional[Any] = None) -> Dict[str, Any]:
     """Reserve the whole campaign's episodes and judge calls up front.
 
     Every candidate is screened on ``screening_episodes_per_arm`` per arm, and
     the selected winner is confirmed on ``confirmation_episodes_per_arm`` per
     arm.  Judge calls are bounded at eligible episodes x request count.
+
+    Strategy demand is derived from the **validated** ``ProviderConfig`` -- the
+    same authority normal preflight uses -- so a **file-backed**
+    ``provider_config_ref`` contributes its real strategy demand instead of
+    being silently treated as "strategy off".  An unresolvable config fails
+    closed rather than under-budgeting.
     """
     comp = spec["comparison"]
     budget = spec["budget"]
@@ -790,14 +797,16 @@ def plan_allocations(spec: dict, n_candidates: int) -> Dict[str, Any]:
         reasons.append("wall-budget: %g > %g"
                        % (total_episodes * float(spec["episode_timeout_s"]),
                           float(budget["max_total_wall_s"])))
-    # strategy demand across the whole tuning plan (zero budget is literal)
-    overrides = spec.get("overrides") or {}
-    ref = spec.get("provider_config_ref")
-    ref = ref if isinstance(ref, dict) else {}
-    strategy = overrides.get("strategy", ref.get("strategy"))
-    if strategy not in (None, "off"):
-        cap = int(overrides.get("strategy_call_cap",
-                                ref.get("strategy_call_cap", 0)) or 0)
+    # strategy demand across the whole tuning plan (zero budget is literal),
+    # read from the validated config so a file-backed reference is honoured.
+    if config is None:
+        config, cfg_err = resolve_provider_config(spec)
+        if cfg_err:
+            # cannot prove the strategy demand is zero: fail closed.
+            reasons.append("strategy-config-unresolvable: %s" % cfg_err)
+            config = None
+    if config is not None and getattr(config, "strategy", "off") != "off":
+        cap = int(getattr(config, "strategy_call_cap", 0) or 0)
         demand = total_episodes * max(1, cap)
         if demand > budget["strategy_calls_total"]:
             reasons.append("strategy-budget: %d > %d"
