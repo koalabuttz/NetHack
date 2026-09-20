@@ -1,7 +1,7 @@
 {
  "commit_range": {
   "base": "56c0c45a0739b29a3173b08b343d5fc786a56712",
-  "head": "f115c807d9689997d8bce25f8e874e3a7617560b"
+  "head": "61aa6d3fac8bf6d9487a3fc78d3aa05706b83de7"
  },
  "commits": [
   {
@@ -251,6 +251,14 @@
   {
    "hash": "f115c807d9689997d8bce25f8e874e3a7617560b",
    "subject": "agent: regenerate report at final head"
+  },
+  {
+   "hash": "fbb9012646c6fb796dd65c3a4be1888fc0e9521a",
+   "subject": "agent: regenerate report at final head"
+  },
+  {
+   "hash": "61aa6d3fac8bf6d9487a3fc78d3aa05706b83de7",
+   "subject": "agent: parse production action sidecars for attempts"
   }
  ],
  "gates": {
@@ -476,5 +484,5 @@
   ]
  },
  "schema_version": 1,
- "suite_count": 1162
+ "suite_count": 1165
 }
