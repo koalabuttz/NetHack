@@ -796,7 +796,7 @@ class StopAndAbort(unittest.TestCase):
                         "pgid": pid, "session": 1, "starttime": "1",
                         "state": "S"}
 
-            def children(self, pid):
+            def children(self, pid, strict=False):
                 if self.mode == "children" and pid == 1:
                     raise PermissionError("children denied")
                 return [2] if pid == 1 else []
@@ -2256,7 +2256,7 @@ class ProcFailClosed(unittest.TestCase):
                         "session": 1, "starttime": info["starttime"],
                         "state": "S"}
 
-            def children(self, pid):
+            def children(self, pid, strict=False):
                 return sorted(p for p, i in self.tree.items()
                               if i["ppid"] == pid and p not in self.dead)
 
@@ -2325,7 +2325,10 @@ class HandshakeAndCancel(unittest.TestCase):
         handlers = B.install_child_cancel_handlers(None, ack_path=ack)
         try:
             self.assertFalse(handlers.acknowledged())
-            handlers._handle(signal.SIGTERM, None)
+            # the handler writes the durable ack AND raises the bench-owned
+            # cancellation so the controller's ``finally`` teardown runs.
+            with self.assertRaises(B.BenchCancelled):
+                handlers._handle(signal.SIGTERM, None)
             self.assertTrue(handlers.acknowledged())
             self.assertTrue(os.path.exists(ack))
             with open(ack) as fh:
@@ -2603,6 +2606,195 @@ class ArmConfigChildAB(unittest.TestCase):
                          "child-config-hash-mismatch")
         self.assertFalse(out["comparison"]["admission"]["apply_allowed"])
         self.assertTrue(out["manifest"]["arm_config_mismatches"])
+
+
+class HandshakeFailClosed(unittest.TestCase):
+    """Finding #2: capture/ready-write failures are fatal, teardown preserved."""
+
+    def _live_spec(self, tmp):
+        spec = _valid_spec(tier="live", episodes=2, episode_timeout_s=8.0,
+                           campaign_timeout_s=120.0)
+        spec["budget"]["max_total_episodes"] = 100
+        return spec
+
+    def test_root_capture_failure_is_fatal_and_writes_no_ready_token(self):
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
+        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        spec = self._live_spec(tmp)
+        runner = B.BenchRunner(spec, tmp)
+        runner._arm_configs = {"baseline": None,
+                               "candidate": B.resolve_provider_config(spec)[0]}
+        # make identity capture fail
+        runner.abort_tree.reader.identity = _raise_proc_error
+        episode_dir = os.path.join(tmp, "ep-1")
+        result, out_dir = runner._run_child(episode_dir, 1,
+                                            runner._arm_configs["candidate"],
+                                            "candidate")
+        self.assertTrue(result["teardown_failure"])
+        self.assertFalse(os.path.exists(B.root_ready_path(episode_dir)))
+        self.assertNotIn("bench-child.json", os.listdir(episode_dir))
+        self.assertTrue(runner.manifest.data["teardown_failure"])
+        self.assertTrue(runner.manifest.data["fatal_episodes"])
+
+    def test_ready_token_write_failure_is_fatal(self):
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
+        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        spec = self._live_spec(tmp)
+        runner = B.BenchRunner(spec, tmp)
+        runner._arm_configs = {"baseline": None,
+                               "candidate": B.resolve_provider_config(spec)[0]}
+
+        real_write = B.write_json_atomic
+
+        def _failing_write(path, obj, mode=0o600):
+            if path.endswith("bench-root-ready.json"):
+                raise OSError("disk full")
+            return real_write(path, obj, mode)
+
+        B.write_json_atomic = _failing_write
+        try:
+            result, _d = runner._run_child(
+                os.path.join(tmp, "ep-1"), 1,
+                runner._arm_configs["candidate"], "candidate")
+        finally:
+            B.write_json_atomic = real_write
+        self.assertTrue(result["teardown_failure"])
+        self.assertFalse(os.path.exists(B.root_ready_path(
+            os.path.join(tmp, "ep-1"))))
+        self.assertTrue(runner.manifest.data["teardown_failure"])
+
+    def test_after_loop_never_relabels_teardown_failure_as_complete(self):
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
+        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        spec = self._live_spec(tmp)
+        runner = B.BenchRunner(spec, tmp)
+        runner._arm_configs = {"baseline": None,
+                               "candidate": B.resolve_provider_config(spec)[0]}
+        runner.manifest.data["teardown_failure"] = True
+        out = runner._after_loop([], "complete", None, [])
+        self.assertNotEqual(out["status"], "complete")
+        self.assertEqual(out["status"], "teardown-failure")
+        self.assertFalse(out["ok"])
+        self.assertTrue(out["teardown_failure"])
+
+    def test_unreadable_owned_child_stat_is_fatal(self):
+        class StrictReader(B.ProcReader):
+            def __init__(self):
+                self.tree = {100: {"ppid": 0, "pgid": 100, "starttime": "1"},
+                             200: {"ppid": 100, "pgid": 200,
+                                   "starttime": "2"}}
+                self.dead = set()
+
+            def identity(self, pid):
+                if pid == 200:
+                    # an unreadable *owned descendant* stat
+                    raise B.ProcError("permission reading stat for %d" % pid)
+                if pid in self.dead or pid not in self.tree:
+                    return None
+                info = self.tree[pid]
+                return {"pid": pid, "ppid": info["ppid"], "pgid": info["pgid"],
+                        "session": 1, "starttime": info["starttime"],
+                        "state": "S"}
+
+        # the lenient default SKIPS an unreadable unrelated entry...
+        class Lenient(B.ProcReader):
+            def identity(self, pid):
+                raise B.ProcError("unreadable")
+
+        self.assertEqual(Lenient(proc_root="/proc").children(1, strict=False),
+                         [])
+        # ...but the owned walk (strict) is fatal
+        outcome = B.OwnedProcessTree(StrictReader(), bound=1.0).reap(100)
+        self.assertTrue(outcome["teardown_failure"])
+        self.assertTrue(outcome["permission_failure"])
+
+
+def _raise_proc_error(pid):
+    raise B.ProcError("capture failed for %d" % pid)
+
+
+class RealChildCancellation(unittest.TestCase):
+    """Finding #2: a real controller child reaches ``finally`` on SIGTERM."""
+
+    def test_first_signal_aborts_the_child_with_controller_teardown(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        # a launcher that parks, so the controller is mid-episode when we stop
+        launcher = os.path.join(tmp, "sleepy-launcher")
+        pidfile = os.path.join(tmp, "launcher.pid")
+        with open(launcher, "w") as fh:
+            fh.write("#!/usr/bin/env python3\n"
+                     "import os, time\n"
+                     "open(%r, 'w').write(str(os.getpid()))\n"
+                     "time.sleep(120)\n" % pidfile)
+        os.chmod(launcher, 0o755)
+        spec = _valid_spec(tier="live", episodes=2, episode_timeout_s=60.0,
+                           campaign_timeout_s=600.0)
+        spec_path = os.path.join(tmp, "spec.json")
+        with open(spec_path, "w") as fh:
+            json.dump(spec, fh)
+        episode_dir = os.path.join(tmp, "ep-1")
+        os.makedirs(episode_dir)
+        candidate, err = B.resolve_provider_config(spec)
+        self.assertIsNone(err)
+        B.write_arm_config(episode_dir, candidate, "candidate")
+        # pre-write the handshake so the child may proceed
+        B.write_json_atomic(B.root_ready_path(episode_dir),
+                            {"root_recorded": True, "pid": 0})
+        argv = [sys.executable, "-m", "tools.agent.bench", "_child",
+                "--spec", spec_path, "--episode-dir", episode_dir,
+                "--timeout", "60", "--root-ready",
+                B.root_ready_path(episode_dir), "--arm-config",
+                B.arm_config_path(episode_dir), "--worker", launcher,
+                "--runner", launcher, "--data", tmp]
+        env = dict(os.environ, PYTHONPATH=os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(B.__file__)))))
+        child = subprocess.Popen(argv, cwd=os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(B.__file__)))), env=env)
+        try:
+            # wait for the controller to have spawned the launcher
+            for _ in range(200):
+                if os.path.exists(pidfile):
+                    break
+                time.sleep(0.05)
+            self.assertTrue(os.path.exists(pidfile))
+            launcher_pid = int(open(pidfile).read())
+            # first (graceful) signal
+            child.send_signal(signal.SIGTERM)
+            rc = child.wait(timeout=30)
+            self.assertEqual(rc, 0)
+        finally:
+            if child.poll() is None:
+                child.kill()
+        # the ACK was written before the child exited
+        ack = os.path.join(episode_dir, "bench-cancel.json")
+        self.assertTrue(os.path.exists(ack))
+        self.assertTrue(json.load(open(ack))["acknowledged"])
+        # the child recorded the bench-owned graceful stop
+        out = json.load(open(os.path.join(episode_dir, "bench-child.json")))
+        self.assertIn("bench_cancelled", out["result"])
+        self.assertEqual(out["result"]["bench_stop_reason"],
+                         "bench-stopped-graceful")
+        # the controller's own ``finally`` finalized the recording
+        self.assertTrue(os.path.exists(os.path.join(
+            episode_dir, "ep-1.meta.json")))
+        # ...and the controller-owned reap tore down the launcher session
+        deadline = time.monotonic() + 10
+        gone = False
+        while time.monotonic() < deadline:
+            try:
+                os.kill(launcher_pid, 0)
+            except ProcessLookupError:
+                gone = True
+                break
+            time.sleep(0.05)
+        self.assertTrue(gone, "launcher %d still alive" % launcher_pid)
 
 
 if __name__ == "__main__":

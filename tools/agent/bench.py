@@ -836,7 +836,15 @@ class ProcReader(object):
         self.proc_root = proc_root
         self._open = open_
 
-    def children(self, pid: int) -> List[int]:
+    def children(self, pid: int, strict: bool = False) -> List[int]:
+        """PIDs whose parent is *pid*.
+
+        ``strict=True`` is used by the **owned walk**: an unreadable stat entry
+        there is *fatal* (it could be an owned descendant we cannot prove we
+        can reap), so it raises :class:`ProcError`.  The default lenient form is
+        for unrelated-process enumeration, where an entry that cannot be ours
+        may be skipped.
+        """
         out = []
         for entry in os.listdir(self.proc_root):
             if not entry.isdigit():
@@ -844,9 +852,9 @@ class ProcReader(object):
             try:
                 identity = self.identity(int(entry))
             except ProcError:
-                # another user's process cannot be a descendant of our own
-                # tree, so an unreadable *unrelated* stat is not fatal here;
-                # the owned-tree walk itself fails closed.
+                if strict:
+                    # an unreadable entry inside the owned walk: fail closed
+                    raise
                 continue
             if identity and identity.get("ppid") == pid \
                     and identity.get("state") not in self.DEAD_STATES:
@@ -981,7 +989,9 @@ class OwnedProcessTree(object):
             ident["own_pgid"] = pg
             seen[pid] = ident
             try:
-                kids = self.reader.children(pid)
+                kids = self.reader.children(pid, strict=True)
+            except ProcError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 raise ProcError("children read failed for %d: %s" % (pid, exc))
             frontier.extend(kids)
@@ -1211,16 +1221,26 @@ class signal_handlers(object):
             self.on_forced()
 
 
+class BenchCancelled(Exception):
+    """A bench-owned graceful cancellation raised inside the child.
+
+    The child installs SIGINT/SIGTERM handlers that record the durable
+    acknowledgment and then **raise this in the main thread**.  Because it is
+    raised while the controller is inside ``run_campaign`` -> ``run_episode``,
+    the controller's own ``finally`` teardown runs: the current episode is
+    *aborted with controller-owned reaping*, not completed.
+    """
+
+
 class ChildCancelHandlers(object):
     """Bench-owned SIGINT/SIGTERM handling inside a child episode process.
 
     The graceful path is primary.  The default disposition for SIGINT/SIGTERM
     kills the child immediately, so ``run_episode``'s ``finally`` (the
     controller-owned ``_reap``) never runs and the launcher/worker session
-    leaks.  These handlers **do not terminate**: they record the request, write
-    a durable acknowledgment, and let the bounded episode finish so the
-    controller reaches its own ``finally`` teardown.  No controller change is
-    required.
+    leaks.  These handlers write a durable acknowledgment and then **raise
+    :class:`BenchCancelled` in the main thread**, so the controller reaches its
+    own ``finally`` teardown.  No controller change is required.
     """
 
     def __init__(self, cancel: Optional[Callable[[], Any]] = None,
@@ -1265,7 +1285,8 @@ class ChildCancelHandlers(object):
                 self.cancel()
             except Exception:  # noqa: BLE001 - cancellation is best-effort
                 pass
-        # deliberately do NOT raise: the episode continues to its ``finally``
+        # raise in the MAIN thread so the controller's ``finally`` teardown runs
+        raise BenchCancelled("bench stop requested (signal %d)" % signum)
 
 
 def install_child_cancel_handlers(cancel: Optional[Callable[[], Any]] = None,
@@ -1954,19 +1975,24 @@ class BenchRunner(object):
         try:
             identity = self.abort_tree.reader.identity(proc.pid) \
                 or {"pid": proc.pid}
-        except Exception:  # noqa: BLE001 - fail closed on capture
+            if identity.get("pid") != proc.pid:
+                raise ProcError("captured identity pid mismatch")
+        except Exception as exc:  # noqa: BLE001 - fail closed on capture
             identity = {"pid": proc.pid, "capture_failed": True}
-            self.manifest.set_status("teardown-failure",
-                                     teardown_failure=True)
+            return self._fatal_episode(key, proc, identity,
+                                       "root-capture-failure: %s" % exc)
         self.manifest.record_root(key, identity)
         # Handshake: signal the child that the root identity is durably
-        # persisted, so it may begin the (expensive) episode work.
+        # persisted, so it may begin the (expensive) episode work.  A
+        # ready-write failure is FATAL: without the token the child must not
+        # be authorized to run, so reap it and record a teardown failure.
         try:
             write_json_atomic(root_ready_path(episode_dir),
                               {"root_recorded": True,
                                "pid": identity.get("pid")})
-        except OSError:
-            pass
+        except OSError as exc:
+            return self._fatal_episode(key, proc, identity,
+                                       "ready-token-write-failure: %s" % exc)
         self._supervise(key, proc, identity)
         try:
             proc.wait(timeout=2.0)
@@ -1984,6 +2010,38 @@ class BenchRunner(object):
             self.manifest.data.setdefault("artifact_remaps", []).append(
                 {"episode": index, "count": len(remapped)})
             self.manifest.flush()
+        return result, episode_dir
+
+    def _fatal_episode(self, key, proc, identity, reason):
+        """A capture/ready-write failure: reap the child, authorize no work.
+
+        The episode is recorded as a non-success teardown failure with a
+        bench-owned non-success stop reason, and the child is terminated
+        *without* ever being authorized to run (no ready token was written).
+        """
+        self.manifest.data["teardown_failure"] = True
+        self.manifest.data.setdefault("fatal_episodes", []).append(
+            {"episode": key, "reason": reason})
+        try:
+            outcome = self.abort_tree.reap(identity)
+            if outcome.get("teardown_failure"):
+                self.manifest.data["fatal_reap_failure"] = True
+        except Exception:  # noqa: BLE001 - reaping is best effort
+            self.manifest.data["fatal_reap_failure"] = True
+        try:
+            proc.wait(timeout=2.0)
+        except Exception:  # noqa: BLE001
+            pass
+        self.manifest.set_status("teardown-failure", teardown_failure=True,
+                                 reason=reason)
+        result = {
+            "stop_reason": "spawn-failure",
+            "failure_reason": "bench:%s" % reason,
+            "closed": False, "returncode": None, "recording_complete": False,
+            "teardown_failure": True, "forced_kill": True,
+            "bench_fatal": reason,
+        }
+        episode_dir = os.path.join(self.out_dir, key)
         return result, episode_dir
 
     def _supervise(self, key, proc, identity) -> None:
@@ -2059,6 +2117,12 @@ class BenchRunner(object):
         forced = forced_search_of(result) or forced_search_of(meta)
         if forced is not None:
             meta["forced_search"] = forced
+        # the bench owns its OWN stop semantics: an interrupted child records a
+        # bench-owned stop reason, which is authoritative for classification.
+        bench_stop = (result or {}).get("bench_stop_reason") \
+            if isinstance(result, dict) else None
+        if bench_stop:
+            meta["stop_reason"] = bench_stop
         decisions = _read_jsonl(paths["decisions"])
         hashes = source_hashes_of(paths)
         budget = meta.get("budget") if isinstance(meta.get("budget"), dict) \
@@ -2146,6 +2210,11 @@ class BenchRunner(object):
                     judge_results: Sequence[dict]) -> Dict[str, Any]:
         """Comparison, postmortem packaging and tuner stages after the loop."""
         live = self._live_validation(cards)
+        # A teardown/capture failure recorded earlier is NEVER relabelled as a
+        # clean completion: it is preserved as the final non-success status.
+        teardown_failure = bool(self.manifest.data.get("teardown_failure"))
+        if teardown_failure and status == "complete":
+            status = "teardown-failure"
         # The scorecard envelope carries the scheduling metadata; the cards
         # themselves stay exact, immutable /2 objects whose hash recomputes.
         envelope = {
@@ -2168,11 +2237,13 @@ class BenchRunner(object):
         self.manifest.set_status(
             status, stop_reason=stop_reason, episodes_done=len(cards),
             partial=(status != "complete"),
+            teardown_failure=teardown_failure,
             live_validation=live,
             scorecards=scorecards_path, comparison=comparison_path,
             postmortem=postmortem_path, tuning=tuning_path)
         return {"ok": status == "complete" and live["ok"],
                 "status": status, "stop_reason": stop_reason,
+                "teardown_failure": teardown_failure,
                 "episodes": len(cards), "live_validation": live,
                 "comparison": comparison, "scorecards": cards,
                 "postmortem": postmortem_path, "tuning": tuning_path,
@@ -2892,11 +2963,23 @@ def _cmd_child(args) -> int:
         ctl, "cancel", None)
     handlers = install_child_cancel_handlers(
         cancel, ack_path=os.path.join(args.episode_dir, "bench-cancel.json"))
+    cancelled = None
     try:
         results = ctl.run_campaign(1)
+    except BenchCancelled as exc:
+        # the controller's own ``finally`` (``_reap``) has now run for the
+        # interrupted episode: the launcher session is torn down by the
+        # controller, and the episode is aborted, not completed.
+        cancelled = str(exc)
+        results = []
     finally:
         handlers.restore()
     full = result_to_meta(results[0] if results else None)
+    if cancelled:
+        full["bench_cancelled"] = cancelled
+        full["bench_stop_reason"] = M.BENCH_STOPPED_GRACEFUL
+        full["closed"] = False
+        full["recording_complete"] = False
     # Record exactly which arm config this child ran, so the parent can verify
     # it against the committed per-arm hash.
     full["bench_config_hash"] = fingerprint
