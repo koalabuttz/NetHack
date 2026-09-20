@@ -329,13 +329,14 @@ MUTATIONS = (
     {
         "name": "mutation_emit_terminals_only_for_directives",
         "file": "tools/agent/policy.py",
-        "old": ("        if not directive:\n"
-                "            self._emit_destination_terminal(\n"
-                "                term, reason, held.serial, "
-                "purpose=held.purpose,\n"
-                "                source=held.source, "
-                "generation=held.generation)"),
-        "new": ("        if False and not directive:\n"
+        "old": ("        self.targets.retire(reason, pos=pos, "
+                "signature=signature)\n"
+                "        self._emit_destination_terminal(\n"
+                "            term, reason, held.serial, purpose=held.purpose,\n"
+                "            source=held.source, generation=held.generation)"),
+        "new": ("        self.targets.retire(reason, pos=pos, "
+                "signature=signature)\n"
+                "        if held.source == navigation.SRC_DIRECTIVE:\n"
                 "            self._emit_destination_terminal(\n"
                 "                term, reason, held.serial, "
                 "purpose=held.purpose,\n"
