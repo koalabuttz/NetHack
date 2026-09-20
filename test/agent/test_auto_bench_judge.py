@@ -45,6 +45,13 @@ CARD = {
 }
 
 
+def _probs(levels, score):
+    """A valid one-hot probability vector over the level indices (sums to 1)."""
+    n = len(levels)
+    idx = min(n - 1, max(0, int(round(float(score)))))
+    return {str(i): (1.0 if i == idx else 0.0) for i in range(n)}
+
+
 def body(noul=0.1, prod=2.5, sane=0.9, model="jev-1.13.0",
          input_tokens=300, output_tokens=20, levels=J.PRODUCTIVITY_LEVELS):
     legend = {str(i): t for i, t in enumerate(levels)}
@@ -55,7 +62,7 @@ def body(noul=0.1, prod=2.5, sane=0.9, model="jev-1.13.0",
             "exploration_productivity": {
                 "type": "score", "score": prod, "confidence": 0.9,
                 "legend": legend,
-                "probabilities": {str(i): 0.0 for i in range(len(levels))}},
+                "probabilities": _probs(levels, prod)},
             "termination_sanity": {"type": "noul", "noul": sane},
         },
         "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
@@ -347,6 +354,83 @@ class RubricDispatch(unittest.TestCase):
         self.assertNotEqual(
             J.rubric_hash("CUSTOM-RUBRIC-TEXT"),
             J.rubric_hash(J.RUBRIC_TEXT))
+
+
+class TypedJudgeAnswers(unittest.TestCase):
+    """Finding #10: strict typed answers, legend/probabilities/model checks."""
+
+    def test_malformed_legend_and_probability_fixtures(self):
+        # probabilities keys do not match the level indices
+        bad = body()
+        bad["answers"]["exploration_productivity"]["probabilities"] = {
+            "0": 1.0}
+        with self.assertRaises(J.JudgeError):
+            J.parse_answers(bad)
+        # probabilities out of range
+        bad = body()
+        bad["answers"]["exploration_productivity"]["probabilities"] = {
+            str(i): (2.0 if i == 0 else 0.0)
+            for i in range(len(J.PRODUCTIVITY_LEVELS))}
+        with self.assertRaises(J.JudgeError):
+            J.parse_answers(bad)
+        # probabilities do not sum to 1
+        bad = body()
+        bad["answers"]["exploration_productivity"]["probabilities"] = {
+            str(i): 0.1 for i in range(len(J.PRODUCTIVITY_LEVELS))}
+        with self.assertRaises(J.JudgeError):
+            J.parse_answers(bad)
+        # legend keys mismatch
+        bad = body()
+        bad["answers"]["exploration_productivity"]["legend"] = {"0": "a"}
+        with self.assertRaises(J.JudgeError):
+            J.parse_answers(bad)
+        # legend value not a string
+        bad = body()
+        bad["answers"]["exploration_productivity"]["legend"]["1"] = 7
+        with self.assertRaises(J.JudgeError):
+            J.parse_answers(bad)
+        # missing required score field
+        bad = body()
+        del bad["answers"]["exploration_productivity"]["legend"]
+        with self.assertRaises(J.JudgeError):
+            J.parse_answers(bad)
+
+    def test_unexpected_extra_fields_rejected(self):
+        bad = body()
+        bad["answers"]["degenerate_loop"]["surprise"] = 1
+        with self.assertRaises(J.JudgeError):
+            J.parse_answers(bad)
+        bad = body()
+        bad["extra_top"] = 1
+        with self.assertRaises(J.JudgeError):
+            J.parse_answers(bad)
+
+    def test_model_mismatch_fixtures(self):
+        self.assertTrue(J.model_matches("jev-latest", "jev-1.13.0"))
+        self.assertTrue(J.model_matches("jev-1.13.0", "jev-1.13.0"))
+        self.assertFalse(J.model_matches("jev-latest", "some-other-model"))
+        # through parse_answers
+        with self.assertRaises(J.JudgeError):
+            J.parse_answers(body(model="other-model"),
+                            expected_model="jev-latest")
+        # a matching alias is accepted
+        ok = J.parse_answers(body(model="jev-1.13.0"),
+                             expected_model="jev-latest")
+        self.assertEqual(ok["model"], "jev-1.13.0")
+        # and a mismatched response is invalid end-to-end
+        judge = _judge(transport=lambda p: body(model="rogue-model"))
+        result = judge.evaluate(CARD)
+        self.assertEqual(result["status"], "invalid")
+        self.assertNotIn("answers", result)
+
+    def test_normalized_typed_metadata_retained(self):
+        typed = J.parse_answers(body(prod=3.0))
+        prod = typed["answers"]["exploration_productivity"]
+        self.assertEqual(prod["score"], 3.0)
+        self.assertEqual(prod["normalized"], round(3.0 / 4.0, 6))
+        self.assertEqual(len(prod["legend"]), len(J.PRODUCTIVITY_LEVELS))
+        self.assertEqual(len(prod["probabilities"]), len(J.PRODUCTIVITY_LEVELS))
+        self.assertAlmostEqual(sum(prod["probabilities"]), 1.0)
 
 
 if __name__ == "__main__":

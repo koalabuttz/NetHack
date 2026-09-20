@@ -229,16 +229,83 @@ def _finite(v) -> bool:
             and v == v and v not in (float("inf"), float("-inf")))
 
 
+#: Documented model aliases (an alias resolves to a versioned id), so a
+#: response naming the resolved id is not a mismatch for an alias request.
+MODEL_ALIASES = {"jev-latest": "jev-1.13.0", "jev-preview": "jev-1.13.0"}
+
+_NOUL_ANSWER_KEYS = ("type", "noul")
+_SCORE_ANSWER_KEYS = ("type", "score", "confidence", "legend", "probabilities")
+_BODY_KEYS = ("model", "answers", "usage")
+
+
+def model_matches(requested: str, returned: Any) -> bool:
+    """Whether a response's ``model`` is the requested model (or its alias)."""
+    if not isinstance(returned, str) or not returned:
+        return False
+    if returned == requested:
+        return True
+    return returned == MODEL_ALIASES.get(requested)
+
+
+def _check_level_probabilities(probs: Any, levels: Sequence[str]) -> List[float]:
+    """``probabilities`` must key exactly the level indices, be in [0,1] and
+    sum to 1."""
+    if not isinstance(probs, dict):
+        raise JudgeError("score: probabilities must be an object")
+    want = {str(i) for i in range(len(levels))}
+    if set(probs) != want:
+        raise JudgeError("score: probability keys %s != level indices %s"
+                         % (sorted(probs), sorted(want)))
+    total = 0.0
+    for key, value in probs.items():
+        if not _finite(value) or not (0.0 <= float(value) <= 1.0):
+            raise JudgeError("score: probability %s out of range: %r"
+                             % (key, value))
+        total += float(value)
+    if abs(total - 1.0) > 1e-5:
+        raise JudgeError("score: probabilities sum to %.6f, not 1" % total)
+    return [float(probs[str(i)]) for i in range(len(levels))]
+
+
+def _check_legend(legend: Any, levels: Sequence[str]) -> List[str]:
+    """``legend`` must key exactly the level indices to non-empty strings."""
+    if not isinstance(legend, dict):
+        raise JudgeError("score: legend must be an object")
+    want = {str(i) for i in range(len(levels))}
+    if set(legend) != want:
+        raise JudgeError("score: legend keys %s != level indices %s"
+                         % (sorted(legend), sorted(want)))
+    out: List[str] = []
+    for i in range(len(levels)):
+        value = legend[str(i)]
+        if not isinstance(value, str) or not value:
+            raise JudgeError("score: legend[%d] must be a non-empty string: %r"
+                             % (i, value))
+        out.append(value)
+    return out
+
+
 def parse_answers(body: Any, *, criteria_levels: Sequence[str] =
-                  PRODUCTIVITY_LEVELS) -> Dict[str, Any]:
+                  PRODUCTIVITY_LEVELS, expected_model: Optional[str] = None
+                  ) -> Dict[str, Any]:
     """Validate a judge body into typed answers; raise :class:`JudgeError`.
 
     A partial response (any missing question id) is invalid -- never partially
-    credited.  NaN/out-of-range scores, extra questions and mismatched types
-    are all rejected, and no score is produced on malformed output.
+    credited.  NaN/out-of-range scores, non-normalized probability vectors, a
+    malformed legend, an unexpected extra field, a mismatched answer type and a
+    response whose ``model`` is not the requested model (or its alias) are all
+    rejected, and no score is produced on malformed output.  The validated
+    legend/probabilities/confidence are retained as typed metadata.
     """
     if not isinstance(body, dict):
         raise JudgeError("body is not an object")
+    extra_body = sorted(set(body) - set(_BODY_KEYS))
+    if extra_body:
+        raise JudgeError("unexpected body fields: %s" % extra_body)
+    if expected_model is not None and not model_matches(expected_model,
+                                                        body.get("model")):
+        raise JudgeError("model mismatch: requested %r, got %r"
+                         % (expected_model, body.get("model")))
     answers = body.get("answers")
     if not isinstance(answers, dict):
         raise JudgeError("missing answers object")
@@ -257,6 +324,13 @@ def parse_answers(body: Any, *, criteria_levels: Sequence[str] =
         if entry.get("type") != primitive:
             raise JudgeError("%s: type %r != %r"
                              % (qid, entry.get("type"), primitive))
+        allowed = _NOUL_ANSWER_KEYS if primitive == "noul" else _SCORE_ANSWER_KEYS
+        extra_keys = sorted(set(entry) - set(allowed))
+        if extra_keys:
+            raise JudgeError("%s: unexpected fields %s" % (qid, extra_keys))
+        missing_keys = sorted(set(allowed) - set(entry))
+        if missing_keys:
+            raise JudgeError("%s: missing fields %s" % (qid, missing_keys))
         if primitive == "noul":
             value = entry.get("noul")
             if not _finite(value) or not (0.0 <= float(value) <= 1.0):
@@ -274,12 +348,16 @@ def parse_answers(body: Any, *, criteria_levels: Sequence[str] =
             if not _finite(confidence) or not (0.0 <= float(confidence) <= 1.0):
                 raise JudgeError("%s: confidence out of range: %r"
                                  % (qid, confidence))
+            probs = _check_level_probabilities(entry.get("probabilities"),
+                                               criteria_levels)
+            legend = _check_legend(entry.get("legend"), criteria_levels)
             out[qid] = {"type": "score", "score": float(value),
                         "confidence": float(confidence),
-                        "normalized": round(float(value) / top, 6)}
+                        "normalized": round(float(value) / top, 6),
+                        "legend": legend,
+                        "probabilities": probs}
     usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
-    return {"answers": out, "usage": usage,
-            "model": body.get("model")}
+    return {"answers": out, "usage": usage, "model": body.get("model")}
 
 
 def advisory_flags(answers: Dict[str, Any]) -> List[str]:
@@ -539,7 +617,8 @@ class BenchJudge(object):
             self.cache[key] = result
             return result
         try:
-            typed = parse_answers(parsed, criteria_levels=self.criteria_levels)
+            typed = parse_answers(parsed, criteria_levels=self.criteria_levels,
+                                  expected_model=self.model)
         except JudgeError as exc:
             self.ledger.invalid += 1
             # an invalid dispatch was still paid: record unknown exposure
@@ -587,6 +666,11 @@ class BenchJudge(object):
             body = self._dispatch(payload)
             if body is None:
                 return None, made, tokens
+            # the response's model is carried through so the merged body can be
+            # validated against the requested model, exactly like the bundled
+            # shape.
+            if isinstance(body, dict) and body.get("model"):
+                merged["model"] = body["model"]
             answers = (body or {}).get("answers") or {}
             if qid in answers:
                 merged["answers"][qid] = answers[qid]

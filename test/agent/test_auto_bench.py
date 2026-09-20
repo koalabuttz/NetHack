@@ -1245,7 +1245,12 @@ class WorkflowWiring(unittest.TestCase):
                     "answers": {
                         "degenerate_loop": {"type": "noul", "noul": 0.1},
                         "exploration_productivity": {
-                            "type": "score", "score": 2.5, "confidence": 0.9},
+                            "type": "score", "score": 2.5, "confidence": 0.9,
+                            "legend": {str(i): t for i, t in enumerate(
+                                J.PRODUCTIVITY_LEVELS)},
+                            "probabilities": {str(i): (1.0 if i == 2 else 0.0)
+                                              for i in range(len(
+                                                  J.PRODUCTIVITY_LEVELS))}},
                         "termination_sanity": {"type": "noul", "noul": 0.9}},
                     "usage": {"input_tokens": 300, "output_tokens": 20}}
 
