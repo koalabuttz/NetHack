@@ -730,5 +730,61 @@ class CommittedBehaviour(unittest.TestCase):
         self.assertEqual(self.ref.directive_settlement[0], "failed")
 
 
+class DefaultTerminalAccounting(unittest.TestCase):
+    """AC2: every acquired destination has exactly one visible terminal.
+
+    Default (non-directive) destinations must report termination through the
+    same owner as directive-owned ones; a default arrival or stall that leaves
+    the lifecycle stream silent is incomplete telemetry (the ep-4 defect).
+    """
+
+    def setUp(self):
+        self.ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+
+    def _terminals(self, serial):
+        return [e for e in self.ref.lifecycle.events
+                if e.get("kind") == "destination"
+                and e.get("outcome") in ("reached", "failed", "expired")
+                and e.get("serial") == serial]
+
+    def test_default_destination_terminal_accounting_complete(self):
+        cells = {(x, 10): FLOOR for x in range(1, 8)}
+        mem = nav_test.mem_with(cells, (1, 10))
+        # a default destination is acquired, then reached
+        cand = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.ref.commit_effect(cand.proposed_effect, cand.semantic_label, 1,
+                               mem, observed_kind="moved",
+                               payload=cand.effect_payload)
+        held = self.ref.targets.held()
+        self.assertIsNotNone(held)
+        serial = held.serial
+        arrive = policy.ScriptedReflex._dest_payload("arrive", held)
+        self.ref.commit_effect("navigate", "navigate", 2, mem,
+                               observed_kind="moved", payload=arrive)
+        self.assertIsNone(self.ref.targets.held())
+        terminals = self._terminals(serial)
+        self.assertEqual(len(terminals), 1,
+                         "a default arrival must emit exactly one terminal")
+
+    def test_default_stall_emits_terminal_once(self):
+        cells = {(x, 10): FLOOR for x in range(1, 8)}
+        mem = nav_test.mem_with(cells, (1, 10))
+        cand = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.ref.commit_effect(cand.proposed_effect, cand.semantic_label, 1,
+                               mem, observed_kind="moved",
+                               payload=cand.effect_payload)
+        serial = self.ref.targets.held().serial
+        for _ in range(navigation.STALL_MAX + 1):
+            if self.ref.targets.held() is None:
+                break
+            payload = policy.ScriptedReflex._dest_payload(
+                "continue", self.ref.targets.held())
+            self.ref.commit_effect("navigate", "navigate", 2, mem,
+                                   observed_kind="no-time", payload=payload)
+        self.assertIsNone(self.ref.targets.held())
+        self.assertEqual(len(self._terminals(serial)), 1,
+                         "a default stall must emit exactly one terminal")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1511,6 +1511,39 @@ class JevAppliedCap(WireHarness):
                              summary["totals"]["reflex"]["paid_dispatched"])
 
 
+class SelectedDecisionOwnership(JevAppliedCap):
+    """AC2/AC3: the accepted Jev member owns the frozen effect, not the wire.
+
+    A non-scripted accepted Jev choice (index 1, a different wire action from
+    the scripted winner) must commit *its own* destination effect and payload;
+    the legacy path discarded it and armed an effect-less ``sent`` candidate.
+    """
+
+    def _runner(self, fake, cap=2, config=None):
+        r, rec, proc = super()._runner(fake, cap=cap, config=config)
+        # the runner-owned persistent classified terrain must carry the ground
+        # for navigation, or the table degrades to a single search candidate
+        r.terrain.merge({p: (".", "gray", 0, "none")
+                         for p in [(5, 5), (4, 5), (6, 5), (5, 4), (5, 6)]})
+        return r, rec, proc
+
+    def test_jev_non_scripted_choice_preserves_destination_effect(self):
+        fake = _ChoiceJev(index=1)
+        r, rec, _ = self._runner(fake)
+        self._answer(r)
+        rec.finalize({})
+        table = r.reflex.last_prepared.table
+        chosen = table.ordered_candidates[1]
+        scripted = table.ordered_candidates[0]
+        # the Jev choice really is a different wire action than the scripted one
+        self.assertNotEqual(candidates.candidate_to_wire(chosen),
+                            candidates.candidate_to_wire(scripted))
+        # the frozen attempt carries the accepted member's exact effect/payload
+        self.assertEqual(r._attempt_effect, chosen.proposed_effect)
+        self.assertEqual(tuple(r._attempt_payload),
+                         tuple(chosen.effect_payload))
+
+
 class SummaryCompatibility(unittest.TestCase):
     """AC.7: additive ``reflex.applied`` reporting keeps old consumers working."""
 

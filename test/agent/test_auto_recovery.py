@@ -21,8 +21,8 @@ for _p in (_ROOT, _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from tools.agent import (forced_search, policy, protocol,  # noqa: E402
-                         recovery, state)
+from tools.agent import (forced_search, navigation, policy,  # noqa: E402
+                         protocol, recovery, state)
 from tools.agent.providers import ProviderConfig, ReflexContext  # noqa: E402
 
 
@@ -455,6 +455,77 @@ class RefusalSuppression(unittest.TestCase):
         self.ref.food.note_inventory_negative(mem.inventory_signature())
         res = self.ref.decide(ctx(mem))
         self.assertNotEqual(res.action, {"key": protocol.KEY_EAT})
+
+
+# ---------------------------------------------------- Phase 0: ep-4 capture
+
+import stall_recovery_fixtures as stall_fx  # noqa: E402  (small fixture)
+
+
+class Ep4LockedDoorStall(unittest.TestCase):
+    """AC1: the ep-4 capped-stationary locked-door stall (Phase 0 capture).
+
+    These tests document the live defect (they FAIL before the Phase 2 fix and
+    PASS after): the legacy ``>=10`` ``_unblock`` branch steps the hero into the
+    locked east door forever, and a default (non-directive) destination
+    retirement is invisible in the lifecycle stream.
+    """
+
+    def setUp(self):
+        self.ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+
+    def test_cap_exhausted_locked_door_adjacent_monster_enters_bounded_recovery(
+            self):
+        # hero (64,4), locked east door at (65,4), monster ':' at (63,4), and a
+        # reachable frontier beyond the door: the capped stationary stage must
+        # enter bounded edge-legal recovery, never the raw-grid step east into
+        # the locked door.
+        mem = mem_with(stall_fx.ep4_cells(), stall_fx.EP4_HERO)
+        mem.no_progress = 10
+        cand = self.ref.prepare(ctx(mem)).table.scripted()
+        self.assertEqual(cand.family, "recovery")
+        # `l` is the east wire key: the locked-door step is the defect
+        self.assertNotEqual(cand.action.to_wire().get("key"),
+                            protocol.DIR_KEYS[(1, 0)])
+        self.assertNotIn(cand.semantic_label, ("unblock",))
+
+    def test_default_locked_door_retirement_is_visible(self):
+        # a default (non-directive) open-door commitment that is explicitly
+        # refused must produce a *visible* terminal lifecycle event for its
+        # serial, not only a private `targets.events` entry.
+        mem = mem_with({(3, 10): FLOOR, (4, 10): FLOOR,
+                        (5, 10): stall_fx.DOOR, (6, 10): FLOOR}, (4, 10))
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_OPEN_DOOR,
+                                pos=(5, 10), family=navigation.TFAM_DOOR)
+        serial = self.ref.targets.held().serial
+        mem.messages.append("The door is locked.")
+        self.ref.note_observation(mem)
+        self.assertIsNone(self.ref.targets.held())
+        terminals = [e for e in self.ref.lifecycle.events
+                     if e.get("kind") == "destination"
+                     and e.get("outcome") in ("failed", "expired")]
+        self.assertTrue(terminals, "default retirement emitted no terminal")
+        self.assertEqual(terminals[-1].get("serial"), serial)
+        self.assertTrue(terminals[-1].get("reason"))
+
+
+class Ep2TrappedQuit(unittest.TestCase):
+    """AC1 (ep-2 half): the trapped sequence stays a bounded graceful quit."""
+
+    def test_ep2_trapped_sequence_requests_native_quit(self):
+        ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+        mem = mem_with({(10, 10): FLOOR}, (10, 10),
+                       messages=list(stall_fx.EP2_TRAPPED_MESSAGES))
+        mem.no_progress = 10
+        mem.status.hunger = "Hungry"
+        ref.last_eat_tick = 0
+        cand = ref.prepare(ctx(mem)).table.scripted()
+        # the trapped state stays inside bounded recovery: never an unbounded
+        # wait, and (after the Phase 2 fix) never the legacy raw-grid exit
+        self.assertEqual(cand.family, "recovery")
+        self.assertNotEqual(cand.action.to_wire().get("key"),
+                            protocol.KEY_HASH)
 
 
 if __name__ == "__main__":
