@@ -1123,8 +1123,15 @@ class _EpisodeRunner(object):
         self._note_recorder_health()
 
     def _lifecycle_sink(self, ev) -> None:
-        """Incremental lifecycle persistence into the event sidecar (§5)."""
+        """Incremental lifecycle persistence into the event sidecar (§5).
+
+        Mirrors :meth:`_event_sink`: a lifecycle write that fails synchronously
+        inside this same loop iteration must disable paid dispatch at once, so
+        the health note runs immediately after the record (review item 8).  The
+        note is reentrancy-safe, so a nested sink call is a no-op.
+        """
         self.rec.record_event(lifecycle_event(ev))
+        self._note_recorder_health()
 
     def _flush_events(self):
         """Finalise any open lifecycle records and persist directive events.

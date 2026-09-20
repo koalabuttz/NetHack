@@ -714,6 +714,32 @@ class Phase4Reports(unittest.TestCase):
             self.assertEqual(M.attempts_from_actions(a), 3)
             self.assertIsNone(M.attempts_from_actions(os.path.join(d, "no")))
 
+    def test_lifecycle_event_keeps_outer_envelope_schema(self):
+        from tools.agent import events, lifecycle_metrics as LM
+        rec = LM.LifecycleRecorder()
+        rec.record(LM.KIND_DESTINATION, LM.DEST_ACQUIRED, serial=1)
+        wrapped = events.lifecycle_event(rec.events[-1])
+        # the OUTER envelope schema is preserved; the lifecycle version is stored
+        # only in the inner schema_version (review item 7)
+        self.assertEqual(wrapped["schema"], events.EVENT_SCHEMA)
+        self.assertEqual(wrapped["schema_version"], LM.SCHEMA_VERSION)
+        self.assertEqual(wrapped["record"], "lifecycle")
+        # the exact persisted record shape after wrapping
+        self.assertEqual(set(wrapped),
+                         {"schema", "record", "schema_version", "kind",
+                          "outcome", "serial"})
+        # the §3 replacement record shape survives the wrap intact
+        rec.record(LM.KIND_DESTINATION, LM.DEST_REPLACED, serial=5,
+                   reason="replaced", replacement_serial=6)
+        w2 = events.lifecycle_event(rec.events[-1])
+        self.assertEqual(w2["schema"], events.EVENT_SCHEMA)
+        self.assertEqual(w2["schema_version"], LM.SCHEMA_VERSION)
+        self.assertEqual(w2["kind"], "destination")
+        self.assertEqual(w2["outcome"], "replaced")
+        self.assertEqual(w2["serial"], 5)
+        self.assertEqual(w2["reason"], "replaced")
+        self.assertEqual(w2["replacement_serial"], 6)
+
     def test_report_coverage_excludes_teardown(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "w.wire.jsonl")
@@ -788,6 +814,21 @@ class ValidationReport(unittest.TestCase):
         # live claims are explicitly labeled, never inferred
         self.assertFalse(report["live_claims"]["measured"])
         self.assertIn("note", report["live_claims"])
+
+    def test_report_provenance_covers_the_whole_implementation_range(self):
+        # review item 9: provenance is generated from the explicit implementation
+        # base through final HEAD (all commits), not a mis-derived ``git log -8``
+        import mutation_checks
+        rng = mutation_checks._commit_range()
+        self.assertEqual(rng["base"], mutation_checks._implementation_base())
+        self.assertEqual(rng["head"], mutation_checks._git("rev-parse", "HEAD"))
+        commits = mutation_checks._commits_since_base()
+        self.assertGreater(len(commits), 8)
+        expected = mutation_checks._git(
+            "log", "--reverse", "--format=%H",
+            "%s..HEAD" % rng["base"]).split()
+        self.assertEqual([c["hash"] for c in commits], expected)
+        self.assertEqual(commits[-1]["hash"], rng["head"])
 
 
 class PresentationV3Metadata(unittest.TestCase):

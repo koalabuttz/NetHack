@@ -436,16 +436,40 @@ def _suite_count():
         return None
 
 
-def _commit_range():
-    """The implementation range: the first phase commit's parent .. HEAD."""
-    head = _git("rev-parse", "HEAD")
-    base = head
+#: The explicitly named commit that opens this implementation series (review
+#: item 9).  Its PARENT is the implementation base, and provenance covers every
+#: commit from there through HEAD -- not a derived ``git log -8`` window.
+_IMPLEMENTATION_BASE_MARKER = "agent: native pickup-shape probe"
+
+
+def _implementation_base():
+    """The parent of the named base commit (explicit, stable, not a window)."""
     for line in reversed(_git("log", "--format=%H %s").splitlines()):
         sha, _, subject = line.partition(" ")
-        if subject.startswith("agent: native pickup-shape probe"):
-            base = _git("rev-parse", "%s^" % sha) or sha
-            break
-    return {"base": base, "head": head}
+        if subject.startswith(_IMPLEMENTATION_BASE_MARKER):
+            return _git("rev-parse", "%s^" % sha) or sha
+    return _git("rev-parse", "HEAD")
+
+
+def _commit_range():
+    """The implementation range: the explicit base .. final HEAD (item 9)."""
+    return {"base": _implementation_base(),
+            "head": _git("rev-parse", "HEAD")}
+
+
+def _commits_since_base():
+    """EVERY commit from the implementation base through HEAD, oldest first.
+
+    Replaces the old ``git log -8`` window: the provenance must name the whole
+    implementation range, so a reader can see all phase commits (review item 9).
+    """
+    rng = "%s..HEAD" % _implementation_base()
+    out = []
+    for line in _git("log", "--reverse", "--format=%H %s", rng).splitlines():
+        sha, _, subject = line.partition(" ")
+        if sha:
+            out.append({"hash": sha, "subject": subject})
+    return out
 
 
 def _lifecycle_summary(artifact=None):
@@ -464,10 +488,9 @@ def _lifecycle_summary(artifact=None):
 
 
 def build_report(*, gates=None, mutations=None, artifact=None):
-    commits = []
-    for line in _git("log", "--format=%H %s", "-8").splitlines():
-        sha, _, subject = line.partition(" ")
-        commits.append({"hash": sha, "subject": subject})
+    # provenance is the WHOLE implementation range (base..HEAD), never a
+    # mis-derived fixed window (review item 9)
+    commits = _commits_since_base()
     mutations = list(mutations or [])
     for m in NOT_PERFORMED:
         mutations.append({"name": m["name"], "killer": None,

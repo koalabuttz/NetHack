@@ -1580,6 +1580,42 @@ class SelectedDecisionOwnership(JevAppliedCap):
                          tuple(chosen.effect_payload))
 
 
+class RecorderHealthSymmetry(WireHarness):
+    """Item 8: the lifecycle sink notes recorder health in the same iteration."""
+
+    def _runner(self):
+        cfg = ProviderConfig(max_ticks=200, reflex="scripted",
+                             postmortem_reserve=0)
+        ctl = controller.Controller(
+            cfg, controller.ControllerPaths("w", "r", "d", "s"), self.dir,
+            episode_timeout=5.0)
+        result = controller.EpisodeResult(index=1)
+        rec = recording.EpisodeRecorder(self.dir, 1)
+        proc = paced([hello()], [0.0])
+        self.addCleanup(proc.close)
+        return controller._EpisodeRunner(ctl, proc, rec, result)
+
+    def test_lifecycle_sink_notes_recorder_health_same_iteration(self):
+        r = self._runner()
+        r.rec_healthy = True
+        r.paid_disabled = False
+
+        class _BadRec(object):
+            failed = True
+
+            def record_event(self, obj):
+                pass
+
+        r.rec = _BadRec()
+        r._lifecycle_sink({"schema": 2, "schema_version": 2,
+                           "kind": "destination", "outcome": "acquired",
+                           "serial": 1})
+        # the same-iteration health note disabled paid dispatch, exactly as the
+        # boundary event sink does
+        self.assertFalse(r.rec_healthy)
+        self.assertTrue(r.paid_disabled)
+
+
 class DoorRefusalSeam(WireHarness):
     """Item 3: refusal is bound to the matched sent attempt's baseline."""
 

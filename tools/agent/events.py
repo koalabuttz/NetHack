@@ -392,8 +392,14 @@ def lifecycle_event(ev: Dict[str, Any]) -> Dict[str, Any]:
     before it existed simply has no lifecycle stream (unavailable, never
     zero).
     """
-    out = {"schema": EVENT_SCHEMA, "record": "lifecycle"}
-    out.update(ev)
+    # The lifecycle payload carries its own inner ``schema`` (the lifecycle
+    # schema version); that must NOT clobber the *outer* event-envelope schema
+    # (review item 7).  The envelope keeps ``schema`` at the event-envelope
+    # version and the lifecycle version travels only in ``schema_version``.
+    out = dict(ev)
+    out.pop("schema", None)
+    out["schema"] = EVENT_SCHEMA
+    out["record"] = "lifecycle"
     return out
 
 
