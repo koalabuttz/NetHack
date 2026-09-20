@@ -1200,7 +1200,12 @@ class WorkflowWiring(unittest.TestCase):
     """Finding #1: the public workflow actually wires the helpers."""
 
     def _spec(self, tmp):
-        ov = {"reflex": "jev", "jev_accept_terms": True, "reflex_call_cap": 8}
+        keyfile = os.path.join(tmp, "jev.key")
+        with open(keyfile, "w") as fh:
+            fh.write("jev-test-key\n")
+        os.chmod(keyfile, 0o600)
+        ov = {"reflex": "jev", "jev_accept_terms": True, "reflex_call_cap": 8,
+              "jev_key_file": keyfile}
         spec = _valid_spec(tier="live", episodes=3, overrides=ov)
         spec["judge"] = {"enabled": True, "model": "jev-latest",
                          "rubric_version": "bench-judge-rubric/1",
@@ -1244,6 +1249,8 @@ class WorkflowWiring(unittest.TestCase):
         spec, spec_path = self._spec(tmp)
         os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
         self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
+        os.environ[B.BENCH_WORKER_ENV] = sys.executable
+        self.addCleanup(os.environ.pop, B.BENCH_WORKER_ENV, None)
 
         dispatches = {"n": 0}
 
@@ -1837,6 +1844,135 @@ class ScorecardEnvelope(unittest.TestCase):
             self.assertIn("pair", meta)
             self.assertIn("order", meta)
         self.assertEqual(len(envelope["schedule"]), 4)
+
+
+class JudgeTransportWiring(unittest.TestCase):
+    """Finding #2: a judge-enabled production run actually dispatches."""
+
+    def _fake_worker(self, tmp):
+        log = os.path.join(tmp, "worker-jobs.jsonl")
+        path = os.path.join(tmp, "fake-worker.py")
+        with open(path, "w") as fh:
+            fh.write(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "job = json.loads(sys.stdin.readline())\n"
+                "log_path = os.path.join(os.path.dirname(os.path.abspath("
+                "__file__)), 'worker-jobs.jsonl')\n"
+                "with open(log_path, 'a') as log:\n"
+                "    log.write(json.dumps({'questions': sorted(\n"
+                "        job['payload']['questions']), "
+                "'url': job['url']}) + '\\n')\n"
+                "levels_hint = 5\n"
+                "body = {'model': 'jev-1.13.0', 'answers': {\n"
+                "    'degenerate_loop': {'type': 'noul', 'noul': 0.1},\n"
+                "    'exploration_productivity': {'type': 'score', 'score': 2.0,\n"
+                "        'confidence': 0.9,\n"
+                "        'legend': {str(i): 'L%d' % i for i in "
+                "range(levels_hint)},\n"
+                "        'probabilities': {str(i): (1.0 if i == 2 else 0.0)\n"
+                "                          for i in range(levels_hint)}},\n"
+                "    'termination_sanity': {'type': 'noul', 'noul': 0.9}},\n"
+                "    'usage': {'input_tokens': 11, 'output_tokens': 2}}\n"
+                "sys.stdout.write(json.dumps({'v': 1, 'ok': True, "
+                "'status': 200,\n"
+                "    'json': body, 'bytes': 1}) + '\\n')\n")
+        os.chmod(path, 0o755)
+        return path, log
+
+    def _spec(self, tmp):
+        keyfile = os.path.join(tmp, "jev.key")
+        with open(keyfile, "w") as fh:
+            fh.write("jev-test-key\n")
+        os.chmod(keyfile, 0o600)
+        spec = _valid_spec(tier="live", episodes=2, overrides={
+            "reflex": "jev", "jev_accept_terms": True, "jev_key_file": keyfile})
+        spec["judge"] = {"enabled": True, "model": "jev-latest",
+                         "rubric_version": "bench-judge-rubric/1",
+                         "deadline_s": 10.0, "max_state_bytes": 8192,
+                         "max_response_bytes": 65536, "retries": 0}
+        spec["budget"]["judge_calls_total"] = 10
+        spec["budget"]["max_total_episodes"] = 100
+        return spec
+
+    def test_default_judge_dispatches_one_bundled_worker_job_per_episode(
+            self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        worker, log = self._fake_worker(tmp)
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
+        os.environ[B.BENCH_WORKER_ENV] = worker
+        os.environ["FAKE_WORKER_LOG"] = log
+        for key in (B.VAPOR_CLOUD_ENV, B.BENCH_WORKER_ENV, "FAKE_WORKER_LOG"):
+            self.addCleanup(os.environ.pop, key, None)
+        spec = self._spec(tmp)
+        runner = B.BenchRunner(spec, tmp)   # NO judge_factory
+
+        def fake_episode(config, paths, episode_dir, index, timeout):
+            os.makedirs(episode_dir, exist_ok=True)
+            with open(os.path.join(episode_dir,
+                                   "ep-%d.meta.json" % index), "w") as fh:
+                json.dump(_meta(), fh)
+            return _meta(), episode_dir
+
+        runner.episode_runner = fake_episode
+        out = runner.run()
+
+        # the judge really dispatched: exactly one bundled job per episode
+        with open(log) as fh:
+            jobs = [json.loads(line) for line in fh if line.strip()]
+        self.assertEqual(len(jobs), 2)
+        for job in jobs:
+            self.assertEqual(set(job["questions"]),
+                             {"degenerate_loop", "exploration_productivity",
+                              "termination_sanity"})
+            self.assertTrue(job["url"].endswith("/systemone"))
+        # each call succeeded with one dispatch (not a zero-dispatch advisory)
+        statuses = [c["status"] for c in out["manifest"]["judge_calls"]]
+        self.assertEqual(statuses, ["ok", "ok"])
+        self.assertEqual([c["dispatches"] for c in
+                          out["manifest"]["judge_calls"]], [1, 1])
+
+    def test_missing_worker_or_key_fails_before_episodes_launch(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
+        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
+        spec = self._spec(tmp)
+        # no BENCH_WORKER at all
+        os.environ.pop(B.BENCH_WORKER_ENV, None)
+        report = B.preflight(spec)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["stage"], "judge")
+        launched = {"n": 0}
+
+        def fake_episode(config, paths, episode_dir, index, timeout):
+            launched["n"] += 1
+            return _meta(), episode_dir
+
+        runner = B.BenchRunner(spec, tmp)
+        runner.episode_runner = fake_episode
+        out = runner.run()
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["stage"], "judge")
+        self.assertEqual(launched["n"], 0)      # nothing launched
+        self.assertEqual(runner.manifest.data["episodes"], [])
+        # a worker that does not exist is refused too
+        os.environ[B.BENCH_WORKER_ENV] = os.path.join(tmp, "nope")
+        try:
+            self.assertEqual(B.preflight(spec)["stage"], "judge")
+        finally:
+            os.environ.pop(B.BENCH_WORKER_ENV, None)
+        # a resolvable worker but no credential reference is refused
+        os.environ[B.BENCH_WORKER_ENV] = sys.executable
+        keyfile = spec["overrides"]["jev_key_file"]
+        spec["overrides"]["jev_key_file"] = None
+        os.environ.pop(B.JEV_KEY_ENV, None)
+        try:
+            self.assertEqual(B.preflight(spec)["stage"], "judge")
+        finally:
+            os.environ.pop(B.BENCH_WORKER_ENV, None)
+            spec["overrides"]["jev_key_file"] = keyfile
 
 
 if __name__ == "__main__":

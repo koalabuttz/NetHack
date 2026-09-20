@@ -403,11 +403,15 @@ def preflight(spec: dict) -> Dict[str, Any]:
                     "error": ("cost_mode=priced-bound requires a complete "
                               "DeepSeek tariff (price_in and price_out)")}
     effective, unattended, forced_from = effective_cost_mode(spec, config)
+    judge_transport, judge_err = judge_transport_preflight(spec, config)
+    if judge_err:
+        return {"ok": False, "stage": "judge", "error": judge_err}
     return {"ok": True, "stage": "done", "config": config,
             "paid_call_bound": paid_call_bound(config),
             "effective_cost_mode": effective,
             "cost_mode_forced_from": forced_from,
             "unattended_apply_allowed": unattended,
+            "judge_transport": judge_transport,
             "allocations": plan_allocations(spec, max(1, spec["budget"][
                 "max_candidates"])),
             "postmortem_reserve": config.postmortem_reserve}
@@ -489,6 +493,64 @@ def vapor_cloud_attestation(source: Optional[dict] = None) -> Dict[str, Any]:
                            % (VAPOR_CLOUD_ENV, VAPOR_CLOUD_TOKEN))}
     return {"attested": True, "token": value,
             "reason": "operator-attested"}
+
+
+#: The env var naming the built worker executable the judge transport spawns.
+BENCH_WORKER_ENV = "BENCH_WORKER"
+#: The env var that may carry the Jev credential when no key file is set.
+JEV_KEY_ENV = "JEV_API_KEY"
+
+
+def judge_key_reference(config, env: Optional[dict] = None) -> Optional[str]:
+    """A resolvable Jev key *reference*: a key file path or the env var name."""
+    env = os.environ if env is None else env
+    key_file = getattr(config, "jev_key_file", None)
+    if key_file:
+        return key_file
+    if (env.get(JEV_KEY_ENV) or "").strip():
+        return JEV_KEY_ENV
+    return None
+
+
+def judge_transport_preflight(spec: dict, config, *,
+                              env: Optional[dict] = None
+                              ) -> Tuple[Optional[Dict[str, Any]],
+                                         Optional[str]]:
+    """Resolve the inputs the default judge transport needs, or an error.
+
+    A judge-enabled run whose worker executable or credential reference cannot
+    be resolved is **refused at preflight** -- never silently downgraded to a
+    zero-dispatch advisory call at run time.
+    """
+    if not spec["judge"]["enabled"]:
+        return None, None
+    env = os.environ if env is None else env
+    worker = (env.get(BENCH_WORKER_ENV) or "").strip()
+    if not worker:
+        return None, ("judge.enabled requires %s (the built worker "
+                      "executable)" % BENCH_WORKER_ENV)
+    if not os.path.exists(worker):
+        return None, "%s does not exist: %s" % (BENCH_WORKER_ENV, worker)
+    key_ref = judge_key_reference(config, env)
+    if not key_ref:
+        return None, ("judge.enabled requires a Jev key reference "
+                      "(provider jev_key_file or %s)" % JEV_KEY_ENV)
+    key_file = key_ref if key_ref != JEV_KEY_ENV else None
+    if key_file is not None:
+        from . import providers
+        try:
+            providers.load_secret(key_file, JEV_KEY_ENV)
+        except providers.SecretError as exc:
+            return None, "jev_key_file is unusable: %s" % exc
+    return {
+        "worker": worker,
+        "key_file": key_file,
+        "key_ref": key_ref,
+        "base_url": getattr(config, "jev_base_url", None),
+        "deadline_s": float(spec["judge"]["deadline_s"]),
+        "max_response_bytes": int(spec["judge"]["max_response_bytes"]),
+        "max_state_bytes": int(spec["judge"]["max_state_bytes"]),
+    }, None
 
 
 def precommit(comparison: dict) -> Dict[str, Any]:
@@ -1371,6 +1433,7 @@ class BenchRunner(object):
         #: episode_id -> {"arm","pair","order"}; scheduling metadata is kept
         #: OUT of the immutable scorecard object.
         self._arms: Dict[str, Dict[str, Any]] = {}
+        self._judge_preflight_error: Optional[str] = None
 
     def _spec_path(self) -> str:
         if self.spec_path is None:
@@ -1523,7 +1586,14 @@ class BenchRunner(object):
         return self._after_loop(cards, status, stop_reason, judge_results)
 
     def _make_judge(self, pre: dict):
-        """Construct the advisory judge when enabled and budgeted."""
+        """Construct the advisory judge, with a real transport, when enabled.
+
+        The default judge is built over the **public worker transport** using
+        the resolved worker executable, credential reference and base URL, so a
+        judge-enabled production run actually dispatches.  A judge whose
+        transport cannot be constructed is a **preflight error**, never a
+        silent zero-dispatch advisory downgrade.
+        """
         if not self.spec["judge"]["enabled"]:
             return None
         calls_total = self.spec["budget"]["judge_calls_total"]
@@ -1532,11 +1602,27 @@ class BenchRunner(object):
         if self.judge_factory is not None:
             return self.judge_factory(calls_total, self.spec["judge"])
         from . import bench_judge as J
+        info = pre.get("judge_transport")
+        if not info:
+            # a required judge whose transport inputs are unresolved is a
+            # preflight error, not an advisory no-op.
+            self._judge_preflight_error = (
+                "judge transport could not be resolved at preflight")
+            self.manifest.set_status("preflight-error",
+                                     judge_error=self._judge_preflight_error)
+            return None
+        transport = J.make_worker_transport(
+            [info["worker"]], key_file=info.get("key_file"),
+            base_url=info.get("base_url"),
+            max_bytes=info.get("max_response_bytes", 65536),
+            deadline_s=float(self.spec["judge"]["deadline_s"]))
         return J.BenchJudge(model=self.spec["judge"]["model"],
                             rubric_version=self.spec["judge"]["rubric_version"],
                             deadline_s=self.spec["judge"]["deadline_s"],
                             max_state_bytes=self.spec["judge"]["max_state_bytes"],
-                            calls_total=calls_total)
+                            max_response_bytes=self.spec["judge"][
+                                "max_response_bytes"],
+                            calls_total=calls_total, transport=transport)
 
     def _run_one(self, config, episode_dir, index):
         os.makedirs(episode_dir, mode=0o700, exist_ok=True)
@@ -1686,7 +1772,13 @@ class BenchRunner(object):
         return card, hashes, paths
 
     def _judge_episode(self, card: dict, index: int) -> Optional[dict]:
-        """One advisory dispatch per *eligible* episode, after sealing."""
+        """One advisory dispatch per *eligible* episode, after sealing.
+
+        A **required** dispatch that cannot even be constructed (a missing
+        transport) is a preflight error, not a silent advisory downgrade: it is
+        recorded as such and the run status reflects it.
+        """
+        from . import bench_judge as J
         if self.judge is None:
             return None
         if card["integrity"]["status"] == "missing":
@@ -1695,6 +1787,14 @@ class BenchRunner(object):
             return None
         try:
             result = self.judge.evaluate(card)
+        except J.JudgeError as exc:
+            if "no transport configured" in str(exc):
+                self._judge_preflight_error = str(exc)
+                self.manifest.set_status("preflight-error",
+                                         judge_error=str(exc))
+                return {"status": "preflight-error", "error": str(exc),
+                        "advisory": False, "episode": index}
+            result = {"status": "error", "error": str(exc), "advisory": True}
         except Exception as exc:  # noqa: BLE001 - advisory never fatal
             result = {"status": "error", "error": str(exc), "advisory": True}
         self.manifest.data["judge_calls"].append(
