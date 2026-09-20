@@ -1827,6 +1827,12 @@ class MultiEpisodeChildWorkflow(unittest.TestCase):
                 # the local ep-1.* was remapped away for episodes 2+
                 self.assertFalse(os.path.exists(os.path.join(
                     entry["dir"], "ep-1.wire.jsonl")), idx)
+            # the parent persisted the root identity before the child proceeded
+            self.assertTrue(os.path.exists(os.path.join(
+                entry["dir"], "bench-root-ready.json")), idx)
+            handshake = json.load(open(os.path.join(
+                entry["dir"], "bench-handshake.json")))
+            self.assertTrue(handshake["root_ready_observed"], idx)
         # every scorecard carries *measured* forced-search counters
         self.assertEqual(len(out["scorecards"]), 3)
         for card in out["scorecards"]:
@@ -2052,6 +2058,182 @@ class JudgeTransportWiring(unittest.TestCase):
         finally:
             os.environ.pop(B.BENCH_WORKER_ENV, None)
             spec["overrides"]["jev_key_file"] = keyfile
+
+
+class ProcFailClosed(unittest.TestCase):
+    """Finding #4: /proc failures fail closed; the root is reaped last."""
+
+    def test_identity_enoent_is_disappearance_permission_is_fatal(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        reader = B.ProcReader(proc_root=tmp)
+        # a missing stat file is a genuine disappearance
+        self.assertIsNone(reader.identity(4242))
+
+        def deny(path, mode="r"):
+            if "/1234/" in path:
+                raise PermissionError("denied")
+            raise FileNotFoundError(path)
+
+        reader = B.ProcReader(proc_root=tmp, open_=deny)
+        self.assertIsNone(reader.identity(1))
+        with self.assertRaises(B.ProcError):
+            reader.identity(1234)
+
+    def test_identity_parse_failure_is_fatal(self):
+        class _Bad(object):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return "not a proc stat line"
+
+        reader = B.ProcReader(proc_root="/nonexistent",
+                              open_=lambda *a, **k: _Bad())
+        with self.assertRaises(B.ProcError):
+            reader.identity(7)
+
+    def test_injected_fault_sets_persisted_teardown_failure(self):
+        # a real ProcReader, with only the `open` seam faulted: the production
+        # classification/teardown path runs unchanged.
+        def deny(path, mode="r"):
+            raise PermissionError("denied")
+
+        reader = B.ProcReader(open_=deny)
+        outcome = B.OwnedProcessTree(reader).reap(999999)
+        self.assertTrue(outcome["teardown_failure"])
+        self.assertTrue(outcome["permission_failure"])
+        self.assertTrue(outcome["errors"])
+
+    def test_getpgid_failure_is_fatal(self):
+        real = os.getpgid
+
+        def deny(pid):
+            raise PermissionError("denied")
+
+        os.getpgid = deny
+        try:
+            reader = B.ProcReader()
+            with self.assertRaises(B.ProcError):
+                reader.pgid(os.getpid())
+        finally:
+            os.getpgid = real
+
+    def test_alive_fails_closed_on_verification_error(self):
+        calls = {"n": 0}
+
+        class Flaky(B.ProcReader):
+            def identity(self, pid):
+                calls["n"] += 1
+                raise B.ProcError("verification blew up")
+
+        result = {"teardown_failure": False, "permission_failure": False,
+                  "errors": []}
+        tree = B.OwnedProcessTree(Flaky())
+        self.assertTrue(tree._alive({"pid": 5, "starttime": "1"}, result))
+        self.assertTrue(result["teardown_failure"])
+        self.assertTrue(result["permission_failure"])
+
+    def test_group_containing_root_is_never_group_signalled(self):
+        class FakeTree(B.ProcReader):
+            """root 100 (pgid 100) -> 200 (inherits pgid 100) and 300 (pgid 300)."""
+
+            def __init__(self):
+                self.tree = {100: {"ppid": 0, "pgid": 100, "starttime": "1"},
+                             200: {"ppid": 100, "pgid": 100, "starttime": "2"},
+                             300: {"ppid": 100, "pgid": 300, "starttime": "3"}}
+                self.calls = []
+                self.dead = set()
+
+            def identity(self, pid):
+                if pid in self.dead or pid not in self.tree:
+                    return None
+                info = self.tree[pid]
+                return {"pid": pid, "ppid": info["ppid"], "pgid": info["pgid"],
+                        "session": 1, "starttime": info["starttime"],
+                        "state": "S"}
+
+            def children(self, pid):
+                return sorted(p for p, i in self.tree.items()
+                              if i["ppid"] == pid and p not in self.dead)
+
+            def pgid(self, pid):
+                return self.tree.get(pid, {}).get("pgid", -1)
+
+            def members(self, pgid):
+                return [p for p, i in self.tree.items()
+                        if i["pgid"] == pgid and p not in self.dead]
+
+            def signal(self, pid, sig):
+                self.calls.append(("signal", pid))
+                self.dead.add(pid)
+
+            def signal_group(self, pgid, sig):
+                self.calls.append(("signal_group", pgid))
+                for p in self.members(pgid):
+                    self.dead.add(p)
+
+        fake = FakeTree()
+        outcome = B.OwnedProcessTree(fake, bound=2.0).reap(100)
+        # the root's own group is NEVER group-signalled
+        self.assertNotIn(("signal_group", 100), fake.calls)
+        # the inherited-PGID descendant was signalled individually
+        self.assertIn(("signal", 200), fake.calls)
+        # 300 (its own group) may be group-signalled
+        self.assertIn(("signal_group", 300), fake.calls)
+        # root-last: every descendant signal precedes the root's own signal
+        root_at = max(i for i, c in enumerate(fake.calls)
+                      if c == ("signal", 100))
+        for i, c in enumerate(fake.calls):
+            if c == ("signal", 100):
+                continue
+            self.assertLess(i, root_at, fake.calls)
+        self.assertFalse(outcome["teardown_failure"], outcome)
+
+
+class HandshakeAndCancel(unittest.TestCase):
+    """Finding #4b/4c: the startup handshake and the graceful child cancel."""
+
+    def test_wait_for_root_ready_blocks_until_the_file_appears(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "bench-root-ready.json")
+        self.assertFalse(B.wait_for_root_ready(path, 0.05))
+        with open(path, "w") as fh:
+            fh.write("{}")
+        self.assertTrue(B.wait_for_root_ready(path, 1.0))
+        # a None path is not a handshake
+        self.assertFalse(B.wait_for_root_ready(None, 0.01))
+
+    def test_default_episode_command_passes_root_ready(self):
+        class _R(object):
+            def _paths(self):
+                return {"worker": "w", "runner": "r", "data": "d"}
+
+        argv = B.default_episode_command(_R(), "spec.json", "/tmp/ep-1", 1, 5)
+        self.assertIn("--root-ready", argv)
+        self.assertEqual(argv[argv.index("--root-ready") + 1],
+                         B.root_ready_path("/tmp/ep-1"))
+
+    def test_child_writes_handshake_and_ack_file(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        ack = os.path.join(tmp, "bench-cancel.json")
+        handlers = B.install_child_cancel_handlers(None, ack_path=ack)
+        try:
+            self.assertFalse(handlers.acknowledged())
+            handlers._handle(signal.SIGTERM, None)
+            self.assertTrue(handlers.acknowledged())
+            self.assertTrue(os.path.exists(ack))
+            with open(ack) as fh:
+                payload = json.load(fh)
+            self.assertTrue(payload["acknowledged"])
+            self.assertEqual(payload["signals"], [int(signal.SIGTERM)])
+        finally:
+            handlers.restore()
 
 
 if __name__ == "__main__":

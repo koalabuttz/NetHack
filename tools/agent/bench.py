@@ -733,19 +733,31 @@ def plan_allocations(spec: dict, n_candidates: int) -> Dict[str, Any]:
 # --------------------------------------------------------------------------
 
 class ProcReader(object):
-    """The pluggable ``/proc`` + signal abstraction (failure injectable)."""
+    """The pluggable ``/proc`` + signal abstraction (failure injectable).
+
+    ``proc_root`` and ``open_`` are *seams* for tests, not semantic overrides:
+    the real parsing and error-classification logic runs unchanged, so an
+    injected fault exercises the production path.
+    """
 
     #: A reaped-but-unwaited process is still in /proc; it is not alive.
     DEAD_STATES = ("Z", "X", "x")
 
+    def __init__(self, proc_root: str = "/proc", open_=open):
+        self.proc_root = proc_root
+        self._open = open_
+
     def children(self, pid: int) -> List[int]:
         out = []
-        for entry in os.listdir("/proc"):
+        for entry in os.listdir(self.proc_root):
             if not entry.isdigit():
                 continue
             try:
                 identity = self.identity(int(entry))
             except ProcError:
+                # another user's process cannot be a descendant of our own
+                # tree, so an unreadable *unrelated* stat is not fatal here;
+                # the owned-tree walk itself fails closed.
                 continue
             if identity and identity.get("ppid") == pid \
                     and identity.get("state") not in self.DEAD_STATES:
@@ -753,11 +765,23 @@ class ProcReader(object):
         return sorted(out)
 
     def identity(self, pid: int) -> Optional[Dict[str, Any]]:
+        """The identity of *pid*, or ``None`` when it has genuinely vanished.
+
+        Disappearance (``ENOENT``) returns ``None``; a permission, I/O or parse
+        failure **raises** :class:`ProcError` -- treating an unreadable process
+        as "gone" is the fail-open defect this guards against.
+        """
         try:
-            with open("/proc/%d/stat" % pid, "r") as fh:
+            with self._open("%s/%d/stat" % (self.proc_root, pid), "r") as fh:
                 stat = fh.read()
-        except OSError:
+        except FileNotFoundError:
             return None
+        except PermissionError as exc:
+            raise ProcError("permission reading stat for %d: %s" % (pid, exc))
+        except OSError as exc:
+            if getattr(exc, "errno", None) == 2:      # ENOENT
+                return None
+            raise ProcError("error reading stat for %d: %s" % (pid, exc))
         try:
             # comm may contain spaces/parens; parse after the last ')'.
             rest = stat[stat.rindex(")") + 2:].split()
@@ -766,13 +790,13 @@ class ProcReader(object):
             pgid = int(rest[2])
             session = int(rest[3])
             starttime = rest[19]
-        except (ValueError, IndexError):
-            return None
+        except (ValueError, IndexError) as exc:
+            raise ProcError("unparseable stat for %d: %s" % (pid, exc))
         return {"pid": pid, "ppid": ppid, "pgid": pgid, "session": session,
                 "starttime": starttime, "state": state}
 
     def pgid(self, pid: int) -> int:
-        """The process group of *pid*; ``-1`` only when it is gone.
+        """The process group of *pid*; ``-1`` only when it is genuinely gone.
 
         A permission failure is raised, never swallowed as ``-1``: treating an
         unreadable ``getpgid`` as "gone" is exactly the fail-open defect the
@@ -783,9 +807,9 @@ class ProcReader(object):
         except ProcessLookupError:
             return -1
         except PermissionError:
-            raise
-        except OSError:
-            return -1
+            raise ProcError("getpgid permission failure for %d" % pid)
+        except OSError as exc:
+            raise ProcError("getpgid failure for %d: %s" % (pid, exc))
 
     def members(self, pgid: int) -> List[int]:
         """Every live PID whose process group is *pgid* (for ownership checks)."""
@@ -874,13 +898,21 @@ class OwnedProcessTree(object):
             frontier.extend(kids)
         return list(seen.values())
 
-    def _group_owned(self, pgid: int, captured_pids: Iterable[int]) -> bool:
-        """True only when every member of *pgid* is inside the captured tree."""
+    def _group_owned(self, pgid: int, captured_pids: Iterable[int],
+                     root_pid: Optional[int] = None) -> bool:
+        """True only when every member of *pgid* is inside the captured tree.
+
+        A group that **contains the root** is never "owned" for the descendant
+        phase: group-signalling it would kill the root before root-last, so an
+        inherited-PGID descendant must be signalled individually instead.
+        """
         try:
             members = self.reader.members(pgid)
         except Exception as exc:  # noqa: BLE001 - cannot prove ownership
             raise ProcError("group membership read failed for pgid %d: %s"
                             % (pgid, exc))
+        if root_pid is not None and root_pid in set(members):
+            return False
         return set(members) <= set(captured_pids)
 
     def reap(self, root: Any) -> Dict[str, Any]:
@@ -927,7 +959,7 @@ class OwnedProcessTree(object):
                 if ident["pid"] == root_pid:
                     continue
                 try:
-                    self._kill(ident, result, pids)
+                    self._kill(ident, result, pids, root_pid)
                 except ProcError as exc:
                     _fatal(exc)
             time.sleep(0.05)
@@ -935,7 +967,7 @@ class OwnedProcessTree(object):
         if root_identity is not None:
             try:
                 self._kill(root_identity, result,
-                           {i["pid"] for i in captured})
+                           {i["pid"] for i in captured}, root_pid)
             except ProcError as exc:
                 _fatal(exc)
         # verify no captured identity survives (bounded: SIGKILL delivery and
@@ -943,7 +975,8 @@ class OwnedProcessTree(object):
         poll_deadline = time.monotonic() + self.grace + 2.0
         surviving: List[int] = []
         while True:
-            surviving = [i["pid"] for i in captured if self._alive(i)]
+            surviving = [i["pid"] for i in captured
+                         if self._alive(i, result)]
             if not surviving or time.monotonic() >= poll_deadline:
                 break
             time.sleep(0.05)
@@ -954,7 +987,8 @@ class OwnedProcessTree(object):
         return result
 
     def _kill(self, ident: Dict[str, Any], result: Dict[str, Any],
-              captured_pids: Iterable[int]) -> None:
+              captured_pids: Iterable[int],
+              root_pid: Optional[int] = None) -> None:
         pid = ident["pid"]
         try:
             current = self.reader.identity(pid)
@@ -976,8 +1010,10 @@ class OwnedProcessTree(object):
         try:
             if pg and pg > 0 and pg != os.getpgrp():
                 # Signal a group only when every member belongs to the captured
-                # tree; otherwise a mixed group could hold an unrelated process.
-                if self._group_owned(pg, captured_pids):
+                # tree AND the root is not in it -- a group holding the root is
+                # never group-signalled before root-last, so an inherited-PGID
+                # descendant is signalled individually.
+                if self._group_owned(pg, captured_pids, root_pid):
                     self.reader.signal_group(pg, signal.SIGKILL)
                 else:
                     self.reader.signal(pid, signal.SIGKILL)
@@ -991,11 +1027,24 @@ class OwnedProcessTree(object):
         except (ProcessLookupError, OSError):
             return
 
-    def _alive(self, ident: Dict[str, Any]) -> bool:
+    def _alive(self, ident: Dict[str, Any],
+               result: Optional[Dict[str, Any]] = None) -> bool:
+        """Whether a captured identity still survives.
+
+        Fails **closed**: a verification exception cannot be read as "gone", so
+        it is recorded as a teardown failure and the process is treated as
+        still alive.
+        """
         try:
             current = self.reader.identity(ident["pid"])
-        except Exception:  # noqa: BLE001
-            return False
+        except Exception as exc:  # noqa: BLE001
+            if result is not None:
+                result["teardown_failure"] = True
+                result["permission_failure"] = True
+                result.setdefault("errors", []).append(
+                    "liveness verification failed for pid %d: %s"
+                    % (ident["pid"], exc))
+            return True
         if current is None:
             return False
         if current.get("state") in getattr(self.reader, "DEAD_STATES", ("Z",)):
@@ -1439,12 +1488,35 @@ def default_episode_command(runner, spec_path: str, episode_dir: str,
     argv = [sys.executable, "-m", "tools.agent.bench", "_child",
             "--spec", spec_path, "--episode-dir", episode_dir,
             "--timeout", str(timeout),
+            "--root-ready", root_ready_path(episode_dir),
             "--worker", paths.get("worker", ""),
             "--runner", paths.get("runner", ""),
             "--data", paths.get("data", "")]
     if paths.get("sysconf"):
         argv += ["--sysconf", paths["sysconf"]]
     return argv
+
+
+def root_ready_path(episode_dir: str) -> str:
+    """The handshake file the parent writes once the root is recorded."""
+    return os.path.join(episode_dir, "bench-root-ready.json")
+
+
+def wait_for_root_ready(path: Optional[str], timeout: float) -> bool:
+    """Block until the parent has durably recorded the root identity.
+
+    The child is spawned *before* the parent can persist the captured root
+    identity, so it waits here -- bounded by *timeout* to avoid a deadlock if
+    the parent died first.  Returns whether the handshake was observed.
+    """
+    if not path:
+        return False
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while time.monotonic() < deadline:
+        if os.path.exists(path):
+            return True
+        time.sleep(0.02)
+    return os.path.exists(path)
 
 
 def default_episode_runner(config, paths, episode_dir: str, index: int,
@@ -1765,6 +1837,14 @@ class BenchRunner(object):
             self.manifest.set_status("teardown-failure",
                                      teardown_failure=True)
         self.manifest.record_root(key, identity)
+        # Handshake: signal the child that the root identity is durably
+        # persisted, so it may begin the (expensive) episode work.
+        try:
+            write_json_atomic(root_ready_path(episode_dir),
+                              {"root_recorded": True,
+                               "pid": identity.get("pid")})
+        except OSError:
+            pass
         self._supervise(key, proc, identity)
         try:
             proc.wait(timeout=2.0)
@@ -2538,6 +2618,17 @@ def _cmd_child(args) -> int:
     if err:
         print("error: %s" % err, file=sys.stderr)
         return 2
+    # Block until the parent has durably recorded our root identity, so a
+    # forced abort always has a validated root to reap.
+    ready = wait_for_root_ready(getattr(args, "root_ready", None),
+                                min(30.0, float(args.timeout or 30.0)))
+    os.makedirs(args.episode_dir, mode=0o700, exist_ok=True)
+    try:
+        write_json_atomic(os.path.join(args.episode_dir,
+                                       "bench-handshake.json"),
+                          {"root_ready_observed": bool(ready)})
+    except OSError:
+        pass
     paths = {"worker": args.worker, "runner": args.runner, "data": args.data,
              "sysconf": args.sysconf or None}
     ctl = C.Controller(config, C.ControllerPaths(**paths), args.episode_dir,
@@ -2578,7 +2669,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                        default=M.DEFAULT_PACKAGE_MAX_BYTES)
     child = sub.add_parser("_child")
     for flag in ("--spec", "--worker", "--runner", "--data", "--sysconf",
-                 "--episode-dir", "--timeout"):
+                 "--episode-dir", "--timeout", "--root-ready"):
         child.add_argument(flag, required=flag in ("spec", "worker", "runner",
                                                    "data", "episode-dir"))
     args = ap.parse_args(argv)
