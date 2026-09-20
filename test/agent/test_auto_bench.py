@@ -1236,6 +1236,80 @@ class WorkflowWiring(unittest.TestCase):
             os.path.join(tmp, "postmortem", "manifest.json")))
 
 
+class BudgetEnforcement(unittest.TestCase):
+    """Finding #4: allocation plans are enforced before any spawn."""
+
+    def test_over_budget_specs_fail_before_spawn(self):
+        spec = _valid_spec(episodes=9)
+        spec["budget"]["max_total_episodes"] = 4
+        report = B.preflight(spec)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["stage"], "budget")
+        # the whole campaign must fit campaign_timeout_s
+        spec = _valid_spec(episodes=10)
+        spec["episode_timeout_s"] = 60.0
+        spec["campaign_timeout_s"] = 100.0
+        self.assertEqual(B.preflight(spec)["stage"], "budget")
+        # strategy demand over the strategy-call budget
+        spec = _valid_spec(episodes=10)
+        spec["overrides"] = {"strategy": "deepseek", "strategy_call_cap": 8}
+        spec["budget"]["strategy_calls_total"] = 20
+        spec["budget"]["max_total_episodes"] = 100
+        spec["campaign_timeout_s"] = 100000.0
+        report = B.preflight(spec)
+        self.assertEqual(report["stage"], "budget")
+        self.assertIn("strategy demand", report["error"])
+
+    def test_zero_judge_budget_is_literally_zero(self):
+        from tools.agent import bench_judge as J
+        spec = _valid_spec()
+        spec["judge"]["enabled"] = True
+        spec["budget"]["judge_calls_total"] = 0
+        report = B.preflight(spec)
+        self.assertEqual(report["stage"], "budget")
+        self.assertIn("zero", report["error"])
+        judge = J.BenchJudge(model="jev-latest", calls_total=0,
+                             transport=lambda p: None)
+        with self.assertRaises(J.JudgeError):
+            judge.evaluate({"episode_id": "e", "exploration": {},
+                            "availability": {}})
+
+    def test_unverified_live_jev_call_bounded_forced_unknown(self):
+        spec = _valid_spec(overrides={"reflex": "jev",
+                                      "jev_accept_terms": True})
+        report = B.preflight(spec)
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["effective_cost_mode"],
+                         "operator-approved-unknown")
+        self.assertFalse(report["unattended_apply_allowed"])
+        self.assertEqual(report["cost_mode_forced_from"], "call-bounded")
+        # an external verified limit keeps the strict mode
+        spec["budget"]["external_limit_ref"] = "provider-quota-xyz"
+        report = B.preflight(spec)
+        self.assertEqual(report["effective_cost_mode"], "call-bounded")
+        self.assertTrue(report["unattended_apply_allowed"])
+
+    def test_judge_timeout_consumes_call_and_records_unknown_exposure(self):
+        from tools.agent import bench_judge as J
+        card = {"episode_id": "e", "exploration": {
+            "entered_cells_instance_scoped": 3}, "availability": {}}
+        judge = J.BenchJudge(model="jev-latest", calls_total=5,
+                             transport=lambda p: None)
+        result = judge.evaluate(card)
+        self.assertEqual(result["status"], "timeout")
+        self.assertEqual(judge.ledger.dispatched, 1)
+        self.assertEqual(judge.ledger.unknown_exposure_calls, 1)
+        self.assertGreater(judge.ledger.unknown_exposure_usd, 0.0)
+        self.assertIn("unknown_exposure_calls", judge.ledger.as_dict())
+        # the consumed call counts against a literal budget
+        judge = J.BenchJudge(model="jev-latest", calls_total=1,
+                             transport=lambda p: None)
+        judge.evaluate(card)
+        with self.assertRaises(J.JudgeError):
+            judge.evaluate({"episode_id": "e2", "exploration": {},
+                            "availability": {}}, force=True)
+
+
 class SpecValidation(unittest.TestCase):
     def test_valid_spec_passes_and_unknown_knob_rejected(self):
         self.assertIsNone(B.validate_spec(_valid_spec()))

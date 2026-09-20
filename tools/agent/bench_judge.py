@@ -89,6 +89,19 @@ ALLOWLIST_PATHS = (
 
 DEFAULT_RUBRIC_VERSION = "bench-judge-rubric/1"
 
+#: The official Jev tariff (verified: $0.042/Mtok input, output free).
+JEV_PROMPT_PER_MTOK = 0.042
+
+
+def estimate_usd(prompt_tokens: int) -> float:
+    """The tariff-based USD reservation for *prompt_tokens* input tokens."""
+    return float(prompt_tokens) * JEV_PROMPT_PER_MTOK / 1_000_000.0
+
+
+def prompt_bound(payload: dict) -> int:
+    """A conservative input-token bound for one request (bytes/4, min 1)."""
+    return max(1, len(json.dumps(payload, sort_keys=True)) // 4)
+
 RUBRIC_TEXT = (
     "You are an ADVISORY reviewer for one recorded NetHack agent episode. "
     "Answer three typed questions from the supplied metrics only. "
@@ -378,10 +391,16 @@ class BenchWorkerSupervisor(object):
 # --------------------------------------------------------------------------
 
 class JudgeLedger(object):
-    """A separate bench ledger: dispatched calls vs cache hits."""
+    """A separate bench ledger: dispatched calls vs cache hits.
 
-    def __init__(self, *, calls_total: int = 0):
-        self.calls_total = int(calls_total)
+    ``calls_total`` is ``None`` when the budget is not enforced (unit tests);
+    ``0`` is interpreted **literally** as zero allowed calls, never as
+    "unlimited".  A timed-out or invalid dispatch still consumed a paid call,
+    so it is recorded as *unknown exposure* with a tariff-based reservation.
+    """
+
+    def __init__(self, *, calls_total: Optional[int] = None):
+        self.calls_total = None if calls_total is None else int(calls_total)
         self.dispatched = 0
         self.cache_hits = 0
         self.rejudges = 0
@@ -389,7 +408,22 @@ class JudgeLedger(object):
         self.timeouts = 0
         self.input_tokens = 0
         self.output_tokens = 0
+        self.unknown_exposure_calls = 0
+        self.unknown_exposure_usd = 0.0
+        self.reserved_prompt_tokens = 0
         self.entries: List[dict] = []
+
+    def over_budget(self, extra: int) -> bool:
+        if self.calls_total is None:
+            return False
+        return self.dispatched + extra > self.calls_total
+
+    def note_unknown_paid_exposure(self, dispatches: int,
+                                   prompt_tokens: int) -> None:
+        """Record paid exposure whose usage never came back."""
+        self.unknown_exposure_calls += int(dispatches)
+        self.reserved_prompt_tokens += int(prompt_tokens)
+        self.unknown_exposure_usd += estimate_usd(int(prompt_tokens))
 
     def note(self, entry: dict) -> None:
         self.entries.append(entry)
@@ -405,6 +439,9 @@ class JudgeLedger(object):
             "timeouts": self.timeouts,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "unknown_exposure_calls": self.unknown_exposure_calls,
+            "unknown_exposure_usd": round(self.unknown_exposure_usd, 6),
+            "reserved_prompt_tokens": self.reserved_prompt_tokens,
         }
 
 
@@ -422,7 +459,7 @@ class BenchJudge(object):
                  request_shape: str = "bundled",
                  transport: Optional[Callable[[dict], Optional[dict]]] = None,
                  supervisor: Optional[BenchWorkerSupervisor] = None,
-                 calls_total: int = 0,
+                 calls_total: Optional[int] = None,
                  criteria_levels: Sequence[str] = PRODUCTIVITY_LEVELS):
         if request_shape not in ("bundled", "single"):
             raise JudgeError("request_shape must be bundled or single")
@@ -465,11 +502,9 @@ class BenchJudge(object):
         state = judge_state(card, max_bytes=self.max_state_bytes)
         max_dispatches = 1 if self.request_shape == "bundled" else \
             len(JUDGE_QUESTIONS)
-        if self.ledger.calls_total and \
-                self.ledger.dispatched + max_dispatches > \
-                self.ledger.calls_total:
+        if self.ledger.over_budget(max_dispatches):
             raise JudgeError("judge_calls_total budget exhausted")
-        parsed, dispatch_count = self._evaluate_shape(state)
+        parsed, dispatch_count, prompt_tokens = self._evaluate_shape(state)
         self.ledger.dispatched += dispatch_count
         result = {
             "schema_version": JUDGE_RESULT_SCHEMA,
@@ -486,7 +521,13 @@ class BenchJudge(object):
         }
         if parsed is None:
             self.ledger.timeouts += 1
+            # a timed-out dispatch consumed a paid call: record unknown exposure
+            self.ledger.note_unknown_paid_exposure(dispatch_count,
+                                                   prompt_tokens)
             result["status"] = "timeout"
+            result["unknown_exposure_calls"] = dispatch_count
+            result["unknown_exposure_usd"] = round(
+                estimate_usd(prompt_tokens), 6)
             self.ledger.note({"cache_key": key, "status": "timeout",
                               "dispatched": True})
             self.cache[key] = result
@@ -495,8 +536,14 @@ class BenchJudge(object):
             typed = parse_answers(parsed, criteria_levels=self.criteria_levels)
         except JudgeError as exc:
             self.ledger.invalid += 1
+            # an invalid dispatch was still paid: record unknown exposure
+            self.ledger.note_unknown_paid_exposure(dispatch_count,
+                                                   prompt_tokens)
             result["status"] = "invalid"
             result["validation_error"] = str(exc)
+            result["unknown_exposure_calls"] = dispatch_count
+            result["unknown_exposure_usd"] = round(
+                estimate_usd(prompt_tokens), 6)
             self.ledger.note({"cache_key": key, "status": "invalid",
                               "error": str(exc), "dispatched": True})
             self.cache[key] = result
@@ -514,24 +561,26 @@ class BenchJudge(object):
                           "dispatched": True})
         return result
 
-    def _evaluate_shape(self, state: dict) -> Tuple[Optional[dict], int]:
-        """Dispatch the request(s); return ``(body, dispatches_made)``."""
+    def _evaluate_shape(self, state: dict) -> Tuple[Optional[dict], int, int]:
+        """Dispatch the request(s); return ``(body, dispatches, prompt_bound)``."""
         if self.request_shape == "bundled":
             payload = build_judge_payload(state, self.model,
                                           self.criteria_levels)
-            return self._dispatch(payload), 1
+            return self._dispatch(payload), 1, prompt_bound(payload)
         # three independently budgeted single-question calls, merged.  A
         # partial failure stops the remaining calls and yields no body.
         merged: Dict[str, Any] = {"answers": {}, "usage": {}}
         made = 0
+        tokens = 0
         for qid, _primitive in JUDGE_QUESTIONS:
             questions = build_questions(self.criteria_levels)
             payload = {"state": state, "model": self.model,
                        "questions": {qid: questions[qid]}}
             made += 1
+            tokens += prompt_bound(payload)
             body = self._dispatch(payload)
             if body is None:
-                return None, made
+                return None, made, tokens
             answers = (body or {}).get("answers") or {}
             if qid in answers:
                 merged["answers"][qid] = answers[qid]
@@ -539,7 +588,7 @@ class BenchJudge(object):
             for k in ("input_tokens", "output_tokens"):
                 merged["usage"][k] = merged["usage"].get(k, 0) + int(
                     usage.get(k, 0) or 0)
-        return merged, made
+        return merged, made, tokens
 
 
 def unwrap_worker_result(result: Any) -> Optional[dict]:

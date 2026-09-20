@@ -386,6 +386,9 @@ def preflight(spec: dict) -> Dict[str, Any]:
     conflict = jev_profile_conflict(config)
     if conflict:
         return {"ok": False, "stage": "scope", "error": conflict}
+    problem = budget_preflight(spec, config)
+    if problem:
+        return {"ok": False, "stage": "budget", "error": problem}
     b = spec["budget"]
     if b["cost_mode"] == "priced-bound":
         from . import providers
@@ -393,9 +396,68 @@ def preflight(spec: dict) -> Dict[str, Any]:
             return {"ok": False, "stage": "cost",
                     "error": ("cost_mode=priced-bound requires a complete "
                               "DeepSeek tariff (price_in and price_out)")}
+    effective, unattended, forced_from = effective_cost_mode(spec, config)
     return {"ok": True, "stage": "done", "config": config,
             "paid_call_bound": paid_call_bound(config),
+            "effective_cost_mode": effective,
+            "cost_mode_forced_from": forced_from,
+            "unattended_apply_allowed": unattended,
+            "allocations": plan_allocations(spec, max(1, spec["budget"][
+                "max_candidates"])),
             "postmortem_reserve": config.postmortem_reserve}
+
+
+def effective_cost_mode(spec: dict, config) -> Tuple[str, bool, Optional[str]]:
+    """Resolve the honest cost mode, forcing unknown-exposure when unstrict.
+
+    A live Jev profile that claims ``call-bounded`` without an external verified
+    limit is **not** strict: it is forced to ``operator-approved-unknown`` and
+    loses unattended apply.
+    """
+    budget = spec["budget"]
+    mode = budget["cost_mode"]
+    if (getattr(config, "reflex", None) == "jev"
+            and mode == "call-bounded"
+            and not budget.get("external_limit_ref")):
+        return "operator-approved-unknown", False, mode
+    unattended = mode != "operator-approved-unknown"
+    return mode, unattended, None
+
+
+def budget_preflight(spec: dict, config) -> Optional[str]:
+    """Reject an allocation plan that exceeds the declared limits."""
+    budget = spec["budget"]
+    comp = spec["comparison"]
+    episodes = spec["episodes"]
+    if budget["max_total_episodes"] and \
+            episodes > budget["max_total_episodes"]:
+        return ("episodes (%d) exceed budget.max_total_episodes (%d)"
+                % (episodes, budget["max_total_episodes"]))
+    # the whole campaign must fit the campaign timeout
+    campaign = spec.get("campaign_timeout_s") or 0
+    if campaign and episodes * spec["episode_timeout_s"] > campaign:
+        return ("episodes x episode_timeout_s (%g) exceed campaign_timeout_s "
+                "(%g)" % (episodes * spec["episode_timeout_s"], campaign))
+    # judge budget: zero is literally zero, and enabled needs a real budget
+    if spec["judge"]["enabled"]:
+        if budget["judge_calls_total"] <= 0:
+            return ("judge.enabled requires budget.judge_calls_total > 0 "
+                    "(zero means zero judge calls)")
+        if episodes > budget["judge_calls_total"]:
+            return ("episodes (%d) exceed budget.judge_calls_total (%d): one "
+                    "bundled dispatch per eligible episode"
+                    % (episodes, budget["judge_calls_total"]))
+    # strategy demand against the strategy-call budget
+    strategy_cap = int(getattr(config, "strategy_call_cap", 0) or 0)
+    if getattr(config, "strategy", "off") != "off" and strategy_cap:
+        demand = episodes * max(1, strategy_cap)
+        if budget["strategy_calls_total"] and \
+                demand > budget["strategy_calls_total"]:
+            return ("strategy demand (%d = episodes x strategy_call_cap) "
+                    "exceeds budget.strategy_calls_total (%d)"
+                    % (demand, budget["strategy_calls_total"]))
+    del comp
+    return None
 
 
 #: The caller-supplied attestation that the vapor-cloud fix is landed.  The
@@ -1204,6 +1266,7 @@ class BenchRunner(object):
                                  cost_mode=pre.get("effective_cost_mode"),
                                  unattended_apply_allowed=pre.get(
                                      "unattended_apply_allowed"))
+        self._unattended = bool(pre.get("unattended_apply_allowed", True))
         # Precommit the comparison design BEFORE any result exists.
         pre_record = precommit_record(self.spec["comparison"])
         self._write_run_artifact("precommit.json", pre_record)
@@ -1228,9 +1291,18 @@ class BenchRunner(object):
                                             judge_results)
                 index += 1
                 episode_dir = os.path.join(self.out_dir, "ep-%d" % index)
-                self.manifest.reserve("ep-%d" % index,
-                                      {"episode": index,
-                                       "dir": episode_dir})
+                # reserve the WHOLE next episode's approved allocation BEFORE
+                # launching it (the per-episode caps reset, so a later episode
+                # must not be able to exceed the campaign budget).
+                self.manifest.reserve("ep-%d" % index, {
+                    "episode": index, "dir": episode_dir,
+                    "allocation": {
+                        "episode_timeout_s": self.spec["episode_timeout_s"],
+                        "strategy_calls": int(getattr(
+                            config, "strategy_call_cap", 0) or 0),
+                        "judge_dispatches": (1 if self.judge is not None
+                                             else 0),
+                    }})
                 result, episode_dir = self._run_one(config, episode_dir, index)
                 card, hashes, paths = self._seal_episode(
                     episode_dir, index, result, requested)
@@ -1475,6 +1547,12 @@ class BenchRunner(object):
                                 base_provenance=None,
                                 cand_provenance=self._prov)
         result["design"] = precommit_record(self.spec["comparison"])
+        if not getattr(self, "_unattended", True):
+            # an unknown-exposure (unstrict) run never permits unattended apply
+            result.setdefault("admission", {})["apply_allowed"] = False
+            result["unattended_apply_allowed"] = False
+            result.setdefault("reasons", []).append(
+                "cost-mode:operator-approved-unknown (no unattended apply)")
         return result
 
     def _package(self, cards: List[dict], comparison: dict, live: dict,
