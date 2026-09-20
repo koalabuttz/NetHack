@@ -639,6 +639,215 @@ MUTATIONS = (
                    "test_prompt_decline_resolution_with_hero_progress_records_"
                    "no_edge"),
     },
+    # --- campaign bench (plan §Test Strategy mutation list) ----------------
+    {
+        "name": "mutation_bench_lifecycle_null_coerced_to_zero",
+        "file": "tools/agent/bench_metrics.py",
+        "old": ("        if field in lifecycle:\n"
+                "            lifecycle_section[field] = lifecycle[field]"),
+        "new": ("        if field in lifecycle:\n"
+                "            lifecycle_section[field] = (lifecycle[field]\n"
+                "                                        if lifecycle[field] is "
+                "not None else 0)"),
+        "killer": ("test_auto_bench.ScorecardContract."
+                   "test_legacy_lifecycle_unavailable_not_zero"),
+    },
+    {
+        "name": "mutation_bench_dry_run_calls_provider",
+        "file": "tools/agent/bench.py",
+        "old": ("        cards = []\n"
+                "        for i, wire in enumerate(self.spec.get("
+                "\"replay_inputs\") or [], start=1):"),
+        "new": ("        cards = []\n"
+                "        import socket as _bench_socket\n"
+                "        _bench_socket.socket()\n"
+                "        for i, wire in enumerate(self.spec.get("
+                "\"replay_inputs\") or [], start=1):"),
+        "killer": ("test_auto_bench.DryRunTier."
+                   "test_dry_run_network_is_impossible"),
+    },
+    {
+        "name": "mutation_bench_fallback_only_passes_tier_validation",
+        "file": "tools/agent/bench_metrics.py",
+        "old": ("    if got != \"jev\":\n"
+                "        return {\"required\": True, \"ok\": False,\n"
+                "                \"reason\": \"requested jev but only %s calls "
+                "were dispatched\"\n"
+                "                          % (got or \"no\")}"),
+        "new": ("    if got != \"jev\":\n"
+                "        return {\"required\": True, \"ok\": True,\n"
+                "                \"reason\": \"fallback-accepted\"}"),
+        "killer": ("test_auto_bench.TierCoverage."
+                   "test_live_jev_capped_fallback_not_reported_as_live_"
+                   "coverage"),
+    },
+    {
+        "name": "mutation_bench_hard_gate_offset_by_target_improvement",
+        "file": "tools/agent/bench_metrics.py",
+        "old": ("    elif hard_failures:\n"
+                "        verdict = \"fail\""),
+        "new": ("    elif hard_failures and False:\n"
+                "        verdict = \"fail\""),
+        "killer": ("test_auto_bench.ComparisonEngine."
+                   "test_hard_failure_cannot_be_offset_by_target_improvement"),
+    },
+    {
+        "name": "mutation_bench_attempts_source_mismatch_comparable",
+        "file": "tools/agent/bench_metrics.py",
+        "old": "    attempts_ok = src_b == src_c and len(src_b) == 1",
+        "new": "    attempts_ok = True",
+        "killer": ("test_auto_bench.ComparisonEngine."
+                   "test_attempts_source_mismatch_not_comparable"),
+    },
+    {
+        "name": "mutation_bench_unresolved_incomplete_not_hard_failure",
+        "file": "tools/agent/bench_metrics.py",
+        "old": "    hard_failure = non_incomplete > 0 or unresolved > 0",
+        "new": "    hard_failure = non_incomplete > 0",
+        "killer": ("test_auto_bench.InvalidTaxonomy."
+                   "test_unresolved_incomplete_is_hard_failure"),
+    },
+    {
+        "name": "mutation_bench_postmortem_reserve_not_forced",
+        "file": "tools/agent/bench.py",
+        "old": ("    if values.get(\"postmortem_reserve\", 0):\n"
+                "        return None, (\"postmortem_reserve must be 0 in a "
+                "bench campaign \"\n"
+                "                      \"(DeepSeek postmortems are "
+                "disabled)\")\n"
+                "    values[\"postmortem_reserve\"] = 0"),
+        "new": ("    if False:\n"
+                "        return None, (\"postmortem_reserve must be 0 in a "
+                "bench campaign \"\n"
+                "                      \"(DeepSeek postmortems are "
+                "disabled)\")"),
+        "killer": ("test_auto_bench.PaidExposure."
+                   "test_bench_forces_zero_postmortem_reserve"),
+    },
+    {
+        "name": "mutation_bench_stop_admits_next_episode",
+        "file": "tools/agent/bench.py",
+        "old": ("                if self.stop.should_stop():\n"
+                "                    break"),
+        "new": ("                if self.stop.should_stop() and False:\n"
+                "                    break"),
+        "killer": ("test_auto_bench.StopAndAbort."
+                   "test_stop_after_episode_prevents_next_episode_and_judge"),
+    },
+    {
+        "name": "mutation_bench_early_stop_on_favorable_look",
+        "file": "tools/agent/bench.py",
+        "old": "                results.append((index, result, episode_dir))",
+        "new": ("                results.append((index, result, episode_dir))\n"
+                "                if index == 1:\n"
+                "                    break"),
+        "killer": ("test_auto_bench.PrecommitAndSchedule."
+                   "test_no_early_stop_and_no_post_result_extension"),
+    },
+    {
+        "name": "mutation_bench_post_result_margin_change_allowed",
+        "file": "tools/agent/bench.py",
+        "old": ("    if drift:\n"
+                "        raise ValueError(\"comparison policy changed after "
+                "precommit: %s \"\n"
+                "                         \"(abandon the run and re-precut "
+                "it)\" % drift)"),
+        "new": ("    if drift and False:\n"
+                "        raise ValueError(\"comparison policy changed after "
+                "precommit: %s \"\n"
+                "                         \"(abandon the run and re-precut "
+                "it)\" % drift)"),
+        "killer": ("test_auto_bench.PrecommitAndSchedule."
+                   "test_no_early_stop_and_no_post_result_extension"),
+    },
+    {
+        "name": "mutation_bench_apply_skips_approval_and_range",
+        "file": "tools/agent/bench.py",
+        "old": ("    if reasons:\n"
+                "        return {\"applied\": False, \"reasons\": reasons}"),
+        "new": ("    if reasons and False:\n"
+                "        return {\"applied\": False, \"reasons\": reasons}"),
+        "killer": ("test_auto_bench.TunerAndApply."
+                   "test_apply_requires_approval_range_hash_and_fresh_"
+                   "confirmation"),
+    },
+    {
+        "name": "mutation_bench_confidence_factor_auto_tuned",
+        "file": "tools/agent/bench.py",
+        "old": ("TUNER_ELIGIBLE_KNOBS = (\"reflex_call_cap\", "
+                "\"strategy_call_cap\",\n"
+                "                        \"boundary_cooldown_ticks\", "
+                "\"boundary_cooldown_wall\")"),
+        "new": ("TUNER_ELIGIBLE_KNOBS = (\"reflex_call_cap\", "
+                "\"strategy_call_cap\",\n"
+                "                        \"boundary_cooldown_ticks\", "
+                "\"boundary_cooldown_wall\",\n"
+                "                        \"jev_relative_factor\")"),
+        "killer": ("test_auto_bench.TunerAndApply."
+                   "test_confidence_factor_frozen_without_specific_policy_"
+                   "approval"),
+    },
+    {
+        "name": "mutation_bench_tuner_peeks_until_success",
+        "file": "tools/agent/bench.py",
+        "old": ("            \"sweeps\": min(2, max(1, len(candidates))),"),
+        "new": ("            \"sweeps\": len(candidates) + 5,"),
+        "killer": ("test_auto_bench.TunerAndApply."
+                   "test_tuner_finite_grid_and_reserved_confirmation_budget"),
+    },
+    {
+        "name": "mutation_bench_partial_run_promoted_to_baseline",
+        "file": "tools/agent/bench.py",
+        "old": ("    if run_status != \"complete\":\n"
+                "        reasons.append(\"run-not-complete:%s\" % run_status)"),
+        "new": ("    if run_status != \"complete\" and False:\n"
+                "        reasons.append(\"run-not-complete:%s\" % run_status)"),
+        "killer": ("test_auto_bench.StopAndAbort."
+                   "test_partial_run_never_promoted_to_baseline"),
+    },
+    {
+        "name": "mutation_bench_termination_safety_admission_ignored",
+        "file": "tools/agent/bench_metrics.py",
+        "old": ("    if delta > margin:\n"
+                "        admission[\"decision\"] = \"fail\""),
+        "new": ("    if delta > margin and False:\n"
+                "        admission[\"decision\"] = \"fail\""),
+        "killer": ("test_auto_bench.TerminationSafety."
+                   "test_termination_safety_admission_blocks_reckless_"
+                   "candidates"),
+    },
+    {
+        "name": "mutation_bench_adverse_not_counted_in_safety_rate",
+        "file": "tools/agent/bench_metrics.py",
+        "old": "SAFETY_CLASSES = (ADVERSE_EARLY, ADVERSE_UNKNOWN, UNRECOGNIZED)",
+        "new": "SAFETY_CLASSES = (ADVERSE_UNKNOWN, UNRECOGNIZED)",
+        "killer": ("test_auto_bench.TerminationSafety."
+                   "test_death_rate_regression_blocks_admission"),
+    },
+    {
+        "name": "mutation_bench_rubric_change_blocks_deterministic_compare",
+        "file": "tools/agent/bench_metrics.py",
+        "old": "        \"comparable\": det_b == det_c,",
+        "new": "        \"comparable\": det_b == det_c and adv_b == adv_c,",
+        "killer": ("test_auto_bench_judge.JudgeContract."
+                   "test_rubric_only_change_leaves_deterministic_comparison_"
+                   "unchanged_and_forces_rejudgment"),
+    },
+    {
+        "name": "mutation_bench_forced_abort_logs_and_ignores_permission",
+        "file": "tools/agent/bench.py",
+        "old": ("        except PermissionError as exc:\n"
+                "            result[\"teardown_failure\"] = True\n"
+                "            result[\"permission_failure\"] = True\n"
+                "            result.setdefault(\"errors\", []).append(\n"
+                "                \"signal permission failure for %d: %s\" "
+                "% (pid, exc))"),
+        "new": ("        except PermissionError as exc:\n"
+                "            return"),
+        "killer": ("test_auto_bench.StopAndAbort."
+                   "test_forced_abort_permission_or_identity_failure_sets_"
+                   "teardown_failure"),
+    },
 )
 
 #: The plan's remaining named mutations whose killer tests are not

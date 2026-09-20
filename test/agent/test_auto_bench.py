@@ -475,6 +475,14 @@ class ComparisonEngine(unittest.TestCase):
         self.assertTrue(diff["provenance"]["comparable"])
 
 
+def _prod_card(episode_id, stop_reason, outcome, entered):
+    """A production-shaped card whose terminal class comes from the real
+    precedence table over an exact ``(stop_reason, outcome)`` pair."""
+    tc = M.classify_terminal(stop_reason, outcome, "horizon-completion")
+    return _card(episode_id=episode_id, terminal_class=tc, entered=entered,
+                 attempts_source="actions")
+
+
 class TerminationSafety(unittest.TestCase):
     def test_unknown_outcome_handled_by_precedence_table(self):
         cls = M.classify_terminal
@@ -518,17 +526,12 @@ class TerminationSafety(unittest.TestCase):
         self.assertEqual(result["verdict"], "fail")
 
     def test_death_rate_regression_blocks_admission(self):
-        base = [M.build_scorecard(
-                    episode_id="b%d" % i, provenance_id="p",
-                    meta=_meta(stop_reason="tick-cap-graceful-quit",
-                               outcome="unknown"),
-                    budget=_budget(), wire_path=_SHORT,
-                    actions_path=_ACTIONS) for i in range(6)]
-        cand = [M.build_scorecard(
-                    episode_id="c%d" % i, provenance_id="p",
-                    meta=_meta(stop_reason="closed", outcome="death"),
-                    budget=_budget(), wire_path=_SHORT,
-                    actions_path=_ACTIONS) for i in range(6)]
+        # production-shaped: a real death is stop_reason="closed",
+        # outcome="death" (the controller never emits stop_reason="death").
+        base = [_prod_card("b%d" % i, "tick-cap-graceful-quit", "unknown",
+                           10.0) for i in range(6)]
+        cand = [_prod_card("c%d" % i, "closed", "death", 40.0)
+                for i in range(6)]
         self.assertEqual(cand[0]["terminal_class"], M.ADVERSE_EARLY)
         self.assertEqual(base[0]["terminal_class"], M.HORIZON_COMPLETION)
         result = M.compare_arms(base, cand, _policy(),
@@ -537,16 +540,10 @@ class TerminationSafety(unittest.TestCase):
         self.assertEqual(result["verdict"], "fail")
 
     def test_policy_exhausted_regression_blocks_admission(self):
-        base = [M.build_scorecard(
-                    episode_id="b%d" % i, provenance_id="p",
-                    meta=_meta(stop_reason="tick-cap-graceful-quit"),
-                    budget=_budget(), wire_path=_SHORT,
-                    actions_path=_ACTIONS) for i in range(6)]
-        cand = [M.build_scorecard(
-                    episode_id="c%d" % i, provenance_id="p",
-                    meta=_meta(stop_reason="policy-exhausted"),
-                    budget=_budget(), wire_path=_SHORT,
-                    actions_path=_ACTIONS) for i in range(6)]
+        base = [_prod_card("b%d" % i, "tick-cap-graceful-quit", "unknown",
+                           10.0) for i in range(6)]
+        cand = [_prod_card("c%d" % i, "policy-exhausted", "unknown", 40.0)
+                for i in range(6)]
         self.assertEqual(cand[0]["terminal_class"], M.ADVERSE_EARLY)
         result = M.compare_arms(base, cand, _policy(),
                                 base_provenance=_prov(),
