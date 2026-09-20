@@ -330,6 +330,12 @@ Each existing test/fixture whose committed contract changes, with old vs new exp
 - Same-wire identity fixtures in the wiring/replay suites: the single same-wire identity expectation is replaced by the two identity tests (§Phase 1, AC3), with action deduplication and Choice membership unchanged.
 - Gate/nav plan clause and code comments: during the documentation phase, update the `doc/agent-jev-gate-nav-plan.md` stationary-semantics preservation clause (line 185) and the corresponding source code comments in `tools/agent/policy.py` (the 3/6/10 ladder and the `_unblock`/`_random_move` exits) to describe the shared legal bounded recovery and attempt-owned counting, without changing strict >40 anti-backtrack or p>k/N.
 
+### Implemented contract-migration entries (discovered during execution)
+
+- `test/agent/test_auto_replay.py::ShortFixtureTest::test_ground_truth_agreement_is_total` and `ProviderCompareTest::test_jev_offline_is_a_scripted_fallback`: **old** agreed-count bound `needs_answered - 6` (destination-commitment baseline) / rate `0.87`; **new** the shared legal bounded recovery builder adds exactly one further *navigation* divergence, so the bound is the **measured** `needs_answered - 7` (agree 40 of 47, rate 0.851).  The single added divergence is the short fixture's need index 12 (`fixtures/auto/short.decisions.jsonl`): the shared builder selects `'y'` (north-west, reason `loop breaker: bounded escape (>=6)`) where the recording holds `'k'` (north).  The corpus is an input recording, not a golden file; regenerating it is the operator-gated step.
+- `test/agent/test_auto_commitment.py::DefaultDestinationPool::test_unvisited_fallback_after_serviced_frontiers` and `CommittedBehaviour::test_serviced_frontier_is_suppressed_then_reacquirable` / `test_locked_door_fails_once_and_next_target_progresses`: the serviced/failed suppression now uses the **split** evidence signatures (`service_signature` for successful servicing, `door_failure_signature` for a closed door), so the fixtures store the split signature rather than the legacy `local_evidence_signature`.
+- `test/agent/mutation_checks.py::mutation_apply_antibacktrack_to_committed_target`: anchor updated to the new `_dest_payload("continue", held, step=step)` continuation line.
+
 ## Risks, alternatives and non-goals
 
 - A blanket counter on all stationary observations would count prompts, inventory and harmless interruptions. Prefer matched gameplay-attempt accounting while retaining existing observation position evidence.

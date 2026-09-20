@@ -196,6 +196,191 @@ MUTATIONS = (
                    "test_strategy_historical_bytes_not_rerendered_after_"
                    "commitment_change"),
     },
+    # -- stall-recovery plan (Rev 3) mutations ---------------------------
+    {
+        "name": "mutation_restore_np10_raw_grid_routing",
+        "file": "tools/agent/policy.py",
+        "old": ("        if np >= 10:\n"
+                "            return self._bounded_recovery(\n"
+                "                mem, hero, \"loop breaker: bounded escape "
+                "(>=10)\")"),
+        "new": ("        if np >= 10:\n"
+                "            return (self._cand({\"key\": "
+                "KEY.DIR_KEYS[(1, 0)]}, \"unblock\", \"recovery\", 0,\n"
+                "                               \"loop breaker: unblock\",\n"
+                "                               \"recovery\"),)"),
+        "killer": ("test_auto_recovery.Phase2BoundedRecovery."
+                   "test_np10_recovery_never_routes_through_locked_door"),
+    },
+    {
+        "name": "mutation_gate_no_progress_on_time_advance",
+        "file": "tools/agent/policy.py",
+        "old": ("            if not self._hero_moved(pre_hero, mem, "
+                "observed_kind):\n"
+                "                self.targets.note_nav_attempt()"),
+        "new": ("            if not self._hero_moved(pre_hero, mem, "
+                "observed_kind) \\\n"
+                "                    and observed_kind != \"no-time\":\n"
+                "                self.targets.note_nav_attempt()"),
+        "killer": ("test_auto_commitment.AttemptCounting."
+                   "test_first_no_time_acquisition_is_attempt_one_of_three"),
+    },
+    {
+        "name": "mutation_change_stall_ge_to_gt",
+        "file": "tools/agent/navigation.py",
+        "old": ("        return (self.stall_attempts >= STALL_MAX\n"
+                "                or self.total_attempts >= self.stall_cap)"),
+        "new": ("        return (self.stall_attempts > STALL_MAX\n"
+                "                or self.total_attempts >= self.stall_cap)"),
+        "killer": ("test_auto_commitment.AttemptCounting."
+                   "test_cap_exhausted_held_destination_retires_at_three_zero_"
+                   "time_attempts"),
+    },
+    {
+        "name": "mutation_seed_progress_pos_at_target",
+        "file": "tools/agent/navigation.py",
+        "old": ("        self.progress_pos = (tuple(hero) if hero is not None "
+                "else tuple(pos))"),
+        "new": "        self.progress_pos = tuple(pos)",
+        "killer": ("test_auto_commitment.AttemptCounting."
+                   "test_first_no_time_acquisition_is_attempt_one_of_three"),
+    },
+    {
+        "name": "mutation_drop_accepted_jev_candidate",
+        "file": "tools/agent/controller.py",
+        "old": ("        # The accepted member -- not the scripted winner -- owns "
+                "the frozen\n"
+                "        # effect from here (plan §2): its exact candidate is "
+                "the selected one.\n"
+                "        self._selected_candidate = outcome.candidate"),
+        "new": "        self._selected_candidate = None",
+        "killer": ("test_auto_integration.SelectedEffectOwnership."
+                   "test_jev_accepts_different_action_non_scripted_candidate_"
+                   "and_commits_its_exact_payload"),
+    },
+    {
+        "name": "mutation_retain_selection_on_write_failure",
+        "file": "tools/agent/controller.py",
+        "old": ("            # A failed/partial write arms nothing (plan 3.4 step "
+                "5): the\n"
+                "            # selected-decision record is cleared too, so a "
+                "write-failed\n"
+                "            # candidate can never commit a destination or "
+                "recovery effect.\n"
+                "            self.selected_decision = None\n"
+                "            self._selected_candidate = None\n"
+                "            self._attempt_effect = None\n"
+                "            self._attempt_payload = ()"),
+        "new": "            self._attempt_payload = ()",
+        "killer": ("test_auto_integration.SelectedEffectOwnership."
+                   "test_write_failure_commits_no_selected_destination_or_"
+                   "recovery_effect"),
+    },
+    {
+        "name": "mutation_retain_discarded_override_payload",
+        "file": "tools/agent/controller.py",
+        "old": ("        chosen = self._selected_candidate\n"
+                "        try:\n"
+                "            chosen_matches = (chosen is not None\n"
+                "                              and "
+                "candidates.candidate_to_wire(chosen)\n"
+                "                              == selected)\n"
+                "        except Exception:                    # noqa: BLE001 - "
+                "defensive\n"
+                "            chosen_matches = False"),
+        "new": ("        chosen = (self._selected_candidate\n"
+                "                  or getattr(self.reflex, \"last_candidate\", "
+                "None))\n"
+                "        chosen_matches = chosen is not None"),
+        "killer": ("test_auto_integration.SelectedEffectOwnership."
+                   "test_override_does_not_commit_discarded_destination"),
+    },
+    {
+        "name": "mutation_count_delivery_repair_twice",
+        "file": "tools/agent/budget.py",
+        "old": ("        if token in self._applied_tokens:\n"
+                "            return False\n"
+                "        self._applied_tokens.add(token)\n"
+                "        self.reflex_applied += 1"),
+        "new": ("        self._applied_tokens.add(token)\n"
+                "        self.reflex_applied += 1"),
+        "killer": ("test_auto_integration.SelectedEffectOwnership."
+                   "test_delivery_repair_preserves_effect_and_applied_token_"
+                   "once"),
+    },
+    {
+        "name": "mutation_restore_raw_passable_recovery",
+        "file": "tools/agent/policy.py",
+        "old": ("            if not navigation.edge_legal(terrain, hero, "
+                "dest):\n"
+                "                continue\n"
+                "            if state.monster_cell(mem.tile(dest), hero, "
+                "dest):\n"
+                "                continue"),
+        "new": ("            if not mem.known_passable(dest):\n"
+                "                continue\n"
+                "            if state.monster_cell(mem.tile(dest), hero, "
+                "dest):\n"
+                "                continue"),
+        "killer": ("test_auto_recovery.Ep4LockedDoorStall."
+                   "test_cap_exhausted_locked_door_adjacent_monster_enters_"
+                   "bounded_recovery"),
+    },
+    {
+        "name": "mutation_emit_terminals_only_for_directives",
+        "file": "tools/agent/policy.py",
+        "old": ("        if not directive:\n"
+                "            self._emit_destination_terminal(\n"
+                "                term, reason, held.serial, "
+                "purpose=held.purpose,\n"
+                "                source=held.source, "
+                "generation=held.generation)"),
+        "new": ("        if False and not directive:\n"
+                "            self._emit_destination_terminal(\n"
+                "                term, reason, held.serial, "
+                "purpose=held.purpose,\n"
+                "                source=held.source, "
+                "generation=held.generation)"),
+        "killer": ("test_auto_commitment.DestinationTerminalOwner."
+                   "test_unreachable_default_retirement_is_visible"),
+    },
+    {
+        "name": "mutation_occupancy_in_service_signature",
+        "file": "tools/agent/navigation.py",
+        "old": ("    pos = tuple(pos)\n"
+                "    out = [terrain.ter(pos)]\n"
+                "    for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):\n"
+                "        out.append(terrain.ter((pos[0] + dx, pos[1] + dy)))\n"
+                "    return tuple(out)"),
+        "new": ("    pos = tuple(pos)\n"
+                "    out = [terrain.ter(pos)]\n"
+                "    for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):\n"
+                "        nb = (pos[0] + dx, pos[1] + dy)\n"
+                "        out.append(terrain.ter(nb))\n"
+                "        out.append(\"occ\" if terrain.occupant(nb) != "
+                "OCC_NONE else \"\")\n"
+                "    return tuple(out)"),
+        "killer": ("test_auto_commitment.Phase3EvidenceSplit."
+                   "test_serviced_frontier_ignores_transient_neighbor_"
+                   "occupancy"),
+    },
+    {
+        "name": "mutation_reject_sole_legal_reverse",
+        "file": "tools/agent/policy.py",
+        "old": ("        if not options:\n"
+                "            return None\n"
+                "        options.sort()\n"
+                "        return options[0][3]"),
+        "new": ("        if not options:\n"
+                "            return None\n"
+                "        options = [o for o in options if o[0] == 0]\n"
+                "        if not options:\n"
+                "            return None\n"
+                "        options.sort()\n"
+                "        return options[0][3]"),
+        "killer": ("test_auto_recovery.Phase2BoundedRecovery."
+                   "test_recovery_only_legal_reverse_is_not_trapped"),
+    },
 )
 
 #: The plan's remaining named mutations whose killer tests are not

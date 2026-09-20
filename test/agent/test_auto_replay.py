@@ -344,14 +344,21 @@ class ShortFixtureTest(unittest.TestCase):
         # action stays legal.  The corpus is an input recording, not a golden
         # file (fixtures/auto/README.md); regenerating it is the operator-gated
         # step (no live re-record is possible in this environment).
-        # Contract migration (stall-recovery plan §1): the stationary-recovery
+        # Contract migration (stall-recovery plan §1).  The stationary-recovery
         # ladder now uses ONE shared edge-legal bounded builder instead of the
-        # legacy raw-grid `_unblock`/`_random_move` exits, so one further
-        # *navigation* selection in this input recording legitimately differs
-        # (the corpus is an input recording, not a golden file).  OLD tolerance:
-        # ``- 6`` / rate ``0.87``.  NEW: ``- 7`` / rate ``0.85``.
-        self.assertGreaterEqual(ag["agree"],
-                                summary["needs_answered"] - 7)
+        # legacy raw-grid `_unblock`/`_random_move` exits.  MEASURED exact
+        # divergence for this recorded corpus: needs_answered = 47, agree = 40,
+        # i.e. exactly 7 of 47 (rate 0.851) -- so the bound below is the measured
+        # value, NOT a guessed slack.  The single added divergence beyond the
+        # destination-commitment baseline is the short fixture's need index 12
+        # (`fixtures/auto/short.decisions.jsonl`): the shared builder now selects
+        # 'y' (north-west) with reason "loop breaker: bounded escape (>=6)" where
+        # the recording holds 'k' (north).  The corpus is an input recording, not
+        # a golden file (fixtures/auto/README.md); regenerating it is the
+        # operator-gated step (no live re-record is possible here).  OLD: ``- 6``
+        # / rate ``0.87``; NEW: the measured ``- 7`` / rate ``0.85``.
+        self.assertEqual(summary["needs_answered"], 47)
+        self.assertGreaterEqual(ag["agree"], 40)
         self.assertGreaterEqual(ag["rate"], 0.85)
         self.assertEqual(summary["legality"]["scripted"]["rate"], 1.0)
         self.assertEqual(summary["provider_fallbacks"]["scripted"], 0)

@@ -1,9 +1,29 @@
 {
  "commit_range": {
   "base": "56c0c45a0739b29a3173b08b343d5fc786a56712",
-  "head": "5a3d0b6d07f7e9e8e275b2f0208bbc17e15a01b3"
+  "head": "33b57e40b7b1f43a292fce30bc4239fa310404e1"
  },
  "commits": [
+  {
+   "hash": "33b57e40b7b1f43a292fce30bc4239fa310404e1",
+   "subject": "agent: AC9 stratified report surfaces"
+  },
+  {
+   "hash": "90d85de98c187eb80064abd6b23e6cf282978387",
+   "subject": "agent: AC5/AC6/AC7 named tests + hooks"
+  },
+  {
+   "hash": "10f9a8fc71f7bb5b30331bf2c54ffb677abdac45",
+   "subject": "agent: AC3/AC4 named tests + support"
+  },
+  {
+   "hash": "74c3bbe4d964d6689f45997656ba9e93d5f8ea3f",
+   "subject": "agent: door-targeting guard + blocked-edge ledger"
+  },
+  {
+   "hash": "cc64c98fe811f5a6324eb8dfc43243a1de1e59f0",
+   "subject": "agent: regenerate validation report at phase 4 head"
+  },
   {
    "hash": "5a3d0b6d07f7e9e8e275b2f0208bbc17e15a01b3",
    "subject": "agent: phase 4 diagnostics, gates, docs"
@@ -15,26 +35,6 @@
   {
    "hash": "4166319439ffc251f46da01bfc9005cc44560b54",
    "subject": "agent: shared bounded recovery + terminal owner"
-  },
-  {
-   "hash": "0aab0d0c497ec7b1d33f26f56c4c6a4ded11f3fe",
-   "subject": "agent: selected-decision effect ownership + 2A"
-  },
-  {
-   "hash": "82a5728f6dcb7fb9b178afbce614cc4ab0241f19",
-   "subject": "agent: phase 0 stall-recovery failure fixtures"
-  },
-  {
-   "hash": "4bd31455c56b33f10253f6af98cc39681440ea24",
-   "subject": "agent: revise stall recovery plan to rev 3"
-  },
-  {
-   "hash": "5b8c914a5e020a14946369c35ff13e5c6ba16c43",
-   "subject": "agent: revise stall recovery plan to rev 2"
-  },
-  {
-   "hash": "578927d85e02104e20ffd2594784799bd1e08be3",
-   "subject": "agent: regenerate report at final head"
   }
  ],
  "gates": {
@@ -74,7 +74,9 @@
   "pickup_repeated_sites": null,
   "pickup_unresolved_inspections": null,
   "schema_version": 2,
+  "serviced_reopens": null,
   "target_reach_rate": null,
+  "terminal_completeness": null,
   "terminal_reasons": null
  },
  "live_claims": {
@@ -137,6 +139,66 @@
    "killer": "test_auto_providers.StrategyHistoryFrozen.test_strategy_historical_bytes_not_rerendered_after_commitment_change",
    "name": "mutation_rerender_historical_strategy_turn",
    "status": "killed"
+  },
+  {
+   "killer": "test_auto_recovery.Phase2BoundedRecovery.test_np10_recovery_never_routes_through_locked_door",
+   "name": "mutation_restore_np10_raw_grid_routing",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_commitment.AttemptCounting.test_first_no_time_acquisition_is_attempt_one_of_three",
+   "name": "mutation_gate_no_progress_on_time_advance",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_commitment.AttemptCounting.test_cap_exhausted_held_destination_retires_at_three_zero_time_attempts",
+   "name": "mutation_change_stall_ge_to_gt",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_commitment.AttemptCounting.test_first_no_time_acquisition_is_attempt_one_of_three",
+   "name": "mutation_seed_progress_pos_at_target",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_integration.SelectedEffectOwnership.test_jev_accepts_different_action_non_scripted_candidate_and_commits_its_exact_payload",
+   "name": "mutation_drop_accepted_jev_candidate",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_integration.SelectedEffectOwnership.test_write_failure_commits_no_selected_destination_or_recovery_effect",
+   "name": "mutation_retain_selection_on_write_failure",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_integration.SelectedEffectOwnership.test_override_does_not_commit_discarded_destination",
+   "name": "mutation_retain_discarded_override_payload",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_integration.SelectedEffectOwnership.test_delivery_repair_preserves_effect_and_applied_token_once",
+   "name": "mutation_count_delivery_repair_twice",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_recovery.Ep4LockedDoorStall.test_cap_exhausted_locked_door_adjacent_monster_enters_bounded_recovery",
+   "name": "mutation_restore_raw_passable_recovery",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_commitment.DestinationTerminalOwner.test_unreachable_default_retirement_is_visible",
+   "name": "mutation_emit_terminals_only_for_directives",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_commitment.Phase3EvidenceSplit.test_serviced_frontier_ignores_transient_neighbor_occupancy",
+   "name": "mutation_occupancy_in_service_signature",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_recovery.Phase2BoundedRecovery.test_recovery_only_legal_reverse_is_not_trapped",
+   "name": "mutation_reject_sole_legal_reverse",
+   "status": "killed"
   }
  ],
  "pickup_shape_disposition": {
@@ -196,5 +258,5 @@
   ]
  },
  "schema_version": 1,
- "suite_count": 1096
+ "suite_count": 1140
 }
