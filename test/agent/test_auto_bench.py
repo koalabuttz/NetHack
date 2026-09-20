@@ -1400,5 +1400,131 @@ class SpecValidation(unittest.TestCase):
         self.assertIn("exposure floor", B.validate_spec(spec))
 
 
+class PrecommitComparison(unittest.TestCase):
+    """Finding #7: exact balanced, precommitted comparison design."""
+
+    def test_pair_schedule_is_exactly_balanced_many_seeds(self):
+        for seed in range(12):
+            for n in (0, 1, 2, 3, 5, 10, 11):
+                sched = M.pair_schedule(n, seed)
+                self.assertEqual(len(sched), n)
+                counts = M.schedule_counts(sched)
+                self.assertLessEqual(abs(counts["AB"] - counts["BA"]), 1,
+                                     (seed, n))
+                if n >= 2:
+                    self.assertEqual(counts["AB"] > 0 and counts["BA"] > 0,
+                                     True, (seed, n))
+                # deterministic
+                self.assertEqual(sched, M.pair_schedule(n, seed))
+
+    def test_episode_schedule_arm_counts_even_and_odd(self):
+        for seed in range(6):
+            even = M.episode_schedule(10, seed)
+            self.assertEqual(sum(1 for e in even if e["arm"] == "baseline"), 5)
+            self.assertEqual(sum(1 for e in even if e["arm"] == "candidate"),
+                             5)
+            odd = M.episode_schedule(11, seed)
+            nb = sum(1 for e in odd if e["arm"] == "baseline")
+            nc = sum(1 for e in odd if e["arm"] == "candidate")
+            self.assertEqual(nb + nc, 11)
+            self.assertLessEqual(abs(nb - nc), 1)
+            # each full pair runs the two arms adjacently
+            self.assertEqual(odd[0]["pair"], 1)
+            self.assertNotEqual(odd[0]["arm"], odd[1]["arm"])
+
+    def test_precommit_hash_tampering_rejected(self):
+        policy = _policy(screening_episodes_per_arm=4,
+                         confirmation_episodes_per_arm=10)
+        design = M.precommit_design(policy, arm_episodes=10)
+        good = M.design_hash(design)
+        ok = M.check_precommit(design, recorded_hash=good,
+                               base_n=10, cand_n=10)
+        self.assertTrue(ok["ok"])
+        tampered = M.check_precommit(design, recorded_hash="deadbeef",
+                                     base_n=10, cand_n=10)
+        self.assertFalse(tampered["ok"])
+        self.assertIn("precommit-hash-mismatch", tampered["reasons"])
+        # an edited design no longer matches its recorded hash
+        edited = json.loads(json.dumps(design))
+        edited["arm_episodes"] = 11
+        self.assertNotEqual(M.design_hash(edited), good)
+        self.assertFalse(M.check_precommit(
+            edited, recorded_hash=good, base_n=10, cand_n=10)["ok"])
+        # via the engine: a tampered hash makes the comparison not-comparable
+        base = _arm(10, entered=10.0)
+        cand = _arm(10, entered=30.0)
+        result = M.compare_arms(base, cand, policy,
+                                base_provenance=_prov(),
+                                cand_provenance=_prov(),
+                                precommit_design=design,
+                                precommit_hash="deadbeef")
+        self.assertEqual(result["verdict"], "not-comparable")
+        self.assertFalse(result["admission"]["apply_allowed"])
+
+    def test_arm_count_or_order_mismatch_rejected(self):
+        policy = _policy(screening_episodes_per_arm=4,
+                         confirmation_episodes_per_arm=10)
+        design = M.precommit_design(policy, arm_episodes=10)
+        h = M.design_hash(design)
+        # 10/10 exact: design accepted
+        self.assertTrue(M.check_precommit(design, recorded_hash=h,
+                                          base_n=10, cand_n=10)["ok"])
+        # 10/11 and 11/11 cannot apply
+        for b_n, c_n in ((10, 11), (11, 11)):
+            res = M.check_precommit(design, recorded_hash=h, base_n=b_n,
+                                    cand_n=c_n)
+            self.assertFalse(res["ok"], (b_n, c_n))
+            self.assertTrue(any("arm-count-mismatch" in r
+                                for r in res["reasons"]))
+        # an order mismatch is rejected
+        wrong = list(reversed(design["schedule"]))
+        self.assertFalse(M.check_precommit(
+            design, recorded_hash=h, base_n=10, cand_n=10,
+            observed_schedule=wrong)["ok"])
+        # exact 10/10 with the committed order may apply
+        base = _arm(10, entered=10.0)
+        cand = _arm(10, entered=30.0)
+        r = M.compare_arms(base, cand, policy, base_provenance=_prov(),
+                           cand_provenance=_prov(),
+                           precommit_design=design, precommit_hash=h,
+                           observed_schedule=design["schedule"])
+        self.assertNotEqual(r["verdict"], "not-comparable")
+        self.assertTrue(r["precommit"]["ok"])
+
+
+class PrecommitScheduleRunner(unittest.TestCase):
+    """Finding #7: the production runner executes the committed schedule."""
+
+    def test_production_runner_executes_counterbalanced_order(self):
+        spec = _valid_spec(tier="live", episodes=4)
+        spec["comparison"]["resampling_seed"] = 3
+        os.environ[B.VAPOR_CLOUD_ENV] = "attested"
+        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        seen = []
+
+        def fake_episode(config, paths, episode_dir, index, timeout):
+            seen.append(index)
+            return _meta(), episode_dir
+
+        runner = B.BenchRunner(spec, tmp)
+        runner.episode_runner = fake_episode
+        out = runner.run()
+        expected = M.episode_schedule(4, 3)
+        self.assertEqual(runner._schedule, expected)
+        self.assertEqual(seen, [1, 2, 3, 4])
+        arms = [e["arm"] for e in out["manifest"]["episodes"]]
+        self.assertEqual(arms, [e["arm"] for e in expected])
+        # pairs are adjacent and alternate arms
+        self.assertEqual(arms[0], expected[0]["arm"])
+        self.assertNotEqual(arms[0], arms[1])
+        self.assertNotEqual(arms[2], arms[3])
+        # the committed schedule is persisted before results and hashed
+        pre = json.load(open(os.path.join(tmp, "precommit.json")))
+        self.assertEqual(pre["design"]["episode_schedule"], expected)
+        self.assertTrue(pre["hash"])
+
+
 if __name__ == "__main__":
     unittest.main()

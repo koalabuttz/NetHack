@@ -502,11 +502,32 @@ def assert_precommitted(pre: dict, comparison: dict) -> None:
                          "(abandon the run and re-precut it)" % drift)
 
 
-def precommit_record(comparison: dict) -> Dict[str, Any]:
-    """A hashable precommit record, persisted before any result exists."""
+def precommit_record(comparison: dict, *, episodes: Optional[int] = None,
+                     arm_episodes: Optional[int] = None) -> Dict[str, Any]:
+    """A hashable precommit record, persisted before any result exists.
+
+    It commits the comparison **policy** *and* the exact balanced counter-
+    balanced schedule (built from ``arm_episodes``, defaulting to the spec's
+    ``confirmation_episodes_per_arm``).  The recorded ``hash`` covers the whole
+    design, so editing either the policy or the schedule is detectable.
+    """
     policy = precommit(comparison)
-    return {"schema_version": "bench-precommit/1", "policy": policy,
-            "hash": M.sha256_json(policy)}
+    if arm_episodes is None:
+        arm_episodes = int(comparison.get("confirmation_episodes_per_arm", 0)
+                           or 0)
+    design = M.precommit_design(comparison, arm_episodes=int(arm_episodes))
+    if episodes is not None:
+        design["total_episodes"] = int(episodes)
+        sched = M.episode_schedule(int(episodes),
+                                   int(comparison.get("resampling_seed", 0)))
+        design["episode_schedule"] = sched
+        design["expected_arm_counts"] = {
+            "baseline": sum(1 for e in sched if e["arm"] == "baseline"),
+            "candidate": sum(1 for e in sched if e["arm"] == "candidate"),
+        }
+    return {"schema_version": "bench-precommit/1",
+            "policy": policy, "design": design,
+            "hash": M.design_hash(design)}
 
 
 # --------------------------------------------------------------------------
@@ -1273,20 +1294,26 @@ class BenchRunner(object):
                                  unattended_apply_allowed=pre.get(
                                      "unattended_apply_allowed"))
         self._unattended = bool(pre.get("unattended_apply_allowed", True))
-        # Precommit the comparison design BEFORE any result exists.
-        pre_record = precommit_record(self.spec["comparison"])
-        self._write_run_artifact("precommit.json", pre_record)
+        # Precommit the comparison design BEFORE any result exists: the policy
+        # AND the exact balanced AB/BA schedule the runner will execute.
+        planned = self.spec["episodes"]
+        self._pre_record = precommit_record(
+            self.spec["comparison"], episodes=planned,
+            arm_episodes=max(1, planned // 2))
+        self._pre_record_hash = self._pre_record["hash"]
+        self._schedule = list(self._pre_record["design"]["episode_schedule"])
+        self._write_run_artifact("precommit.json", self._pre_record)
         self.judge = self._make_judge(pre)
 
         results: List[Tuple[int, Any, str]] = []
         cards: List[dict] = []
         judge_results: List[dict] = []
-        planned = self.spec["episodes"]
+        executed_schedule: List[str] = []
         index = 0
         with signal_handlers(
                 self.stop,
                 on_forced=lambda: self._force_abort(results)) as _handlers:
-            while index < planned:
+            while index < len(self._schedule):
                 if self.stop.should_stop():
                     break
                 if self._deadline_exceeded():
@@ -1296,12 +1323,18 @@ class BenchRunner(object):
                     return self._after_loop(cards, "partial", M.BENCH_ABORTED,
                                             judge_results)
                 index += 1
+                entry = self._schedule[index - 1]
+                arm = entry["arm"]
+                executed_schedule.append(
+                    entry["order"] if len(entry["order"]) == 2
+                    else ("AB" if arm == "baseline" else "BA"))
                 episode_dir = os.path.join(self.out_dir, "ep-%d" % index)
                 # reserve the WHOLE next episode's approved allocation BEFORE
                 # launching it (the per-episode caps reset, so a later episode
                 # must not be able to exceed the campaign budget).
                 self.manifest.reserve("ep-%d" % index, {
-                    "episode": index, "dir": episode_dir,
+                    "episode": index, "dir": episode_dir, "arm": arm,
+                    "pair": entry["pair"], "order": entry["order"],
                     "allocation": {
                         "episode_timeout_s": self.spec["episode_timeout_s"],
                         "strategy_calls": int(getattr(
@@ -1312,11 +1345,13 @@ class BenchRunner(object):
                 result, episode_dir = self._run_one(config, episode_dir, index)
                 card, hashes, paths = self._seal_episode(
                     episode_dir, index, result, requested)
+                card["arm"] = arm
                 cards.append(card)
                 results.append((index, result, episode_dir))
                 self.manifest.settle("ep-%d" % index, "completed")
                 self.manifest.add_episode({
-                    "index": index, "dir": episode_dir,
+                    "index": index, "dir": episode_dir, "arm": arm,
+                    "pair": entry["pair"], "order": entry["order"],
                     "scorecard_hash": M.sha256_bytes(
                         M.pretty_scorecard(card).encode("utf-8")),
                     "source_hashes": hashes,
@@ -1327,6 +1362,9 @@ class BenchRunner(object):
                 judged = self._judge_episode(card, index)
                 if judged is not None:
                     judge_results.append(judged)
+        self._executed_schedule = executed_schedule
+        self.manifest.data["executed_schedule"] = executed_schedule
+        self.manifest.flush()
         stop_reason = self.stop.stop_reason()
         status = "complete" if stop_reason is None else "partial"
         return self._after_loop(cards, status, stop_reason, judge_results)
@@ -1542,17 +1580,32 @@ class BenchRunner(object):
                     "admission": {"apply_allowed": False},
                     "verdict": "not-comparable"}
         baseline = self._baseline_cards()
-        if not baseline:
+        by_arm_base = [c for c in cards if c.get("arm") == "baseline"]
+        by_arm_cand = [c for c in cards if c.get("arm") == "candidate"]
+        if by_arm_base and by_arm_cand:
+            # an interleaved A/B run carries both arms in this run
+            base_arm, cand_arm = by_arm_base, by_arm_cand
+        elif by_arm_cand:
+            base_arm, cand_arm = baseline, by_arm_cand
+        else:
+            base_arm, cand_arm = baseline, list(cards)
+        if not base_arm:
             return {"schema_version": M.COMPARISON_SCHEMA, "refused": True,
                     "refusal_reason": "no-baseline",
                     "admission": {"apply_allowed": False},
                     "verdict": "inconclusive"}
         policy = dict(self.spec["comparison"])
         policy["admission_margin"] = 0.0
-        result = M.compare_arms(baseline, cards, policy,
-                                base_provenance=None,
-                                cand_provenance=self._prov)
-        result["design"] = precommit_record(self.spec["comparison"])
+        pre = getattr(self, "_pre_record", None) or precommit_record(
+            self.spec["comparison"], episodes=self.spec["episodes"],
+            arm_episodes=max(1, self.spec["episodes"] // 2))
+        result = M.compare_arms(
+            base_arm, cand_arm, policy,
+            base_provenance=None, cand_provenance=self._prov,
+            precommit_design=pre.get("design"),
+            precommit_hash=pre.get("hash"),
+            observed_schedule=getattr(self, "_executed_schedule", None))
+        result["design"] = pre
         if not getattr(self, "_unattended", True):
             # an unknown-exposure (unstrict) run never permits unattended apply
             result.setdefault("admission", {})["apply_allowed"] = False

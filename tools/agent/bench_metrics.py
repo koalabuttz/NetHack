@@ -887,14 +887,129 @@ DEFAULT_TARGET = "exploration.entered_cells_instance_scoped"
 
 
 def pair_schedule(n_pairs: int, seed: int) -> List[str]:
-    """A fixed seeded, counterbalanced AB/BA pair order.
+    """A fixed seeded, **exactly balanced** counterbalanced AB/BA pair order.
 
-    Every pair runs baseline and candidate adjacent; the *order* is drawn from
-    the seeded RNG, so ordering effects cannot align with the candidate and
-    both AB and BA occur.  Same seed -> same schedule.
+    Exactly ``n_pairs // 2`` pairs run ``AB`` and the rest run ``BA``, so the
+    count difference is at most 1 and **both orders occur whenever
+    ``n_pairs >= 2``**.  The order of the balanced multiset is drawn from the
+    seeded RNG, so ordering effects cannot align with the candidate.  Same seed
+    -> same schedule.
     """
-    rng = random.Random(seed)
-    return ["AB" if rng.random() < 0.5 else "BA" for _ in range(int(n_pairs))]
+    n = max(0, int(n_pairs))
+    if n == 0:
+        return []
+    n_ab = n // 2
+    n_ba = n - n_ab
+    seq = ["AB"] * n_ab + ["BA"] * n_ba
+    random.Random(seed).shuffle(seq)
+    return seq
+
+
+def schedule_counts(schedule: Sequence[str]) -> Dict[str, int]:
+    """The AB/BA counts of a schedule (their difference is <= 1 when balanced)."""
+    return {"AB": sum(1 for s in schedule if s == "AB"),
+            "BA": sum(1 for s in schedule if s == "BA")}
+
+
+def schedule_hash(schedule: Sequence[str]) -> str:
+    return sha256_json(list(schedule))
+
+
+def episode_schedule(total_episodes: int, seed: int) -> List[Dict[str, Any]]:
+    """The flat counterbalanced episode schedule the runner executes.
+
+    Each full pair contributes one baseline and one candidate episode in the
+    seeded AB/BA order; an odd leftover episode runs on whichever arm is
+    currently behind, keeping the arm-count difference <= 1.  Deterministic in
+    ``(total_episodes, seed)``.
+    """
+    total = max(0, int(total_episodes))
+    pairs = total // 2
+    orders = pair_schedule(pairs, seed)
+    seq: List[Dict[str, Any]] = []
+    for i, order in enumerate(orders):
+        first, second = (("baseline", "candidate") if order == "AB"
+                         else ("candidate", "baseline"))
+        seq.append({"pair": i + 1, "order": order, "arm": first})
+        seq.append({"pair": i + 1, "order": order, "arm": second})
+    if total % 2 == 1:
+        n_base = sum(1 for e in seq if e["arm"] == "baseline")
+        n_cand = sum(1 for e in seq if e["arm"] == "candidate")
+        leftover = "baseline" if n_base <= n_cand else "candidate"
+        seq.append({"pair": pairs + 1,
+                    "order": "A" if leftover == "baseline" else "B",
+                    "arm": leftover})
+    return seq
+
+
+def precommit_design(policy: dict, *, arm_episodes: int) -> Dict[str, Any]:
+    """The committed comparison design: policy + exact balanced schedule."""
+    seed = int(policy.get("resampling_seed", 0))
+    order = pair_schedule(int(arm_episodes), seed)
+    return {
+        "schema_version": "bench-precommit-design/1",
+        "arm_episodes": int(arm_episodes),
+        "schedule": order,
+        "schedule_hash": schedule_hash(order),
+        "schedule_counts": schedule_counts(order),
+        "expected_arm_counts": {"baseline": int(arm_episodes),
+                                "candidate": int(arm_episodes)},
+        "resampling_seed": seed,
+        "policy": {
+            "target_metric": policy.get("target_metric", DEFAULT_TARGET),
+            "min_improvement": policy.get("min_improvement"),
+            "confidence_level": policy.get("confidence_level"),
+            "resamples": policy.get("resamples"),
+            "min_completed_episodes_per_arm":
+                policy.get("min_completed_episodes_per_arm"),
+            "min_aggregate_at_risk_ticks_per_arm":
+                policy.get("min_aggregate_at_risk_ticks_per_arm"),
+        },
+    }
+
+
+def design_hash(design: dict) -> str:
+    """The hash of a committed design (used to detect editing)."""
+    return sha256_json(design)
+
+
+def expected_arm_counts(design: dict) -> Dict[str, int]:
+    """The committed per-arm episode counts (exact, odd totals included)."""
+    counts = design.get("expected_arm_counts")
+    if isinstance(counts, dict) and "baseline" in counts:
+        return {"baseline": int(counts["baseline"]),
+                "candidate": int(counts["candidate"])}
+    arm = int(design.get("arm_episodes", 0))
+    return {"baseline": arm, "candidate": arm}
+
+
+def check_precommit(design: Optional[dict], *, recorded_hash: Optional[str],
+                    base_n: int, cand_n: int,
+                    observed_schedule: Optional[Sequence[str]] = None
+                    ) -> Dict[str, Any]:
+    """Verify the observed run matches the committed design exactly.
+
+    Returns ``{"ok": bool, "reasons": [...], "expected_arm_counts": ...}``.
+    A tampered ``recorded_hash``, an arm count that differs (10/11 or 11/11
+    against a committed 10/10), or a differing order all make the comparison
+    rejectable.
+    """
+    reasons: List[str] = []
+    if design is None:
+        return {"ok": False, "reasons": ["no-precommit-design"],
+                "expected_arm_counts": None}
+    if recorded_hash is not None and recorded_hash != design_hash(design):
+        reasons.append("precommit-hash-mismatch")
+    want = expected_arm_counts(design)
+    if base_n != want["baseline"] or cand_n != want["candidate"]:
+        reasons.append("arm-count-mismatch:%d/%d!=%d/%d"
+                       % (base_n, cand_n, want["baseline"], want["candidate"]))
+    if observed_schedule is not None and \
+            list(observed_schedule) != list(design.get("schedule") or []):
+        reasons.append("order-mismatch")
+    return {"ok": not reasons, "reasons": reasons,
+            "expected_arm_counts": want,
+            "committed_schedule_hash": design.get("schedule_hash")}
 
 
 def _quantile(sorted_vals: Sequence[float], q: float) -> float:
@@ -1022,8 +1137,18 @@ def termination_safety_admission(base_cards: Sequence[dict],
 def compare_arms(base_cards: Sequence[dict], cand_cards: Sequence[dict],
                  policy: dict, *, base_provenance: Optional[dict] = None,
                  cand_provenance: Optional[dict] = None,
-                 config_diff: Optional[dict] = None) -> Dict[str, Any]:
-    """The single comparison engine for A/B and candidate-vs-baseline."""
+                 config_diff: Optional[dict] = None,
+                 precommit_design: Optional[dict] = None,
+                 precommit_hash: Optional[str] = None,
+                 observed_schedule: Optional[Sequence[str]] = None
+                 ) -> Dict[str, Any]:
+    """The single comparison engine for A/B and candidate-vs-baseline.
+
+    When a committed ``precommit_design`` is supplied, the observed arm counts
+    and (if given) the observed order must match it **exactly** -- a committed
+    10/arm rejects 10/11 and 11/11, and a tampered ``precommit_hash`` rejects
+    outright.
+    """
     target = policy.get("target_metric", DEFAULT_TARGET)
     min_improvement = float(policy.get("min_improvement", 0.0))
     margins = dict(policy.get("noninferiority_margins") or {})
@@ -1087,7 +1212,13 @@ def compare_arms(base_cards: Sequence[dict], cand_cards: Sequence[dict],
     # verdict assembly -------------------------------------------------
     verdict = "inconclusive"
     reasons: List[str] = []
-    if not prov["comparable"]:
+    design = check_precommit(precommit_design, recorded_hash=precommit_hash,
+                             base_n=len(base_list), cand_n=len(cand_list),
+                             observed_schedule=observed_schedule)
+    if precommit_design is not None and not design["ok"]:
+        verdict = "not-comparable"
+        reasons.extend("precommit:" + r for r in design["reasons"])
+    elif not prov["comparable"]:
         verdict = "not-comparable"
         reasons.extend(["provenance:" + r for r in prov["reasons"]])
     elif not attempts_ok:
@@ -1157,8 +1288,11 @@ def compare_arms(base_cards: Sequence[dict], cand_cards: Sequence[dict],
         "screening_episodes_per_arm": screening,
         "confirmation_episodes_per_arm": confirmation,
         "arm_samples": arm_n,
-        "apply_allowed": bool(verdict == "pass" and not diagnostic_only),
+        "apply_allowed": bool(verdict == "pass" and not diagnostic_only
+                              and design["ok"]),
         "fallback_attempts_source": bool(fallback_only),
+        "precommit_ok": bool(design["ok"]),
+        "precommit_expected_arm_counts": design["expected_arm_counts"],
     }
     return {
         "schema_version": COMPARISON_SCHEMA,
@@ -1179,6 +1313,16 @@ def compare_arms(base_cards: Sequence[dict], cand_cards: Sequence[dict],
         "attempts_source": {"baseline": sorted(src_b),
                             "candidate": sorted(src_c), "comparable":
                             attempts_ok},
+        "precommit": {
+            "committed": precommit_design is not None,
+            "recorded_hash": precommit_hash,
+            "design_hash": (design_hash(precommit_design)
+                            if precommit_design is not None else None),
+            "ok": bool(design["ok"]),
+            "reasons": design["reasons"],
+            "expected_arm_counts": design["expected_arm_counts"],
+            "schedule": (precommit_design or {}).get("schedule"),
+        },
         "admission": admission_record,
         "config_diff": config_diff or {},
     }
