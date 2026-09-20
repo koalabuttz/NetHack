@@ -28,7 +28,7 @@ import signal
 import subprocess
 import sys
 import time
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import bench_metrics as M
 
@@ -535,10 +535,36 @@ class ProcReader(object):
                 "starttime": starttime, "state": state}
 
     def pgid(self, pid: int) -> int:
+        """The process group of *pid*; ``-1`` only when it is gone.
+
+        A permission failure is raised, never swallowed as ``-1``: treating an
+        unreadable ``getpgid`` as "gone" is exactly the fail-open defect the
+        review calls out.
+        """
         try:
             return os.getpgid(pid)
-        except (ProcessLookupError, PermissionError, OSError):
+        except ProcessLookupError:
             return -1
+        except PermissionError:
+            raise
+        except OSError:
+            return -1
+
+    def members(self, pgid: int) -> List[int]:
+        """Every live PID whose process group is *pgid* (for ownership checks)."""
+        out = []
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            try:
+                if self.pgid(pid) == pgid:
+                    out.append(pid)
+            except PermissionError:
+                raise
+            except OSError:
+                continue
+        return sorted(out)
 
     def signal(self, pid: int, sig: int) -> None:
         os.kill(pid, sig)
@@ -572,6 +598,7 @@ class OwnedProcessTree(object):
         return self._walk(pid)
 
     def _walk(self, root: int) -> List[Dict[str, Any]]:
+        """PPID recursion from *root*, with fail-closed identity validation."""
         seen: Dict[int, Dict[str, Any]] = {}
         frontier = [root]
         while frontier:
@@ -584,39 +611,72 @@ class OwnedProcessTree(object):
                 raise ProcError("identity read failed for %d: %s" % (pid, exc))
             if ident is None:
                 continue
+            try:
+                pg = self.reader.pgid(pid)
+            except Exception as exc:  # noqa: BLE001 - fatal, never -1
+                raise ProcError("getpgid failed for %d: %s" % (pid, exc))
+            if pg < 0:
+                # a negative pgid for a still-live process is a resolution
+                # failure, not a disappearance.
+                try:
+                    still = self.reader.identity(pid)
+                except Exception as exc:  # noqa: BLE001
+                    raise ProcError("identity re-check failed for %d: %s"
+                                    % (pid, exc))
+                if still is not None and still.get("state") \
+                        not in getattr(self.reader, "DEAD_STATES", ("Z",)):
+                    raise ProcError("pgid resolution failed for live pid %d"
+                                    % pid)
+                continue
+            ident["own_pgid"] = pg
             seen[pid] = ident
             try:
                 kids = self.reader.children(pid)
             except Exception as exc:  # noqa: BLE001
                 raise ProcError("children read failed for %d: %s" % (pid, exc))
             frontier.extend(kids)
-        # Determine each member's own pgid, re-validating identity.
-        for ident in seen.values():
-            pg = self.reader.pgid(ident["pid"])
-            ident["own_pgid"] = pg
         return list(seen.values())
 
-    def reap(self, root: int) -> Dict[str, Any]:
-        """The forced path: SIGKILL the owned tree, root last."""
-        result = {"teardown_failure": False, "killed": [], "survivors": [],
-                  "permission_failure": False}
+    def _group_owned(self, pgid: int, captured_pids: Iterable[int]) -> bool:
+        """True only when every member of *pgid* is inside the captured tree."""
         try:
-            captured = self.capture(root)
-        except ProcError as exc:
+            members = self.reader.members(pgid)
+        except Exception as exc:  # noqa: BLE001 - cannot prove ownership
+            raise ProcError("group membership read failed for pgid %d: %s"
+                            % (pgid, exc))
+        return set(members) <= set(captured_pids)
+
+    def reap(self, root: Any) -> Dict[str, Any]:
+        """The forced path: SIGKILL the owned tree, root last.
+
+        *root* may be a captured identity dict or a bare pid.  Every failure is
+        recorded and returns a non-success teardown result -- cleanup continues
+        best effort, but the run is never reported as clean.
+        """
+        root_pid = root["pid"] if isinstance(root, dict) else int(root)
+        result: Dict[str, Any] = {"teardown_failure": False, "killed": [],
+                                  "survivors": [], "permission_failure": False,
+                                  "errors": []}
+
+        def _fatal(exc: ProcError) -> None:
             result["teardown_failure"] = True
             result["permission_failure"] = True
+            result["errors"].append(str(exc))
             result["error"] = str(exc)
+
+        try:
+            captured = self._walk(root_pid)
+        except ProcError as exc:
+            _fatal(exc)
             return result
-        root_identity = next((i for i in captured if i["pid"] == root), None)
+        root_identity = next((i for i in captured if i["pid"] == root_pid), None)
         deadline = time.monotonic() + self.bound
         stable = 0
         while time.monotonic() < deadline and stable < 2:
             try:
-                tree = self._walk(root)
+                tree = self._walk(root_pid)
             except ProcError as exc:
-                result["teardown_failure"] = True
-                result["permission_failure"] = True
-                result["error"] = str(exc)
+                _fatal(exc)
                 return result
             ids = {i["pid"] for i in tree}
             if ids == {i["pid"] for i in captured}:
@@ -624,30 +684,40 @@ class OwnedProcessTree(object):
             else:
                 stable = 0
             captured = tree
+            pids = {i["pid"] for i in captured}
             # kill descendants (never the root yet) and their owned groups
             for ident in captured:
-                if ident["pid"] == root:
+                if ident["pid"] == root_pid:
                     continue
-                self._kill(ident, result)
+                try:
+                    self._kill(ident, result, pids)
+                except ProcError as exc:
+                    _fatal(exc)
             time.sleep(0.05)
         # reap the root last
         if root_identity is not None:
-            self._kill(root_identity, result)
+            try:
+                self._kill(root_identity, result,
+                           {i["pid"] for i in captured})
+            except ProcError as exc:
+                _fatal(exc)
         # verify no captured identity survives (bounded: SIGKILL delivery and
         # zombie reaping are asynchronous)
         poll_deadline = time.monotonic() + self.grace + 2.0
+        surviving: List[int] = []
         while True:
             surviving = [i["pid"] for i in captured if self._alive(i)]
             if not surviving or time.monotonic() >= poll_deadline:
                 break
             time.sleep(0.05)
-        for pid in surviving:
-            result["survivors"].append(pid)
-        if result["survivors"] or result["permission_failure"]:
+        result["survivors"] = surviving
+        if result["survivors"] or result["permission_failure"] \
+                or result["errors"]:
             result["teardown_failure"] = True
         return result
 
-    def _kill(self, ident: Dict[str, Any], result: Dict[str, Any]) -> None:
+    def _kill(self, ident: Dict[str, Any], result: Dict[str, Any],
+              captured_pids: Iterable[int]) -> None:
         pid = ident["pid"]
         try:
             current = self.reader.identity(pid)
@@ -655,13 +725,25 @@ class OwnedProcessTree(object):
             raise ProcError("identity re-check failed for %d: %s" % (pid, exc))
         if current is None:
             return
+        if current.get("state") in getattr(self.reader, "DEAD_STATES", ("Z",)):
+            return
         if current.get("starttime") != ident.get("starttime"):
-            # PID reuse: do not signal a different process.
+            # PID reuse / a stale identity: we cannot confirm this is the tree
+            # we captured, so we must not signal it -- but that is a
+            # teardown failure, never a silent skip.
+            result.setdefault("errors", []).append(
+                "start-time mismatch for pid %d (stale/PID-reused): not "
+                "signalled" % pid)
             return
         pg = ident.get("own_pgid", -1)
         try:
             if pg and pg > 0 and pg != os.getpgrp():
-                self.reader.signal_group(pg, signal.SIGKILL)
+                # Signal a group only when every member belongs to the captured
+                # tree; otherwise a mixed group could hold an unrelated process.
+                if self._group_owned(pg, captured_pids):
+                    self.reader.signal_group(pg, signal.SIGKILL)
+                else:
+                    self.reader.signal(pid, signal.SIGKILL)
             self.reader.signal(pid, signal.SIGKILL)
             result["killed"].append(pid)
         except PermissionError as exc:
@@ -775,6 +857,17 @@ def write_json_atomic(path: str, obj: Any, mode: int = 0o600) -> None:
             pass
         raise
     os.replace(tmp, path)
+
+
+def child_env(source: Optional[dict] = None) -> Dict[str, str]:
+    """The allowlisted environment for an episode child process.
+
+    Credential-looking names are dropped; the child loads its own referenced
+    secret files.  Reuses the provider worker's allowlist so the child and the
+    worker share one env policy.
+    """
+    from . import providers
+    return providers.worker_env(source)
 
 
 def _read_json(path: Optional[str]) -> Optional[dict]:
@@ -911,6 +1004,21 @@ class Manifest(object):
                 entry["outcome"] = outcome
         self.flush()
 
+    def record_root(self, key: str, identity: dict) -> None:
+        """Persist the captured root identity (PID/start/session/PGID) atomically.
+
+        Written *before* the episode's work runs, so a forced abort always has
+        a validated root to reap.
+        """
+        for entry in self.data["reservations"]:
+            if entry["key"] == key and not entry.get("settled"):
+                entry["root"] = dict(identity)
+        self.flush()
+
+    def unsettled_roots(self) -> List[dict]:
+        return [e["root"] for e in self.data["reservations"]
+                if not e.get("settled") and e.get("root")]
+
     def note_unknown_exposure(self, detail: dict) -> None:
         self.data["unknown_exposure"].append(dict(detail))
         self.flush()
@@ -948,9 +1056,35 @@ class Manifest(object):
 # the runner
 # --------------------------------------------------------------------------
 
+#: The repository root, used as the child process working directory so
+#: ``python3 -m tools.agent.bench`` resolves.
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
+
+
+def default_episode_command(runner, spec_path: str, episode_dir: str,
+                            index: int, timeout: float) -> List[str]:
+    """The argv that runs exactly one episode in a dedicated child process."""
+    paths = runner._paths() or {}
+    argv = [sys.executable, "-m", "tools.agent.bench", "_child",
+            "--spec", spec_path, "--episode-dir", episode_dir,
+            "--timeout", str(timeout),
+            "--worker", paths.get("worker", ""),
+            "--runner", paths.get("runner", ""),
+            "--data", paths.get("data", "")]
+    if paths.get("sysconf"):
+        argv += ["--sysconf", paths["sysconf"]]
+    return argv
+
+
 def default_episode_runner(config, paths, episode_dir: str, index: int,
                            timeout: float):
-    """Run exactly one episode via ``Controller.run_campaign(1)``."""
+    """In-process fallback runner (used only when explicitly injected).
+
+    The production path launches a dedicated child through
+    :func:`default_episode_command`; this in-process form is retained for the
+    offline tests that must not spawn a real launcher.
+    """
     from . import controller as C
     if not paths:
         raise RuntimeError("bench live tier needs BENCH_WORKER/BENCH_RUNNER/"
@@ -974,14 +1108,23 @@ class BenchRunner(object):
 
     def __init__(self, spec: dict, out_dir: str, *,
                  episode_runner: Optional[Callable] = None,
+                 episode_command_factory: Optional[Callable] = None,
                  judge_factory: Optional[Callable] = None,
                  stop_file: Optional[str] = None,
+                 grace: float = 5.0,
+                 spec_path: Optional[str] = None,
                  now: Callable[[], float] = time.monotonic):
         self.spec = spec
         self.out_dir = out_dir
-        self.episode_runner = episode_runner or default_episode_runner
+        # ``episode_runner`` is an injected IN-PROCESS runner (offline tests).
+        # The production default is a dedicated child process spawned from
+        # ``episode_command_factory``.
+        self.episode_runner = episode_runner
+        self.episode_command_factory = episode_command_factory or \
+            default_episode_command
         self.judge_factory = judge_factory
         self.stop = StopController(stop_file)
+        self.grace = grace
         self.now = now
         self.manifest = Manifest(os.path.join(out_dir, "manifest.json"),
                                  spec_ref=spec.get("name"))
@@ -991,6 +1134,13 @@ class BenchRunner(object):
                                      or 1)
         self.judge = None
         self._prov = None
+        self.spec_path = spec_path
+
+    def _spec_path(self) -> str:
+        if self.spec_path is None:
+            self.spec_path = os.path.join(self.out_dir, "spec.json")
+            write_json_atomic(self.spec_path, self.spec)
+        return self.spec_path
 
     # -- provenance --------------------------------------------------------
     def provenance_id(self) -> Optional[str]:
@@ -1120,11 +1270,95 @@ class BenchRunner(object):
                             calls_total=calls_total)
 
     def _run_one(self, config, episode_dir, index):
-        paths = self._paths()
-        result, episode_dir = self.episode_runner(
-            config, paths, episode_dir, index,
+        os.makedirs(episode_dir, mode=0o700, exist_ok=True)
+        if self.episode_runner is not None:
+            # injected in-process runner (offline tests): no child process
+            result, episode_dir = self.episode_runner(
+                config, self._paths(), episode_dir, index,
+                self.spec["episode_timeout_s"])
+            return result, episode_dir
+        return self._run_child(episode_dir, index)
+
+    def _run_child(self, episode_dir, index):
+        """Launch the episode as a dedicated child/session, then supervise it.
+
+        The captured PID/start-time/session/PGID are persisted *before* the
+        work runs, so a forced abort always has a validated root to reap.
+        """
+        key = "ep-%d" % index
+        argv = self.episode_command_factory(
+            self, self._spec_path(), episode_dir, index,
             self.spec["episode_timeout_s"])
+        proc = subprocess.Popen(argv, start_new_session=True, cwd=ROOT,
+                                stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                env=child_env())
+        try:
+            identity = self.abort_tree.reader.identity(proc.pid) \
+                or {"pid": proc.pid}
+        except Exception:  # noqa: BLE001 - fail closed on capture
+            identity = {"pid": proc.pid, "capture_failed": True}
+            self.manifest.set_status("teardown-failure",
+                                     teardown_failure=True)
+        self.manifest.record_root(key, identity)
+        self._supervise(key, proc, identity)
+        try:
+            proc.wait(timeout=2.0)
+        except Exception:  # noqa: BLE001
+            pass
+        result = None
+        child = _read_json(os.path.join(episode_dir, "bench-child.json"))
+        if child:
+            result = child.get("result")
         return result, episode_dir
+
+    def _supervise(self, key, proc, identity) -> None:
+        """Wait for the child, relaying a graceful stop and enforcing deadlines.
+
+        The wall deadline is enforced **asynchronously during** the episode: a
+        second stop request, a campaign/`campaign_timeout_s` deadline or the
+        episode timeout aborts the captured tree immediately rather than being
+        noticed only between episodes.
+        """
+        deadline = time.monotonic() + self.spec["episode_timeout_s"]
+        grace_deadline = None
+        while True:
+            if proc.poll() is not None:
+                return
+            if self.stop.forced():
+                self._abort_handle(key, proc, identity, "forced-abort")
+                return
+            if self._deadline_exceeded():
+                self._abort_handle(key, proc, identity,
+                                   "campaign-deadline-exceeded")
+                return
+            if self.stop.should_stop() and grace_deadline is None:
+                # relay the FIRST (graceful) stop to the child so it can reach
+                # its own ``finally`` teardown.
+                try:
+                    os.kill(proc.pid, signal.SIGTERM)
+                except (OSError, ProcessLookupError):
+                    pass
+                grace_deadline = time.monotonic() + self.grace
+            if grace_deadline is not None and time.monotonic() >= grace_deadline:
+                self._abort_handle(key, proc, identity, "graceful-stop-timeout")
+                return
+            if time.monotonic() >= deadline:
+                self._abort_handle(key, proc, identity, "episode-timeout")
+                return
+            time.sleep(0.05)
+
+    def _abort_handle(self, key, proc, identity, reason) -> Dict[str, Any]:
+        outcome = self.abort_tree.reap(identity)
+        teardown = bool(outcome.get("teardown_failure"))
+        self.manifest.note_unknown_exposure(
+            {"reason": reason, "root_pid": identity.get("pid"),
+             "teardown_failure": teardown})
+        if teardown:
+            self.manifest.data["teardown_failure"] = True
+            self.manifest.set_status("teardown-failure", teardown_failure=True)
+        return outcome
 
     def _seal_episode(self, episode_dir: str, index: int, result: Any,
                       requested: dict) -> Tuple[dict, dict, dict]:
@@ -1317,19 +1551,20 @@ class BenchRunner(object):
         return (self.now() - self.started) > limit
 
     def _force_abort(self, results) -> None:
-        # forced: reap the owned tree of every recorded episode process
+        # forced: reap the owned tree of every captured episode root
         teardown_failed = False
-        for entry in list(self.manifest.data["episodes"]):
-            pid = entry.get("root_pid")
-            if pid:
-                outcome = self.abort_tree.reap(int(pid))
-                if outcome.get("teardown_failure"):
-                    teardown_failed = True
+        for root in list(self.manifest.unsettled_roots()) + [
+                {"pid": e["root_pid"]}
+                for e in self.manifest.data["episodes"]
+                if e.get("root_pid")]:
+            outcome = self.abort_tree.reap(root)
+            if outcome.get("teardown_failure"):
+                teardown_failed = True
         self.manifest.note_unknown_exposure(
             {"reason": "forced-abort", "episodes": len(results)})
         if teardown_failed:
-            self.manifest.set_status("teardown-failure",
-                                     teardown_failure=True)
+            self.manifest.data["teardown_failure"] = True
+            self.manifest.set_status("teardown-failure", teardown_failure=True)
 
 
 # --------------------------------------------------------------------------

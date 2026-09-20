@@ -19,6 +19,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -153,6 +154,16 @@ def _card(**over):
 def _arm(n, entered=20.0, **kw):
     return [_card(episode_id="ep-%d" % i, entered=entered + i, **kw)
             for i in range(n)]
+
+
+def _alive(pid):
+    """True only for a live (non-zombie) process."""
+    try:
+        with open("/proc/%d/stat" % pid) as fh:
+            stat = fh.read()
+    except OSError:
+        return False
+    return stat[stat.rindex(")") + 2:].split()[0] not in ("Z", "X", "x")
 
 
 def _policy(**over):
@@ -649,70 +660,119 @@ class StopAndAbort(unittest.TestCase):
                         "admission": {"apply_allowed": True}})
         self.assertFalse(teardown["promoted"])
 
+    def _nested_tree_scripts(self, tmp):
+        """Write root/launcher/provider scripts that build a nested tree."""
+        pidfile = os.path.join(tmp, "pids.txt")
+        provider = os.path.join(tmp, "provider.py")
+        launcher = os.path.join(tmp, "launcher.py")
+        root = os.path.join(tmp, "root.py")
+        with open(provider, "w") as fh:
+            fh.write("import signal, time\n"
+                     "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                     "time.sleep(120)\n")
+        with open(launcher, "w") as fh:
+            fh.write("import os, signal, subprocess, sys, time\n"
+                     "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                     "p = subprocess.Popen([sys.executable, %r],\n"
+                     "                     start_new_session=True)\n"
+                     "open(%r, 'a').write('%%d\\n' %% p.pid)\n"
+                     "time.sleep(120)\n" % (provider, pidfile))
+        with open(root, "w") as fh:
+            fh.write(
+                "import os, signal, subprocess, sys, threading, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "open(%r, 'w').write('%%d\\n' %% os.getpid())\n"
+                "l = subprocess.Popen([sys.executable, %r],\n"
+                "                     start_new_session=True)\n"
+                "open(%r, 'a').write('%%d\\n' %% l.pid)\n"
+                "def late():\n"
+                "    time.sleep(0.4)\n"
+                "    p = subprocess.Popen([sys.executable, %r],\n"
+                "                         start_new_session=True)\n"
+                "    open(%r, 'a').write('%%d\\n' %% p.pid)\n"
+                "threading.Thread(target=late, daemon=True).start()\n"
+                "time.sleep(120)\n" % (pidfile, launcher, pidfile, provider,
+                                       pidfile))
+        return root, pidfile
+
     def test_forced_abort_reaps_nested_launcher_and_provider_groups(self):
+        """Exercise ``BenchRunner`` itself: a forced abort reaps only the
+        captured episode tree (launcher session + TERM-ignoring provider + a
+        descendant spawned during the walk) and leaves an unrelated sentinel."""
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
-        pidfile = os.path.join(tmp, "pids.txt")
-        code = (
-            "import os, signal, subprocess, sys, threading, time\n"
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-            "def spawn(detach, ignore):\n"
-            "    body = ('import signal,time\\n'\n"
-            "            + ('signal.signal(signal.SIGTERM, signal.SIG_IGN)\\n'"
-            "               if ignore else '')\n"
-            "            + 'time.sleep(120)\\n')\n"
-            "    return subprocess.Popen([sys.executable, '-c', body],\n"
-            "                            start_new_session=detach)\n"
-            "pids = []\n"
-            "pids.append(spawn(True, True).pid)   # launcher session\n"
-            "pids.append(spawn(False, False).pid)  # inherits supervisor pgid\n"
-            "def late():\n"
-            "    time.sleep(0.3)\n"
-            "    pids.append(spawn(True, True).pid)  # spawned during the walk\n"
-            "threading.Thread(target=late, daemon=True).start()\n"
-            "def dump():\n"
-            "    time.sleep(0.6)\n"
-            "    open(os.environ['PIDFILE'], 'w').write(' '.join(map(str, "
-            "pids)))\n"
-            "threading.Thread(target=dump, daemon=True).start()\n"
-            "time.sleep(120)\n")
-        env = dict(os.environ, PIDFILE=pidfile)
-        # root inherits the supervisor's process group (NOT a new session)
-        root = subprocess.Popen([sys.executable, "-c", code], env=env,
-                                start_new_session=False)
-        self.addCleanup(root.kill)
-        # wait for the pid dump
-        for _ in range(60):
-            if os.path.exists(pidfile):
-                break
-            time.sleep(0.05)
+        root_py, pidfile = self._nested_tree_scripts(tmp)
+        # an unrelated process in its own session: never part of the tree
+        sentinel = subprocess.Popen([sys.executable, "-c",
+                                     "import time; time.sleep(60)"],
+                                    start_new_session=True)
+        self.addCleanup(sentinel.kill)
+
+        spec = _valid_spec(tier="live", episodes=1)
+        os.environ[B.VAPOR_CLOUD_ENV] = "attested"
+        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
+        runner = B.BenchRunner(
+            spec, tmp, grace=0.5,
+            episode_command_factory=lambda *a: [sys.executable, root_py])
+        timer = threading.Timer(1.5, lambda: setattr(runner.stop, "level", 2))
+        timer.daemon = True
+        timer.start()
+        out = runner.run()
+        timer.cancel()
+
         deadline = time.monotonic() + 5
         while not os.path.exists(pidfile) and time.monotonic() < deadline:
             time.sleep(0.05)
         with open(pidfile) as fh:
             children = [int(x) for x in fh.read().split()]
-        self.assertGreaterEqual(len(children), 2)
-        tree = B.OwnedProcessTree()
-        outcome = tree.reap(root.pid)
-        # reap the root (a direct child of this test) before checking the tree
-        root.wait(timeout=5)
-        deadline = time.monotonic() + 5
+        self.assertGreaterEqual(len(children), 3)
+        # every captured identity is gone ...
+        deadline = time.monotonic() + 6
         while time.monotonic() < deadline:
-            alive = []
-            for pid in children:
-                try:
-                    os.kill(pid, 0)
-                    alive.append(pid)
-                except ProcessLookupError:
-                    pass
+            alive = [p for p in children if _alive(p)]
             if not alive:
                 break
             time.sleep(0.1)
-        self.assertFalse(outcome["teardown_failure"], outcome)
-        # the supervisor (this test process) survived the walk
         for pid in children:
-            with self.assertRaises(ProcessLookupError):
-                os.kill(pid, 0)
+            self.assertFalse(_alive(pid), "captured pid %d survived" % pid)
+        # ... the unrelated sentinel survived (no killpg of a group we do not
+        # own), and the supervisor (this test) is still alive
+        self.assertTrue(_alive(sentinel.pid))
+        # partial/non-success, artifacts retained, no teardown failure
+        self.assertEqual(out["status"], "partial")
+        self.assertFalse(out["ok"])
+        self.assertTrue(os.path.isdir(os.path.join(tmp, "ep-1")))
+        self.assertEqual(len(out["manifest"]["episodes"]), 1)
+        self.assertFalse(out["manifest"].get("teardown_failure"))
+
+    def test_runner_forced_abort_persists_injected_teardown_failure(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        root_py, _pidfile = self._nested_tree_scripts(tmp)
+        spec = _valid_spec(tier="live", episodes=1)
+        os.environ[B.VAPOR_CLOUD_ENV] = "attested"
+        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
+        runner = B.BenchRunner(
+            spec, tmp, grace=0.3,
+            episode_command_factory=lambda *a: [sys.executable, root_py])
+
+        class DenyReader(B.ProcReader):
+            def identity(self, pid):
+                if pid == os.getpid():
+                    return {"pid": pid, "ppid": 0, "pgid": pid, "session": 1,
+                            "starttime": "1", "state": "S"}
+                raise PermissionError("/proc read denied")
+
+        runner.abort_tree = B.OwnedProcessTree(DenyReader())
+        timer = threading.Timer(1.0, lambda: setattr(runner.stop, "level", 2))
+        timer.daemon = True
+        timer.start()
+        try:
+            out = runner.run()
+        finally:
+            timer.cancel()
+        self.assertTrue(out["manifest"].get("teardown_failure"))
+        self.assertFalse(out["ok"])
 
     def test_forced_abort_permission_or_identity_failure_sets_teardown_failure(
             self):
@@ -725,10 +785,10 @@ class StopAndAbort(unittest.TestCase):
                 if self.mode == "identity" and pid == 2:
                     raise PermissionError("proc read denied")
                 if self.mode == "starttime" and pid == 2:
-                    # first read (capture) matches; the re-check mismatches,
-                    # modelling PID reuse -- it must NOT be signalled.
+                    # alternate: the capture/loop read and the kill re-check
+                    # disagree, modelling PID reuse -- it must NOT be signalled.
                     self._pid2_calls += 1
-                    start = "1" if self._pid2_calls == 1 else "9999"
+                    start = "1" if self._pid2_calls % 2 == 1 else "9999"
                     return {"pid": 2, "ppid": 1, "pgid": 2, "session": 1,
                             "starttime": start, "state": "S"}
                 return {"pid": pid, "ppid": 1 if pid != 1 else 0,
@@ -741,7 +801,14 @@ class StopAndAbort(unittest.TestCase):
                 return [2] if pid == 1 else []
 
             def pgid(self, pid):
+                if self.mode == "getpgid" and pid == 2:
+                    raise PermissionError("getpgid denied")
                 return pid
+
+            def members(self, pgid):
+                if self.mode == "members":
+                    raise PermissionError("members denied")
+                return [pgid]
 
             def signal(self, pid, sig):
                 if self.mode == "signal":
@@ -750,14 +817,18 @@ class StopAndAbort(unittest.TestCase):
             def signal_group(self, pgid, sig):
                 return None
 
-        for mode in ("identity", "children", "signal"):
+        for mode in ("identity", "children", "getpgid", "members", "signal"):
             outcome = B.OwnedProcessTree(DenyReader(mode)).reap(1)
             self.assertTrue(outcome["teardown_failure"], mode)
             self.assertTrue(outcome["permission_failure"], mode)
-        # a start-time mismatch must NOT signal (PID reuse safety), and is not
-        # itself a teardown failure
+            self.assertTrue(outcome["errors"], mode)
+        # a stale/PID-reused identity must not be signalled -- but that is a
+        # recorded teardown failure, never a silent skip
         outcome = B.OwnedProcessTree(DenyReader("starttime")).reap(1)
         self.assertFalse(outcome["permission_failure"])
+        self.assertTrue(outcome["teardown_failure"])
+        self.assertTrue(any("start-time mismatch" in e
+                            for e in outcome["errors"]))
 
 
 # ==========================================================================
