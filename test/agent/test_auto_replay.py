@@ -350,18 +350,18 @@ class ShortFixtureTest(unittest.TestCase):
         # `_random_move` exits.  (b) `no_progress` now advances only on *matched
         # gameplay* frames, so the recording's unmatched/prompt frames no longer
         # drive the loop breaker.  MEASURED exact divergence for this recorded
-        # corpus: needs_answered = 47, agree = 39, i.e. exactly 8 of 47 (rate
-        # 0.8298) -- the bound below is the measured value, NOT guessed slack.
-        # The two added divergences beyond the earlier baseline are the short
-        # fixture's needs index 10/11 (`fixtures/auto/short.decisions.jsonl`):
-        # the recording answers them with a search (`s`) under the old
-        # unmatched-frame stationary advance, while the replay now reaches only
-        # np<3 and continues the route.  The corpus is an input recording, not a
-        # golden file (fixtures/auto/README.md); regenerating it is the
-        # operator-gated step (no live re-record is possible here).
+        # corpus: needs_answered = 47, agree = 38, i.e. exactly 9 of 47 (rate
+        # 0.8085) -- the bound below is the measured value, NOT guessed slack.
+        # The added divergences are this recording's needs index 10/11 (the old
+        # unmatched-frame stationary advance drove the loop breaker) and index
+        # 38 (cycle retirement is now deferred to the reconciled recovery-effect
+        # boundary, so the route continues one step longer).  The corpus is an
+        # input recording, not a golden file (fixtures/auto/README.md);
+        # regenerating it is the operator-gated step (no live re-record is
+        # possible here).
         self.assertEqual(summary["needs_answered"], 47)
-        self.assertGreaterEqual(ag["agree"], 39)
-        self.assertGreaterEqual(ag["rate"], 0.829)
+        self.assertGreaterEqual(ag["agree"], 38)
+        self.assertGreaterEqual(ag["rate"], 0.808)
         self.assertEqual(summary["legality"]["scripted"]["rate"], 1.0)
         self.assertEqual(summary["provider_fallbacks"]["scripted"], 0)
 
@@ -424,12 +424,13 @@ class ProviderCompareTest(unittest.TestCase):
         # ``agree == needs_answered``; the committed-destination policy now
         # changes a bounded number of navigation selections, so agreement is
         # high but not total (the offline tier still falls back structurally).
-        # The stall-recovery plan §1 (shared legal bounded recovery) and review
-        # item 1 (stationary advance only on matched gameplay frames) add
-        # further navigation divergences vs this recorded corpus, so the
-        # tolerant bound is the measured ``- 8`` (agree 39 of 47).
+        # The stall-recovery plan §1 (shared legal bounded recovery), review
+        # item 1 (stationary advance only on matched gameplay frames) and item 2
+        # (deferred cycle retirement) add further navigation divergences vs this
+        # recorded corpus, so the tolerant bound is the measured ``- 9``
+        # (agree 38 of 47).
         self.assertGreaterEqual(summary["agreement"]["jev"]["agree"],
-                                summary["needs_answered"] - 8)
+                                summary["needs_answered"] - 9)
         flagged = [r for r in records if r.get("record") == "need"
                    and r.get("candidates", {}).get("jev")]
         self.assertTrue(flagged)

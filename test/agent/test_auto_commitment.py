@@ -821,6 +821,94 @@ class AttemptCounting(unittest.TestCase):
         self.assertEqual(mem.no_progress, np_before)
 
 
+class RecoveryRetirementBoundary(unittest.TestCase):
+    """Item 2: retirement only at the reconciled recovery-effect boundary."""
+
+    def setUp(self):
+        self.ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+
+    def _terminals(self, serial):
+        return [e for e in self.ref.lifecycle.events
+                if e.get("kind") == "destination" and e.get("serial") == serial
+                and e.get("outcome") in ("reached", "failed", "expired",
+                                         "replaced")]
+
+    def _cycle_mem(self):
+        cells = {(2, 10): FLOOR, (3, 10): FLOOR, (4, 10): FLOOR,
+                 (3, 9): FLOOR, (2, 9): WALL, (2, 11): WALL, (3, 11): WALL,
+                 (4, 9): WALL, (4, 11): WALL}
+        return nav_test.mem_with(cells, (3, 10))
+
+    def _nominate_cycle(self, mem):
+        for pos in [(3, 10), (2, 10), (3, 10), (2, 10), (3, 10)]:
+            mem.hero = pos
+            self.ref.note_observation(mem)
+
+    def _hold_and_cycle(self):
+        mem = self._cycle_mem()
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_EXPLORE_FRONTIER,
+                                pos=(2, 10), family=navigation.TFAM_FRONTIER)
+        serial = self.ref.targets.held().serial
+        self._nominate_cycle(mem)
+        return mem, serial
+
+    def test_cycle_nomination_does_not_retire_before_selection(self):
+        _mem, serial = self._hold_and_cycle()
+        self.assertTrue(self.ref._cycled)
+        self.assertIsNotNone(self.ref.targets.held())
+        self.assertEqual(self._terminals(serial), [])
+
+    def test_emergency_preemption_does_not_retire_or_spend(self):
+        # (1) active cycle + held destination + forced low-HP emergency
+        mem, serial = self._hold_and_cycle()
+        mem.status.hp = 1
+        mem.status.hp_max = 20
+        cand = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.assertEqual(cand.family, "emergency")
+        # the preemption alone retires nothing and spends no destination counter
+        self.assertIsNotNone(self.ref.targets.held())
+        self.assertEqual(self._terminals(serial), [])
+        self.assertEqual(self.ref.targets.stall_attempts, 0)
+
+    def test_successful_recovery_move_retires_once(self):
+        # (2) a reconciled successful recovery move retires exactly once
+        mem, serial = self._hold_and_cycle()
+        cand = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.assertEqual(cand.proposed_effect, "recovery")
+        self.ref.commit_effect(cand.proposed_effect, cand.semantic_label, 1,
+                               mem, observed_kind="moved",
+                               payload=cand.effect_payload, pre_hero=(3, 10))
+        self.assertIsNone(self.ref.targets.held())
+        terms = self._terminals(serial)
+        self.assertEqual(len(terms), 1)
+        self.assertEqual(terms[0].get("reason"), "cycle")
+
+    def test_recovery_no_time_failure_records_only_edge_evidence(self):
+        # (3) a no-time recovery failure emits no terminal, only edge evidence
+        cells = {(10, 10): FLOOR, (11, 10): FLOOR, (9, 10): WALL,
+                 (10, 9): WALL, (10, 11): WALL}
+        mem = nav_test.mem_with(cells, (10, 10))
+        mem.messages.append("You already found a monster.")
+        mem.no_progress = 10
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_EXPLORE_FRONTIER,
+                                pos=(11, 10), family=navigation.TFAM_FRONTIER)
+        serial = self.ref.targets.held().serial
+        cand = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.assertEqual(cand.proposed_effect, "recovery")
+        before = len(self.ref.lifecycle.events)
+        self.ref.commit_effect(cand.proposed_effect, cand.semantic_label, 1,
+                               mem, observed_kind="no-time",
+                               payload=cand.effect_payload, pre_hero=(10, 10))
+        # no terminal (no new lifecycle event) and the destination survives
+        self.assertEqual(len(self.ref.lifecycle.events), before)
+        self.assertEqual(self._terminals(serial), [])
+        self.assertIsNotNone(self.ref.targets.held())
+        # only the scoped edge ledger changed
+        self.assertTrue(self.ref.blocked_edges)
+
+
 class Phase3Progression(unittest.TestCase):
     """AC7: exploration-stable progression and reacquisition preferences."""
 
@@ -1119,7 +1207,7 @@ class DestinationTerminalOwner(unittest.TestCase):
         self.ref.note_observation(mem)
         self.assertEqual(len(self._terminals(serial)), 1, "locked")
 
-        # cycle invalidation
+        # cycle: the fold only nominates; the reconciled recovery effect retires
         self.ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
         cells = {(2, 10): FLOOR, (3, 10): FLOOR, (4, 10): FLOOR,
                  (3, 9): FLOOR, (2, 9): WALL, (2, 11): WALL, (3, 11): WALL,
@@ -1133,6 +1221,14 @@ class DestinationTerminalOwner(unittest.TestCase):
         for pos in [(3, 10), (2, 10), (3, 10), (2, 10), (3, 10)]:
             mem.hero = pos
             self.ref.note_observation(mem)
+        # the fold only nominates recovery: the destination is still held
+        self.assertTrue(self.ref._cycled)
+        self.assertIsNotNone(self.ref.targets.held())
+        cand = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.assertEqual(cand.proposed_effect, "recovery")
+        self.ref.commit_effect(cand.proposed_effect, cand.semantic_label, 1,
+                               mem, observed_kind="moved",
+                               payload=cand.effect_payload, pre_hero=(3, 10))
         self.assertIsNone(self.ref.targets.held())
         self.assertEqual(len(self._terminals(serial)), 1, "cycle")
 

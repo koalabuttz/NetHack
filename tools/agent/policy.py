@@ -406,9 +406,12 @@ class ScriptedReflex(object):
             return
         if payload and payload[0] == "recovery":
             # A selected *and reconciled* recovery move records its scoped edge
-            # outcome (plan §1/§4); nothing else is committed from it.
-            self._note_recovery_outcome(payload[1], observed_kind, mem,
-                                        pre_hero)
+            # outcome and, when it advanced, retires the nominated destination
+            # at this boundary (plan §1/§4).  Nothing else is committed here.
+            self._note_recovery_outcome(
+                payload[1], observed_kind, mem, pre_hero,
+                held_serial=(payload[2] if len(payload) > 2 else None),
+                reason=(payload[3] if len(payload) > 3 else ""))
             self.intent = ""
             return
         self.intent = ""
@@ -657,8 +660,23 @@ class ScriptedReflex(object):
         return stored == navigation.blocked_edge_signature(terrain, tuple(src),
                                                            tuple(dst))
 
-    def _note_recovery_outcome(self, step, observed_kind, mem,
-                               pre_hero) -> None:
+    def _recovery_payload(self, step) -> tuple:
+        """The frozen recovery effect payload (plan §1).
+
+        Carries the recovery *nomination*: when a destination is held, its
+        serial and the nomination reason (``cycle`` or ``stalled``) ride the
+        selected effect.  Retirement therefore happens only when that exact
+        effect is sent and reconciled as *moved* -- never at nomination time,
+        and never for a preemption, override or write failure.
+        """
+        held = self.targets.held()
+        if held is None:
+            return ("recovery", tuple(step))
+        reason = "cycle" if self._cycled else "stalled"
+        return ("recovery", tuple(step), held.serial, reason)
+
+    def _note_recovery_outcome(self, step, observed_kind, mem, pre_hero,
+                               held_serial=None, reason="") -> None:
         """Record one *selected and reconciled* recovery move's edge outcome.
 
         A zero-time failure becomes scoped edge/action failure evidence keyed by
@@ -672,10 +690,26 @@ class ScriptedReflex(object):
         dst = (src[0] + int(step[0]), src[1] + int(step[1]))
         key = (self.instance_id, src, dst)
         if observed_kind in ("no-time", "stationary-time-advanced"):
+            # A zero-time failure is *only* scoped edge evidence (§1): it never
+            # retires the destination, spends no counter and emits no terminal.
             self.blocked_edges[key] = navigation.blocked_edge_signature(
                 self._terrain(mem), src, dst)
-        else:
-            self.blocked_edges.pop(key, None)
+            return
+        self.blocked_edges.pop(key, None)
+        if observed_kind != "moved":
+            # unknown outcome: ownership stays with the destination
+            return
+        # The recovery move actually advanced the hero: this is the reconciled
+        # recovery-effect boundary at which the nominated destination is
+        # retired exactly once (§1).  A serial that has already been retired or
+        # replaced is never resurrected.
+        if held_serial is None:
+            return
+        cur = self.targets.held()
+        if cur is None or cur.serial != int(held_serial):
+            return
+        self._retire_owned(reason or "recovery",
+                           outcome=lifecycle_metrics.DEST_EXPIRED)
 
     @staticmethod
     def _hero_moved(pre_hero, mem, observed_kind) -> bool:
@@ -1738,7 +1772,7 @@ class ScriptedReflex(object):
                 {"key": KEY.DIR_KEYS[step]}, "recovery-step", "recovery", 0,
                 why, "recovery",
                 direction=step, direction_rank=navigation.DIR_RANK[step],
-                effect_payload=("recovery", tuple(step))),)
+                effect_payload=self._recovery_payload(step)),)
         # No legal movement exists: a *bounded* ordinary search first (its own
         # per-site budget still caps it), and only once that is refused or
         # exhausted does the bounded search-fallback / forced-search / trapped
@@ -1874,16 +1908,12 @@ class ScriptedReflex(object):
         recent = mem.recent_messages(6)
         self.recovery.observe(recent, hero, self._search_site(hero))
         self._cycled = self.recovery.note_cycle(hero)
-        if self._cycled:
-            # Cycle recovery invalidates the active destination before the
-            # existing edge-legal recovery singleton runs, so a stale
-            # destination cannot re-drive the loop (plan 1.5 "Cycle").  The
-            # invalidation is emitted through the one terminal owner, so a
-            # default destination's cycle termination is visible too (§3).
-            held = self.targets.held()
-            sig = (navigation.service_signature(self._terrain(mem), held.pos)
-                   if held is not None else None)
-            self._retire_cycle_owned(sig)
+        # Cycle detection only *nominates* recovery (plan §1): it does NOT
+        # retire the held destination here.  The nomination (held serial +
+        # reason) rides the selected recovery effect, and retirement happens at
+        # that effect's reconciled boundary -- so an emergency/maintenance
+        # preemption that replaces the recovery move can neither retire the
+        # destination nor spend its counters.
         self._fold_floor(mem)
         self._fold_pickup_outcome(mem)
         self._fold_door_outcome(mem)
