@@ -61,6 +61,8 @@ COMPARISON_KEYS = (
 )
 TUNING_KEYS = ("mode", "parameters", "approval_id", "approval_expiry",
                "expected_base_config_hash")
+#: Optional tuning keys that are still part of the *allowed* schema.
+TUNING_OPTIONAL_KEYS = ("overlay_version",)
 DEADLINE_CLASSES = ("horizon-completion", "adverse-early")
 
 #: Provider knobs an operator may override through a spec, and the frozen ones.
@@ -251,12 +253,16 @@ def _validate_comparison(c: dict) -> Optional[str]:
 
 
 def _validate_tuning(t: dict) -> Optional[str]:
-    problem = _unknown_keys(t, TUNING_KEYS, "tuning")
+    problem = _unknown_keys(t, tuple(TUNING_KEYS) + TUNING_OPTIONAL_KEYS,
+                            "tuning")
     if problem:
         return problem[0]
     for key in TUNING_KEYS:
         if key not in t:
             return "tuning missing required key %r" % key
+    if "overlay_version" in t and (not _is_int(t["overlay_version"])
+                                   or t["overlay_version"] < 0):
+        return "tuning.overlay_version must be a nonnegative integer"
     if t["mode"] not in ("suggest", "apply-approved"):
         return "tuning.mode must be suggest or apply-approved"
     if not isinstance(t["parameters"], dict):
@@ -1731,65 +1737,157 @@ def _config_overlay(values: Dict[str, Any]) -> Dict[str, Any]:
             if k not in secret_keys and k in TUNER_ELIGIBLE_KNOBS}
 
 
+def _overlay_files(overlay_dir: str) -> List[int]:
+    """The versions of existing immutable overlay files, ascending."""
+    if not os.path.isdir(overlay_dir):
+        return []
+    out = []
+    for name in os.listdir(overlay_dir):
+        if name.startswith("config-overlay-v") and name.endswith(".json"):
+            try:
+                out.append(int(name[len("config-overlay-v"):-len(".json")]))
+            except ValueError:
+                continue
+    return sorted(out)
+
+
+def _check_approval(approval: Optional[dict], now: float) -> List[str]:
+    """Validate a *verified* approval object; ``None``/omitted always fails."""
+    reasons: List[str] = []
+    if not isinstance(approval, dict):
+        return ["no-verified-approval"]
+    if not approval.get("id"):
+        reasons.append("approval-missing-id")
+    if not approval.get("authorization_hash"):
+        reasons.append("approval-missing-authorization-hash")
+    if not isinstance(approval.get("authorized"), dict) or \
+            not approval["authorized"]:
+        reasons.append("approval-missing-authorized-ranges")
+    expiry = approval.get("expiry")
+    if not _finite(expiry):
+        reasons.append("approval-missing-expiry")
+    elif float(expiry) <= now:
+        reasons.append("approval-expired")
+    return reasons
+
+
 def apply_approved(spec: dict, *, candidate: dict, confirmation: dict,
                    config_hash: str, current_config: dict,
-                   overlay_dir: str,
-                   approval_valid: Optional[bool] = None) -> Dict[str, Any]:
+                   overlay_dir: str, approval: Optional[dict] = None,
+                   now: Optional[Callable[[], float]] = None) -> Dict[str, Any]:
     """Write a versioned nonsecret overlay -- only after every precondition.
 
-    Preconditions: fresh confirmation passed, admission allows apply, approval
-    id is valid (and, when supplied, not expired), the baseline config hash
-    matches, and every changed key/value is in its exact authorized grid.
-    Returns a rollback pointer; never rewrites a secret config file.
+    Preconditions (ALL required):
+      * a **verified approval object** (id, authorization hash + ranges, and an
+        expiry in the future relative to trusted time) -- ``None`` fails;
+      * a fresh confirmation that passed and whose admission allows apply;
+      * the baseline config hash matches;
+      * every changed key/value is inside its exact *authorized* grid/range.
+
+    Overlays are immutable and versioned: two applies create two distinct
+    files (overwriting is refused).  The apply record persists the exact
+    before/after diff, confirmation evidence/run ids, the approval expiry and
+    authorization hash, and the previous active reference.  Never rewrites a
+    secret config file.
     """
     tuning = spec["tuning"]
+    now = now or time.time
     reasons: List[str] = []
     if tuning["mode"] != "apply-approved":
         reasons.append("mode-not-apply-approved")
-    if approval_valid is False:
-        reasons.append("approval-invalid-or-expired")
-    if not tuning.get("approval_id"):
-        reasons.append("no-approval-id")
+    reasons.extend(_check_approval(approval, float(now())))
     if (confirmation or {}).get("verdict") != "pass":
         reasons.append("confirmation-not-pass")
     if not (confirmation or {}).get("admission", {}).get("apply_allowed"):
         reasons.append("admission-not-applied")
     if tuning.get("expected_base_config_hash") != config_hash:
         reasons.append("config-hash-mismatch")
-    # exact key/range compliance
+    # exact key/range compliance against the APPROVAL's authorized ranges
+    authorized = (approval or {}).get("authorized") or {}
     for knob, value in (candidate or {}).items():
         rail = tuning["parameters"].get(knob)
-        if knob not in TUNER_ELIGIBLE_KNOBS or not rail:
+        auth = authorized.get(knob)
+        if knob not in TUNER_ELIGIBLE_KNOBS or not rail or not auth:
             reasons.append("unauthorized-key:%s" % knob)
             continue
         if value not in rail["grid"]:
             reasons.append("value-out-of-grid:%s=%r" % (knob, value))
-        if rail.get("min") is not None and value < rail["min"]:
-            reasons.append("value-below-rail:%s" % knob)
-        if rail.get("max") is not None and value > rail["max"]:
-            reasons.append("value-above-rail:%s" % knob)
+        grid = auth.get("grid")
+        if grid is not None and value not in grid:
+            reasons.append("value-outside-approval:%s=%r" % (knob, value))
+        if auth.get("min") is not None and value < auth["min"]:
+            reasons.append("value-below-approval:%s" % knob)
+        if auth.get("max") is not None and value > auth["max"]:
+            reasons.append("value-above-approval:%s" % knob)
     if reasons:
         return {"applied": False, "reasons": reasons}
+
+    version = max(_overlay_files(overlay_dir) + [0]) + 1
+    os.makedirs(overlay_dir, mode=0o700, exist_ok=True)
+    path = os.path.join(overlay_dir, "config-overlay-v%d.json" % version)
+    if os.path.exists(path):
+        return {"applied": False, "reasons": ["overlay-overwrite-refused"]}
     merged = dict(current_config)
     merged.update(candidate)
     overlay = _config_overlay(merged)
-    version = int(spec["tuning"].get("overlay_version", 0)) + 1
-    os.makedirs(overlay_dir, mode=0o700, exist_ok=True)
-    path = os.path.join(overlay_dir, "config-overlay-v%d.json" % version)
+    before = {k: current_config.get(k) for k in candidate}
+    after = {k: candidate[k] for k in candidate}
     write_json_atomic(path, {"schema_version": "config-overlay/1",
                              "version": version,
-                             "approval_id": tuning["approval_id"],
-                             "base_config_hash": config_hash,
                              "overlay": overlay})
     pointer = os.path.join(overlay_dir, "active.json")
     previous = None
     if os.path.exists(pointer):
-        with open(pointer, "r", encoding="utf-8") as fh:
-            previous = json.load(fh).get("active")
+        previous = _read_json(pointer) or {}
+        previous = previous.get("active")
+    record = {
+        "schema_version": "bench-apply-record/1",
+        "overlay_path": path,
+        "version": version,
+        "before": before,
+        "after": after,
+        "diff": {"%s" % k: {"before": before[k], "after": after[k]}
+                 for k in sorted(after)},
+        "approval_id": (approval or {}).get("id"),
+        "approval_expiry": (approval or {}).get("expiry"),
+        "authorization_hash": (approval or {}).get("authorization_hash"),
+        "confirmation_run_ids": list(
+            (confirmation or {}).get("run_ids")
+            or (confirmation or {}).get("evidence") or []),
+        "previous_active": previous,
+        "base_config_hash": config_hash,
+    }
+    record_path = os.path.join(overlay_dir,
+                               "apply-record-v%d.json" % version)
+    write_json_atomic(record_path, record)
     write_json_atomic(pointer, {"active": path, "previous": previous,
-                                "version": version})
+                                "version": version,
+                                "record": record_path})
     return {"applied": True, "overlay_path": path, "version": version,
-            "rollback": previous, "overlay": overlay}
+            "rollback": previous, "overlay": overlay,
+            "record": record_path, "diff": record["diff"]}
+
+
+def rollback_apply(overlay_dir: str) -> Dict[str, Any]:
+    """Restore the previous active overlay (content, not just a path).
+
+    Returns the restored path and its exact bytes so a caller can verify the
+    rollback restored the earlier overlay byte-for-byte.
+    """
+    pointer = os.path.join(overlay_dir, "active.json")
+    state = _read_json(pointer)
+    if not state or not state.get("previous"):
+        return {"rolled_back": False, "reason": "no-previous-overlay"}
+    restored = state["previous"]
+    with open(restored, "rb") as fh:
+        content = fh.read()
+    write_json_atomic(pointer, {"active": restored,
+                                "previous": None,
+                                "rolled_back_from": state.get("active"),
+                                "version": state.get("version")})
+    return {"rolled_back": True, "active": restored,
+            "content_sha256": M.sha256_bytes(content),
+            "content": content.decode("utf-8")}
 
 
 # --------------------------------------------------------------------------

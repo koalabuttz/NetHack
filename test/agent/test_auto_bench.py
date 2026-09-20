@@ -886,39 +886,91 @@ class TunerAndApply(unittest.TestCase):
         self.assertEqual(plan["allocations"]["confirmation_episodes"],
                          2 * spec["comparison"]["confirmation_episodes_per_arm"])
 
+    def _approval(self, **over):
+        approval = {"id": "AP-1", "authorization_hash": "authhash-1",
+                    "authorized": {"reflex_call_cap": {"grid": [4, 8, 12],
+                                                       "min": 0, "max": 16}},
+                    "expiry": time.time() + 3600.0}
+        approval.update(over)
+        return approval
+
     def test_apply_requires_approval_range_hash_and_fresh_confirmation(self):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         spec = _valid_spec()
         spec["tuning"]["mode"] = "apply-approved"
-        # missing approval / hash / fresh confirmation -> refused
+        spec["tuning"]["expected_base_config_hash"] = "h"
+        # no approval object at all -> refused (fail-closed defaults)
         denied = B.apply_approved(
+            spec, candidate={"reflex_call_cap": 8},
+            confirmation={"verdict": "pass",
+                          "admission": {"apply_allowed": True}},
+            config_hash="h", current_config={"reflex_call_cap": 4},
+            overlay_dir=tmp, approval=None)
+        self.assertFalse(denied["applied"])
+        self.assertIn("no-verified-approval", denied["reasons"])
+        # an EXPIRED approval is refused
+        expired = B.apply_approved(
+            spec, candidate={"reflex_call_cap": 8},
+            confirmation={"verdict": "pass",
+                          "admission": {"apply_allowed": True}},
+            config_hash="h", current_config={"reflex_call_cap": 4},
+            overlay_dir=tmp, approval=self._approval(expiry=time.time() - 1))
+        self.assertFalse(expired["applied"])
+        self.assertIn("approval-expired", expired["reasons"])
+        # an incomplete approval object is refused
+        partial = B.apply_approved(
+            spec, candidate={"reflex_call_cap": 8},
+            confirmation={"verdict": "pass",
+                          "admission": {"apply_allowed": True}},
+            config_hash="h", current_config={"reflex_call_cap": 4},
+            overlay_dir=tmp, approval={"id": "AP-1"})
+        self.assertFalse(partial["applied"])
+        self.assertIn("approval-missing-authorization-hash", partial["reasons"])
+        # a stale confirmation is refused
+        stale = B.apply_approved(
             spec, candidate={"reflex_call_cap": 8},
             confirmation={"verdict": "inconclusive", "admission": {}},
             config_hash="h", current_config={"reflex_call_cap": 4},
-            overlay_dir=tmp)
-        self.assertFalse(denied["applied"])
-        self.assertTrue(denied["reasons"])
-        # out-of-grid value refused even with everything else valid
-        spec["tuning"]["approval_id"] = "AP-1"
-        spec["tuning"]["expected_base_config_hash"] = "h"
-        bad = B.apply_approved(
-            spec, candidate={"reflex_call_cap": 7},
-            confirmation={"verdict": "pass",
-                          "admission": {"apply_allowed": True}},
-            config_hash="h", current_config={"reflex_call_cap": 4},
-            overlay_dir=tmp)
-        self.assertFalse(bad["applied"])
-        self.assertTrue(any("value-out-of-grid" in r for r in bad["reasons"]))
-        # a valid apply succeeds
-        good = B.apply_approved(
+            overlay_dir=tmp, approval=self._approval())
+        self.assertFalse(stale["applied"])
+        self.assertIn("confirmation-not-pass", stale["reasons"])
+        # a mismatched config hash is refused
+        bad_hash = B.apply_approved(
             spec, candidate={"reflex_call_cap": 8},
             confirmation={"verdict": "pass",
                           "admission": {"apply_allowed": True}},
+            config_hash="OTHER", current_config={"reflex_call_cap": 4},
+            overlay_dir=tmp, approval=self._approval())
+        self.assertIn("config-hash-mismatch", bad_hash["reasons"])
+        # a value outside the APPROVAL's grid is refused
+        bad = B.apply_approved(
+            spec, candidate={"reflex_call_cap": 12},
+            confirmation={"verdict": "pass",
+                          "admission": {"apply_allowed": True}},
             config_hash="h", current_config={"reflex_call_cap": 4},
-            overlay_dir=tmp)
+            overlay_dir=tmp,
+            approval=self._approval(authorized={
+                "reflex_call_cap": {"grid": [4, 8]}}))
+        self.assertTrue(any("value-outside-approval" in r
+                            for r in bad["reasons"]))
+        # a valid apply succeeds and records the diff
+        approval = self._approval()
+        good = B.apply_approved(
+            spec, candidate={"reflex_call_cap": 8},
+            confirmation={"verdict": "pass",
+                          "admission": {"apply_allowed": True},
+                          "run_ids": ["run-7"]},
+            config_hash="h", current_config={"reflex_call_cap": 4},
+            overlay_dir=tmp, approval=approval)
         self.assertTrue(good["applied"])
         self.assertTrue(os.path.exists(good["overlay_path"]))
+        record = json.load(open(good["record"]))
+        self.assertEqual(record["diff"]["reflex_call_cap"],
+                         {"before": 4, "after": 8})
+        self.assertEqual(record["confirmation_run_ids"], ["run-7"])
+        self.assertEqual(record["approval_expiry"], approval["expiry"])
+        self.assertEqual(record["authorization_hash"], "authhash-1")
 
     def test_overlay_apply_rollback_preserves_secret_config(self):
         tmp = tempfile.mkdtemp()
@@ -929,12 +981,13 @@ class TunerAndApply(unittest.TestCase):
         spec = _valid_spec()
         spec["tuning"].update({"mode": "apply-approved", "approval_id": "AP-2",
                                "expected_base_config_hash": "h"})
+        approval = self._approval(id="AP-2", authorization_hash="auth-2")
         first = B.apply_approved(
             spec, candidate={"reflex_call_cap": 8},
             confirmation={"verdict": "pass",
                           "admission": {"apply_allowed": True}},
             config_hash="h", current_config={"reflex_call_cap": 4},
-            overlay_dir=tmp)
+            overlay_dir=tmp, approval=approval)
         self.assertTrue(first["applied"])
         self.assertIsNone(first["rollback"])
         second = B.apply_approved(
@@ -942,8 +995,12 @@ class TunerAndApply(unittest.TestCase):
             confirmation={"verdict": "pass",
                           "admission": {"apply_allowed": True}},
             config_hash="h", current_config={"reflex_call_cap": 8},
-            overlay_dir=tmp)
+            overlay_dir=tmp, approval=approval)
         self.assertEqual(second["rollback"], first["overlay_path"])
+        # two applies create two DISTINCT immutable files (no overwrite)
+        self.assertNotEqual(first["overlay_path"], second["overlay_path"])
+        self.assertEqual(first["version"], 1)
+        self.assertEqual(second["version"], 2)
         # the overlay never carries a credential reference
         with open(second["overlay_path"]) as fh:
             overlay = json.load(fh)["overlay"]
@@ -952,6 +1009,15 @@ class TunerAndApply(unittest.TestCase):
         # the secret config file is untouched
         with open(secret) as fh:
             self.assertEqual(json.load(fh)["jev_key_file"], "/secret/jev.key")
+        # rollback restores the FIRST overlay BYTE-FOR-BYTE
+        with open(first["overlay_path"], "rb") as fh:
+            first_bytes = fh.read()
+        rolled = B.rollback_apply(tmp)
+        self.assertTrue(rolled["rolled_back"])
+        with open(rolled["active"], "rb") as fh:
+            restored = fh.read()
+        self.assertEqual(restored, first_bytes)
+        self.assertEqual(M.sha256_bytes(restored), M.sha256_bytes(first_bytes))
 
     def test_confidence_factor_frozen_without_specific_policy_approval(self):
         spec = _valid_spec()
@@ -1313,6 +1379,12 @@ class BudgetEnforcement(unittest.TestCase):
 class SpecValidation(unittest.TestCase):
     def test_valid_spec_passes_and_unknown_knob_rejected(self):
         self.assertIsNone(B.validate_spec(_valid_spec()))
+        # tuning.overlay_version is part of the allowed (optional) schema
+        spec = _valid_spec()
+        spec["tuning"]["overlay_version"] = 3
+        self.assertIsNone(B.validate_spec(spec))
+        spec["tuning"]["overlay_version"] = -1
+        self.assertIn("overlay_version", B.validate_spec(spec) or "")
         spec = _valid_spec()
         spec["mystery"] = 1
         self.assertIn("unknown key", B.validate_spec(spec))
