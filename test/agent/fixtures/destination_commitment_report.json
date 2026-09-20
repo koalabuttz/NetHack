@@ -1,7 +1,7 @@
 {
  "commit_range": {
   "base": "56c0c45a0739b29a3173b08b343d5fc786a56712",
-  "head": "81cf6bea36f6cd69b85d0f31cdaa69251d754292"
+  "head": "f115c807d9689997d8bce25f8e874e3a7617560b"
  },
  "commits": [
   {
@@ -241,12 +241,16 @@
    "subject": "agent: AC9 attempt and reopen metric semantics"
   },
   {
-   "hash": "5f3f187c286ee0d733e5839b385bcf40a0c9e780",
-   "subject": "agent: minor review items (schema, health, provenance)"
+   "hash": "d254ed957d54cc90d4b47d8b27dde502603ec3f6",
+   "subject": "agent: minor review items 7-9"
   },
   {
-   "hash": "81cf6bea36f6cd69b85d0f31cdaa69251d754292",
+   "hash": "0e5c30d29ae6d13640909b34f3d7cf79e771a6be",
    "subject": "agent: retarget directive terminal mutation"
+  },
+  {
+   "hash": "f115c807d9689997d8bce25f8e874e3a7617560b",
+   "subject": "agent: regenerate report at final head"
   }
  ],
  "gates": {
