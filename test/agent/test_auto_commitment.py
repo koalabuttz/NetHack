@@ -812,6 +812,153 @@ class AttemptCounting(unittest.TestCase):
         self.assertEqual(self.ref.targets.stall_attempts, before)
 
 
+class DestinationTerminalOwner(unittest.TestCase):
+    """AC6: one terminal owner for every destination termination source."""
+
+    _TERMINAL = ("reached", "failed", "expired", "replaced")
+
+    def setUp(self):
+        self.ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+
+    def _terminals(self, serial):
+        return [e for e in self.ref.lifecycle.events
+                if e.get("kind") == "destination"
+                and e.get("outcome") in self._TERMINAL
+                and e.get("serial") == serial]
+
+    def _acquire(self, hero=(1, 10), kind="moved", pre=(1, 10)):
+        cells = {(x, 10): FLOOR for x in range(1, 8)}
+        mem = nav_test.mem_with(cells, hero)
+        cand = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.ref.commit_effect(cand.proposed_effect, cand.semantic_label, 1,
+                               mem, observed_kind=kind,
+                               payload=cand.effect_payload, pre_hero=pre)
+        return mem
+
+    def test_default_arrival_stall_locked_cycle_and_instance_emit_terminal_once(
+            self):
+        # arrival
+        mem = self._acquire()
+        serial = self.ref.targets.held().serial
+        arrive = policy.ScriptedReflex._dest_payload(
+            "arrive", self.ref.targets.held())
+        self.ref.commit_effect("navigate", "navigate", 2, mem,
+                               observed_kind="moved", payload=arrive)
+        self.assertIsNone(self.ref.targets.held())
+        self.assertEqual(len(self._terminals(serial)), 1, "arrival")
+
+        # locked-door refusal
+        self.ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+        mem = nav_test.mem_with({(3, 10): FLOOR, (4, 10): FLOOR,
+                                 (5, 10): DOOR, (6, 10): FLOOR}, (4, 10))
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_OPEN_DOOR,
+                                pos=(5, 10), family=navigation.TFAM_DOOR)
+        serial = self.ref.targets.held().serial
+        mem.messages.append("The door is locked.")
+        self.ref.note_observation(mem)
+        self.assertEqual(len(self._terminals(serial)), 1, "locked")
+
+        # cycle invalidation
+        self.ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+        cells = {(2, 10): FLOOR, (3, 10): FLOOR, (4, 10): FLOOR,
+                 (3, 9): FLOOR, (2, 9): WALL, (2, 11): WALL, (3, 11): WALL,
+                 (4, 9): WALL, (4, 11): WALL}
+        mem = nav_test.mem_with(cells, (3, 10))
+        self.ref.targets.commit(instance_id=self.ref.instance_id,
+                                purpose=navigation.COMMIT_EXPLORE_FRONTIER,
+                                pos=(2, 10),
+                                family=navigation.TFAM_FRONTIER)
+        serial = self.ref.targets.held().serial
+        for pos in [(3, 10), (2, 10), (3, 10), (2, 10), (3, 10)]:
+            mem.hero = pos
+            self.ref.note_observation(mem)
+        self.assertIsNone(self.ref.targets.held())
+        self.assertEqual(len(self._terminals(serial)), 1, "cycle")
+
+        # instance change
+        self.ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+        self._acquire()
+        serial = self.ref.targets.held().serial
+        self.ref.begin_instance(2)
+        terminals = self._terminals(serial)
+        self.assertEqual(len(terminals), 1, "instance")
+        self.assertEqual(terminals[0].get("reason"), "instance_change")
+
+    def test_instance_transition_emits_expired_terminal_before_reset(self):
+        self._acquire()
+        serial = self.ref.targets.held().serial
+        self.ref.begin_instance(7)
+        self.assertIsNone(self.ref.targets.held())
+        terminals = self._terminals(serial)
+        self.assertEqual(len(terminals), 1)
+        self.assertEqual(terminals[0].get("outcome"), "expired")
+        self.assertEqual(terminals[0].get("reason"), "instance_change")
+
+    def test_default_and_directive_replacement_emit_terminal_then_acquisition(
+            self):
+        cells = {(x, 10): FLOOR for x in range(1, 12)}
+        mem = nav_test.mem_with(cells, (1, 10))
+        # a default acquisition at (11,10)
+        first = policy.ScriptedReflex._dest_payload(
+            "acquire", None,
+            target=navigation.Target((11, 10), navigation.TFAM_FRONTIER,
+                                     (1, 0), 0),
+            purpose=navigation.COMMIT_EXPLORE_FRONTIER,
+            source=navigation.SRC_DEFAULT)
+        self.ref.commit_effect("navigate", "navigate", 1, mem,
+                               observed_kind="moved", payload=first)
+        old = self.ref.targets.held().serial
+        # a directive replacement at a different square (5,10)
+        second = policy.ScriptedReflex._dest_payload(
+            "acquire", None,
+            target=navigation.Target((5, 10), navigation.TFAM_FRONTIER,
+                                     (1, 0), 0),
+            purpose=navigation.COMMIT_EXPLORE_FRONTIER,
+            source=navigation.SRC_DIRECTIVE, generation=1)
+        self.ref.commit_effect("navigate", "navigate", 2, mem,
+                               observed_kind="moved", payload=second)
+        new = self.ref.targets.held().serial
+        self.assertNotEqual(new, old)
+        events = [e for e in self.ref.lifecycle.events
+                  if e.get("kind") == "destination"]
+        replaced = [e for e in events if e.get("outcome") == "replaced"]
+        acquired = [e for e in events if e.get("outcome") == "acquired"]
+        self.assertEqual(len(replaced), 1)
+        self.assertEqual(replaced[0].get("serial"), old)
+        self.assertEqual(replaced[0].get("replacement_serial"), new)
+        self.assertEqual(replaced[0].get("reason"), "replaced")
+        self.assertEqual(len(acquired), 2)
+
+    def test_earlier_fold_retirement_cannot_be_reinstalled(self):
+        mem = self._acquire()
+        held = self.ref.targets.held()
+        cont = policy.ScriptedReflex._dest_payload("continue", held)
+        # the destination is retired (e.g. by a cycle) ...
+        self.ref._retire_cycle_owned(())
+        self.assertIsNone(self.ref.targets.held())
+        # ... so a continuation frozen for that serial must be dropped
+        self.ref.commit_effect("navigate", "navigate", 2, mem,
+                               observed_kind="moved", payload=cont)
+        self.assertIsNone(self.ref.targets.held())
+
+    def test_emergency_suspension_does_not_spend_destination_stall(self):
+        # an emergency/maintenance preemption *alone* emits no destination
+        # terminal and spends no destination counter (stall-recovery plan §1/§3)
+        mem = self._acquire()
+        serial = self.ref.targets.held().serial
+        before_actions = len([e for e in self.ref.lifecycle.events
+                              if e.get("outcome") == "action"])
+        # a low-HP escape decision composes no destination payload at all
+        mem.status.hp = 1
+        mem.status.hp_max = 20
+        cand = self.ref.prepare(nav_test.ctx(mem)).table.scripted()
+        self.assertEqual(cand.family, "emergency")
+        self.assertEqual(self._terminals(serial), [])
+        self.assertEqual(len([e for e in self.ref.lifecycle.events
+                              if e.get("outcome") == "action"]), before_actions)
+
+
 class DefaultTerminalAccounting(unittest.TestCase):
     """AC2: every acquired destination has exactly one visible terminal.
 

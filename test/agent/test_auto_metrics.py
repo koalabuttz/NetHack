@@ -353,6 +353,24 @@ class LifecycleMetrics(unittest.TestCase):
             self.assertIsNone(s[field], field)
         self.assertNotEqual(s["commitment_length_median"], 0)
 
+    def test_lifecycle_metrics_flag_incomplete_legacy_streams(self):
+        from tools.agent import lifecycle_metrics as LM
+        # a schema-only (legacy) stream carries no additive schema_version: its
+        # metrics are reported unavailable rather than a manufactured zero
+        legacy = [{"schema": 1, "kind": LM.KIND_DESTINATION,
+                   "outcome": LM.DEST_ACQUIRED, "serial": 1}]
+        s = LM.summarize(legacy)
+        self.assertTrue(s["legacy_stream"])
+        self.assertFalse(s["available"])
+        self.assertIsNone(s["destination_switch_rate"])
+        # a current stream is not flagged and carries the additive version
+        cur = LM.LifecycleRecorder()
+        cur.record(LM.KIND_DESTINATION, LM.DEST_ACQUIRED, serial=1)
+        s2 = cur.summarize()
+        self.assertFalse(s2["legacy_stream"])
+        self.assertEqual(s2["schema_version"], LM.SCHEMA_VERSION)
+        self.assertTrue(s2["available"])
+
     def test_commitment_length_and_reach_rate_from_a_full_stream(self):
         from tools.agent import lifecycle_metrics as LM
         rec = LM.LifecycleRecorder()

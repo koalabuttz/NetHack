@@ -299,22 +299,32 @@ class CycleRecoveryPolicy(unittest.TestCase):
         cand = self.ref.prepare(ctx(mem)).table.scripted()
         self.assertEqual(cand.family, "recovery")
 
-    def test_stationary_recovery_ladder_3_6_10_unchanged(self):
+    def test_stationary_thresholds_shared_legal_bounded_recovery(self):
+        """Contract migration (stall-recovery plan, migration checklist).
+
+        The old ``..._unchanged`` expectation only checked that 3/6/10 returned
+        the recovery *family*; it pinned no mechanism.  The preserved contract
+        is the threshold values (3/6/10) and emergency/hunger precedence, while
+        the expected recovery mechanism is now the shared legal bounded builder
+        -- so each threshold still returns the recovery family, and none emits
+        the removed legacy raw-grid labels.
+        """
         cells = {(10, 10): FLOOR}
-        mem = mem_with(cells, (10, 10))
-        mem.no_progress = 3
-        self.assertEqual(self.ref.prepare(ctx(mem)).table.scripted().family,
-                         "recovery")
-        ref2 = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
-        mem2 = mem_with(cells, (10, 10))
-        mem2.no_progress = 6
-        self.assertEqual(ref2.prepare(ctx(mem2)).table.scripted().family,
-                         "recovery")
-        ref3 = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
-        mem3 = mem_with(cells, (10, 10))
-        mem3.no_progress = 10
-        self.assertEqual(ref3.prepare(ctx(mem3)).table.scripted().family,
-                         "recovery")
+        for np in (3, 6, 10):
+            ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+            mem = mem_with(cells, (10, 10))
+            mem.no_progress = np
+            cand = ref.prepare(ctx(mem)).table.scripted()
+            self.assertEqual(cand.family, "recovery", np)
+            self.assertNotIn(cand.semantic_label, ("unblock", "random-move"))
+        # emergency precedence is preserved: a low-HP disengage still preempts
+        ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+        mem = mem_with({(10, 10): FLOOR, (9, 10): WALL}, (10, 10))
+        mem.no_progress = 10
+        mem.status.hp = 1
+        mem.status.hp_max = 20
+        self.assertEqual(ref.prepare(ctx(mem)).table.scripted().family,
+                         "emergency")
 
     def test_failed_proposal_does_not_fold_motion_history(self):
         # preparing a proposal (even a rejected one) never advances the
@@ -483,11 +493,16 @@ class Ep4LockedDoorStall(unittest.TestCase):
         mem = mem_with(stall_fx.ep4_cells(), stall_fx.EP4_HERO)
         mem.no_progress = 10
         cand = self.ref.prepare(ctx(mem)).table.scripted()
-        self.assertEqual(cand.family, "recovery")
         # `l` is the east wire key: the locked-door step is the defect
         self.assertNotEqual(cand.action.to_wire().get("key"),
                             protocol.DIR_KEYS[(1, 0)])
-        self.assertNotIn(cand.semantic_label, ("unblock",))
+        # the stage is a bounded recovery endpoint -- a legal recovery step, an
+        # allowed bounded search, or the graceful forced-search/trapped
+        # escalation -- never the legacy raw-grid `unblock`/`random-move` exit
+        self.assertIn(cand.semantic_label,
+                      ("recovery-step", "search", "search-secret",
+                       "forced-search", "trapped"))
+        self.assertNotIn(cand.semantic_label, ("unblock", "random-move"))
 
     def test_default_locked_door_retirement_is_visible(self):
         # a default (non-directive) open-door commitment that is explicitly
@@ -510,6 +525,63 @@ class Ep4LockedDoorStall(unittest.TestCase):
         self.assertTrue(terminals[-1].get("reason"))
 
 
+class Phase2BoundedRecovery(unittest.TestCase):
+    """AC5: 3/6/10 and cycle recovery share ONE legal bounded builder."""
+
+    def setUp(self):
+        self.ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+
+    def test_stationary_thresholds_3_6_10_share_legal_bounded_recovery(self):
+        # a corridor whose only legal exit is east; a refused search keeps the
+        # 3-threshold inside the same bounded builder as 6 and 10
+        cells = {(10, 10): FLOOR, (11, 10): FLOOR, (9, 10): WALL,
+                 (10, 9): WALL, (10, 11): WALL}
+        for np in (3, 6, 10):
+            ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+            mem = mem_with(cells, (10, 10),
+                           messages=["You already found a monster."])
+            mem.no_progress = np
+            cand = ref.prepare(ctx(mem)).table.scripted()
+            self.assertEqual(cand.family, "recovery", np)
+            self.assertEqual(cand.semantic_label, "recovery-step", np)
+            self.assertEqual(cand.direction, (1, 0), np)
+
+    def test_np10_recovery_never_routes_through_locked_door(self):
+        cells = stall_fx.ep4_cells()
+        cells[(64, 3)] = FLOOR          # a legal north exit exists
+        mem = mem_with(cells, stall_fx.EP4_HERO)
+        mem.no_progress = 10
+        cand = self.ref.prepare(ctx(mem)).table.scripted()
+        self.assertEqual(cand.family, "recovery")
+        # takes the legal north exit, never the locked east door
+        self.assertEqual(cand.direction, (0, -1))
+        self.assertNotEqual(cand.action.to_wire().get("key"),
+                            protocol.DIR_KEYS[(1, 0)])
+
+    def test_cycle_with_stationary_count_does_not_fall_back_into_navigation(
+            self):
+        cells = {(3, 10): FLOOR, (2, 10): FLOOR, (4, 10): FLOOR,
+                 (3, 9): FLOOR}
+        mem = mem_with(cells, (3, 10))
+        self.ref._cycled = True
+        mem.no_progress = 6
+        cand = self.ref.prepare(ctx(mem)).table.scripted()
+        self.assertEqual(cand.family, "recovery")
+        self.assertIn(cand.semantic_label, ("recovery-step",))
+
+    def test_recovery_only_legal_reverse_is_not_trapped(self):
+        cells = {(2, 10): FLOOR, (3, 10): FLOOR, (1, 10): WALL,
+                 (2, 9): WALL, (2, 11): WALL, (3, 9): WALL, (3, 11): WALL,
+                 (4, 10): WALL}
+        mem = mem_with(cells, (3, 10))
+        self.ref.recovery.previous_distinct = (2, 10)
+        mem.no_progress = 10
+        cand = self.ref.prepare(ctx(mem)).table.scripted()
+        # the only legal escape is the reverse step, kept -- never a quit
+        self.assertEqual(cand.direction, (-1, 0))
+        self.assertEqual(cand.semantic_label, "recovery-step")
+
+
 class Ep2TrappedQuit(unittest.TestCase):
     """AC1 (ep-2 half): the trapped sequence stays a bounded graceful quit."""
 
@@ -521,11 +593,13 @@ class Ep2TrappedQuit(unittest.TestCase):
         mem.status.hunger = "Hungry"
         ref.last_eat_tick = 0
         cand = ref.prepare(ctx(mem)).table.scripted()
-        # the trapped state stays inside bounded recovery: never an unbounded
-        # wait, and (after the Phase 2 fix) never the legacy raw-grid exit
-        self.assertEqual(cand.family, "recovery")
-        self.assertNotEqual(cand.action.to_wire().get("key"),
-                            protocol.KEY_HASH)
+        # the trapped state stays inside the bounded machinery: a legal
+        # recovery step, an allowed bounded search, or the graceful
+        # forced-search/trapped escalation -- never the legacy raw-grid exit
+        self.assertIn(cand.semantic_label,
+                      ("recovery-step", "search", "search-secret",
+                       "forced-search", "trapped"))
+        self.assertNotIn(cand.semantic_label, ("unblock", "random-move"))
 
 
 if __name__ == "__main__":

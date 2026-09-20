@@ -344,9 +344,15 @@ class ShortFixtureTest(unittest.TestCase):
         # action stays legal.  The corpus is an input recording, not a golden
         # file (fixtures/auto/README.md); regenerating it is the operator-gated
         # step (no live re-record is possible in this environment).
+        # Contract migration (stall-recovery plan §1): the stationary-recovery
+        # ladder now uses ONE shared edge-legal bounded builder instead of the
+        # legacy raw-grid `_unblock`/`_random_move` exits, so one further
+        # *navigation* selection in this input recording legitimately differs
+        # (the corpus is an input recording, not a golden file).  OLD tolerance:
+        # ``- 6`` / rate ``0.87``.  NEW: ``- 7`` / rate ``0.85``.
         self.assertGreaterEqual(ag["agree"],
-                                summary["needs_answered"] - 6)
-        self.assertGreaterEqual(ag["rate"], 0.87)
+                                summary["needs_answered"] - 7)
+        self.assertGreaterEqual(ag["rate"], 0.85)
         self.assertEqual(summary["legality"]["scripted"]["rate"], 1.0)
         self.assertEqual(summary["provider_fallbacks"]["scripted"], 0)
 
@@ -409,8 +415,11 @@ class ProviderCompareTest(unittest.TestCase):
         # ``agree == needs_answered``; the committed-destination policy now
         # changes a bounded number of navigation selections, so agreement is
         # high but not total (the offline tier still falls back structurally).
+        # The stall-recovery plan §1 add one further navigation divergence (the
+        # shared legal bounded recovery builder replaces the legacy raw-grid
+        # exits), so the tolerant bound is ``- 7``.
         self.assertGreaterEqual(summary["agreement"]["jev"]["agree"],
-                                summary["needs_answered"] - 6)
+                                summary["needs_answered"] - 7)
         flagged = [r for r in records if r.get("record") == "need"
                    and r.get("candidates", {}).get("jev")]
         self.assertTrue(flagged)

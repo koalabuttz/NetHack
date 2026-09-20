@@ -678,10 +678,19 @@ class ScriptedReflex(object):
             if not self._hero_moved(pre_hero, mem, observed_kind):
                 self.targets.note_nav_attempt()
             serial = self.targets.held().serial
+            if replaced:
+                # §3: the superseded serial is terminated exactly once with
+                # ``reason=replaced`` and its replacement serial; the new
+                # serial's acquisition is a separate, distinct event -- the two
+                # are never combined, and the pairing is the sole input to the
+                # replacement switch count.
+                self._emit_destination_terminal(
+                    lifecycle_metrics.DEST_REPLACED, "replaced", cur.serial,
+                    purpose=cur.purpose, source=cur.source,
+                    generation=cur.generation, replacement_serial=serial)
             self.lifecycle.record(
                 lifecycle_metrics.KIND_DESTINATION,
-                lifecycle_metrics.DEST_REPLACED if replaced
-                else lifecycle_metrics.DEST_ACQUIRED,
+                lifecycle_metrics.DEST_ACQUIRED,
                 serial=serial, purpose=purpose, source=source,
                 generation=int(generation), reason=reason)
             self._record_directive_resolved(source, generation, reason)
@@ -697,7 +706,7 @@ class ScriptedReflex(object):
                 self.targets.set_phase(navigation.PHASE_INTERACTING)
                 return
             self._note_serviced(mem, pos)
-            self.targets.retire("reached")
+            self._retire_owned("reached", outcome=lifecycle_metrics.DEST_REACHED)
             if cur.source == navigation.SRC_DIRECTIVE:
                 self._settle_directive("reached", cur.generation, reason,
                                        serial=cur.serial)
@@ -731,13 +740,15 @@ class ScriptedReflex(object):
                 self.targets.note_interact_attempt()
             if navigation.door_open(self._terrain(mem), pos):
                 self._note_serviced(mem, pos)
-                self.targets.retire("door-opened")
+                self._retire_owned("door-opened",
+                                   outcome=lifecycle_metrics.DEST_REACHED)
                 return
             sig = navigation.local_evidence_signature(self._terrain(mem),
                                                       cur.pos)
             if self.targets.door_attempts_exhausted:
-                self.targets.retire("door-ineffective", pos=cur.pos,
-                                    signature=sig)
+                self._retire_owned("door-ineffective",
+                                   outcome=lifecycle_metrics.DEST_FAILED,
+                                   pos=cur.pos, signature=sig)
                 if cur.source == navigation.SRC_DIRECTIVE:
                     self._settle_directive("failed", cur.generation,
                                            "door-ineffective",
@@ -746,8 +757,9 @@ class ScriptedReflex(object):
         if self.targets.stalled():
             held = self.targets.held()
             if held is not None:
-                self.targets.retire(
-                    "stalled", pos=held.pos,
+                self._retire_owned(
+                    "stalled", outcome=lifecycle_metrics.DEST_FAILED,
+                    pos=held.pos,
                     signature=navigation.local_evidence_signature(
                         self._terrain(mem), held.pos))
                 if held.source == navigation.SRC_DIRECTIVE:
@@ -769,9 +781,10 @@ class ScriptedReflex(object):
         if held is not None:
             self._record_directive_resolved(held.source, held.generation,
                                             reason, resolved=False)
-            self.targets.retire(
+            self._retire_owned(
                 "unreachable" if reason == "unreachable"
-                else "directive-unresolved", pos=held.pos,
+                else "directive-unresolved",
+                outcome=lifecycle_metrics.DEST_FAILED, pos=held.pos,
                 signature=navigation.local_evidence_signature(
                     self._terrain(mem), held.pos))
             if held.source == navigation.SRC_DIRECTIVE:
@@ -1018,24 +1031,28 @@ class ScriptedReflex(object):
             return (self._cand({"key": KEY.KEY_SEARCH}, "search-in-place",
                                "recovery", 0,
                                "no hero fix: search in place", "recovery"),)
-        # 3. loop breakers: progress without ever walking into a monster
+        # 3. loop breakers: every stationary threshold (and cycle recovery)
+        #    shares ONE bounded, edge-legal recovery builder (plan §1), so no
+        #    threshold can route a raw-grid frontier step into a locked door or
+        #    an unbounded search/wait.  The 3/6/10 escalation concept is kept;
+        #    only the recovery mechanism is the shared legal builder.
         np = mem.no_progress
         if np >= 10:
-            action = self._unblock(mem, hero, st)
-            return (self._cand(action, "unblock", "recovery", 0,
-                               "loop breaker: unblock", "recovery"),)
+            return self._bounded_recovery(
+                mem, hero, "loop breaker: bounded escape (>=10)")
         if np >= 6:
-            key, why = self._random_move(mem, hero)
-            return (self._cand({"key": key}, "random-move", "recovery", 0,
-                               "loop breaker: %s" % why, "recovery"),)
+            return self._bounded_recovery(
+                mem, hero, "loop breaker: bounded escape (>=6)")
         if np >= 3:
             if self._allows_search(mem, hero) and not self._cycled:
                 return (self._cand({"key": KEY.KEY_SEARCH}, "search",
                                    "recovery", 0, "loop breaker: search",
                                    "site-search"),)
-            # a refused search at this site is suppressed (5.1): fall through
-            # to navigation / a non-search recovery step, never another `s`
-            return self._navigation_candidates(context, mem, hero)
+            # a refused or exhausted ordinary search at this site is
+            # suppressed (5.1): proceed to *legal* bounded recovery, never back
+            # into an unchanged failed route or another raw-grid step
+            return self._bounded_recovery(
+                mem, hero, "loop breaker: bounded recovery (search refused)")
         # 3b. an active detected movement cycle (period-2 or period-3) enters
         #     recovery even with no stationary no_progress: `_cycled` is an
         #     independent condition, not merely a search suppressor
@@ -1281,6 +1298,70 @@ class ScriptedReflex(object):
             lifecycle_metrics.KIND_DIRECTIVE, lifecycle_metrics.DIR_RESOLVED,
             generation=int(generation), resolved=bool(resolved), reason=reason)
 
+    def _emit_destination_terminal(self, outcome, reason, serial, *,
+                                   purpose=None, source=None, generation=None,
+                                   replacement_serial=None) -> None:
+        """Emit exactly one terminal destination lifecycle event (plan §3).
+
+        The single emission primitive every retirement path funnels through, so
+        a default and a directive-owned destination are terminated by the same
+        code and a terminal can never be silently omitted or doubled.
+        """
+        fields = {"serial": serial, "reason": reason}
+        if purpose is not None:
+            fields["purpose"] = purpose
+        if source is not None:
+            fields["source"] = source
+        if generation is not None:
+            fields["generation"] = int(generation)
+        if replacement_serial is not None:
+            fields["replacement_serial"] = int(replacement_serial)
+        self.lifecycle.record(lifecycle_metrics.KIND_DESTINATION, outcome,
+                              **fields)
+
+    def _retire_owned(self, reason, *, outcome=None, pos=None, signature=None):
+        """The single destination retirement owner (plan §3).
+
+        Captures ``(instance, serial, source, purpose, generation)`` *before*
+        clearing state and emits exactly one terminal destination event for
+        every source.  A directive-owned destination's destination terminal is
+        emitted once by :meth:`_settle_directive` (the once-only settlement side
+        effect layered on top), so the owner does not double-emit for it; every
+        default destination is terminated here.  Returns the retired
+        commitment, or ``None`` when nothing was held.
+        """
+        held = self.targets.held()
+        if held is None:
+            return None
+        term = outcome or lifecycle_metrics.DEST_FAILED
+        directive = (held.source == navigation.SRC_DIRECTIVE)
+        self.targets.retire(reason, pos=pos, signature=signature)
+        if not directive:
+            self._emit_destination_terminal(
+                term, reason, held.serial, purpose=held.purpose,
+                source=held.source, generation=held.generation)
+        return held
+
+    def _retire_cycle_owned(self, signature=None):
+        """Cycle/recovery invalidation through the one terminal owner (§1/§3).
+
+        Cycle detection may *nominate* recovery, but the destination is
+        invalidated here, at the reconciled observation fold, exactly once and
+        with a visible terminal for a default destination as well.
+        """
+        held = self.targets.held()
+        if held is None:
+            self.targets.invalidate_cycle(signature)
+            return None
+        directive = (held.source == navigation.SRC_DIRECTIVE)
+        self.targets.invalidate_cycle(signature)
+        if not directive:
+            self._emit_destination_terminal(
+                lifecycle_metrics.DEST_EXPIRED, "cycle", held.serial,
+                purpose=held.purpose, source=held.source,
+                generation=held.generation)
+        return held
+
     def _settle_directive(self, outcome, generation, reason, serial=None) -> None:
         """Queue a directive-owned destination settlement (plan 1.5).
 
@@ -1293,11 +1374,10 @@ class ScriptedReflex(object):
             lifecycle_metrics.KIND_DIRECTIVE,
             lifecycle_metrics.DIR_TERMINAL, generation=int(generation),
             outcome_detail=outcome, reason=reason)
-        self.lifecycle.record(
-            lifecycle_metrics.KIND_DESTINATION,
+        self._emit_destination_terminal(
             lifecycle_metrics.DEST_REACHED if outcome == "reached"
             else lifecycle_metrics.DEST_FAILED,
-            serial=serial, reason=reason)
+            reason, serial)
 
     @staticmethod
     def _dest_payload(op, held, target=None, purpose=None, source=None,
@@ -1480,17 +1560,48 @@ class ScriptedReflex(object):
     def _cycle_candidate(self, mem, hero):
         """A singleton, edge-legal escape from an active movement cycle.
 
-        Enumerates known-safe neighbours with the same terrain and
-        :func:`navigation.edge_legal` checks planning uses (so no unsafe
-        diagonal or door entry leaks in), excludes monster/unknown
-        destinations, and prefers a non-reversing exit by a deterministic
+        Delegates to the one shared bounded recovery builder (§1), so cycle
+        recovery and every stationary threshold use the *same* legal mechanism.
+        """
+        return self._bounded_recovery(
+            mem, hero, "cycle recovery: leave the repeating movement")
+
+    def _bounded_recovery(self, mem, hero, why):
+        """The one shared bounded, edge-legal recovery candidate (plan §1).
+
+        Used by the 3/6/10 stationary thresholds and by cycle recovery.  It
+        enumerates known-safe neighbours with the same classified terrain and
+        :func:`navigation.edge_legal` checks planning uses (so no raw-grid
+        frontier step, locked-door entry, unsafe diagonal or monster step leaks
+        in), and prefers a non-reversing exit by a deterministic
         visit-count/direction-rank order.  A traversable dead end whose only
         legal escape is backtracking keeps that reversal -- it is never
-        misreported as trapped merely because of the preference.  With no legal
-        movement at all it reuses the existing bounded search-fallback /
-        forced-search nomination machinery rather than manufacturing an
-        unbudgeted search, a dangerous prefix or an indefinite wait.  Returns a
-        one-member candidate tuple, as the loop-breaker branches do.
+        misreported as trapped.  With no legal movement at all it reuses the
+        existing bounded search-fallback / forced-search nomination machinery
+        rather than manufacturing an unbudgeted search, a dangerous prefix or
+        an indefinite wait.  Returns a one-member candidate tuple.
+        """
+        step = self._recovery_legal_step(mem, hero)
+        if step is not None:
+            return (self._cand(
+                {"key": KEY.DIR_KEYS[step]}, "recovery-step", "recovery", 0,
+                why, "recovery",
+                direction=step, direction_rank=navigation.DIR_RANK[step]),)
+        # No legal movement exists: a *bounded* ordinary search first (its own
+        # per-site budget still caps it), and only once that is refused or
+        # exhausted does the bounded search-fallback / forced-search / trapped
+        # escalation run -- so `s` is still never an unbounded fallback.
+        if self._allows_search(mem, hero):
+            return (self._cand({"key": KEY.KEY_SEARCH}, "search", "recovery",
+                               0, why, "site-search"),)
+        return self._search_fallback(mem, hero)
+
+    def _recovery_legal_step(self, mem, hero):
+        """The best legal, non-reversing escape step, or ``None`` (§1).
+
+        The single enumeration shared by every stationary threshold and cycle
+        recovery; ``None`` means no legal movement exists, so the caller
+        escalates to the bounded search-fallback machinery.
         """
         terrain = self._terrain(mem)
         previous = self.recovery.previous_distinct
@@ -1507,14 +1618,10 @@ class ScriptedReflex(object):
             options.append((0 if not reversing else 1,
                             mem.visits.get(dest, 0),
                             navigation.DIR_RANK[step], step))
-        if options:
-            options.sort()
-            step = options[0][3]
-            return (self._cand(
-                {"key": KEY.DIR_KEYS[step]}, "recovery-step", "recovery", 0,
-                "cycle recovery: leave the repeating movement", "recovery",
-                direction=step, direction_rank=navigation.DIR_RANK[step]),)
-        return self._search_fallback(mem, hero)
+        if not options:
+            return None
+        options.sort()
+        return options[0][3]
 
     def _search_site(self, hero):
         """The deterministic site key for the ordinary-search budget."""
@@ -1612,12 +1719,14 @@ class ScriptedReflex(object):
         if self._cycled:
             # Cycle recovery invalidates the active destination before the
             # existing edge-legal recovery singleton runs, so a stale
-            # destination cannot re-drive the loop (plan 1.5 "Cycle").
+            # destination cannot re-drive the loop (plan 1.5 "Cycle").  The
+            # invalidation is emitted through the one terminal owner, so a
+            # default destination's cycle termination is visible too (§3).
             held = self.targets.held()
             sig = (navigation.local_evidence_signature(self._terrain(mem),
                                                        held.pos)
                    if held is not None else None)
-            self.targets.invalidate_cycle(sig)
+            self._retire_cycle_owned(sig)
         self._fold_floor(mem)
         self._fold_pickup_outcome(mem)
         self._fold_door_outcome(mem)
@@ -1696,8 +1805,9 @@ class ScriptedReflex(object):
         joined = " ".join(t.lower() for t in mem.recent_messages(6))
         if any(k in joined for k in ("is locked", "it's locked", "locked door",
                                      "resists", "you cannot open")):
-            self.targets.retire(
-                "locked-door", pos=held.pos,
+            self._retire_owned(
+                "locked-door", outcome=lifecycle_metrics.DEST_FAILED,
+                pos=held.pos,
                 signature=navigation.local_evidence_signature(
                     self._terrain(mem), held.pos))
             if held.source == navigation.SRC_DIRECTIVE:
@@ -1802,6 +1912,15 @@ class ScriptedReflex(object):
         episode's committed inventory observations legitimately survive an
         arrival.
         """
+        # An instance change terminates the held destination *before* the scope
+        # is cleared (plan §3): a terminal with a stable reason is emitted
+        # exactly once, so a default destination cannot silently vanish.
+        held = self.targets.held()
+        if held is not None:
+            self._emit_destination_terminal(
+                lifecycle_metrics.DEST_EXPIRED, "instance_change", held.serial,
+                purpose=held.purpose, source=held.source,
+                generation=held.generation)
         self.instance_id = int(iid or 0)
         self.recovery = recovery.RecoveryState()
         self.food = recovery.FoodNegatives()
@@ -1951,20 +2070,11 @@ class ScriptedReflex(object):
             return False
         return not self._adjacent_monsters(mem, hero)
 
-    def _unblock(self, mem, hero, st):
-        """Break a stuck state without walking into an ambiguous monster."""
-        if self._safe_to_rest(mem, st, hero):
-            return {"key": KEY.KEY_WAIT}
-        if self._adjacent_monsters(mem, hero):
-            target = self._frontier_target(mem, hero)
-            if target is not None:
-                step = self._first_step(mem, hero, target)
-                if step is not None:
-                    dest = (hero[0] + step[0], hero[1] + step[1])
-                    if not state.monster_cell(mem.tile(dest), hero, dest):
-                        return {"key": KEY.DIR_KEYS[step]}
-            return {"key": KEY.KEY_SEARCH}
-        return {"key": KEY.KEY_SEARCH}
+    # NOTE: the legacy raw-grid ``_unblock`` (frontier target + first step) and
+    # ``_frontier_target`` helpers were removed by the stall-recovery plan §1:
+    # they used raw ``state.passable`` (which permits a locked ``+``) and no
+    # longer had any live caller.  Every stationary threshold and cycle
+    # recovery now route through :meth:`_bounded_recovery`.
 
     # -- navigation ------------------------------------------------------
     def _nav_reason(self, extra: str = "") -> str:
@@ -1979,17 +2089,6 @@ class ScriptedReflex(object):
         if extra:
             return "navigate (%s)" % extra
         return "navigate"
-
-    def _frontier_target(self, mem, hero):
-        best = None
-        for pos in mem.grid:
-            if pos == hero or not state.passable(mem.tile(pos)):
-                continue
-            if self._is_frontier(mem, pos):
-                if best is None or _manhattan(pos, hero) < \
-                        _manhattan(best, hero):
-                    best = pos
-        return best
 
     def _nearest(self, cells, hero):
         cells = list(cells)
@@ -2007,11 +2106,15 @@ class ScriptedReflex(object):
         hero is not hungry, not at low HP and has no adjacent monster -- so an
         unsafe hold becomes a search instead.
         """
+        terrain = self._terrain(mem)
         dirs = list(KEY.DIR_KEYS)
         self.rng.shuffle(dirs)
         for d in dirs:
             dest = (hero[0] + d[0], hero[1] + d[1])
-            if mem.known_passable(dest):
+            # the classified edge legality helper (plan §1): never a raw
+            # passability check, so a closed door or an illegal diagonal can
+            # no longer be chosen
+            if navigation.edge_legal(terrain, hero, dest):
                 return KEY.DIR_KEYS[d], "random walk (known floor)"
         if hero is not None and self._safe_to_rest(mem, mem.status, hero):
             return KEY.KEY_WAIT, "no known floor: wait"

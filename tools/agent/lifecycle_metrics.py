@@ -15,7 +15,10 @@ import json
 import os
 from typing import Any, Dict, Iterable, List, Optional
 
-SCHEMA_VERSION = 1
+#: The additive lifecycle schema version (plan §3).  Bumped to 2 so a record
+#: carries ``schema_version`` inside its ``kind``-tagged payload; readers treat
+#: a stream with no ``schema_version`` as legacy (metrics unavailable).
+SCHEMA_VERSION = 2
 
 # Destination lifecycle outcomes (plan section 5).
 DEST_ACQUIRED = "acquired"
@@ -47,7 +50,9 @@ KIND_DESTINATION = "destination"
 KIND_PICKUP = "pickup"
 KIND_DIRECTIVE = "directive"
 
-_TERMINAL_DEST = (DEST_REACHED, DEST_FAILED, DEST_EXPIRED)
+#: ``replaced`` is terminal for completeness accounting (plan §3) and is the
+#: sole input to replacement switch pairing (``serial`` -> ``replacement_serial``).
+_TERMINAL_DEST = (DEST_REACHED, DEST_FAILED, DEST_EXPIRED, DEST_REPLACED)
 
 
 def _hashable(value):
@@ -91,7 +96,10 @@ class LifecycleRecorder(object):
         self.emitted = 0
 
     def record(self, kind: str, outcome: str, **fields: Any) -> None:
-        ev = {"schema": SCHEMA_VERSION, "kind": kind, "outcome": outcome}
+        # ``schema`` is the outer envelope version (retained); ``schema_version``
+        # is the additive inside-payload version (plan §3).  No field is renamed.
+        ev = {"schema": SCHEMA_VERSION, "schema_version": SCHEMA_VERSION,
+              "kind": kind, "outcome": outcome}
         ev.update(fields)
         self.events.append(ev)
         self.recorded += 1
@@ -162,6 +170,14 @@ def summarize(events: Optional[Iterable[dict]]) -> Dict[str, Any]:
     """Derive the plan's lifecycle metrics, or ``None`` when unevidenced."""
     if events is None:
         events = []
+    events = list(events)
+    # A stream in which no record carries the additive ``schema_version`` is a
+    # legacy (schema-only) stream: its lifecycle metrics are reported
+    # *unavailable rather than zero*, and the flag makes that explicit.
+    legacy_stream = bool(events) and not any(
+        e.get("schema_version") is not None for e in events)
+    if legacy_stream:
+        events = []
     dest = [e for e in events if e.get("kind") == KIND_DESTINATION]
     pick = [e for e in events if e.get("kind") == KIND_PICKUP]
     direc = [e for e in events if e.get("kind") == KIND_DIRECTIVE]
@@ -215,6 +231,7 @@ def summarize(events: Optional[Iterable[dict]]) -> Dict[str, Any]:
 
     return {
         "schema_version": SCHEMA_VERSION,
+        "legacy_stream": legacy_stream,
         "available": bool(dest or pick or direc),
         "commitment_length_median": (_percentile(lengths, 0.5)
                                      if lengths else None),
