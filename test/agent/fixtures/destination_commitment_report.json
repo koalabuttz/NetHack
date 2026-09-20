@@ -1,7 +1,7 @@
 {
  "commit_range": {
   "base": "56c0c45a0739b29a3173b08b343d5fc786a56712",
-  "head": "82bf8694201e2b3210d02858a3e2fde6258918e5"
+  "head": "cdfdc3f3632ef3c45ad8123ead8749cf06ec92d1"
  },
  "commits": [
   {
@@ -339,6 +339,38 @@
   {
    "hash": "82bf8694201e2b3210d02858a3e2fde6258918e5",
    "subject": "agent: test invalid clearing of pending prompt"
+  },
+  {
+   "hash": "13f341df8a13466da42abb99529e922e4e59855a",
+   "subject": "agent: prompt continuity and evaluator clearing"
+  },
+  {
+   "hash": "210bce1504116f9dc41eb3fa325b485371d8b9fd",
+   "subject": "agent: add round-2 prompt mutations"
+  },
+  {
+   "hash": "41a9c7ae01fbdc58e3b3f70d5a660b6adb2c528a",
+   "subject": "agent: qualify route reopening under exit b"
+  },
+  {
+   "hash": "1287c3c50b8a020c47aad19c9b57702ecf7f4059",
+   "subject": "agent: pin campaign bench preflight (Phase 1)"
+  },
+  {
+   "hash": "7e8c32d411671339af190a3c6277c2a3b67d4360",
+   "subject": "agent: add campaign bench core (Phase 2-3)"
+  },
+  {
+   "hash": "b00a097280995d2310cd56e5d840fa43c5a8114e",
+   "subject": "agent: add advisory jev bench judge (Phase 4)"
+  },
+  {
+   "hash": "ecb332cb99596ef8cc6131b16829f88a92045337",
+   "subject": "agent: add campaign bench mutation checks"
+  },
+  {
+   "hash": "cdfdc3f3632ef3c45ad8123ead8749cf06ec92d1",
+   "subject": "agent: document campaign bench (Phase 6)"
   }
  ],
  "gates": {
@@ -590,6 +622,96 @@
    "killer": "test_auto_prompt_edge.DeclineEvidence.test_prompt_decline_resolution_with_hero_progress_records_no_edge",
    "name": "mutation_remove_unchanged_confirmed_hero_condition",
    "status": "killed"
+  },
+  {
+   "killer": "test_auto_bench.ScorecardContract.test_legacy_lifecycle_unavailable_not_zero",
+   "name": "mutation_bench_lifecycle_null_coerced_to_zero",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_bench.DryRunTier.test_dry_run_network_is_impossible",
+   "name": "mutation_bench_dry_run_calls_provider",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_bench.TierCoverage.test_live_jev_capped_fallback_not_reported_as_live_coverage",
+   "name": "mutation_bench_fallback_only_passes_tier_validation",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_bench.ComparisonEngine.test_hard_failure_cannot_be_offset_by_target_improvement",
+   "name": "mutation_bench_hard_gate_offset_by_target_improvement",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_bench.ComparisonEngine.test_attempts_source_mismatch_not_comparable",
+   "name": "mutation_bench_attempts_source_mismatch_comparable",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_bench.InvalidTaxonomy.test_unresolved_incomplete_is_hard_failure",
+   "name": "mutation_bench_unresolved_incomplete_not_hard_failure",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_bench.PaidExposure.test_bench_forces_zero_postmortem_reserve",
+   "name": "mutation_bench_postmortem_reserve_not_forced",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_bench.StopAndAbort.test_stop_after_episode_prevents_next_episode_and_judge",
+   "name": "mutation_bench_stop_admits_next_episode",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_bench.PrecommitAndSchedule.test_no_early_stop_and_no_post_result_extension",
+   "name": "mutation_bench_early_stop_on_favorable_look",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_bench.PrecommitAndSchedule.test_no_early_stop_and_no_post_result_extension",
+   "name": "mutation_bench_post_result_margin_change_allowed",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_bench.TunerAndApply.test_apply_requires_approval_range_hash_and_fresh_confirmation",
+   "name": "mutation_bench_apply_skips_approval_and_range",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_bench.TunerAndApply.test_confidence_factor_frozen_without_specific_policy_approval",
+   "name": "mutation_bench_confidence_factor_auto_tuned",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_bench.TunerAndApply.test_tuner_finite_grid_and_reserved_confirmation_budget",
+   "name": "mutation_bench_tuner_peeks_until_success",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_bench.StopAndAbort.test_partial_run_never_promoted_to_baseline",
+   "name": "mutation_bench_partial_run_promoted_to_baseline",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_bench.TerminationSafety.test_termination_safety_admission_blocks_reckless_candidates",
+   "name": "mutation_bench_termination_safety_admission_ignored",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_bench.TerminationSafety.test_death_rate_regression_blocks_admission",
+   "name": "mutation_bench_adverse_not_counted_in_safety_rate",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_bench_judge.JudgeContract.test_rubric_only_change_leaves_deterministic_comparison_unchanged_and_forces_rejudgment",
+   "name": "mutation_bench_rubric_change_blocks_deterministic_compare",
+   "status": "killed"
+  },
+  {
+   "killer": "test_auto_bench.StopAndAbort.test_forced_abort_permission_or_identity_failure_sets_teardown_failure",
+   "name": "mutation_bench_forced_abort_logs_and_ignores_permission",
+   "status": "killed"
   }
  ],
  "pickup_shape_disposition": {
@@ -649,5 +771,5 @@
   ]
  },
  "schema_version": 1,
- "suite_count": 1219
+ "suite_count": 1274
 }
