@@ -1105,6 +1105,31 @@ class LiveEvaluatorParity(unittest.TestCase):
         for a in acts[2:]:
             self.assertNotEqual(a["action"], {"key": KEY_EAST}, a)
 
+    def test_real_live_invalid_clears_then_retry_rebinds(self):
+        # review F1: an `invalid` after a sent answer discards the pending
+        # context, so a stale answer can never write evidence; a fresh
+        # confirmation then rebinds correctly
+        r, _recorder, _proc = self._live()
+        r._on_obs(_rec(1, _cmd(1), _MAP_TRAP, 100))
+        r._answer_now(None)
+        r._on_obs(_rec(2, _yn_need(2), _MAP_TRAP, 100))
+        self.assertIsNotNone(r.reflex.pending_prompt)
+        r._answer_now(None)                       # the `n` decline is bound
+        self.assertTrue(r.reflex.pending_prompt.answer_sent)
+        r._on_invalid({"type": "invalid", "code": "kind"})
+        self.assertIsNone(r.reflex.pending_prompt)
+        self.assertEqual(r.reflex.prompt_declined_edges, {})
+        # a fresh confirmation now rebinds from the cleared state: a new
+        # movement send, then its confirmation, then the successor observation
+        r._on_obs(_rec(3, _cmd(3), _MAP_TRAP, 101))
+        r._answer_now(None)
+        r._on_obs(_rec(4, _yn_need(4), _MAP_TRAP, 101))
+        self.assertIsNotNone(r.reflex.pending_prompt)
+        r._answer_now(None)
+        r._on_obs(_rec(5, _cmd(5), _MAP_TRAP, 102))
+        self.assertEqual(len(r.reflex.prompt_declined_edges), 1)
+        self.assertIsNone(r.reflex.pending_prompt)
+
     def test_ambiguous_hero_frame_arms_no_context_real_path(self):
         # review F2 through the production path: when the reconciled confirmed
         # hero is *not* the frozen source square, no context is armed and no
