@@ -68,6 +68,13 @@ class EpisodeMetrics(object):
         self.loop_spans: List[int] = []
         self._last_fp = None
         self._run = 0
+        # AC9: recovered attempts vs displayed-time advances, and the maximum
+        # stationary span (a run of identical hero squares).
+        self.attempts = 0
+        self.stationary_span = 0
+        self.teardown_frames = 0
+        self._prev_hero = None
+        self._stat_run = 0
 
     def fold(self, snap: protocol.Snapshot) -> None:
         self.observations += 1
@@ -78,6 +85,15 @@ class EpisodeMetrics(object):
                 self.stairs_cells.add(pos)
         hero = hero_of(snap)
         if hero is not None:
+            if self._prev_hero is not None and hero != self._prev_hero:
+                self.attempts += 1
+            if hero == self._prev_hero:
+                self._stat_run += 1
+                if self._stat_run > self.stationary_span:
+                    self.stationary_span = self._stat_run
+            else:
+                self._stat_run = 0
+            self._prev_hero = hero
             self.entered.add(hero)
         text = snap.status_text()
         depth = parse_dlvl(text.get("dungeon-level") or "")
@@ -119,18 +135,33 @@ class EpisodeMetrics(object):
             "depth_final": self.depth_final,
             "displayed_turns": turns,
             "time_advances": self.time_advances,
+            "attempts": self.attempts,
+            "stationary_span_max": self.stationary_span,
             "longest_loop_span": self.loop_span,
             "loop_spans_ge_2": sum(1 for s in self.loop_spans if s >= 2),
+            "teardown_frames_excluded": self.teardown_frames,
         }
 
 
 def episode_metrics(wire_path: str, meta: Optional[dict] = None) -> dict:
-    """Stream one ``.wire.jsonl`` recording into a metrics dict."""
+    """Stream one ``.wire.jsonl`` recording into a metrics dict.
+
+    Coverage excludes *teardown*: once the episode's ``closed`` record is seen,
+    any later observation is a post-close teardown frame (a goodbye/quit
+    confirmation) and is counted but never folded into cells/coverage, so a
+    teardown frame can neither inflate discovered area nor the stationary span.
+    """
     em = EpisodeMetrics()
     snap = protocol.Snapshot()
+    closed = False
     with open(wire_path, "r", encoding="utf-8") as fh:
         for line in fh:
             if '"obs"' not in line:
+                if '"closed"' in line:
+                    closed = True
+                continue
+            if closed:
+                em.teardown_frames += 1
                 continue
             try:
                 rec = json.loads(line)
@@ -175,6 +206,65 @@ def campaign_metrics(campaign_dir: str) -> dict:
                                            meta)})
     return {"campaign_dir": campaign_dir, "episodes": episodes,
             "episode_count": len(episodes)}
+
+
+# -- AC9 confidence/consultation report ------------------------------------
+#
+# The closed consultation-outcome vocabulary, keyed by the decision reason the
+# provider tier wrote.  A *skipped singleton* and a *cap-unavailable* fallback
+# are deliberately distinct from a genuine *rejected* answer, so a report can
+# never conflate a deliberate singleton bypass or a spent cap with a real
+# confidence rejection (plan AC9).
+CONSULTATION_OUTCOMES = ("accepted", "rejected", "skipped-singleton",
+                         "skipped-unsupported", "cap-unavailable",
+                         "unavailable", "timeout", "scripted", "other")
+
+_OUTCOME_RULES = (
+    ("skipped-singleton", "jev skipped: singleton"),
+    ("skipped-unsupported", "jev skipped: "),
+    ("cap-unavailable", "jev paid-reflex cap reached"),
+    ("cap-unavailable", "jev paid-reflex unavailable"),
+    ("unavailable", "jev unavailable:"),
+    ("timeout", "deadline exceeded"),
+    ("timeout", "jev fallback:"),
+    ("rejected", "jev rejected:"),
+    ("accepted", "jev choice"),
+)
+
+
+def classify_consultation(provider: str, reason: str) -> str:
+    """Map one decision's provider/reason to a consultation outcome (AC9)."""
+    text = reason or ""
+    for code, needle in _OUTCOME_RULES:
+        if needle in text:
+            return code
+    if (provider or "") == "scripted":
+        return "scripted"
+    return "other"
+
+
+def confidence_report(records, n_by_key=None) -> dict:
+    """Stratify consultations by phase, option count (N) and outcome (AC9).
+
+    *records* is an iterable of decision records (``{"record": "need", ...}``);
+    *n_by_key* optionally maps a need key to the offered option count, so the
+    report can separate a binary/ternary table from a larger one.  The result is
+    a flat ``{"<phase>|n=<N>|<outcome>": count}`` histogram.
+    """
+    n_by_key = n_by_key or {}
+    strata: Dict[str, int] = {}
+    for r in records or ():
+        if not isinstance(r, dict) or r.get("record") != "need":
+            continue
+        need = r.get("need") or {}
+        phase = need.get("kind", "unknown")
+        key = (need.get("seq"), need.get("id"))
+        n = n_by_key.get(key)
+        outcome = classify_consultation(r.get("provider", ""),
+                                        r.get("reason", ""))
+        label = "%s|n=%s|%s" % (phase, "?" if n is None else n, outcome)
+        strata[label] = strata.get(label, 0) + 1
+    return strata
 
 
 def _main(argv: Iterable[str] = ()) -> int:

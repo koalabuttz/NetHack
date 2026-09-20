@@ -630,6 +630,94 @@ class LifecycleRecording(unittest.TestCase):
             os.path.join(tmp, "missing.events.jsonl"))["target_reach_rate"])
 
 
+class Phase4Reports(unittest.TestCase):
+    """AC9: stratified consultation/acceptance reporting and clean coverage."""
+
+    _PAL = [[0, " ", "none", 0, "none"], [1, "@", "white", 0, "none"],
+            [2, ".", "gray", 0, "none"]]
+
+    def _wire(self, path, frames, closed_after=None):
+        from test_auto import obs
+        with open(path, "w") as fh:
+            for i, (hero, t) in enumerate(frames, start=1):
+                rec = obs(i, None,
+                          map_=[[hero[0], hero[1], 1],
+                                [hero[0] + 1, hero[1], 2]], pal=self._PAL)
+                rec["s"] = {"time": {"text": str(t)}}
+                fh.write(json.dumps(rec) + "\n")
+                if closed_after is not None and i == closed_after:
+                    fh.write(json.dumps({"type": "closed"}) + "\n")
+
+    def test_confidence_report_stratifies_binary_ternary_singleton_timeout(
+            self):
+        from tools.agent import exploration_metrics as E
+        recs = [
+            {"record": "need", "need": {"seq": 1, "id": 1, "kind": "command"},
+             "provider": "jev", "reason": "jev choice: navigate"},
+            {"record": "need", "need": {"seq": 2, "id": 2, "kind": "command"},
+             "provider": "scripted", "reason": "jev rejected: confidence"},
+            {"record": "need", "need": {"seq": 3, "id": 3, "kind": "menu"},
+             "provider": "scripted", "reason": "jev skipped: singleton"},
+            {"record": "need", "need": {"seq": 4, "id": 4, "kind": "command"},
+             "provider": "scripted", "reason": "jev paid-reflex cap reached"},
+            {"record": "need", "need": {"seq": 5, "id": 5, "kind": "command"},
+             "provider": "scripted", "reason": "jev fallback: deadline exceeded"},
+        ]
+        n = {(1, 1): 2, (2, 2): 3, (3, 3): 1, (4, 4): 4, (5, 5): 2}
+        rep = E.confidence_report(recs, n_by_key=n)
+        # accepted / rejected / skipped-singleton / cap-unavailable / timeout
+        # are each enumerated by phase and N -- a singleton bypass and a spent
+        # cap are never conflated with a genuine confidence rejection
+        self.assertEqual(rep["command|n=2|accepted"], 1)
+        self.assertEqual(rep["command|n=3|rejected"], 1)
+        self.assertEqual(rep["menu|n=1|skipped-singleton"], 1)
+        self.assertEqual(rep["command|n=4|cap-unavailable"], 1)
+        self.assertEqual(rep["command|n=2|timeout"], 1)
+        self.assertEqual(set(E.CONSULTATION_OUTCOMES),
+                         {"accepted", "rejected", "skipped-singleton",
+                          "skipped-unsupported", "cap-unavailable",
+                          "unavailable", "timeout", "scripted", "other"})
+
+    def test_report_attempts_vs_time_advances_and_stationary_span(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "w.wire.jsonl")
+            self._wire(p, [((5, 5), 100), ((6, 5), 100), ((7, 5), 101),
+                           ((7, 5), 101), ((7, 5), 101)])
+            m = M.episode_metrics(p)
+        # two hero moves are two attempts; only one displayed-time advance
+        self.assertEqual(m["attempts"], 2)
+        self.assertEqual(m["time_advances"], 1)
+        self.assertEqual(m["stationary_span_max"], 2)
+
+    def test_report_coverage_excludes_teardown(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "w.wire.jsonl")
+            self._wire(p, [((5, 5), 100), ((6, 5), 101), ((7, 5), 102)],
+                       closed_after=2)
+            m = M.episode_metrics(p)
+        # the post-close teardown frame is counted but never folded into
+        # coverage or the stationary span
+        self.assertEqual(m["observations"], 2)
+        self.assertEqual(m["teardown_frames_excluded"], 1)
+        self.assertEqual(m["entered_cells_instance_scoped"], 2)
+
+    def test_report_terminal_completeness_and_serviced_reopens(self):
+        from tools.agent import lifecycle_metrics as LM
+        rec = LM.LifecycleRecorder()
+        rec.record(LM.KIND_DESTINATION, LM.DEST_ACQUIRED, serial=1)
+        rec.record(LM.KIND_DESTINATION, LM.DEST_ACTION, serial=1)
+        rec.record(LM.KIND_DESTINATION, LM.DEST_REACHED, serial=1,
+                   reason="reached")
+        rec.record(LM.KIND_DESTINATION, LM.DEST_ACQUIRED, serial=2)  # open
+        rec.record(LM.KIND_DESTINATION, LM.DEST_ACQUIRED, serial=3)
+        rec.record(LM.KIND_DESTINATION, LM.DEST_REPLACED, serial=3,
+                   reason="replaced", replacement_serial=4)
+        s = rec.summarize()
+        # three acquired serials; 1 and 3 carry a terminal, 2 does not
+        self.assertAlmostEqual(s["terminal_completeness"], 2.0 / 3.0)
+        self.assertEqual(s["serviced_reopens"], 1)
+
+
 class ValidationReport(unittest.TestCase):
     """AC16/AC18: the validation report carries every required field."""
 

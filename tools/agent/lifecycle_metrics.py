@@ -229,10 +229,23 @@ def summarize(events: Optional[Iterable[dict]]) -> Dict[str, Any]:
             tok = _hashable(tok)              # JSON round-trip: lists -> tuples
             attempts_by_token[tok] = attempts_by_token.get(tok, 0) + 1
 
+    # Terminal completeness (AC9): the share of acquired serials that carry at
+    # least one terminal disposition -- a serial with no terminal is an
+    # incomplete lifecycle, reported as such rather than silently dropped.
+    acquired_serials = {e.get("serial") for e in acquired}
+    terminated_serials = {e.get("serial") for e in terminal}
+    completeness = (len(acquired_serials & terminated_serials)
+                    / float(len(acquired_serials)) if acquired_serials else None)
+
     return {
         "schema_version": SCHEMA_VERSION,
         "legacy_stream": legacy_stream,
         "available": bool(dest or pick or direc),
+        "terminal_completeness": completeness,
+        # serviced-site reopens: a superseded serial's replacement is the one
+        # destination record that evidences a re-acquisition of a serviced or
+        # parked site (the site-level reopen rule lives in navigation).
+        "serviced_reopens": len(switches) if dest else None,
         "commitment_length_median": (_percentile(lengths, 0.5)
                                      if lengths else None),
         "commitment_length_p90": (_percentile(lengths, 0.9)
