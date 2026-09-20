@@ -33,10 +33,12 @@ probability.  Structural validity is separate from safety confidence.
 import heapq
 import random
 import time
+from dataclasses import replace as _dc_replace
 from typing import Dict, List, Optional, Tuple
 
-from . import (candidates, forced_search, instances, lifecycle_metrics,
-               navigation, pickup, protocol, recovery, state)
+from . import (arbitration, candidates, forced_search, instances,
+               lifecycle_metrics, navigation, pickup, protocol, recovery,
+               state)
 from .arbitration import select_retained
 from .directives import DirectiveView
 from .providers import ReflexContext, ReflexResult, ReflexTimeout
@@ -225,6 +227,20 @@ class ScriptedReflex(object):
         # zero-time failure of a selected recovery move suppresses that edge
         # under unchanged evidence; a change to the edge's signature reopens it.
         self.blocked_edges = {}
+        # The scoped *prompt-declined* edge ledger (prompt-edge plan §D): keyed
+        # by ``(instance_id, src, dst, movement_action_class)`` -> a bounded
+        # ``(blocked_edge_signature, normalized_prompt_text)`` record.  One
+        # record per directed edge/action class (overwritten), cleared on an
+        # instance reset.  It is queried *per action class*, so a normal
+        # navigation decline never suppresses the same edge for the emergency
+        # class (a sole legal escape stays available).
+        self.prompt_declined_edges = {}
+        # The one bounded pending movement-confirmation context (plan §C).  It
+        # is held on the reflex (which the controller and evaluator each own)
+        # and driven by them: armed at the prompt's arrival, bound to the answer
+        # send, and resolved only when the post-answer observation proves the
+        # confirmation dismissed with an unchanged hero.
+        self._pending_prompt = None
 
     # -- provider surface ------------------------------------------------
     def _check_deadline(self) -> None:
@@ -664,6 +680,106 @@ class ScriptedReflex(object):
         return stored == navigation.blocked_edge_signature(terrain, tuple(src),
                                                            tuple(dst))
 
+    # -- prompt-declined edge evidence (prompt-edge plan §C/§D) -----------
+    def prompt_decline_record_key(self, instance, src, dst, action_class):
+        """The bounded prompt-declined ledger key: edge + action class (§D)."""
+        return (int(instance), tuple(src), tuple(dst), str(action_class))
+
+    def record_prompt_decline(self, instance, src, dst, action_class, mem,
+                              prompt_text) -> None:
+        """Write the one bounded ``prompt-declined`` record for a directed edge.
+
+        Keyed by ``(instance, src, dst, action_class)``; the value is the edge's
+        current blocked-edge signature plus the normalized prompt text, so one
+        record per directed edge/action class is retained (overwritten) and an
+        unrelated change can never reopen it.
+        """
+        terrain = self._terrain(mem)
+        key = self.prompt_decline_record_key(instance, src, dst, action_class)
+        self.prompt_declined_edges[key] = (
+            navigation.blocked_edge_signature(terrain, tuple(src), tuple(dst)),
+            " ".join(str(prompt_text or "").split()))
+
+    def _prompt_edge_suppressed(self, terrain, src, dst, action_class) -> bool:
+        """True while a prompt-decline record holds this edge for *action_class*."""
+        rec = self.prompt_declined_edges.get(
+            self.prompt_decline_record_key(self.instance_id, src, dst,
+                                           action_class))
+        if rec is None:
+            return False
+        return rec[0] == navigation.blocked_edge_signature(
+            terrain, tuple(src), tuple(dst))
+
+    def edge_suppressed(self, terrain, src, dst,
+                        action_class=navigation.ACTION_NORMAL) -> bool:
+        """The immutable blocked-edge view for one directed edge (plan §E).
+
+        Consults the recovery zero-time ledger (normal/recovery classes only)
+        and the prompt-decline ledger *for the requested action class*.  The
+        emergency class therefore never inherits a normal-navigation prompt
+        suppression, so a sole legal escape stays available.
+        """
+        src = tuple(src)
+        dst = tuple(dst)
+        if action_class != navigation.ACTION_EMERGENCY \
+                and self._edge_blocked(terrain, src, dst):
+            return True
+        return self._prompt_edge_suppressed(terrain, src, dst, action_class)
+
+    def _edge_admissible(self, terrain, action_class):
+        """A pure, directed edge-admissibility predicate for one plan (§E)."""
+        def pred(src, dst, _cls):
+            return not self.edge_suppressed(terrain, src, dst, action_class)
+        return pred
+
+    # -- the one bounded pending prompt context (prompt-edge plan §C) -----
+    def arm_movement_prompt(self, origin, response_need, instance,
+                            confirmed_hero, need_key=()) -> bool:
+        """Arm the pending prompt context for a matched confirmation (§A/§C).
+
+        Returns ``True`` only when a new context was created -- the
+        identity-bound term the caller folds into ``advance_stationary``.  A
+        re-presented confirmation (an existing pending context) creates no
+        second context and therefore earns no second count.
+        """
+        if self._pending_prompt is not None:
+            return False
+        pending = arbitration.matched_movement_prompt(
+            origin, response_need, instance, confirmed_hero, need_key)
+        if pending is None:
+            return False
+        self._pending_prompt = pending
+        return True
+
+    @property
+    def pending_prompt(self):
+        """The current bounded pending movement-confirmation context, or None."""
+        return self._pending_prompt
+
+    def note_prompt_answer_sent(self, ordinal) -> None:
+        """Bind the answer send to the pending context (no evidence yet)."""
+        p = self._pending_prompt
+        if p is None or p.answer_sent:
+            return
+        self._pending_prompt = _dc_replace(p, answer_sent=True,
+                                           answer_ordinal=int(ordinal))
+
+    def resolve_prompt_decline(self, mem, instance, confirmed_hero,
+                               dismissed) -> bool:
+        """Write the decline record iff the post-answer observation proves it."""
+        p = self._pending_prompt
+        if not arbitration.prompt_decline_confirmed(
+                p, instance, confirmed_hero, dismissed):
+            return False
+        self.record_prompt_decline(p.instance, p.src, p.dst, p.action_class,
+                                   mem, p.prompt_text)
+        self._pending_prompt = None
+        return True
+
+    def clear_pending_prompt(self) -> None:
+        """Discard the pending context (reset / transition / replacement)."""
+        self._pending_prompt = None
+
     def _recovery_payload(self, step) -> tuple:
         """The frozen recovery effect payload (plan §1).
 
@@ -1096,6 +1212,15 @@ class ScriptedReflex(object):
         if "save" in low and "really" in low:
             return {"yn": KEY.KEY_Y}, "confirm save", "prompt", ()
 
+        # A recognized blocking movement-entry confirmation (prompt-edge plan
+        # §A/AC2) is always declined, *before* the native default and the
+        # conservative visible-choice selection, so a `yes` native default can
+        # never accept an unlearned cloud entry.  Declining is the safe action
+        # and the fix counts on the decline being recorded, never on a blind
+        # acceptance.
+        if arbitration.is_movement_entry_confirmation(prompt):
+            return {"yn": KEY.KEY_N}, "decline cloud entry", "prompt", ()
+
         if self.intent == "eat" and "eat" in low:
             action, reason, effect = self._eat_answer(context, letters,
                                                       has_star)
@@ -1249,8 +1374,10 @@ class ScriptedReflex(object):
             return (self._cand({"key": ord(">")}, "descend", "descend", 900,
                                "descend the known stairs", "descend"),)
         terrain = self._terrain(mem, context)
-        plan = navigation.plan(terrain, hero, mem.visits, None,
-                               self._check_deadline)
+        plan = navigation.plan(
+            terrain, hero, mem.visits, None, self._check_deadline,
+            edge_admissible=self._edge_admissible(terrain,
+                                                  navigation.ACTION_NORMAL))
         held = self.targets.held()
         # A newly activated explicit destination replaces the old one at the
         # next genuine command decision (plan 1.5); the superseded default
@@ -1833,7 +1960,8 @@ class ScriptedReflex(object):
             # blocked-edge signature (plan §1/§4): unchanged evidence cannot
             # select a zero-time-failed recovery edge forever, while a change
             # to that edge's legality/occupancy signature reopens it.
-            if self._edge_blocked(terrain, hero, dest):
+            if self.edge_suppressed(terrain, hero, dest,
+                                    navigation.ACTION_RECOVERY):
                 continue
             reversing = self._is_reverse(step, hero, previous)
             options.append((0 if not reversing else 1,
@@ -2170,8 +2298,12 @@ class ScriptedReflex(object):
         self.instance_id = int(iid or 0)
         self.recovery = recovery.RecoveryState()
         self.food = recovery.FoodNegatives()
-        # A fresh level-instance scope clears the scoped failed-edge ledger.
+        # A fresh level-instance scope clears the scoped failed-edge ledger and
+        # the prompt-declined edge ledger, and discards any pending prompt
+        # context bound to the old instance (prompt-edge plan §C/§D).
         self.blocked_edges = {}
+        self.prompt_declined_edges = {}
+        self.clear_pending_prompt()
         # A fresh level-instance scope clears the commitment and the scoped
         # serviced/failed ledgers (plan 1.5 "Level instance change").
         self.targets.reset()
@@ -2290,26 +2422,80 @@ class ScriptedReflex(object):
 
     # -- safety: escape ------------------------------------------------
     def _escape(self, mem, hero):
-        """Disengage at low HP: never toward a monster."""
+        """Disengage at low HP with the classified, edge-legal emergency view.
+
+        The emergency branch keeps its precedence (it is chosen before every
+        other command candidate), but its movement *selection and routing* now
+        use the classified :class:`navigation.TerrainMemory`,
+        :func:`navigation.edge_legal` and the **same immutable blocked-edge
+        view** ordinary planning uses, with the exact prompt-edge-plan §E
+        fallback order: (1) a legal emergency edge not suppressed for the
+        emergency class, preferred retreat first; (2) another legal emergency
+        edge; (3) a sole geometrically legal edge suppressed only by a
+        normal-navigation prompt record; (4) stairs; (5) safe rest; (6) search.
+        """
+        terrain = self._terrain(mem)
         threats = self._adjacent_monsters(mem, hero)
-        for dx, dy in threats:
-            away = (-dx, -dy)
-            if mem.known_passable((hero[0] + away[0], hero[1] + away[1])):
-                return {"key": KEY.DIR_KEYS[away]}, "low HP: retreat"
-        for d, k in KEY.DIR_KEYS.items():
-            dest = (hero[0] + d[0], hero[1] + d[1])
-            if d not in threats and mem.known_passable(dest):
-                return {"key": k}, "low HP: sidestep"
+        away = {(-int(dx), -int(dy)) for dx, dy in threats}
+        step = self._emergency_move(mem, terrain, hero, threats)
+        if step is not None:
+            why = ("low HP: retreat" if step in away else "low HP: sidestep")
+            return {"key": KEY.DIR_KEYS[step]}, why
         if hero in mem.stairs_up:
             return {"key": ord("<")}, "low HP: withdraw upstairs"
         target = self._nearest(mem.stairs_up, hero)
         if target is not None:
-            step = self._first_step(mem, hero, target)
+            step = self._emergency_step_toward(mem, terrain, hero, target)
             if step is not None:
                 return {"key": KEY.DIR_KEYS[step]}, "low HP: flee upstairs"
         if self._safe_to_rest(mem, mem.status, hero):
             return {"key": KEY.KEY_WAIT}, "low HP: hold position"
         return {"key": KEY.KEY_SEARCH}, "low HP: search for an exit"
+
+    def _emergency_move(self, mem, terrain, hero, threats):
+        """The best legal emergency-class step, or ``None`` (§E fallback 1-3)."""
+        away = {(-int(dx), -int(dy)) for dx, dy in threats}
+        geometric = []
+        options = []
+        for step in navigation.DIRECTIONS:
+            dest = (hero[0] + step[0], hero[1] + step[1])
+            if dest == hero:
+                continue
+            if not navigation.edge_legal(terrain, hero, dest):
+                continue
+            if state.monster_cell(mem.tile(dest), hero, dest):
+                continue
+            geometric.append((step, dest))
+            if self.edge_suppressed(terrain, hero, dest,
+                                    navigation.ACTION_EMERGENCY):
+                continue
+            options.append((0 if step in away else 1, mem.visits.get(dest, 0),
+                            navigation.DIR_RANK[step], step))
+        if options:
+            options.sort()
+            return options[0][3]
+        # Step 3: a *sole* geometrically legal edge suppressed only by a
+        # normal-navigation prompt record remains eligible as an emergency-class
+        # move, so a declined normal edge can never trap the hero.
+        if len(geometric) == 1:
+            step, dest = geometric[0]
+            if (self._prompt_edge_suppressed(terrain, hero, dest,
+                                             navigation.ACTION_NORMAL)
+                    and not self._edge_blocked(terrain, hero, dest)):
+                return step
+        return None
+
+    def _emergency_step_toward(self, mem, terrain, hero, target):
+        """The first filtered step toward *target*, or ``None`` (§E step 4)."""
+        plan = navigation.plan(
+            terrain, hero, mem.visits, None, self._check_deadline,
+            edge_admissible=self._edge_admissible(terrain,
+                                                  navigation.ACTION_EMERGENCY),
+            action_class=navigation.ACTION_EMERGENCY)
+        target = tuple(target)
+        if target in plan.dist:
+            return plan.first.get(target)
+        return None
 
     def _safe_to_rest(self, mem, st, hero) -> bool:
         if self._hungry(st):
@@ -2365,7 +2551,8 @@ class ScriptedReflex(object):
             if not navigation.edge_legal(terrain, hero, dest):
                 continue
             # a scoped failure suppresses the edge under unchanged evidence too
-            if self._edge_blocked(terrain, hero, dest):
+            if self.edge_suppressed(terrain, hero, dest,
+                                    navigation.ACTION_NORMAL):
                 continue
             return KEY.DIR_KEYS[d], "random walk (known floor)"
         if hero is not None and self._safe_to_rest(mem, mem.status, hero):
@@ -2383,43 +2570,12 @@ class ScriptedReflex(object):
                 return True
         return False
 
-    def _first_step(self, mem, hero, target):
-        """Dijkstra over remembered passable cells with a visit penalty."""
-        if target == hero:
-            return None
-        dist = {hero: 0.0}
-        parent: Dict[Tuple[int, int], Tuple[int, int]] = {}
-        pq = [(0.0, hero)]
-        found = False
-        while pq:
-            self._check_deadline()
-            d, pos = heapq.heappop(pq)
-            if d > dist.get(pos, float("inf")):
-                continue
-            if pos == target:
-                found = True
-                break
-            x, y = pos
-            for dx, dy in KEY.DIR_KEYS:
-                nx, ny = x + dx, y + dy
-                nxt = (nx, ny)
-                if nxt not in mem.grid or not state.passable(
-                        mem.tile(nxt)):
-                    continue
-                cost = 1.0 + 0.5 * mem.visits.get(nxt, 0)
-                nd = d + cost
-                if nd < dist.get(nxt, float("inf")):
-                    dist[nxt] = nd
-                    parent[nxt] = pos
-                    heapq.heappush(pq, (nd, nxt))
-        if not found:
-            return None
-        node = target
-        while parent.get(node) != hero and node in parent:
-            node = parent[node]
-        if parent.get(node) != hero:
-            return None
-        return (node[0] - hero[0], node[1] - hero[1])
+    # NOTE: the legacy raw-grid ``_first_step`` Dijkstra was removed by the
+    # prompt-edge plan §E: emergency flee-upstairs routing now goes through the
+    # classified terrain, ``navigation.edge_legal`` and the same immutable
+    # blocked-edge view ordinary planning uses
+    # (:meth:`_emergency_step_toward`), so it is no longer a second, unfiltered
+    # grid search.
 
     # -- text / extcmd ---------------------------------------------------
     def _textish(self, context: ReflexContext):
