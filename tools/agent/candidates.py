@@ -695,9 +695,12 @@ class MatchedMovementPrompt:
 
     Created at the prompt's arrival (the first reconciled response to the
     matched movement attempt), bound to the frozen origin's exact directed
-    edge, and retained until its actual answer is sent and the post-answer
-    observation proves the confirmation was dismissed with an unchanged hero.
-    Only then is a ``prompt-declined`` edge record written.
+    edge and to the **validated ``yn`` response NeedKey** -- not the
+    originating command need key.  It is retained until its actual answer is
+    sent and bound (``response_need_key`` plus the exact answer byte), and the
+    post-answer observation proves the confirmation was dismissed with an
+    unchanged confirmed hero.  Only then is a ``prompt-declined`` edge record
+    written.
     """
 
     attempt_key: tuple
@@ -706,13 +709,18 @@ class MatchedMovementPrompt:
     dst: Tuple[int, int]
     action_class: str
     prompt_text: str
-    need_key: tuple
+    #: The validated NeedKey of the ``yn`` response itself, so a later answer is
+    #: bound only to this exact confirmation.
+    response_need_key: tuple = ()
     #: True only once the originating attempt has been counted stationary, so
     #: the count can never be applied twice.
     counted: bool = False
-    #: Bound after a complete send of the answer.
+    #: Bound only after a complete send of the *decline* answer (`KEY_N`).
     answer_sent: bool = False
     answer_ordinal: Optional[int] = None
+    #: The exact answer byte, retained so a `y`/ESC answer is never credited as
+    #: a decline.
+    answer_byte: Optional[int] = None
 
 
 # Re-export ``field`` so callers that want to extend these dataclasses can do

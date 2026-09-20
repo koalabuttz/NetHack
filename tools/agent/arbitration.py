@@ -336,6 +336,15 @@ def direction_delta(action, dir_keys) -> Optional[Tuple[int, int]]:
 #: direction-shaped *door interaction* is not movement and must fail closed.
 DOOR_PURPOSE = "open-door"
 
+#: The gameplay need kinds under which a movement operation may be sent.  A
+#: non-gameplay need (menu/prompt/ack/line/extcmd/position) never establishes a
+#: movement edge, so the taxonomy rejects it outright (plan §A).
+GAMEPLAY_NEED_KINDS = ("command", "key", "direction")
+
+#: The exact ``KEY_N`` decline byte.  An answer is credited as a decline only
+#: when its byte is this value; a `y`/ESC/other byte never writes evidence.
+DECLINE_BYTE = ord("n")
+
 #: Accepted operation classes: ``label -> (operation, action_class)``.  Every
 #: other label fails closed (plan §A rejected rows).
 _ACCEPTED_MOVEMENT_OPS = {
@@ -343,6 +352,10 @@ _ACCEPTED_MOVEMENT_OPS = {
     "recovery-step": ("recovery", "recovery"),
     "escape": ("emergency", "emergency"),
 }
+
+#: The destination payload operations that are genuine movement steps.  Any
+#: other operation (``arrive``, an interaction, an unknown token) fails closed.
+_DEST_MOVEMENT_OPS = ("acquire", "continue")
 
 #: Labels that are *never* movement even though they may carry a direction.
 _REJECTED_MOVEMENT_LABELS = frozenset(
@@ -372,6 +385,9 @@ def movement_origin_from_selected(candidate, need_kind, source_instance,
     """
     if candidate is None or pre_hero is None:
         return None
+    # a movement edge is established only by a gameplay send
+    if str(need_kind or "") not in GAMEPLAY_NEED_KINDS:
+        return None
     label = getattr(candidate, "semantic_label", "")
     if not label or label in _REJECTED_MOVEMENT_LABELS:
         return None
@@ -382,12 +398,14 @@ def movement_origin_from_selected(candidate, need_kind, source_instance,
     delta = direction_delta(candidate.action, _DIR_KEYS)
     if delta is None:
         return None
-    # a destination operation must carry its frozen destination payload: a
-    # synthesized/effect-less navigate candidate fails closed, and a
-    # direction-shaped door *interaction* is not movement.
+    # a destination operation must carry its frozen destination payload, name
+    # an explicit accepted movement operation (``acquire``/``continue``), and
+    # not be a direction-shaped door *interaction*; anything else fails closed.
     if label == "navigate":
         payload = getattr(candidate, "effect_payload", ()) or ()
         if not (len(payload) >= 4 and payload[0] == "dest"):
+            return None
+        if str(payload[1]) not in _DEST_MOVEMENT_OPS:
             return None
         if _dest_purpose(candidate) == DOOR_PURPOSE:
             return None
@@ -420,13 +438,15 @@ def is_movement_entry_confirmation(prompt_text) -> bool:
 
 
 def matched_movement_prompt(origin, response_need, instance, confirmed_hero,
-                            need_key=()):
+                            response_need_key=()):
     """The pending prompt context for a matched blocking confirmation, or None.
 
     Created only when the response is a ``yn`` need carrying a recognized
     movement-entry confirmation, the instance is the origin's instance, and the
     *confirmed* hero is still the frozen source square (a moved hero is not a
-    stationary confirmation).  ``None`` for every other frame.
+    stationary confirmation).  The stored key is the **validated response
+    NeedKey** itself, so a later answer is bound only to this exact
+    confirmation.  ``None`` for every other frame.
     """
     if origin is None or not isinstance(response_need, dict):
         return None
@@ -445,19 +465,40 @@ def matched_movement_prompt(origin, response_need, instance, confirmed_hero,
         src=tuple(origin.src), dst=tuple(origin.dst),
         action_class=origin.action_class,
         prompt_text=" ".join(str(prompt).split()),
-        need_key=tuple(need_key))
+        response_need_key=candidates.normalize_need_key(response_need_key))
+
+
+def answer_binds_to_prompt(pending, need_key, answer_byte) -> bool:
+    """True iff a sent answer is the *decline* of this exact confirmation (§C).
+
+    Requires the current need key to be the pending context's validated
+    response NeedKey **and** the answer byte to be exactly :data:`DECLINE_BYTE`.
+    A `y`, an ESC, or an answer to any other need never binds and therefore
+    never writes decline evidence.
+    """
+    if pending is None:
+        return False
+    if candidates.normalize_need_key(need_key) \
+            != candidates.normalize_need_key(pending.response_need_key):
+        return False
+    if answer_byte is None:
+        return False
+    return int(answer_byte) == DECLINE_BYTE
 
 
 def prompt_decline_confirmed(pending, instance, hero, dismissed) -> bool:
     """True only when a decline is proven by the post-answer observation (§C).
 
-    Requires the answer to have been *sent*, the observation to be in the same
-    instance, the confirmed hero to be unchanged at the frozen source square,
-    and the engine to have left the confirmation (``dismissed``).  A stale
-    ``n``, a failed write, a replacement prompt or a re-presented confirmation
-    therefore never writes evidence.
+    Requires the *decline* answer to have been bound and sent (a `y`/ESC answer
+    is never credited), the observation to be in the same instance, the
+    confirmed hero to be unchanged at the frozen source square, and the engine
+    to have left the confirmation (``dismissed``).  A stale ``n``, a failed
+    write, a replacement prompt or a re-presented confirmation therefore never
+    writes evidence.
     """
     if pending is None or not pending.answer_sent:
+        return False
+    if pending.answer_byte != DECLINE_BYTE:
         return False
     if instance is None or int(instance) != int(pending.instance):
         return False
@@ -490,7 +531,8 @@ __all__ = [
     "ChoiceOutcome", "validate_raw_choice", "Reconciliation",
     "classify_outcome", "arrival_outcome", "direction_delta",
     "ARRIVAL_PHRASES",
-    "DOOR_PURPOSE", "movement_origin_from_selected",
+    "DOOR_PURPOSE", "GAMEPLAY_NEED_KINDS", "DECLINE_BYTE",
+    "movement_origin_from_selected",
     "is_movement_entry_confirmation", "matched_movement_prompt",
-    "prompt_decline_confirmed", "set_dir_keys",
+    "prompt_decline_confirmed", "answer_binds_to_prompt", "set_dir_keys",
 ]

@@ -235,6 +235,19 @@ class ScriptedReflex(object):
         # navigation decline never suppresses the same edge for the emergency
         # class (a sole legal escape stays available).
         self.prompt_declined_edges = {}
+        # Exit-(b) capability (prompt-edge plan §D/Phase 0): the cloud encoding
+        # is indistinguishable, so a prompt-declined record suppresses
+        # **regardless of local signature changes**.  Signature-based reopening
+        # is gated behind this explicit positive-reopening capability, which
+        # stays disabled until the mandatory operator-gated trace; an
+        # instance/scope reset remains the only reopening.
+        self.positive_reopening_enabled = False
+        # The frozen origin of the pending confirmation (prompt-edge plan §A/F6):
+        # held only for the bounded prompt window so the internal-only
+        # ReflexContext seam can carry an immutable origin alongside the pending
+        # context.  The in-flight *send* origin is otherwise transient controller
+        # state consumed at the next observation.
+        self._prompt_origin = None
         # The one bounded pending movement-confirmation context (plan §C).  It
         # is held on the reflex (which the controller and evaluator each own)
         # and driven by them: armed at the prompt's arrival, bound to the answer
@@ -681,9 +694,23 @@ class ScriptedReflex(object):
                                                            tuple(dst))
 
     # -- prompt-declined edge evidence (prompt-edge plan §C/§D) -----------
+    @staticmethod
+    def normalize_action_class(action_class) -> str:
+        """Fold a movement action class into the two-class ledger (plan §D/§E).
+
+        Destination navigation, random movement and bounded recovery all share
+        the **normal** class (a decline suppresses the edge for every ordinary
+        movement); only the emergency escape class is distinct, so a sole legal
+        emergency escape is never suppressed by a normal decline.
+        """
+        return (navigation.ACTION_EMERGENCY
+                if str(action_class) == navigation.ACTION_EMERGENCY
+                else navigation.ACTION_NORMAL)
+
     def prompt_decline_record_key(self, instance, src, dst, action_class):
         """The bounded prompt-declined ledger key: edge + action class (§D)."""
-        return (int(instance), tuple(src), tuple(dst), str(action_class))
+        return (int(instance), tuple(src), tuple(dst),
+                self.normalize_action_class(action_class))
 
     def record_prompt_decline(self, instance, src, dst, action_class, mem,
                               prompt_text) -> None:
@@ -701,12 +728,23 @@ class ScriptedReflex(object):
             " ".join(str(prompt_text or "").split()))
 
     def _prompt_edge_suppressed(self, terrain, src, dst, action_class) -> bool:
-        """True while a prompt-decline record holds this edge for *action_class*."""
+        """True while a prompt-decline record holds this edge for *action_class*.
+
+        Under exit (b) the record suppresses **regardless of any local
+        signature change** (terrain corridor/floor transitions, occupant
+        presence, side cells, time, visits or remote cells): the stored
+        signature and prompt text are retained for diagnostics only.
+        Signature-based reopening is gated behind
+        :attr:`positive_reopening_enabled`, which stays disabled until the
+        mandatory operator-gated cloud trace.
+        """
         rec = self.prompt_declined_edges.get(
             self.prompt_decline_record_key(self.instance_id, src, dst,
                                            action_class))
         if rec is None:
             return False
+        if not self.positive_reopening_enabled:
+            return True
         return rec[0] == navigation.blocked_edge_signature(
             terrain, tuple(src), tuple(dst))
 
@@ -724,7 +762,8 @@ class ScriptedReflex(object):
         if action_class != navigation.ACTION_EMERGENCY \
                 and self._edge_blocked(terrain, src, dst):
             return True
-        return self._prompt_edge_suppressed(terrain, src, dst, action_class)
+        return self._prompt_edge_suppressed(
+            terrain, src, dst, self.normalize_action_class(action_class))
 
     def _edge_admissible(self, terrain, action_class):
         """A pure, directed edge-admissibility predicate for one plan (§E)."""
@@ -734,21 +773,24 @@ class ScriptedReflex(object):
 
     # -- the one bounded pending prompt context (prompt-edge plan §C) -----
     def arm_movement_prompt(self, origin, response_need, instance,
-                            confirmed_hero, need_key=()) -> bool:
+                            confirmed_hero, response_need_key=()) -> bool:
         """Arm the pending prompt context for a matched confirmation (§A/§C).
 
         Returns ``True`` only when a new context was created -- the
         identity-bound term the caller folds into ``advance_stationary``.  A
         re-presented confirmation (an existing pending context) creates no
-        second context and therefore earns no second count.
+        second context and therefore earns no second count.  The context is
+        bound to the **validated ``yn`` response NeedKey**.
         """
         if self._pending_prompt is not None:
             return False
         pending = arbitration.matched_movement_prompt(
-            origin, response_need, instance, confirmed_hero, need_key)
+            origin, response_need, instance, confirmed_hero,
+            response_need_key)
         if pending is None:
             return False
         self._pending_prompt = pending
+        self._prompt_origin = origin
         return True
 
     @property
@@ -756,13 +798,31 @@ class ScriptedReflex(object):
         """The current bounded pending movement-confirmation context, or None."""
         return self._pending_prompt
 
-    def note_prompt_answer_sent(self, ordinal) -> None:
-        """Bind the answer send to the pending context (no evidence yet)."""
+    @property
+    def prompt_origin(self):
+        """The frozen origin edge of the pending confirmation, or ``None``."""
+        return self._prompt_origin
+
+    def note_prompt_answer_sent(self, ordinal, need_key=(), answer_byte=None):
+        """Bind a sent answer, or discard on a non-decline / replacement (§C).
+
+        The answer binds only when its need key is the pending context's
+        validated response NeedKey **and** the byte is exactly ``KEY_N``; a
+        `y`/ESC answer or an answer to a different need clears the context and
+        writes nothing (the confirmation was not declined).
+        """
         p = self._pending_prompt
-        if p is None or p.answer_sent:
+        if p is None:
             return
-        self._pending_prompt = _dc_replace(p, answer_sent=True,
-                                           answer_ordinal=int(ordinal))
+        if not arbitration.answer_binds_to_prompt(p, need_key, answer_byte):
+            self._pending_prompt = None
+            self._prompt_origin = None
+            return
+        if p.answer_sent:
+            return
+        self._pending_prompt = _dc_replace(
+            p, answer_sent=True, answer_ordinal=int(ordinal),
+            answer_byte=int(answer_byte))
 
     def resolve_prompt_decline(self, mem, instance, confirmed_hero,
                                dismissed) -> bool:
@@ -774,11 +834,13 @@ class ScriptedReflex(object):
         self.record_prompt_decline(p.instance, p.src, p.dst, p.action_class,
                                    mem, p.prompt_text)
         self._pending_prompt = None
+        self._prompt_origin = None
         return True
 
     def clear_pending_prompt(self) -> None:
         """Discard the pending context (reset / transition / replacement)."""
         self._pending_prompt = None
+        self._prompt_origin = None
 
     def _recovery_payload(self, step) -> tuple:
         """The frozen recovery effect payload (plan §1).
@@ -2474,14 +2536,22 @@ class ScriptedReflex(object):
         if options:
             options.sort()
             return options[0][3]
-        # Step 3: a *sole* geometrically legal edge suppressed only by a
+        # Step 3: a *sole* geometrically legal edge suppressed **only** by a
         # normal-navigation prompt record remains eligible as an emergency-class
-        # move, so a declined normal edge can never trap the hero.
+        # move, so a declined normal edge can never trap the hero.  An
+        # emergency-class record (or a recovery zero-time failure) is never
+        # overridden here: step 3 requires the suppression to be normal-only,
+        # so a previously emergency-declined edge is never retried and the
+        # policy proceeds to stairs/rest/search instead.
         if len(geometric) == 1:
             step, dest = geometric[0]
-            if (self._prompt_edge_suppressed(terrain, hero, dest,
+            normal_only = (
+                self._prompt_edge_suppressed(terrain, hero, dest,
                                              navigation.ACTION_NORMAL)
-                    and not self._edge_blocked(terrain, hero, dest)):
+                and not self._prompt_edge_suppressed(
+                    terrain, hero, dest, navigation.ACTION_EMERGENCY)
+                and not self._edge_blocked(terrain, hero, dest))
+            if normal_only:
                 return step
         return None
 

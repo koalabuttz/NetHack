@@ -645,8 +645,13 @@ class ReplayPass(object):
                 self.protocol_failure = "malformed need: %s" % reason
                 self.closed = True
                 return
-        matched_prompt = self._capture_movement_prompt(frame_need, staged)
+        # (3) Reconcile hero/instance FIRST, then capture the matched movement
+        # prompt from the reconciled confirmed hero and the settled instance
+        # (review F2), bound to the frame's validated yn NeedKey (review F1).
         self._reconcile(staged)
+        frame_key = (NeedKey(1, seq, frame_need.get("id"))
+                     if frame_need is not None else None)
+        matched_prompt = self._capture_movement_prompt(frame_need, frame_key)
         self.mem.commit(
             staged, hero=self._resolved_hero,
             advance_stationary=bool(
@@ -655,7 +660,7 @@ class ReplayPass(object):
                 or matched_prompt))
         self.reflex.note_observation(self.mem)
         self._commit_effect()
-        self._resolve_pending_prompt(frame_need, staged)
+        self._resolve_pending_prompt(frame_need, frame_key)
         # a new obs supersedes any need still awaiting pages: that need was
         # never answered in the recorded trajectory
         if self._pending is not None and not self._pending.decided:
@@ -1179,7 +1184,12 @@ class ReplayPass(object):
             # terrain and the scripted reflex's pending intent.
             terrain=self.terrain,
             intent=getattr(self.reflex, "intent", "") or "",
-            directives=[view] if view.active else [], deadline=0.0)
+            directives=[view] if view.active else [], deadline=0.0,
+            # Internal-only seam, populated identically to the live path
+            # (prompt-edge plan §A, review F6).
+            prompt_origin=getattr(self.reflex, "prompt_origin", None),
+            matched_movement_prompt=getattr(self.reflex, "pending_prompt",
+                                            None))
         proposal, provider_label, reason, fallback = \
             self._propose(ctx)
 
@@ -1319,14 +1329,24 @@ class ReplayPass(object):
                 (self._last_key, self._sent_ordinal))
         else:
             # Bind a modeled non-command ``yn`` answer to the pending prompt
-            # context (plan §C), exactly as the live controller does.
+            # context (plan §C), exactly as the live controller does: only the
+            # exact response NeedKey and the ``KEY_N`` byte bind; any other
+            # answer discards the context without writing.
             if self.reflex.pending_prompt is not None \
                     and isinstance(action, dict) and "yn" in action:
-                self.reflex.note_prompt_answer_sent(self._sent_ordinal)
+                key = (NeedKey(1, self._last_key[0], self._last_key[1])
+                       if self._last_key is not None else ())
+                self.reflex.note_prompt_answer_sent(
+                    self._sent_ordinal, key, action.get("yn"))
         return self._sent_ordinal
 
-    def _capture_movement_prompt(self, frame_need, staged):
-        """Arm the one bounded pending prompt context (evaluator mirror, §A/§C)."""
+    def _capture_movement_prompt(self, frame_need, frame_key):
+        """Arm the one bounded pending prompt context (evaluator mirror, §A/§C).
+
+        Mirrors the live controller: the *confirmed* hero is the reconciled
+        ``_resolved_hero`` (review F2) and the context is bound to the frame's
+        validated response NeedKey (review F1).
+        """
         origin = self._movement_origin
         self._movement_origin = None
         if origin is None or not isinstance(frame_need, dict):
@@ -1337,20 +1357,24 @@ class ReplayPass(object):
         if arm is None or self.reflex.pending_prompt is not None:
             return False
         return bool(arm(
-            origin, frame_need, self.instance.current(), staged.hero,
-            need_key=(self._last_key or ())))
+            origin, frame_need, self.instance.current(), self._resolved_hero,
+            response_need_key=(frame_key or ())))
 
-    def _resolve_pending_prompt(self, frame_need, staged):
+    def _resolve_pending_prompt(self, frame_need, frame_key):
         """Confirm a decline iff the post-answer observation proves it (§C)."""
         resolve = getattr(self.reflex, "resolve_prompt_decline", None)
         pending = getattr(self.reflex, "pending_prompt", None)
         if resolve is None or pending is None or not pending.answer_sent:
             return
-        kind = (frame_need.get("kind")
-                if isinstance(frame_need, dict) else None)
-        prompt = ((frame_need.get("prompt") or "")
-                  if isinstance(frame_need, dict) else "")
-        if kind == "yn" and arbitration.is_movement_entry_confirmation(prompt):
+        cloud = (isinstance(frame_need, dict)
+                 and frame_need.get("kind") == "yn"
+                 and arbitration.is_movement_entry_confirmation(
+                     frame_need.get("prompt") or ""))
+        if cloud:
+            if frame_key is not None and \
+                    tuple(frame_key) == tuple(pending.response_need_key):
+                return
+            self.reflex.clear_pending_prompt()
             return
         resolve(self.mem, self.instance.current(), self._resolved_hero, True)
         clear = getattr(self.reflex, "clear_pending_prompt", None)

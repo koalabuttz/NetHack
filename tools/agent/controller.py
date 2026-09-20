@@ -1418,11 +1418,16 @@ class _EpisodeRunner(object):
             reason = protocol.validate_need(frame_need)
             if reason:
                 raise _ProtocolFailure("malformed need: %s" % reason)
-        # (3) Derive and capture the matched movement prompt while the frozen
-        # origin and the pre-send hero are still available.  Only a matched,
-        # recognized blocking confirmation whose hero is unchanged may count.
-        matched_prompt = self._capture_movement_prompt(frame_need, staged)
+        # (3) Reconcile hero/instance FIRST, then derive and capture the matched
+        # movement prompt from the *reconciled confirmed hero* and the settled
+        # instance (review F2) -- never from the raw first displayed `@` of the
+        # frame -- and before the single memory commit.  The pending context is
+        # bound to the frame's validated ``yn`` NeedKey (review F1).
         self._reconcile_observation(staged)
+        frame_key = (protocol.NeedKey(self.result.index, seq,
+                                      frame_need.get("id"))
+                     if frame_need is not None else None)
+        matched_prompt = self._capture_movement_prompt(frame_need, frame_key)
         self.mem.commit(
             staged, hero=self._resolved_hero,
             advance_stationary=bool(
@@ -1453,7 +1458,7 @@ class _EpisodeRunner(object):
         # Resolve the bounded pending prompt context against this committed
         # observation (prompt-edge plan §C): a proven dismissal with an
         # unchanged hero writes the decline record exactly once.
-        self._resolve_pending_prompt(frame_need, staged)
+        self._resolve_pending_prompt(frame_need, frame_key)
         # A held directive-owned destination whose advice is no longer active
         # (TTL/precondition lapse) is terminated once with a stable reason
         # (plan §3): directive expiry is never laundered into a default.
@@ -1764,14 +1769,17 @@ class _EpisodeRunner(object):
             cand, need_kind, self.instance.current() or 0, hero,
             self.attempt.primary_key)
 
-    def _capture_movement_prompt(self, frame_need, staged):
+    def _capture_movement_prompt(self, frame_need, frame_key):
         """Arm the one bounded pending prompt context for a matched confirmation.
 
-        Returns ``True`` only when a *new* context was created (the
-        identity-bound term folded into ``advance_stationary``).  A re-presented
-        confirmation creates no second context and therefore earns no second
-        count.  The frozen origin is consumed here so it can never be attached
-        to a later, unrelated frame.
+        The frozen origin is consumed here so it can never be attached to a
+        later, unrelated frame.  The *confirmed* hero used for the match is the
+        controller's reconciled ``_resolved_hero`` (review F2), not the frame's
+        raw first displayed ``@``, and the context is bound to the frame's
+        validated ``yn`` NeedKey (review F1).  Returns ``True`` only when a new
+        context was created (the identity-bound term folded into
+        ``advance_stationary``); a re-presented confirmation earns no second
+        count.
         """
         origin = self._movement_origin
         self._movement_origin = None
@@ -1783,11 +1791,16 @@ class _EpisodeRunner(object):
         if arm is None or self.reflex.pending_prompt is not None:
             return False
         return bool(arm(
-            origin, frame_need, self.instance.current(), staged.hero,
-            need_key=(getattr(self, "pending_key", None) or ())))
+            origin, frame_need, self.instance.current(), self._resolved_hero,
+            response_need_key=(frame_key or ())))
 
     def _bind_prompt_answer(self, ordinal, selected):
-        """Bind a sent ``yn`` answer to the pending prompt context (plan §C)."""
+        """Bind a sent ``yn`` answer to the pending prompt context (plan §C).
+
+        Only an answer whose need key is the pending context's validated
+        response NeedKey and whose byte is exactly ``KEY_N`` binds; a `y`/ESC
+        answer or a different need clears the context and writes nothing.
+        """
         if getattr(self.reflex, "pending_prompt", None) is None:
             return
         act = selected if isinstance(selected, dict) else {}
@@ -1795,27 +1808,37 @@ class _EpisodeRunner(object):
             return
         note = getattr(self.reflex, "note_prompt_answer_sent", None)
         if note is not None:
-            note(ordinal)
+            note(ordinal, getattr(self, "pending_key", None),
+                 act.get("yn"))
 
-    def _resolve_pending_prompt(self, frame_need, staged):
+    def _resolve_pending_prompt(self, frame_need, frame_key):
         """Confirm a decline iff the post-answer observation proves it (§C).
 
-        The confirmation is *dismissed* when this frame no longer presents the
-        same cloud confirmation; the record is written only for an unchanged
-        confirmed hero in the same instance.  A re-presented confirmation keeps
-        the context; any other post-answer frame resolves it exactly once.
+        The bound send identity (decline byte + response NeedKey) is required.
+        A frame that re-presents the *same* confirmation keeps the context (no
+        double count and no write); an unrelated replacement cloud prompt
+        discards the context without writing; any other post-answer frame is
+        the expected successor, so the decline is confirmed only for an
+        unchanged reconciled hero in the same instance.
         """
         resolve = getattr(self.reflex, "resolve_prompt_decline", None)
         pending = getattr(self.reflex, "pending_prompt", None)
         if resolve is None or pending is None or not pending.answer_sent:
             return
-        kind = (frame_need.get("kind")
-                if isinstance(frame_need, dict) else None)
-        prompt = ((frame_need.get("prompt") or "")
-                  if isinstance(frame_need, dict) else "")
-        if kind == "yn" and arbitration.is_movement_entry_confirmation(prompt):
-            return                      # still presenting: keep waiting
+        cloud = (isinstance(frame_need, dict)
+                 and frame_need.get("kind") == "yn"
+                 and arbitration.is_movement_entry_confirmation(
+                     frame_need.get("prompt") or ""))
+        if cloud:
+            if frame_key is not None and \
+                    tuple(frame_key) == tuple(pending.response_need_key):
+                return                  # re-presented: keep waiting
+            self._clear_pending_prompt()  # unrelated replacement: discard
+            return
         resolve(self.mem, self.instance.current(), self._resolved_hero, True)
+        self._clear_pending_prompt()
+
+    def _clear_pending_prompt(self):
         clear = getattr(self.reflex, "clear_pending_prompt", None)
         if clear is not None:
             clear()
@@ -1947,6 +1970,11 @@ class _EpisodeRunner(object):
             self._attempt_payload = ()
             if not had_attempt:
                 self.force_fallback = True
+        # An invalid for the answer (or any part of the transaction) discards
+        # the pending prompt context: the confirmation must be re-matched by a
+        # fresh arrival, so a stale/rejected answer never writes evidence and a
+        # later retry starts from a cleared, correctly rebindable state (§C).
+        self._clear_pending_prompt()
         # the engine left the SAME request outstanding: re-arm it, but keep
         # the ORIGINAL need deadline -- the retry shares the first budget
         self.pending = True
@@ -1968,6 +1996,8 @@ class _EpisodeRunner(object):
         self._attempt_effect = None
         self._attempt_label = ""
         self._attempt_payload = ()
+        # an episode close discards the pending prompt context too (§C)
+        self._clear_pending_prompt()
         # A prefix still armed when the episode ends cannot be cleared: record
         # the un-cleared dangerous prefix honestly rather than pretending a
         # graceful in-game quit was possible (plan 5.4).  No prefixed action
@@ -3206,7 +3236,15 @@ class _EpisodeRunner(object):
             role=self.c.config.role or "",
             destination=self._destination_record(),
             directives=[view] if view.active else [],
-            deadline=reflex_dl or 0.0, rejected=rs)
+            deadline=reflex_dl or 0.0, rejected=rs,
+            # Internal-only, policy-input-only seam (prompt-edge plan §A,
+            # review F6): the frozen origin edge of the pending confirmation and
+            # the one bounded pending confirmation context, as immutable values
+            # (both ``None`` outside the prompt window).  Never rendered,
+            # serialized, or consulted by providers.
+            prompt_origin=getattr(self.reflex, "prompt_origin", None),
+            matched_movement_prompt=getattr(self.reflex, "pending_prompt",
+                                            None))
 
     def _destination_record(self):
         """The active destination commitment for the presentation (plan §2.3).
