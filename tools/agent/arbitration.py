@@ -389,7 +389,7 @@ def movement_origin_from_selected(candidate, need_kind, source_instance,
         payload = getattr(candidate, "effect_payload", ()) or ()
         if not (len(payload) >= 4 and payload[0] == "dest"):
             return None
-        if str(payload[3]) == DOOR_PURPOSE:
+        if _dest_purpose(candidate) == DOOR_PURPOSE:
             return None
     src = (int(pre_hero[0]), int(pre_hero[1]))
     dst = (src[0] + delta[0], src[1] + delta[1])
