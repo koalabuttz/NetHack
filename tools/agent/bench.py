@@ -2356,8 +2356,55 @@ def _overlay_files(overlay_dir: str) -> List[int]:
     return sorted(out)
 
 
-def _check_approval(approval: Optional[dict], now: float) -> List[str]:
-    """Validate a *verified* approval object; ``None``/omitted always fails."""
+def approval_authorized(approval: Optional[dict]) -> Dict[str, Any]:
+    """The canonical authorized-ranges map (sorted knobs, sorted grids)."""
+    authorized = (approval or {}).get("authorized")
+    if not isinstance(authorized, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    for knob in sorted(authorized):
+        rail = authorized[knob]
+        if not isinstance(rail, dict):
+            out[knob] = rail
+            continue
+        grid = rail.get("grid")
+        out[knob] = {
+            "grid": sorted(grid) if isinstance(grid, list) else grid,
+            "min": rail.get("min"),
+            "max": rail.get("max"),
+        }
+    return out
+
+
+def approval_payload(approval: Optional[dict]) -> Dict[str, Any]:
+    """The canonical authorized payload an approval must be hashed over.
+
+    Recipe: ``sha256`` over the canonical JSON (sorted keys, no whitespace) of
+    ``{"id", "expiry", "authorized"}`` where ``authorized`` is the sorted
+    per-knob ``{"grid", "min", "max"}`` map.  Documented so an operator can
+    recompute it independently.
+    """
+    return {
+        "id": (approval or {}).get("id"),
+        "expiry": (approval or {}).get("expiry"),
+        "authorized": approval_authorized(approval),
+    }
+
+
+def approval_hash(approval: Optional[dict]) -> str:
+    """The recomputed sha256 of the canonical authorized payload."""
+    return M.sha256_json(approval_payload(approval))
+
+
+def _check_approval(approval: Optional[dict], now: Optional[float],
+                    tuning: Optional[dict] = None) -> List[str]:
+    """Validate a *verified* approval object; ``None``/omitted always fails.
+
+    Every dimension is checked and **fails closed**: the object must carry an
+    ID, an authorization hash that matches its recomputed canonical payload, a
+    non-empty authorized range map, and an expiry in the future relative to
+    trusted time; and the ID/expiry must match the spec's tuning fields.
+    """
     reasons: List[str] = []
     if not isinstance(approval, dict):
         return ["no-verified-approval"]
@@ -2365,14 +2412,27 @@ def _check_approval(approval: Optional[dict], now: float) -> List[str]:
         reasons.append("approval-missing-id")
     if not approval.get("authorization_hash"):
         reasons.append("approval-missing-authorization-hash")
+    elif approval["authorization_hash"] != approval_hash(approval):
+        # mutating ANY range or the expiry without re-hashing is caught here
+        reasons.append("approval-authorization-hash-mismatch")
     if not isinstance(approval.get("authorized"), dict) or \
             not approval["authorized"]:
         reasons.append("approval-missing-authorized-ranges")
     expiry = approval.get("expiry")
     if not _finite(expiry):
         reasons.append("approval-missing-expiry")
-    elif float(expiry) <= now:
+    elif now is None or not _finite(now):
+        # trusted time is unavailable -> fail closed rather than assume valid
+        reasons.append("trusted-time-unavailable")
+    elif float(expiry) <= float(now):
         reasons.append("approval-expired")
+    if tuning is not None:
+        if tuning.get("approval_id") != approval.get("id"):
+            reasons.append("approval-id-mismatch")
+        spec_expiry = tuning.get("approval_expiry")
+        if not _finite(spec_expiry) or \
+                float(spec_expiry) != float(expiry or float("nan")):
+            reasons.append("approval-expiry-mismatch")
     return reasons
 
 
@@ -2400,7 +2460,11 @@ def apply_approved(spec: dict, *, candidate: dict, confirmation: dict,
     reasons: List[str] = []
     if tuning["mode"] != "apply-approved":
         reasons.append("mode-not-apply-approved")
-    reasons.extend(_check_approval(approval, float(now())))
+    try:
+        trusted_now: Optional[float] = float(now())
+    except Exception:  # noqa: BLE001 - trusted time unavailable -> fail closed
+        trusted_now = None
+    reasons.extend(_check_approval(approval, trusted_now, tuning))
     if (confirmation or {}).get("verdict") != "pass":
         reasons.append("confirmation-not-pass")
     if not (confirmation or {}).get("admission", {}).get("apply_allowed"):

@@ -322,17 +322,36 @@ stall/door constants and forced-search budgets are not automatic tuning knobs.
 
 `apply-approved` writes a versioned **nonsecret** config overlay only after
 **all** of: a fresh confirmation passes, the termination-safety contract passes,
-a **verified approval object** is present (an `id`, an `authorization_hash`,
-a non-empty `authorized` grid/range map, and an `expiry` in the future relative
-to trusted time — `None`/omitted always fails), every changed key/value is
-inside its exact **authorized** grid/range, and the baseline config hash
-matches. Overlays are **immutable and versioned**: two valid applies create two
-distinct files (overwriting is refused). Each apply persists an
-`bench-apply-record/1` with the exact before/after diff, the confirmation
-evidence/run ids, the approval expiry and authorization hash, and the previous
-active reference. `rollback_apply()` restores the previous overlay
-**byte-for-byte** (it returns the restored content and its checksum). The bench
-never rewrites a secret config file or patches a running agent.
+a **verified approval object** is present, every changed key/value is inside its
+exact **authorized** grid/range, and the baseline config hash matches.
+
+The approval object is `{"id", "authorization_hash", "authorized", "expiry"}`;
+`authorization_hash` must equal the **recomputed** sha256 of the canonical
+authorized payload — the recipe is documented so an operator can recompute it
+independently:
+
+```
+payload  = {"id": <id>, "expiry": <expiry>,
+            "authorized": {<knob>: {"grid": <sorted grid or null>,
+                                    "min": <min or null>,
+                                    "max": <max or null>}, ...}}   # sorted knobs
+sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+```
+
+`bench.approval_hash(approval)` / `bench.approval_payload(approval)` implement
+this exactly. Mutating **any** range or the expiry without re-hashing is
+therefore rejected (`approval-authorization-hash-mismatch`); the approval `id`
+must equal `spec.tuning.approval_id` (`approval-id-mismatch`) and its `expiry`
+must equal `spec.tuning.approval_expiry` (`approval-expiry-mismatch`); and an
+unavailable trusted clock fails closed (`trusted-time-unavailable`).
+
+Overlays are **immutable and versioned**: two valid applies create two distinct
+files (overwriting is refused). Each apply persists an `bench-apply-record/1`
+with the exact before/after diff, the confirmation evidence/run ids, the
+approval expiry and authorization hash, and the previous active reference.
+`rollback_apply()` restores the previous overlay **byte-for-byte** (it returns
+the restored content and its checksum). The bench never rewrites a secret config
+file or patches a running agent.
 
 ## Stop escalation and containment (AC7)
 

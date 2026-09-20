@@ -887,12 +887,22 @@ class TunerAndApply(unittest.TestCase):
         self.assertEqual(plan["allocations"]["confirmation_episodes"],
                          2 * spec["comparison"]["confirmation_episodes_per_arm"])
 
-    def _approval(self, **over):
-        approval = {"id": "AP-1", "authorization_hash": "authhash-1",
+    def _approval(self, spec=None, **over):
+        """A *verified* approval object whose hash matches its payload.
+
+        The hash is the real sha256 over the canonical authorized payload, and
+        the spec's ``approval_id``/``approval_expiry`` are bound to it.
+        """
+        approval = {"id": "AP-1",
                     "authorized": {"reflex_call_cap": {"grid": [4, 8, 12],
                                                        "min": 0, "max": 16}},
                     "expiry": time.time() + 3600.0}
         approval.update(over)
+        approval["authorization_hash"] = over.get("authorization_hash") \
+            or B.approval_hash(approval)
+        if spec is not None:
+            spec["tuning"]["approval_id"] = approval["id"]
+            spec["tuning"]["approval_expiry"] = approval["expiry"]
         return approval
 
     def test_apply_requires_approval_range_hash_and_fresh_confirmation(self):
@@ -911,12 +921,13 @@ class TunerAndApply(unittest.TestCase):
         self.assertFalse(denied["applied"])
         self.assertIn("no-verified-approval", denied["reasons"])
         # an EXPIRED approval is refused
+        expired_approval = self._approval(spec, expiry=time.time() - 1)
         expired = B.apply_approved(
             spec, candidate={"reflex_call_cap": 8},
             confirmation={"verdict": "pass",
                           "admission": {"apply_allowed": True}},
             config_hash="h", current_config={"reflex_call_cap": 4},
-            overlay_dir=tmp, approval=self._approval(expiry=time.time() - 1))
+            overlay_dir=tmp, approval=expired_approval)
         self.assertFalse(expired["applied"])
         self.assertIn("approval-expired", expired["reasons"])
         # an incomplete approval object is refused
@@ -933,7 +944,7 @@ class TunerAndApply(unittest.TestCase):
             spec, candidate={"reflex_call_cap": 8},
             confirmation={"verdict": "inconclusive", "admission": {}},
             config_hash="h", current_config={"reflex_call_cap": 4},
-            overlay_dir=tmp, approval=self._approval())
+            overlay_dir=tmp, approval=self._approval(spec))
         self.assertFalse(stale["applied"])
         self.assertIn("confirmation-not-pass", stale["reasons"])
         # a mismatched config hash is refused
@@ -942,7 +953,7 @@ class TunerAndApply(unittest.TestCase):
             confirmation={"verdict": "pass",
                           "admission": {"apply_allowed": True}},
             config_hash="OTHER", current_config={"reflex_call_cap": 4},
-            overlay_dir=tmp, approval=self._approval())
+            overlay_dir=tmp, approval=self._approval(spec))
         self.assertIn("config-hash-mismatch", bad_hash["reasons"])
         # a value outside the APPROVAL's grid is refused
         bad = B.apply_approved(
@@ -951,12 +962,12 @@ class TunerAndApply(unittest.TestCase):
                           "admission": {"apply_allowed": True}},
             config_hash="h", current_config={"reflex_call_cap": 4},
             overlay_dir=tmp,
-            approval=self._approval(authorized={
+            approval=self._approval(spec, authorized={
                 "reflex_call_cap": {"grid": [4, 8]}}))
         self.assertTrue(any("value-outside-approval" in r
                             for r in bad["reasons"]))
         # a valid apply succeeds and records the diff
-        approval = self._approval()
+        approval = self._approval(spec)
         good = B.apply_approved(
             spec, candidate={"reflex_call_cap": 8},
             confirmation={"verdict": "pass",
@@ -971,7 +982,67 @@ class TunerAndApply(unittest.TestCase):
                          {"before": 4, "after": 8})
         self.assertEqual(record["confirmation_run_ids"], ["run-7"])
         self.assertEqual(record["approval_expiry"], approval["expiry"])
-        self.assertEqual(record["authorization_hash"], "authhash-1")
+        self.assertEqual(record["authorization_hash"],
+                         approval["authorization_hash"])
+
+    def test_approval_rejects_tampered_hash_id_and_expiry(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        spec = _valid_spec()
+        spec["tuning"].update({"mode": "apply-approved",
+                               "expected_base_config_hash": "h"})
+        good = self._approval(spec)
+        conf = {"verdict": "pass", "admission": {"apply_allowed": True}}
+        # baseline: the verified object applies
+        self.assertTrue(B.apply_approved(
+            spec, candidate={"reflex_call_cap": 8}, confirmation=conf,
+            config_hash="h", current_config={"reflex_call_cap": 4},
+            overlay_dir=tmp, approval=good)["applied"])
+        # mutating ONE range without re-hashing is caught
+        tampered = json.loads(json.dumps(good))
+        tampered["authorized"]["reflex_call_cap"]["grid"] = [4, 8, 20]
+        res = B.apply_approved(
+            spec, candidate={"reflex_call_cap": 8}, confirmation=conf,
+            config_hash="h", current_config={"reflex_call_cap": 4},
+            overlay_dir=tmp, approval=tampered)
+        self.assertFalse(res["applied"])
+        self.assertIn("approval-authorization-hash-mismatch", res["reasons"])
+        # mutating the expiry without re-hashing is caught
+        tampered = json.loads(json.dumps(good))
+        tampered["expiry"] = good["expiry"] + 10.0
+        res = B.apply_approved(
+            spec, candidate={"reflex_call_cap": 8}, confirmation=conf,
+            config_hash="h", current_config={"reflex_call_cap": 4},
+            overlay_dir=tmp, approval=tampered)
+        self.assertIn("approval-authorization-hash-mismatch", res["reasons"])
+        # a mismatched approval/spec ID fails
+        other = self._approval(spec, id="AP-OTHER")
+        spec["tuning"]["approval_id"] = "AP-1"
+        res = B.apply_approved(
+            spec, candidate={"reflex_call_cap": 8}, confirmation=conf,
+            config_hash="h", current_config={"reflex_call_cap": 4},
+            overlay_dir=tmp, approval=other)
+        self.assertIn("approval-id-mismatch", res["reasons"])
+        # a spec/object expiry mismatch fails
+        self._approval(spec)                       # re-bind matching values
+        spec["tuning"]["approval_expiry"] = good["expiry"] + 10.0
+        res = B.apply_approved(
+            spec, candidate={"reflex_call_cap": 8}, confirmation=conf,
+            config_hash="h", current_config={"reflex_call_cap": 4},
+            overlay_dir=tmp, approval=good)
+        self.assertIn("approval-expiry-mismatch", res["reasons"])
+        # trusted time unavailable fails closed
+        spec["tuning"]["approval_expiry"] = good["expiry"]
+
+        def _no_time():
+            raise RuntimeError("no trusted clock")
+
+        res = B.apply_approved(
+            spec, candidate={"reflex_call_cap": 8}, confirmation=conf,
+            config_hash="h", current_config={"reflex_call_cap": 4},
+            overlay_dir=tmp, approval=good, now=_no_time)
+        self.assertFalse(res["applied"])
+        self.assertIn("trusted-time-unavailable", res["reasons"])
 
     def test_overlay_apply_rollback_preserves_secret_config(self):
         tmp = tempfile.mkdtemp()
@@ -982,7 +1053,7 @@ class TunerAndApply(unittest.TestCase):
         spec = _valid_spec()
         spec["tuning"].update({"mode": "apply-approved", "approval_id": "AP-2",
                                "expected_base_config_hash": "h"})
-        approval = self._approval(id="AP-2", authorization_hash="auth-2")
+        approval = self._approval(spec, id="AP-2")
         first = B.apply_approved(
             spec, candidate={"reflex_call_cap": 8},
             confirmation={"verdict": "pass",
