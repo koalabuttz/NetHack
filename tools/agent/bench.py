@@ -450,6 +450,14 @@ def preflight(spec: dict) -> Dict[str, Any]:
     config, err = resolve_provider_config(spec)
     if err:
         return {"ok": False, "stage": "provider_config", "error": err}
+    # an unresolvable *baseline* config reference is refused here too, so
+    # `validate` is honest about a broken A/B setup.
+    baseline_config = None
+    if spec.get("baseline_config_ref") is not None:
+        baseline_config, _cand, base_err = resolve_arm_configs(spec)
+        if base_err:
+            return {"ok": False, "stage": "provider_config",
+                    "error": base_err}
     conflict = jev_profile_conflict(config)
     if conflict:
         return {"ok": False, "stage": "scope", "error": conflict}
@@ -473,6 +481,7 @@ def preflight(spec: dict) -> Dict[str, Any]:
             "cost_mode_forced_from": forced_from,
             "unattended_apply_allowed": unattended,
             "judge_transport": judge_transport,
+            "baseline_config_hash": config_fingerprint(baseline_config),
             "allocations": plan_allocations(spec, spec["budget"][
                 "max_candidates"]),
             "postmortem_reserve": config.postmortem_reserve}

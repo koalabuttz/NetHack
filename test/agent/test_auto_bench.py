@@ -1658,6 +1658,20 @@ class PrecommitScheduleRunner(unittest.TestCase):
         self.assertNotIn("expected_config_hashes", pre["design"])
         self.assertFalse(out["comparison"]["same_run_experiment"])
 
+    def test_unresolvable_baseline_config_is_refused_at_preflight(self):
+        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
+        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
+        spec = _valid_spec(tier="live", episodes=2)
+        spec["baseline_config_ref"] = "/nope/missing-baseline.json"
+        report = B.preflight(spec)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["stage"], "provider_config")
+        # a resolvable baseline config is reported with its hash
+        spec["baseline_config_ref"] = {"reflex": "scripted", "strategy": "off"}
+        report = B.preflight(spec)
+        self.assertTrue(report["ok"])
+        self.assertTrue(report["baseline_config_hash"])
+
     def test_observed_order_and_config_hash_mismatch_stay_not_comparable(self):
         spec = _valid_spec(tier="live", episodes=4)
         spec["comparison"]["resampling_seed"] = 3
