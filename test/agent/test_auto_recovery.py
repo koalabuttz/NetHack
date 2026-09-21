@@ -90,9 +90,13 @@ class SearchBudgetTest(unittest.TestCase):
 
     def test_one_refusal_suppresses_the_site(self):
         b = recovery.SearchBudget()
-        b.note_refused((1, 1))
+        # the refusal is recorded *with* the site whose own search observed it
+        # (plan §4 site-correlated binding), never as a bare flag
+        b.note_refused((1, 1), "monster")
         self.assertFalse(b.allows((1, 1)))
         self.assertTrue(b.allows((2, 2)))
+        self.assertEqual(b.refusal_kind_for((1, 1)), "monster")
+        self.assertIsNone(b.refusal_kind_for((2, 2)))
 
     def test_revision_change_reopens_the_site(self):
         b = recovery.SearchBudget()
@@ -409,9 +413,12 @@ class RefusalSuppression(unittest.TestCase):
         # a boxed-in hero whose ordinary search was refused must never emit
         # another `s`; with known floor it takes a step instead
         cells = {(10, 10): FLOOR, (11, 10): FLOOR}
-        mem = mem_with(cells, (10, 10),
-                       messages=["You already found a monster."])
+        mem = mem_with(cells, (10, 10))
         mem.no_progress = 3
+        # the site's own search observed the refusal and its reconciliation
+        # fold bound it to *this* site (plan §4); the ordinary search here is
+        # therefore suppressed
+        self.ref.recovery.note_refused((10, 10), "monster")
         res = self.ref.decide(ctx(mem))
         self.assertNotEqual(res.action, {"key": protocol.KEY_SEARCH})
 
@@ -422,11 +429,14 @@ class RefusalSuppression(unittest.TestCase):
         # committed by the controller only after the send and its reconciled
         # observation, so the direct call asserts the action and the commit is
         # then exercised explicitly.
-        mem = mem_with({(10, 10): FLOOR}, (10, 10),
-                       messages=["You already found a monster."])
+        mem = mem_with({(10, 10): FLOOR}, (10, 10))
         mem.no_progress = 3
         mem.status.hunger = "Hungry"
         self.ref.last_eat_tick = 0     # the eat intent is already on cooldown
+        # the site's own search observed the refusal, which its fold bound to
+        # this site (plan §4), so the forced-search gate is open but no legal
+        # alternative exists
+        self.ref.recovery.note_refused((10, 10), "monster")
         res = self.ref.decide(ctx(mem, tick=0))
         self.assertEqual(res.action, {"key": protocol.KEY_HASH})
         # a proposal alone mutates no gameplay/recovery/intent state
@@ -546,9 +556,11 @@ class Phase2BoundedRecovery(unittest.TestCase):
                  (10, 9): WALL, (10, 11): WALL}
         for np in (3, 6, 10):
             ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
-            mem = mem_with(cells, (10, 10),
-                           messages=["You already found a monster."])
+            mem = mem_with(cells, (10, 10))
             mem.no_progress = np
+            # the site's own search observed the refusal, which its fold bound
+            # to this site (plan §4)
+            ref.recovery.note_refused((10, 10), "monster")
             cand = ref.prepare(ctx(mem)).table.scripted()
             self.assertEqual(cand.family, "recovery", np)
             self.assertEqual(cand.semantic_label, "recovery-step", np)
@@ -636,8 +648,11 @@ class Phase2EdgeFailureAndExhaustion(unittest.TestCase):
         # an adjacent monster makes a hold unsafe and no neighbour is a legal
         # step (all unknown), with the ordinary search refused
         mem = mem_with({(10, 10): FLOOR, (10, 9): (":", "gray", 0, "none")},
-                       (10, 10), messages=["You already found a monster."])
+                       (10, 10))
         mem.no_progress = 10
+        # the site's own search observed the refusal, which its fold bound to
+        # this site (plan §4)
+        self.ref.recovery.note_refused((10, 10), "monster")
         cand = self.ref.prepare(ctx(mem)).table.scripted()
         # no legal movement and a refused search: the bounded endpoint is the
         # forced-search nomination or the graceful trapped quit
@@ -725,21 +740,35 @@ class NoTimeRecoverySearchBudget(unittest.TestCase):
         self.ref.instance_id = 1        # the reflex knows its instance
         # no refusal evidence yet: the bounded searches must be nominated
         mem = self._stuck_with_monster()
-        # the first `limit` decisions are bounded ordinary searches, each of
-        # which reconciles zero-time (the hero is held)
-        for i in range(limit):
+        # while the hero is held, each of the first `limit - 1` decisions is a
+        # bounded ordinary search that reconciles zero-time, consuming the
+        # no-time budget at this site
+        for i in range(limit - 1):
             cand = self._step(mem, tick=i)
             self.assertEqual(cand.semantic_label, "search", i)
             self.assertEqual(cand.action.to_wire(),
                              {"key": protocol.KEY_SEARCH})
             self.assertTrue(self.ref.recovery.allows_search(site), i)
             self._commit_no_time(mem, cand, tick=i)
-        # the bounded no-time budget is now spent at this site
-        self.assertEqual(self.ref.recovery.no_time_searches(site), limit)
-        self.assertFalse(self.ref.recovery.allows_search(site))
-        # a freshly observed correlated refusal unlocks the forced-search
-        # nomination (stale text must never fail a new site -- plan §4)
+        self.assertEqual(self.ref.recovery.no_time_searches(site), limit - 1)
+        self.assertTrue(self.ref.recovery.allows_search(site))
+        # the hold lifts: the site's own bounded search now executes, and its
+        # response frame carries the engine's already-found-monster refusal --
+        # a *fresh* refusal observed by this site's own search, which its
+        # reconciliation fold binds to the site (plan §4) with precedence over
+        # the time outcome, suppressing the site
+        cand = self._step(mem, tick=limit - 1)
+        self.assertEqual(cand.semantic_label, "search")
+        self.assertEqual(cand.action.to_wire(), {"key": protocol.KEY_SEARCH})
         mem.messages.append("You already found a monster.")
+        mem.message_count += 1          # the response frame commits one message
+        self.ref.commit_effect(cand.proposed_effect, cand.semantic_label,
+                               limit - 1, mem, observed_kind="advanced",
+                               payload=cand.effect_payload)
+        self.assertEqual(self.ref.recovery.refusal_kind_for(site), "monster")
+        self.assertFalse(self.ref.recovery.allows_search(site))
+        # the next decision escalates to the forced-search nomination with
+        # the site-correlated refusal kind -- never another `s`
         cand = self._step(mem, tick=limit)
         self.assertEqual(cand.semantic_label, "forced-search")
         self.assertEqual(cand.proposed_effect,

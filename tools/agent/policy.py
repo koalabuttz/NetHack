@@ -468,15 +468,29 @@ class ScriptedReflex(object):
         elif effect in ("refresh-inventory", "refresh-inventory-periodic"):
             self.last_inv_tick = tick
         elif effect in ("secret-search", "site-search") or \
-                "recovery-search" in (payload or ()):
+                "recovery-search" in (payload or ()) or \
+                "search-baseline" in (payload or ()):
             # A *completed* search consumes the ordinary per-site budget
             # (plan 5.1).  A **no-time** search advanced nothing: the hero is
             # stuck, so it is a matched gameplay attempt that must consume its
             # own bounded budget (plan §1/§2A) -- otherwise recovery would
             # nominate `s` forever and never reach the forced-search /
-            # trapped-quit escalation.
+            # trapped-quit escalation.  Refusal evidence is bound to the
+            # site whose selected search produced it: only messages *new*
+            # since the frozen prepare-time baseline may mark the site
+            # refused (plan §4) -- stale text never fails a new site.
             site = self._search_site(mem.hero)
-            if no_time:
+            baseline = None
+            pl = list(payload or ())
+            if "search-baseline" in pl:
+                baseline = pl[pl.index("search-baseline") + 1]
+            refusal = None
+            if baseline is not None:
+                refusal = recovery.refusal_in(
+                    mem.messages_since(baseline))
+            if refusal is not None:
+                self.recovery.note_refused(site, refusal)
+            elif no_time:
                 self.recovery.note_no_time_search(site)
             else:
                 if effect == "secret-search":
@@ -1361,7 +1375,8 @@ class ScriptedReflex(object):
                 # -> controller gates -> trapped graceful quit), never another
                 # unbounded zero-time search
                 return self._search_fallback(mem, hero)
-            payload = (("recovery-search",)
+            payload = (("recovery-search", "search-baseline",
+                        len(mem.messages))
                        if action.get("key") == KEY.KEY_SEARCH else ())
             return (self._cand(action, "escape", "emergency", 0, why,
                                "emergency", effect_payload=payload),)
@@ -1403,9 +1418,10 @@ class ScriptedReflex(object):
                 mem, hero, "loop breaker: bounded escape (>=6)")
         if np >= 3:
             if self._allows_search(mem, hero) and not self._cycled:
-                return (self._cand({"key": KEY.KEY_SEARCH}, "search",
-                                   "recovery", 0, "loop breaker: search",
-                                   "site-search"),)
+                return (self._cand(
+                    {"key": KEY.KEY_SEARCH}, "search", "recovery", 0,
+                    "loop breaker: search", "site-search",
+                    effect_payload=("search-baseline", len(mem.messages))),)
             # a refused or exhausted ordinary search at this site is
             # suppressed (5.1): proceed to *legal* bounded recovery, never back
             # into an unchanged failed route or another raw-grid step
@@ -1494,10 +1510,10 @@ class ScriptedReflex(object):
         if mem.searches_since_progress < 3 \
                 and self._allows_search(mem, hero) \
                 and not self._cycled:
-            return (self._cand({"key": KEY.KEY_SEARCH}, "search-secret",
-                               "secret-search", 300,
-                               "search for secret doors",
-                               "secret-search"),)
+            return (self._cand(
+                {"key": KEY.KEY_SEARCH}, "search-secret", "secret-search",
+                300, "search for secret doors", "secret-search",
+                effect_payload=("search-baseline", len(mem.messages))),)
         return self._search_fallback(mem, hero)
 
     def _route_committed(self, held, terrain, hero, plan):
@@ -2015,8 +2031,10 @@ class ScriptedReflex(object):
         # exhausted does the bounded search-fallback / forced-search / trapped
         # escalation run -- so `s` is still never an unbounded fallback.
         if self._allows_search(mem, hero):
-            return (self._cand({"key": KEY.KEY_SEARCH}, "search", "recovery",
-                               0, why, "site-search"),)
+            return (self._cand(
+                {"key": KEY.KEY_SEARCH}, "search", "recovery", 0, why,
+                "site-search",
+                effect_payload=("search-baseline", len(mem.messages))),)
         return self._search_fallback(mem, hero)
 
     def _recovery_legal_step(self, mem, hero):
@@ -2099,7 +2117,7 @@ class ScriptedReflex(object):
         st = mem.status
         kind = (self._pending_kind or "")
         commandish = kind in ("command", "key", "direction")
-        refusal = recovery.refusal_in(mem.recent_messages(6))
+        refusal = self.recovery.refusal_kind_for(self._search_site(hero))
         return forced_search.ForcedSearchContext(
             hero_confirmed=hero is not None,
             command_need_coherent=commandish,
@@ -2436,15 +2454,13 @@ class ScriptedReflex(object):
     def _allows_search(self, mem, hero) -> bool:
         """True only while a justified ordinary search is still bounded here.
 
-        Combines the persisted per-site budget with the *current* refusal
-        evidence derived purely from the recent messages (plan 5.1), so the
-        decision is a pure function of public memory and needs no fold during
-        candidate construction (plan 3.1).
+        Consumes the persisted per-site budget, which includes the
+        site-correlated refusal record written at the search's own
+        reconciliation fold (plan §4).  Generic recent-message scanning is
+        deliberately absent: a stale refusal from another site must never
+        fail a new one.
         """
-        site = self._search_site(hero)
-        if recovery.refusal_in(mem.recent_messages(6)) is not None:
-            return False
-        return self.recovery.allows_search(site)
+        return self.recovery.allows_search(self._search_site(hero))
 
     def _terrain(self, mem, context=None):
         """The classified terrain used for routing (plan 1.1, AC12).

@@ -504,43 +504,50 @@ class ForcedSearchBinding(WireHarness):
 
     def test_generic_key_need_never_binds_the_suffix(self):
         recs = [self._live(1, 1, t=100), self._live(2, 2, t=100),
-                self._live(3, 3, t=100, kind="key"),
-                self._live(4, None, t=100)]
+                self._live(3, 3, t=100),
+                self._live(4, 4, t=100, kind="key"),
+                self._live(5, None, t=100)]
         result, keys = self._keys(recs)
         self.assertIn("m", keys)               # the prefix was armed
-        self.assertNotIn("s", keys)            # ... never the suffix
+        # the only `s` is the site's own bounded search, sent *before* the
+        # prefix (its fold binds the refusal); no *suffix* search is ever sent
+        self.assertEqual(keys.count("s"), 1)
         self.assertEqual(result.forced_suffixes, 0)
         self.assertGreaterEqual(result.forced_cancels, 1)
 
     def test_generic_direction_need_never_binds_the_suffix(self):
         recs = [self._live(1, 1, t=100), self._live(2, 2, t=100),
-                self._live(3, 3, t=100, kind="direction"),
-                self._live(4, None, t=100)]
+                self._live(3, 3, t=100),
+                self._live(4, 4, t=100, kind="direction"),
+                self._live(5, None, t=100)]
         result, keys = self._keys(recs)
         self.assertIn("m", keys)
-        self.assertNotIn("s", keys)
+        self.assertEqual(keys.count("s"), 1)   # the ordinary bounded search
         self.assertEqual(result.forced_suffixes, 0)
 
     def test_time_advance_after_prefix_refuses_the_binding(self):
         recs = [self._live(1, 1, t=100), self._live(2, 2, t=100),
-                self._live(3, 3, t=101), self._live(4, None, t=101)]
+                self._live(3, 3, t=100),
+                self._live(4, 4, t=101), self._live(5, None, t=101)]
         result, keys = self._keys(recs)
         self.assertIn("m", keys)
-        self.assertNotIn("s", keys)
+        self.assertEqual(keys.count("s"), 1)   # the ordinary bounded search
         self.assertEqual(result.forced_suffixes, 0)
 
     def test_hp_change_after_prefix_refuses_the_binding(self):
         recs = [self._live(1, 1, t=100), self._live(2, 2, t=100),
-                self._live(3, 3, hp=4, t=100), self._live(4, None, t=100)]
+                self._live(3, 3, t=100),
+                self._live(4, 4, hp=4, t=100), self._live(5, None, t=100)]
         result, keys = self._keys(recs)
-        self.assertNotIn("s", keys)
+        self.assertEqual(keys.count("s"), 1)   # the ordinary bounded search
         self.assertEqual(result.forced_suffixes, 0)
 
     def test_command_need_still_binds_and_succeeds(self):
         recs = [self._live(1, 1, t=100), self._live(2, 2, t=100),
-                self._live(3, 3, t=100), self._live(4, None, t=101)]
+                self._live(3, 3, t=100), self._live(4, 4, t=100),
+                self._live(5, None, t=101)]
         result, keys = self._keys(recs)
-        self.assertEqual(keys.count("s"), 1)
+        self.assertEqual(keys.count("s"), 2)   # the bounded search + the suffix
         self.assertEqual(result.forced_suffixes, 1)
         self.assertEqual(result.forced_successes, 1)
 
@@ -548,12 +555,13 @@ class ForcedSearchBinding(WireHarness):
         # the prompt cannot carry the native double-m: nothing prefixed is
         # sent, and no later command leaks through the prefix either
         recs = [self._live(1, 1, t=100), self._live(2, 2, t=100),
-                self._live(3, 3, t=100, kind="yn"),
-                self._live(4, 4, t=100), self._live(5, None, t=100)]
+                self._live(3, 3, t=100),
+                self._live(4, 4, t=100, kind="yn"),
+                self._live(5, 5, t=100), self._live(6, None, t=100)]
         result, keys = self._keys(recs)
         self.assertIn("m", keys)
         self.assertNotIn("yn", keys)
-        self.assertNotIn("s", keys)
+        self.assertEqual(keys.count("s"), 1)   # the ordinary bounded search
         self.assertEqual(result.forced_suffixes, 0)
         self.assertGreaterEqual(result.forced_uncleared, 1)
 

@@ -166,7 +166,9 @@ class SearchBudget(object):
         self.no_time_limit = int(no_time_limit)
         self.completed: Dict[object, int] = {}
         self.no_time: Dict[object, int] = {}
-        self.refused: Set[object] = set()
+        #: site -> the recognised refusal kind observed by that site's own
+        #: search (plan §4 site-correlated binding)
+        self.refused: Dict[object, str] = {}
 
     def note_completed(self, site) -> None:
         self.completed[site] = self.completed.get(site, 0) + 1
@@ -175,8 +177,13 @@ class SearchBudget(object):
         """Record one *zero-time* recovery search attempt at *site*."""
         self.no_time[site] = self.no_time.get(site, 0) + 1
 
-    def note_refused(self, site) -> None:
-        self.refused.add(site)
+    def note_refused(self, site, kind: str) -> None:
+        """Record a refusal newly observed by this site's own search."""
+        self.refused[site] = kind
+
+    def refusal_kind_for(self, site):
+        """The recognised refusal kind recorded for *site*, or ``None``."""
+        return self.refused.get(site)
 
     def no_time_count(self, site) -> int:
         return self.no_time.get(site, 0)
@@ -194,7 +201,7 @@ class SearchBudget(object):
         """A relevant site change reopens the budget (4.3)."""
         self.completed.pop(site, None)
         self.no_time.pop(site, None)
-        self.refused.discard(site)
+        self.refused.pop(site, None)
 
     def reset(self) -> None:
         self.completed.clear()
@@ -295,10 +302,12 @@ class RecoveryState(object):
 
     def observe(self, messages: Sequence[str], pos: Optional[Tuple[int, int]],
                 site) -> None:
-        """Fold public messages and the confirmed position into the state."""
-        if refusal_in(messages) is not None:
-            self.refused_site = site
-            self.search.note_refused(site)
+        """Fold the confirmed position into the state.
+
+        Refusal attribution deliberately does NOT happen here: a refusal may
+        only be recorded by the reconciliation fold of the search whose own
+        newly observed messages contain it (plan §4 site-correlated binding).
+        """
 
     def allows_search(self, site) -> bool:
         return self.search.allows(site)
@@ -309,6 +318,14 @@ class RecoveryState(object):
     def note_no_time_search(self, site) -> None:
         """Record one zero-time recovery search attempt at *site* (plan §2A)."""
         self.search.note_no_time(site)
+
+    def note_refused(self, site, kind: str) -> None:
+        """Record a site-correlated search refusal (plan §4)."""
+        self.search.note_refused(site, kind)
+
+    def refusal_kind_for(self, site):
+        """The recognised refusal kind recorded for *site*, or ``None``."""
+        return self.search.refusal_kind_for(site)
 
     def no_time_searches(self, site) -> int:
         """How many zero-time recovery searches this site has spent."""

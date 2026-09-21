@@ -453,15 +453,17 @@ class LiveWiring(WireHarness):
         # transaction origin, so the following command need is at t=100 and
         # the suffix's outcome frame advances to t=101.
         recs = [_live_obs(1, 1, t=100), _live_obs(2, 2, t=100),
-                _live_obs(3, 3, t=100), _live_obs(4, None, t=101)]
+                _live_obs(3, 3, t=100), _live_obs(4, 4, t=100),
+                _live_obs(5, None, t=101)]
         result, keys = self._run(recs)
         self.assertIn("m", keys)
         self.assertIn("s", keys)
         self.assertEqual(result.forced_activations, 1)
         self.assertEqual(result.forced_suffixes, 1)
         self.assertEqual(result.forced_successes, 1)
-        # the suffix is the single s bound to the immediately following need
-        self.assertEqual(keys.count("s"), 1)
+        # the two `s` keys are the site's own bounded search and the single
+        # suffix s bound to the immediately following need
+        self.assertEqual(keys.count("s"), 2)
 
     def test_activation_cap_persists_and_denies_the_fourth(self):
         # enough identical trapped command needs to attempt four activations
@@ -479,7 +481,8 @@ class LiveWiring(WireHarness):
         # HP strictly above 50% is required; equality must fail locally, so
         # the reflex never even nominates and the fallback is the trapped quit
         recs = [_live_obs(1, 1, hp=5, hp_max=10, t=100),
-                _live_obs(2, 2, hp=5, hp_max=10, t=100)]
+                _live_obs(2, 2, hp=5, hp_max=10, t=100),
+                _live_obs(3, 3, hp=5, hp_max=10, t=100)]
         result, keys = self._run(recs)
         self.assertNotIn("m", keys)
         self.assertIn("#", keys)
@@ -498,10 +501,12 @@ class LiveWiring(WireHarness):
         # the suffix cannot bind, so the controller cancels with double-m and
         # never sends the prefixed search
         recs = [_live_obs(1, 1, t=100), _live_obs(2, 2, t=100),
-                _live_obs(3, 3, hp=5, hp_max=10, t=100)]
+                _live_obs(3, 3, t=100),
+                _live_obs(4, 4, hp=5, hp_max=10, t=100)]
         result, keys = self._run(recs)
         self.assertIn("m", keys)
-        self.assertNotIn("s", keys)
+        # the only `s` is the site's own bounded search, sent before the prefix
+        self.assertEqual(keys.count("s"), 1)
         self.assertEqual(result.forced_suffixes, 0)
         self.assertGreaterEqual(result.forced_cancels, 1)
         # the cancellation is the native double-m (two m keys, no time)
@@ -513,13 +518,14 @@ class LiveWiring(WireHarness):
         # cleared: the transport is terminated and *nothing* is sent through
         # the prefix -- no prompt answer, no later command, no suffix.
         recs = [_live_obs(1, 1, t=100), _live_obs(2, 2, t=100),
-                _live_obs(3, 3, kind="yn", t=100),
-                _live_obs(4, 4, t=100), _live_obs(5, None, t=100)]
+                _live_obs(3, 3, t=100),
+                _live_obs(4, 4, kind="yn", t=100),
+                _live_obs(5, 5, t=100), _live_obs(6, None, t=100)]
         result, keys = self._run(recs)
         self.assertIn("m", keys)
         # the prompt is never answered while the prefix is armed
         self.assertNotIn("yn", keys)
-        self.assertNotIn("s", keys)
+        self.assertEqual(keys.count("s"), 1)   # the ordinary bounded search
         self.assertEqual(result.forced_suffixes, 0)
         self.assertGreaterEqual(result.forced_uncleared, 1)
         self.assertEqual(result.stop_reason, "transport-failure-write")
@@ -539,10 +545,13 @@ class LiveWiring(WireHarness):
         # max_ticks reached after the prefix: the transaction is cancelled
         # first, and no prefixed quit is ever sent
         recs = [_live_obs(1, 1, t=100), _live_obs(2, 2, t=100),
-                _live_obs(3, 3, t=100)]
-        result, keys = self._run(recs, max_ticks=2)
+                _live_obs(3, 3, t=100), _live_obs(4, 4, t=100)]
+        result, keys = self._run(recs, max_ticks=3)
         self.assertIn("m", keys)
-        self.assertNotIn("s", keys)
+        # the only `s` is the ordinary bounded search; the tick cap cancels the
+        # armed prefix and no prefixed quit is ever sent
+        self.assertEqual(keys.count("s"), 1)
+        self.assertEqual(result.forced_suffixes, 0)
         self.assertNotIn("#", keys)
 
 
