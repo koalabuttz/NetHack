@@ -625,8 +625,6 @@ class StopAndAbort(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         spec = _valid_spec(tier="live", episodes=5)
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
-        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         runner = B.BenchRunner(spec, tmp)
         calls = {"n": 0}
 
@@ -710,8 +708,6 @@ class StopAndAbort(unittest.TestCase):
         self.addCleanup(sentinel.kill)
 
         spec = _valid_spec(tier="live", episodes=1)
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
-        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         runner = B.BenchRunner(
             spec, tmp, grace=0.5,
             episode_command_factory=lambda *a: [sys.executable, root_py])
@@ -751,8 +747,6 @@ class StopAndAbort(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp, True)
         root_py, _pidfile = self._nested_tree_scripts(tmp)
         spec = _valid_spec(tier="live", episodes=1)
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
-        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         runner = B.BenchRunner(
             spec, tmp, grace=0.3,
             episode_command_factory=lambda *a: [sys.executable, root_py])
@@ -841,8 +835,6 @@ class PrecommitAndSchedule(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         spec = _valid_spec(tier="live", episodes=4)
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
-        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         runner = B.BenchRunner(spec, tmp)
         calls = {"n": 0}
 
@@ -1155,35 +1147,37 @@ class PostmortemPackage(unittest.TestCase):
 
 
 # ==========================================================================
-# AC10 - live testing gated on the vapor-cloud attestation
+# AC10 - live tiers run without the (waived) vapor-cloud attestation gate
 # ==========================================================================
 
-class LiveGate(unittest.TestCase):
-    def test_live_testing_gated_on_vapor_cloud_attestation(self):
-        os.environ.pop(B.VAPOR_CLOUD_ENV, None)
+class LiveTierPreflight(unittest.TestCase):
+    def test_live_spec_preflights_without_attestation(self):
+        # The operator waived the env-variable attestation gate: the vapor-cloud
+        # fix landed, is review-approved, and is covered by the deterministic
+        # suite, so a live spec must now validate with NO attestation env var
+        # set and no attestation helper in the module.
+        os.environ.pop("BENCH_VAPOR_CLOUD_ATTESTED", None)
+        self.assertFalse(hasattr(B, "vapor_cloud_attestation"))
+        self.assertFalse(hasattr(B, "VAPOR_CLOUD_ENV"))
+        self.assertFalse(hasattr(B, "VAPOR_CLOUD_TOKEN"))
         spec = _valid_spec(tier="live")
         report = B.preflight(spec)
-        self.assertFalse(report["ok"])
-        self.assertEqual(report["stage"], "live-gate")
-        self.assertIn("pending-operator", report["error"])
-        # a NON-EMPTY but wrong value is still not an attestation
-        for bogus in ("attested-in-test", "yes", "true", "landed"):
-            os.environ[B.VAPOR_CLOUD_ENV] = bogus
-            try:
-                self.assertFalse(B.vapor_cloud_attestation()["attested"], bogus)
-                self.assertFalse(B.preflight(spec)["ok"], bogus)
-            finally:
-                os.environ.pop(B.VAPOR_CLOUD_ENV, None)
-        # only the exact documented token is accepted
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
-        try:
-            report = B.preflight(spec)
-        finally:
-            os.environ.pop(B.VAPOR_CLOUD_ENV, None)
-        self.assertTrue(report["ok"])
-        self.assertEqual(B.vapor_cloud_attestation({})["attested"], False)
-        self.assertFalse(B.vapor_cloud_attestation(
-            {B.VAPOR_CLOUD_ENV: "anything"})["attested"])
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["stage"], "done")
+        self.assertEqual(report["postmortem_reserve"], 0)
+        # the rest of live-tier preflight is still enforced: an over-budget
+        # live spec still fails at the budget stage ...
+        over = _valid_spec(tier="live")
+        over["budget"]["max_total_episodes"] = 0
+        rep_budget = B.preflight(over)
+        self.assertFalse(rep_budget["ok"])
+        self.assertEqual(rep_budget["stage"], "budget")
+        # ... and a structurally invalid live spec still fails up front.
+        bad = _valid_spec(tier="live")
+        bad["profile"] = "nonsense"
+        rep_spec = B.preflight(bad)
+        self.assertFalse(rep_spec["ok"])
+        self.assertEqual(rep_spec["stage"], "spec")
 
 
 # ==========================================================================
@@ -1319,8 +1313,6 @@ class WorkflowWiring(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         spec, spec_path = self._spec(tmp)
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
-        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         os.environ[B.BENCH_WORKER_ENV] = sys.executable
         self.addCleanup(os.environ.pop, B.BENCH_WORKER_ENV, None)
 
@@ -1596,8 +1588,6 @@ class PrecommitScheduleRunner(unittest.TestCase):
         # a genuinely distinct baseline config makes this an A/B experiment
         spec["baseline_config_ref"] = {"reflex": "scripted", "strategy": "off",
                                        "strategy_call_cap": 4}
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
-        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         seen = []
@@ -1638,8 +1628,6 @@ class PrecommitScheduleRunner(unittest.TestCase):
     def test_candidate_only_run_does_not_fabricate_baseline_labels(self):
         spec = _valid_spec(tier="live", episodes=4)
         spec["comparison"]["resampling_seed"] = 3
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
-        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
 
@@ -1659,8 +1647,6 @@ class PrecommitScheduleRunner(unittest.TestCase):
         self.assertFalse(out["comparison"]["same_run_experiment"])
 
     def test_unresolvable_baseline_config_is_refused_at_preflight(self):
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
-        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         spec = _valid_spec(tier="live", episodes=2)
         spec["baseline_config_ref"] = "/nope/missing-baseline.json"
         report = B.preflight(spec)
@@ -1674,8 +1660,6 @@ class PrecommitScheduleRunner(unittest.TestCase):
         self.assertTrue(report["baseline_config_hash"])
 
     def test_equal_baseline_and_candidate_fingerprints_are_refused(self):
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
-        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         spec = _valid_spec(tier="live", episodes=2)
         # an identical config under a different reference is NOT a distinct arm
         spec["baseline_config_ref"] = {"reflex": "scripted", "strategy": "off"}
@@ -1692,8 +1676,6 @@ class PrecommitScheduleRunner(unittest.TestCase):
         spec["comparison"]["resampling_seed"] = 3
         spec["baseline_config_ref"] = {"reflex": "scripted", "strategy": "off",
                                        "strategy_call_cap": 4}
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
-        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
 
@@ -1899,8 +1881,6 @@ class MultiEpisodeChildWorkflow(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         launcher = self._fake_launcher(tmp)
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
-        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         os.environ["BENCH_RUNNER"] = launcher
         os.environ["BENCH_WORKER"] = launcher
         os.environ["BENCH_DATA"] = tmp
@@ -1991,8 +1971,6 @@ class ScorecardEnvelope(unittest.TestCase):
     """Finding #8: the runner never mutates the immutable /2 scorecard."""
 
     def test_full_runner_scorecards_validate_and_hashes_recompute(self):
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
-        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         spec = _valid_spec(tier="live", episodes=4)
@@ -2085,10 +2063,9 @@ class JudgeTransportWiring(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         worker, log = self._fake_worker(tmp)
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
         os.environ[B.BENCH_WORKER_ENV] = worker
         os.environ["FAKE_WORKER_LOG"] = log
-        for key in (B.VAPOR_CLOUD_ENV, B.BENCH_WORKER_ENV, "FAKE_WORKER_LOG"):
+        for key in (B.BENCH_WORKER_ENV, "FAKE_WORKER_LOG"):
             self.addCleanup(os.environ.pop, key, None)
         spec = self._spec(tmp)
         runner = B.BenchRunner(spec, tmp)   # NO judge_factory
@@ -2121,8 +2098,6 @@ class JudgeTransportWiring(unittest.TestCase):
     def test_missing_worker_or_key_fails_before_episodes_launch(self):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
-        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         spec = self._spec(tmp)
         # no BENCH_WORKER at all
         os.environ.pop(B.BENCH_WORKER_ENV, None)
@@ -2354,8 +2329,6 @@ class LiteralZeroAndTuningBudget(unittest.TestCase):
         return runner, launched
 
     def test_zero_max_episodes_is_literally_zero(self):
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
-        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         spec = _valid_spec(episodes=2, tier="live")
         spec["budget"]["max_total_episodes"] = 0
         report = B.preflight(spec)
@@ -2545,11 +2518,10 @@ class ArmConfigChildAB(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         launcher = self._fake_launcher(tmp)
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
         os.environ["BENCH_RUNNER"] = launcher
         os.environ["BENCH_WORKER"] = launcher
         os.environ["BENCH_DATA"] = tmp
-        for key in (B.VAPOR_CLOUD_ENV, "BENCH_RUNNER", "BENCH_WORKER",
+        for key in ("BENCH_RUNNER", "BENCH_WORKER",
                     "BENCH_DATA"):
             self.addCleanup(os.environ.pop, key, None)
         spec, baseline = self._ab_spec(tmp)
@@ -2587,8 +2559,6 @@ class ArmConfigChildAB(unittest.TestCase):
     def test_swapped_child_config_makes_the_run_not_comparable(self):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
-        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         spec, _baseline = self._ab_spec(tmp)
         runner = B.BenchRunner(spec, tmp)
 
@@ -2618,8 +2588,6 @@ class HandshakeFailClosed(unittest.TestCase):
         return spec
 
     def test_root_capture_failure_is_fatal_and_writes_no_ready_token(self):
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
-        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         spec = self._live_spec(tmp)
@@ -2639,8 +2607,6 @@ class HandshakeFailClosed(unittest.TestCase):
         self.assertTrue(runner.manifest.data["fatal_episodes"])
 
     def test_ready_token_write_failure_is_fatal(self):
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
-        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         spec = self._live_spec(tmp)
@@ -2668,8 +2634,6 @@ class HandshakeFailClosed(unittest.TestCase):
         self.assertTrue(runner.manifest.data["teardown_failure"])
 
     def test_after_loop_never_relabels_teardown_failure_as_complete(self):
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
-        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         spec = self._live_spec(tmp)
@@ -2895,8 +2859,6 @@ class ArmAwareStrategyBudget(unittest.TestCase):
     def test_candidate_off_baseline_deepseek_demand_is_arm_aware(self):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
-        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         spec = self._ab_spec(tmp,
                              {"reflex": "scripted", "strategy": "deepseek",
                               "strategy_call_cap": 8},
@@ -2975,11 +2937,10 @@ class ArmAwareStrategyBudget(unittest.TestCase):
         with open(launcher, "w") as fh:
             fh.write("#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
         os.chmod(launcher, 0o755)
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
         os.environ["BENCH_RUNNER"] = launcher
         os.environ["BENCH_WORKER"] = launcher
         os.environ["BENCH_DATA"] = tmp
-        for key in (B.VAPOR_CLOUD_ENV, "BENCH_RUNNER", "BENCH_WORKER",
+        for key in ("BENCH_RUNNER", "BENCH_WORKER",
                     "BENCH_DATA"):
             self.addCleanup(os.environ.pop, key, None)
         spec = self._ab_spec(tmp,
@@ -3049,8 +3010,6 @@ class CandidateOnlyStrategyBudget(unittest.TestCase):
                              {"baseline": 34, "candidate": 34})
 
     def test_candidate_only_demand_boundary_fails_before_spawn(self):
-        os.environ[B.VAPOR_CLOUD_ENV] = B.VAPOR_CLOUD_TOKEN
-        self.addCleanup(os.environ.pop, B.VAPOR_CLOUD_ENV, None)
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         spec = self._spec(5)

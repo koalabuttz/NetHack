@@ -95,6 +95,11 @@ supplied**; `live_claims.measured` is `false` and the attestation is recorded
 as **pending-operator**. No live campaign is run in this implementation; the
 gate is enforced by `test_live_testing_gated_on_vapor_cloud_attestation`.
 
+*(2026-09-21: the operator waived this gate after the prerequisite landed and
+was review-approved — see the annotation under AC10. Live tiers now run with no
+attestation env var; the gating test is replaced by
+`test_live_spec_preflights_without_attestation`.)*
+
 ## Goal
 
 Build an artifact-first campaign bench around the existing agent tooling: run bounded campaigns, derive reproducible scorecards, compare behavior, request a cheap per-episode Jev second opinion, package regressions for coding-agent analysis, and suggest or narrowly apply approved parameter changes.
@@ -335,6 +340,8 @@ AC8. Search is finite, repeatable over frozen input reports, obeys episode/wall/
 AC9. Apply changes only authorized keys/ranges against the approved config hash; every apply has exact diff, evidence and rollback pointer. Default remains report-only.
 AC10. Live testing does not begin before the vapor-cloud prerequisite lands; its status is supplied by the caller, and the gate is enforced by an executable preflight test (`test_live_testing_gated_on_vapor_cloud_attestation`), not by convention.
 
+> **2026-09-21 — operator waived the attestation gate (AC10 annotation; the history above is retained, not deleted).** The vapor-cloud prerequisite **landed**: the fix is implemented, review-approved, and covered by the deterministic suite. The operator therefore waived the env-variable attestation (`BENCH_VAPOR_CLOUD_ATTESTED=vapor-cloud-fix-landed-and-tested`). The gate, the `vapor_cloud_attestation()` helper and the exact token were removed from live-tier preflight; live bench specs now **validate and run with no attestation env var**. The gating test is replaced by **`test_live_spec_preflights_without_attestation`** (a live spec passes preflight with no attestation set, and budget/tier validation is still enforced). All other live-tier preflight behavior (budget checks, tier-coverage detection, judge transport preflight, `postmortem_reserve=0`) is unchanged. No live campaign is run by this change; `mutation_checks.py` still records `live_claims.measured: false`.
+
 AC11. The termination-safety admission contract (§2) is predeclared, deterministic and blocks any apply: episodes are classified by the **terminal-classification table over the complete exact administrative `stop_reason` vocabulary** — `policy-exhausted` → adverse-early; `tick-cap-graceful-quit` → horizon-completion; `content-deadline`/`episode-timeout` → horizon/completion or adverse-early per the predeclared `deadline_classification`; `protocol-failure`/`transport-failure-write`/`transport-failure-eof`/`spawn-failure`/`recorder-failure`/`closed-unanswered` → operational/integrity failure; the bench-owned `bench-stopped-graceful`/`bench-aborted` → excluded-from-comparison; any unrecognized future `stop_reason` → operational/integrity failure or adverse/unknown, **never benign** — and, only for a generic `stop_reason="closed"`, the visible-text `outcome` (`death`/`starvation` → adverse-early observed; `ascension` → explicit category; else adverse/unknown). A candidate that raises the adverse/unknown rate beyond the approved noninferiority margin fails; an arm below any predeclared active exposure minimum yields **inconclusive** (not not-comparable); neither passes on coverage gain.
 
 AC12. A postmortem package is bounded, checksummed and untrusted-transcript-safe: it contains a manifest, bounded excerpts with line/event/tick ranges and omitted counts, checksums, and task text that is explicitly not instructions.
@@ -388,7 +395,7 @@ Named tests (proposed, implementer executes):
 - `test_attempts_source_fallback_one_arm_not_comparable`
 - `test_postmortem_package_is_bounded_and_checksummed`
 - `test_postmortem_task_text_is_not_instructions`
-- `test_live_testing_gated_on_vapor_cloud_attestation`
+- `test_live_spec_preflights_without_attestation` (2026-09-21: replaces `test_live_testing_gated_on_vapor_cloud_attestation` after the operator waived the attestation gate; history retained)
 - `test_death_rate_regression_blocks_admission`: production-shaped pairs — a candidate whose episodes terminate as `stop_reason="closed", outcome="death"` is rejected on the adverse-rate noninferiority limit even when coverage rises.
 - `test_policy_exhausted_regression_blocks_admission`: production-shaped — a candidate carrying more early-adverse terminations via the real `stop_reason="policy-exhausted"` (not a `stop_reason="death"`, which the controller never emits) is rejected.
 - `test_unknown_outcome_handled_by_precedence_table`: **one production-shaped `(stop_reason, outcome)` case per enumerated row** — `("policy-exhausted", *)` → adverse-early; `("tick-cap-graceful-quit", *)` → horizon-completion; `("content-deadline", *)`/`("episode-timeout", *)` → horizon/completion or adverse-early per `deadline_classification`; `("protocol-failure", *)`, `("transport-failure-write", *)`, `("transport-failure-eof", *)`, `("spawn-failure", *)`, `("recorder-failure", *)`, `("closed-unanswered", *)` → operational/integrity failure; `("bench-stopped-graceful", *)`/`("bench-aborted", *)` → excluded-from-comparison; `("closed", "death")`/`("closed", "starvation")` → adverse-early; `("closed", "ascension")` → explicit `ascension`; `("closed", "<unrecognized>")` → adverse/unknown; and an unenumerated `stop_reason` → operational/integrity failure or adverse/unknown (never benign).
@@ -414,7 +421,7 @@ Each acceptance criterion's named tests; a mutation that regresses an AC must fa
 | AC7 | `test_stop_after_episode_prevents_next_episode_and_judge`, `test_forced_abort_reaps_nested_launcher_and_provider_groups`, `test_forced_abort_permission_or_identity_failure_sets_teardown_failure`, `test_partial_run_never_promoted_to_baseline`, `test_unknown_exposure_survives_timeout_and_resume` |
 | AC8 | `test_comparison_fixed_resampling_and_inconclusive_small_sample`, `test_tuner_finite_grid_and_reserved_confirmation_budget`, `test_no_early_stop_and_no_post_result_extension`, `test_counterbalanced_pair_order_is_deterministic` |
 | AC9 | `test_apply_requires_approval_range_hash_and_fresh_confirmation`, `test_confidence_factor_frozen_without_specific_policy_approval`, `test_overlay_apply_rollback_preserves_secret_config` |
-| AC10 | `test_live_testing_gated_on_vapor_cloud_attestation` |
+| AC10 | `test_live_spec_preflights_without_attestation` (2026-09-21: replaces the waived-gate test `test_live_testing_gated_on_vapor_cloud_attestation`) |
 | AC11 | `test_termination_safety_admission_blocks_reckless_candidates` (the named regression in which a candidate enters more cells but dies / exhausts policy more often and must fail or be inconclusive), `test_death_rate_regression_blocks_admission`, `test_policy_exhausted_regression_blocks_admission`, `test_unknown_outcome_handled_by_precedence_table`, `test_insufficient_common_exposure_is_inconclusive_not_not_comparable` |
 | AC12 | `test_postmortem_package_is_bounded_and_checksummed`, `test_postmortem_task_text_is_not_instructions` |
 

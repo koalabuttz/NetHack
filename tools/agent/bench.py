@@ -575,12 +575,6 @@ def preflight(spec: dict) -> Dict[str, Any]:
     problem = validate_spec(spec)
     if problem:
         return {"ok": False, "stage": "spec", "error": problem}
-    if spec["tier"] == LIVE:
-        attest = vapor_cloud_attestation()
-        if not attest["attested"]:
-            return {"ok": False, "stage": "live-gate",
-                    "error": ("live bench testing requires the vapor-cloud "
-                              "attestation: %s" % attest["reason"])}
     config, err = resolve_provider_config(spec)
     if err:
         return {"ok": False, "stage": "provider_config", "error": err}
@@ -694,31 +688,6 @@ def budget_preflight(spec: dict, config,
                 % (demand, counts, counts.get("baseline", 0),
                    counts.get("candidate", 0), budget["strategy_calls_total"]))
     return None
-
-
-#: The caller-supplied attestation that the vapor-cloud fix is landed.  The
-#: bench never invents it; without it no live tier passes preflight (AC10).
-VAPOR_CLOUD_ENV = "BENCH_VAPOR_CLOUD_ATTESTED"
-#: The **exact** affirmative token the operator must supply.  A non-empty
-#: string is not enough: an attestation is a structured, unambiguous claim, so
-#: only the documented value is accepted.
-VAPOR_CLOUD_TOKEN = "vapor-cloud-fix-landed-and-tested"
-
-
-def vapor_cloud_attestation(source: Optional[dict] = None) -> Dict[str, Any]:
-    """Whether the operator has supplied the *exact* vapor-cloud attestation.
-
-    The attestation must equal :data:`VAPOR_CLOUD_TOKEN`; any other value
-    (including a generic ``"yes"`` or an empty string) is **not** attested.
-    """
-    source = os.environ if source is None else source
-    value = (source.get(VAPOR_CLOUD_ENV) or "").strip()
-    if value != VAPOR_CLOUD_TOKEN:
-        return {"attested": False,
-                "reason": ("pending-operator: set %s=%s"
-                           % (VAPOR_CLOUD_ENV, VAPOR_CLOUD_TOKEN))}
-    return {"attested": True, "token": value,
-            "reason": "operator-attested"}
 
 
 #: The env var naming the built worker executable the judge transport spawns.
@@ -1858,8 +1827,17 @@ class BenchRunner(object):
                                  network_calls=0,
                                  judge_behavior="not-evaluated "
                                  "(dry-run makes no Jev calls)")
+        envelope = {
+            "schema_version": "bench-scorecards/1",
+            "candidate": cards,
+            "arms": {},
+            "schedule": None,
+            "committed_schedule": None,
+            "precommit": precommit_record(self.spec["comparison"]),
+        }
+        path = self._write_run_artifact("scorecards.json", envelope)
         return {"tier": DRY_RUN, "scorecards": cards, "network_calls": 0,
-                "judge_behavior": "not-evaluated"}
+                "judge_behavior": "not-evaluated", "scorecards_path": path}
 
     # -- live tier ---------------------------------------------------------
     def run_live(self) -> Dict[str, Any]:
@@ -2871,7 +2849,8 @@ def _cmd_score(args) -> int:
     spec = load_spec(args.spec)
     runner = BenchRunner(spec, args.out_dir or ".")
     result = runner.run_dry()
-    print(json.dumps({"scorecards": len(result["scorecards"])}, indent=2))
+    print(json.dumps({"scorecards": len(result["scorecards"]),
+                      "path": result.get("scorecards_path")}, indent=2))
     return 0
 
 

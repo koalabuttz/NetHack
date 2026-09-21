@@ -42,10 +42,11 @@ directory and **write their artifacts** (they never return a stub failure):
 
 `run --tier dry-run` performs **offline evaluation only**: it makes no provider
 call and reports `judge_behavior: "not-evaluated"`. Enabling the paid judge is
-allowed only for an explicit live tier, and a live tier additionally requires
-the caller's vapor-cloud attestation (see **AC10** below) — the value
-`BENCH_VAPOR_CLOUD_ATTESTED` must equal the exact token
-`vapor-cloud-fix-landed-and-tested` (any other non-empty value is refused).
+allowed only for an explicit live tier. Live tiers need **no environment
+gate**: the vapor-cloud prerequisite this project once gated on has landed (the
+fix is implemented, review-approved, and covered by the deterministic suite),
+so the operator waived the env-variable attestation and live specs validate and
+run without it (see **AC10** below).
 
 ### Episodes and artifacts
 
@@ -514,16 +515,19 @@ baseline.
 | AC7 | Stops admit no further work, reap all children, preserve partial artifacts, never label interruption successful; the forced path signals only the owned tree and a permission/identity failure fails the criterion |
 | AC8 | Search is finite, repeatable, obeys episode/wall/candidate budgets, and requires fresh confirmation before apply |
 | AC9 | Apply changes only authorized keys/ranges against the approved config hash, with exact diff, evidence and rollback pointer; default is report-only |
-| AC10 | Live testing does not begin before the vapor-cloud prerequisite lands, enforced by an executable preflight test |
+| AC10 | Live tiers run without an environment gate: the vapor-cloud prerequisite landed (fix implemented, review-approved, covered by the deterministic suite) and the operator waived the attestation |
 | AC11 | The termination-safety admission contract is predeclared, deterministic, and blocks any apply |
 | AC12 | A postmortem package is bounded, checksummed and untrusted-transcript-safe |
 
-**AC10 status: pending-operator.** The caller must attest that the vapor-cloud
-fix is landed before any live bench testing: set `BENCH_VAPOR_CLOUD_ATTESTED` to
-the **exact documented token** `vapor-cloud-fix-landed-and-tested` (any other
-non-empty value — `yes`, `true`, a label — is refused by preflight).
-`mutation_checks.py` records `live_claims.measured: false`; no live campaign was
-run in this implementation.
+**AC10 status: waived.** The vapor-cloud prerequisite landed — the fix is
+implemented, review-approved, and covered by the deterministic suite — so the
+operator **waived the env-variable attestation gate**. Live bench specs now
+validate and run with no `BENCH_VAPOR_CLOUD_ATTESTED` (or any other) attestation
+variable; the gate, its helper and its exact token were removed.
+`test_live_spec_preflights_without_attestation` asserts a live spec passes
+preflight with no attestation set (and that budget/tier validation is still
+enforced). No live campaign is run by the deterministic gate itself;
+`mutation_checks.py` records `live_claims.measured: false`.
 
 ## Per-change workflow
 
