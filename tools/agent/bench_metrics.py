@@ -670,13 +670,25 @@ def _usage_block(meta: dict, budget: dict, avail: Dict[str, str]) \
     return out
 
 
-def tier_coverage(meta: dict, requested: Optional[dict] = None) -> Dict[str, Any]:
+def tier_coverage(meta: dict, requested: Optional[dict] = None,
+                  budget: Optional[dict] = None) -> Dict[str, Any]:
     """Observed provider tiers for one episode, vs the requested tiers.
 
     A requested paid tier that produced **no** dispatched call (a fallback-only
     run) is reported as its actual, cheaper tier -- never as the requested one.
+
+    Observed Jev coverage is taken from the **actual paid-dispatch evidence**
+    first: the per-episode ledger's ``reflex.paid_dispatched`` (paid
+    consultations *reserved*) and ``reflex.applied`` (complete sends).  The
+    per-provider ``providers`` usage block is a secondary source, because a
+    dispatched consultation whose usage was never reported (a timeout, or a
+    provider-majority fallback) leaves no ``providers`` entry while still being
+    a genuine paid call.
     """
-    budget = meta.get("budget") if isinstance(meta.get("budget"), dict) else {}
+    budget = budget if isinstance(budget, dict) else None
+    if budget is None:
+        budget = meta.get("budget") if isinstance(meta.get("budget"), dict) \
+            else {}
     providers = budget.get("providers") if isinstance(budget, dict) else None
     providers = providers or {}
     reflex_calls = 0
@@ -687,9 +699,23 @@ def tier_coverage(meta: dict, requested: Optional[dict] = None) -> Dict[str, Any
             reflex_calls += calls
         if "deepseek" in name:
             strategy_calls_reported += calls
+
+    def _count(value) -> int:
+        return int(value) if isinstance(value, int) and not isinstance(
+            value, bool) else 0
+
+    reflex_ledger = budget.get("reflex") if isinstance(budget, dict) else None
+    reflex_ledger = reflex_ledger if isinstance(reflex_ledger, dict) else {}
+    paid_dispatched = _count(reflex_ledger.get("paid_dispatched"))
+    applied = _count(reflex_ledger.get("applied"))
+    paid_evidence = max(paid_dispatched, applied)
+
     config = meta.get("config") if isinstance(meta.get("config"), dict) else {}
     observed = {
-        "reflex": "jev" if reflex_calls > 0 else "scripted",
+        # a Jev profile is "observed live" when the ledger proves a paid
+        # dispatch happened, even if no usage row was reported for it.
+        "reflex": "jev" if (reflex_calls > 0 or paid_evidence > 0)
+        else "scripted",
         "strategy": "deepseek" if strategy_calls_reported > 0
         else (config.get("strategy") or "off"),
     }
@@ -697,6 +723,8 @@ def tier_coverage(meta: dict, requested: Optional[dict] = None) -> Dict[str, Any
                         "strategy": config.get("strategy")}
     return {"requested": req, "observed": observed,
             "reflex_paid_calls": reflex_calls,
+            "reflex_paid_dispatched": paid_dispatched,
+            "reflex_applied": applied,
             "strategy_reported_calls": strategy_calls_reported}
 
 
@@ -740,7 +768,7 @@ def build_scorecard(*, episode_id: str, provenance_id: Optional[str],
         recording_complete=meta.get("recording_complete"),
         wire_path=wire_path, events_path=events_path, actions_path=actions_path,
         operational=operational)
-    coverage = tier_coverage(meta, requested_tiers)
+    coverage = tier_coverage(meta, requested_tiers, budget=budget)
     operational_ok = _operational_ok(meta)
 
     # -- termination -----------------------------------------------------

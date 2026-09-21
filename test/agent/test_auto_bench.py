@@ -338,6 +338,65 @@ class TierCoverage(unittest.TestCase):
         self.assertTrue(check["required"])
         self.assertFalse(check["ok"])
 
+    def test_paid_dispatch_evidence_passes_live_jev_validation(self):
+        """The ledger's paid-dispatched fact proves live Jev coverage.
+
+        Regression for the false negative: a Jev consultation that timed out or
+        fell back leaves no ``providers`` usage row, so the observed tier must
+        come from ``reflex.paid_dispatched``/``applied`` instead.
+        """
+        meta = _meta(config={"reflex": "jev", "strategy": "off"})
+        budget = _budget(providers={},
+                         reflex={"applied": 6, "paid_dispatched": 21,
+                                 "successful": 6, "rejected": 12,
+                                 "fallback": 87, "timeout": 3, "invalid": 0,
+                                 "low_confidence": 81})
+        card = M.build_scorecard(
+            episode_id="ep-1", provenance_id="p", meta=meta, budget=budget,
+            wire_path=_SHORT, actions_path=_ACTIONS,
+            requested_tiers={"reflex": "jev", "strategy": "off"})
+        self.assertEqual(card["integrity"]["observed_tiers"]["reflex"], "jev")
+        self.assertEqual(card["reflex"]["paid_dispatched"], 21)
+        check = M.live_jev_validation(
+            card["integrity"]["requested_tiers"],
+            card["integrity"]["observed_tiers"])
+        self.assertTrue(check["required"])
+        self.assertTrue(check["ok"], check)
+
+    def test_zero_paid_dispatches_still_fails_live_jev_validation(self):
+        meta = _meta(config={"reflex": "jev", "strategy": "off"})
+        budget = _budget(providers={},
+                         reflex={"applied": 0, "paid_dispatched": 0,
+                                 "successful": 0, "rejected": 0,
+                                 "fallback": 26, "timeout": 0, "invalid": 0,
+                                 "low_confidence": 22})
+        card = M.build_scorecard(
+            episode_id="ep-1", provenance_id="p", meta=meta, budget=budget,
+            wire_path=_SHORT, actions_path=_ACTIONS,
+            requested_tiers={"reflex": "jev", "strategy": "off"})
+        self.assertEqual(card["integrity"]["observed_tiers"]["reflex"],
+                         "scripted")
+        check = M.live_jev_validation(
+            card["integrity"]["requested_tiers"],
+            card["integrity"]["observed_tiers"])
+        self.assertTrue(check["required"])
+        self.assertFalse(check["ok"])
+        self.assertEqual(check["reason"],
+                         "requested jev but only scripted calls were dispatched")
+
+    def test_applied_only_jev_evidence_also_counts(self):
+        # an applied send proves a live Jev decision even with 0 paid_dispatched
+        meta = _meta(config={"reflex": "jev", "strategy": "off"})
+        budget = _budget(providers={},
+                         reflex={"applied": 4, "paid_dispatched": 0,
+                                 "successful": 4, "rejected": 0,
+                                 "fallback": 0, "timeout": 0, "invalid": 0,
+                                 "low_confidence": 0})
+        coverage = M.tier_coverage(meta, {"reflex": "jev", "strategy": "off"},
+                                   budget=budget)
+        self.assertEqual(coverage["observed"]["reflex"], "jev")
+        self.assertEqual(coverage["reflex_applied"], 4)
+
 
 # ==========================================================================
 # AC5 - paid exposure
