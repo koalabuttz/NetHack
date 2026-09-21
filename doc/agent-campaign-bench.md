@@ -65,6 +65,28 @@ Scheduling metadata (`arm`, `pair`, `order`, `config_hash`) lives in the
 the immutable `/2` scorecard object, whose hash therefore recomputes from the
 exact persisted bytes.
 
+**Artifact freshness (stale data is never measured).** Reusing a run directory,
+or an episode retry, must not let a stale artifact beside a fresh one silently
+poison a scorecard:
+
+* the **remap overwrites** any pre-existing `ep-<index>.*` destination
+  (`os.replace`, atomic): the freshly written child artifact is authoritative,
+  so a previous run's file can never persist next to a fresh meta;
+* the **seal verifies freshness** against the episode start timestamp recorded
+  in the manifest. A sealed wire/meta/actions/decisions/events source whose
+  mtime does not postdate that start cannot have been produced by this episode,
+  so the card becomes `integrity.status = "stale-source"` with an
+  `availability` note and a forced `gates.hard_failure` — unavailable evidence,
+  never a measured value. (A small 1-second mtime tolerance absorbs coarse
+  filesystem timestamp granularity; a genuinely stale file is minutes or hours
+  old. With no recorded start marker, freshness cannot be judged, so nothing is
+  assumed fresh or stale.)
+* **reruns into the same `--out-dir` are refused.** `BenchRunner` fails loudly
+  (`stage: "out-dir-reuse"`) when an episode directory already exists and is
+  non-empty, rather than clearing it or interleaving runs — the non-destructive
+  choice: the earlier run's artifacts are left byte-identical and the operator
+  is told to use a fresh `--out-dir`.
+
 **Each child runs the SCHEDULED arm config.** The parent writes an immutable
 per-episode `bench-arm-config.json` (the fully resolved `ProviderConfig` values
 plus their fingerprint) *before* the spawn and passes `--arm-config` to the

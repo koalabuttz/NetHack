@@ -3242,5 +3242,126 @@ class CandidateOnlyStrategyBudget(unittest.TestCase):
                                         B.scheduled_arm_counts(spec)), 40)
 
 
+class BenchArtifactFreshness(unittest.TestCase):
+    """Artifact staleness: the remap overwrites, the seal detects, the rerun refuses."""
+
+    def _live_spec(self, tmp, episodes=2):
+        spec = _valid_spec(tier="live", episodes=episodes,
+                           episode_timeout_s=30.0, campaign_timeout_s=600.0)
+        spec["budget"]["max_total_episodes"] = 100
+        return spec
+
+    def _write_episode(self, episode_dir, index, *, wire_mtime=None):
+        os.makedirs(episode_dir, exist_ok=True)
+        meta = _meta()
+        with open(os.path.join(episode_dir, "ep-%d.meta.json" % index),
+                  "w") as fh:
+            json.dump(meta, fh)
+        for name, payload in (("wire.jsonl", '{"type": "obs"}\n'),
+                              ("actions.jsonl", ""),
+                              ("decisions.jsonl", ""),
+                              ("events.jsonl", "")):
+            with open(os.path.join(episode_dir,
+                                   "ep-%d.%s" % (index, name)), "w") as fh:
+                fh.write(payload)
+        if wire_mtime is not None:
+            wire = os.path.join(episode_dir, "ep-%d.wire.jsonl" % index)
+            os.utime(wire, (wire_mtime, wire_mtime))
+
+    def test_remap_overwrites_stale_destinations(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        # a STALE ep-2.wire.jsonl left by a previous run
+        stale = os.path.join(tmp, "ep-2.wire.jsonl")
+        with open(stale, "w") as fh:
+            fh.write('{"stale": true}\n')
+        old = time.time() - 3600.0
+        os.utime(stale, (old, old))
+        # the FRESH artifact the child just wrote under its local index
+        fresh = os.path.join(tmp, "ep-1.wire.jsonl")
+        with open(fresh, "w") as fh:
+            fh.write('{"fresh": true}\n')
+        applied = B.remap_child_artifacts(tmp, 2)
+        dst = os.path.join(tmp, "ep-2.wire.jsonl")
+        self.assertIn((fresh, dst), applied)
+        self.assertFalse(os.path.exists(fresh))
+        with open(dst) as fh:
+            self.assertEqual(fh.read(), '{"fresh": true}\n')
+        # the stale content and mtime are gone: the fresh artifact won
+        self.assertGreater(os.path.getmtime(dst), old)
+
+    def test_sealed_episode_detects_stale_wire(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        spec = self._live_spec(tmp)
+        runner = B.BenchRunner(spec, tmp)
+        started_at = time.time()
+        # a wire that PREDATES the episode start (from a previous run)
+        ep_dir = os.path.join(tmp, "ep-1")
+        self._write_episode(ep_dir, 1, wire_mtime=started_at - 3600.0)
+        card, _hashes, _paths = runner._seal_episode(
+            ep_dir, 1, None, {}, episode_started_at=started_at)
+        self.assertEqual(card["integrity"]["status"], "stale-source")
+        self.assertTrue(card["gates"]["hard_failure"])
+        self.assertTrue(any("stale-wire" in r
+                            for r in card["integrity"]["reasons"]),
+                        card["integrity"]["reasons"])
+        self.assertIn("bench.stale_source", card["availability"])
+        # the card is still shape-valid: staleness is visible, never silent
+        self.assertEqual(M.validate_scorecard_shape(card), [])
+
+    def test_fresh_artifacts_are_not_flagged_stale(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        spec = self._live_spec(tmp)
+        runner = B.BenchRunner(spec, tmp)
+        # the episode started BEFORE the artifacts were written
+        started_at = time.time() - 30.0
+        ep_dir = os.path.join(tmp, "ep-1")
+        self._write_episode(ep_dir, 1)
+        card, _hashes, _paths = runner._seal_episode(
+            ep_dir, 1, None, {}, episode_started_at=started_at)
+        self.assertNotEqual(card["integrity"]["status"], "stale-source")
+        self.assertNotIn("bench.stale_source", card["availability"])
+        # with no start marker, freshness cannot be judged -> not assumed stale
+        card2, _h2, _p2 = runner._seal_episode(ep_dir, 1, None, {})
+        self.assertNotEqual(card2["integrity"]["status"], "stale-source")
+
+    def test_rerun_into_same_out_dir_starts_clean(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        spec = self._live_spec(tmp)
+
+        def fake_episode(config, paths, episode_dir, index, timeout):
+            os.makedirs(episode_dir, exist_ok=True)
+            with open(os.path.join(episode_dir,
+                                   "ep-%d.meta.json" % index), "w") as fh:
+                json.dump(_meta(ticks=index), fh)
+            return _meta(ticks=index), episode_dir
+
+        first = B.BenchRunner(spec, tmp)
+        first.episode_runner = fake_episode
+        self.assertTrue(first.run()["ok"])
+        artifact = os.path.join(tmp, "ep-1", "ep-1.meta.json")
+        with open(artifact) as fh:
+            before = fh.read()
+        # a RERUN into the same out-dir must fail loudly, not mix runs
+        second = B.BenchRunner(spec, tmp)
+        second.episode_runner = fake_episode
+        out = second.run()
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["stage"], "out-dir-reuse")
+        self.assertIn("non-empty", out["error"])
+        # the first run's artifacts are byte-unchanged (nothing was mixed)
+        with open(artifact) as fh:
+            self.assertEqual(fh.read(), before)
+        # an explicitly fresh out-dir runs cleanly
+        fresh_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, fresh_dir, True)
+        third = B.BenchRunner(spec, fresh_dir)
+        third.episode_runner = fake_episode
+        self.assertTrue(third.run()["ok"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1638,9 +1638,13 @@ def remap_child_artifacts(episode_dir: str, index: int,
     The controller is invoked with ``run_campaign(1)`` inside the isolated
     episode directory, so the child always writes ``ep-1.*``; the parent's
     artifact convention is the *global* index.  Remapping here keeps one
-    convention everywhere -- without it, episodes 2+ look missing.  Existing
-    destination files are never overwritten (the collision is reported by
-    returning the ``(src, dst)`` pair unmoved).  Returns the applied renames.
+    convention everywhere -- without it, episodes 2+ look missing.
+
+    A pre-existing destination is **overwritten**: the freshly written child
+    artifact is authoritative, and leaving a stale ``ep-<index>.*`` from a
+    previous run beside a fresh meta is exactly the silent-stale-data failure
+    this guards against (a scorecard would otherwise mix fresh meta with stale
+    wire).  ``os.replace`` is an atomic overwrite.  Returns the applied renames.
     """
     if int(index) == int(local_index):
         return []
@@ -1650,11 +1654,61 @@ def remap_child_artifacts(episode_dir: str, index: int,
         dst = os.path.join(episode_dir, "ep-%d.%s" % (index, suffix))
         if not os.path.exists(src):
             continue
-        if os.path.exists(dst):
-            continue
         os.replace(src, dst)
         applied.append((src, dst))
     return applied
+
+
+#: Mtime tolerance when judging artifact freshness.  It exists only to absorb
+#: coarse (1-second) filesystem mtime granularity: a genuinely stale artifact
+#: left from a previous run is minutes or hours old, never under a second.
+_STALE_SKEW_S = 1.0
+
+
+def stale_artifact_reasons(paths: Dict[str, str],
+                           episode_started_at: Optional[float]) -> List[str]:
+    """The sealed artifacts that do NOT postdate the episode's start.
+
+    Freshness is judged against the **episode start timestamp recorded in the
+    manifest**: a sealed source whose mtime predates it cannot have been
+    produced by this episode, so measuring from it would mix in stale evidence.
+    ``None`` means no start marker was recorded, so freshness cannot be judged
+    (that is reported by the caller rather than assumed fresh).
+    """
+    if episode_started_at is None:
+        return []
+    reasons: List[str] = []
+    for label in ("wire", "meta", "actions", "decisions", "events"):
+        path = paths.get(label)
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if mtime < float(episode_started_at) - _STALE_SKEW_S:
+            reasons.append("stale-%s:mtime=%.3f<started_at=%.3f"
+                           % (label, mtime, float(episode_started_at)))
+    return reasons
+
+
+def reused_episode_dir_error(episode_dir: str) -> Optional[str]:
+    """An explicit error when an episode would be run into a NON-EMPTY dir.
+
+    Reruns into the same ``--out-dir`` must not mix runs: the bench **fails**
+    (the simpler, non-destructive choice) instead of silently writing a fresh
+    episode beside stale artifacts from a previous run.  A missing or empty
+    directory is fine.
+    """
+    try:
+        entries = os.listdir(episode_dir)
+    except OSError:
+        return None
+    if entries:
+        return ("episode directory %s already exists and is non-empty (%d "
+                "entries); refusing to reuse an out-dir so a rerun cannot mix "
+                "runs -- use a fresh --out-dir" % (episode_dir, len(entries)))
+    return None
 
 
 class Manifest(object):
@@ -1824,7 +1878,8 @@ class BenchRunner(object):
                  stop_file: Optional[str] = None,
                  grace: float = 5.0,
                  spec_path: Optional[str] = None,
-                 now: Callable[[], float] = time.monotonic):
+                 now: Callable[[], float] = time.monotonic,
+                 now_wall: Callable[[], float] = time.time):
         self.spec = spec
         self.out_dir = out_dir
         # ``episode_runner`` is an injected IN-PROCESS runner (offline tests).
@@ -1837,6 +1892,8 @@ class BenchRunner(object):
         self.stop = StopController(stop_file)
         self.grace = grace
         self.now = now
+        # wall-clock marker used for episode start timestamps (freshness)
+        self.now_wall = now_wall
         self.manifest = Manifest(os.path.join(out_dir, "manifest.json"),
                                  spec_ref=spec.get("name"))
         self.abort_tree = OwnedProcessTree()
@@ -2001,12 +2058,27 @@ class BenchRunner(object):
                     observed_pairs.append(entry["order"])
                     last_pair = entry["pair"]
                 episode_dir = os.path.join(self.out_dir, "ep-%d" % index)
+                # Refuse to run an episode into a non-empty existing directory:
+                # a rerun into the same out-dir must fail loudly rather than
+                # silently mix a fresh episode with stale artifacts.
+                reuse_error = reused_episode_dir_error(episode_dir)
+                if reuse_error:
+                    self.manifest.set_status("refused", stage="out-dir-reuse",
+                                             error=reuse_error,
+                                             episodes_done=len(cards))
+                    return {"ok": False, "error": reuse_error,
+                            "stage": "out-dir-reuse", "episodes": len(cards),
+                            "manifest": self.manifest.data}
+                # The episode start marker: recorded BEFORE the episode runs so
+                # the sealed artifacts can be checked for freshness against it.
+                episode_started_at = self.now_wall()
                 # reserve the WHOLE next episode's approved allocation BEFORE
                 # launching it (the per-episode caps reset, so a later episode
                 # must not be able to exceed the campaign budget).
                 self.manifest.reserve("ep-%d" % index, {
                     "episode": index, "dir": episode_dir, "arm": arm,
                     "pair": entry["pair"], "order": entry["order"],
+                    "started_at": episode_started_at,
                     "allocation": {
                         "episode_timeout_s": self.spec["episode_timeout_s"],
                         # the reservation records the SCHEDULED arm's demand,
@@ -2020,7 +2092,8 @@ class BenchRunner(object):
                                                     arm)
                 card, hashes, paths = self._seal_episode(
                     episode_dir, index, result,
-                    requested_by_arm.get(arm, requested))
+                    requested_by_arm.get(arm, requested),
+                    episode_started_at=episode_started_at)
                 # the child must have run EXACTLY the committed arm config
                 expected_cfg_hash = (self._pre_record["design"]
                                      .get("expected_config_hashes", {})
@@ -2048,6 +2121,7 @@ class BenchRunner(object):
                 self.manifest.add_episode({
                     "index": index, "dir": episode_dir, "arm": arm,
                     "pair": entry["pair"], "order": entry["order"],
+                    "started_at": episode_started_at,
                     "config_hash": config_fingerprint(arm_cfg),
                     "scorecard_hash": M.sha256_bytes(
                         M.pretty_scorecard(card).encode("utf-8")),
@@ -2272,7 +2346,9 @@ class BenchRunner(object):
         return outcome
 
     def _seal_episode(self, episode_dir: str, index: int, result: Any,
-                      requested: dict) -> Tuple[dict, dict, dict]:
+                      requested: dict,
+                      episode_started_at: Optional[float] = None
+                      ) -> Tuple[dict, dict, dict]:
         """Hash the artifacts and build/store the immutable scorecard.
 
         The forced-search evidence is taken from the child result *or* the
@@ -2280,8 +2356,16 @@ class BenchRunner(object):
         value while a genuinely absent source stays unavailable.  The exact
         scorecard shape is validated **before** the card is returned, so a
         malformed card can never be sealed as if it were complete.
+
+        **Freshness.** Every sealed source must postdate the episode's start
+        timestamp recorded in the manifest; a source that predates it cannot
+        have been produced by this episode, so the card becomes
+        ``integrity.status = "stale-source"`` with a forced ``hard_failure`` --
+        unavailable evidence is never measured from (the scorecard is still
+        emitted, so the staleness is visible rather than silent).
         """
         paths = episode_artifact_paths(episode_dir, index)
+        stale = stale_artifact_reasons(paths, episode_started_at)
         meta = _read_json(paths["meta"]) or result_to_meta(result)
         forced = forced_search_of(result) or forced_search_of(meta)
         if forced is not None:
@@ -2304,6 +2388,14 @@ class BenchRunner(object):
             forced_search=forced, requested_tiers=requested,
             deadline_classification=self.spec["comparison"][
                 "deadline_classification"])
+        if stale:
+            # a stale source is UNAVAILABLE evidence, never a measured value:
+            # mark the card and force the hard-failure gate without inventing
+            # a new schema field (availability is free-form by contract).
+            card["integrity"]["status"] = "stale-source"
+            card["integrity"]["reasons"].extend(stale)
+            card["availability"]["bench.stale_source"] = ",".join(stale)
+            card["gates"]["hard_failure"] = True
         problems = M.validate_scorecard_shape(card)
         if problems:
             # record the deviation without adding a new schema field: a reason
