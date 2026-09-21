@@ -138,39 +138,67 @@ class FoodNegatives(object):
 #: one refused/equivalent no-time search suppresses the site immediately.
 SEARCH_SITE_LIMIT = 3
 
+#: The per-site budget for **no-time** recovery searches (plan §1/§2A).
+#:
+#: A search that reconciles as ``no-time`` advanced nothing: the hero is stuck
+#: (held/paralysed by an adjacent monster, say), so it is neither a *completed*
+#: search (the ordinary budget only spends on a time-advancing outcome) nor a
+#: recognised *refusal*.  Without its own bound the ladder would nominate ``s``
+#: forever.  Two zero-time recovery searches at one stationary site exhaust it,
+#: and the ladder then escalates exactly per the stall plan (forced-search
+#: nomination -> controller gates -> trapped graceful quit).
+SEARCH_NO_TIME_LIMIT = 2
+
 
 class SearchBudget(object):
-    """Per-site completed/rejected ordinary-search accounting (5.1).
+    """Per-site completed/**no-time**/rejected ordinary-search accounting.
 
-    A *site* is a deterministic key (e.g. hero position plus map revision).
-    The budget counts observed outcomes: a local validation or write failure
-    must not consume it, so only a completed or refused search is recorded.
+    A *site* is a deterministic key (e.g. hero position).  The ordinary budget
+    counts observed outcomes: a local validation or write failure must not
+    consume it, so only a completed or refused search is recorded.  A separate
+    **no-time** budget (plan §1/§2A) bounds a zero-time recovery search, which
+    is a matched gameplay attempt that made no progress.
     """
 
-    def __init__(self, limit: int = SEARCH_SITE_LIMIT) -> None:
+    def __init__(self, limit: int = SEARCH_SITE_LIMIT,
+                 no_time_limit: int = SEARCH_NO_TIME_LIMIT) -> None:
         self.limit = int(limit)
+        self.no_time_limit = int(no_time_limit)
         self.completed: Dict[object, int] = {}
+        self.no_time: Dict[object, int] = {}
         self.refused: Set[object] = set()
 
     def note_completed(self, site) -> None:
         self.completed[site] = self.completed.get(site, 0) + 1
 
+    def note_no_time(self, site) -> None:
+        """Record one *zero-time* recovery search attempt at *site*."""
+        self.no_time[site] = self.no_time.get(site, 0) + 1
+
     def note_refused(self, site) -> None:
         self.refused.add(site)
+
+    def no_time_count(self, site) -> int:
+        return self.no_time.get(site, 0)
 
     def allows(self, site) -> bool:
         """True while a justified ordinary search is still bounded here."""
         if site in self.refused:
+            return False
+        if self.no_time.get(site, 0) >= self.no_time_limit:
+            # zero-time recovery searches are exhausted at this site
             return False
         return self.completed.get(site, 0) < self.limit
 
     def revision_changed(self, site) -> None:
         """A relevant site change reopens the budget (4.3)."""
         self.completed.pop(site, None)
+        self.no_time.pop(site, None)
         self.refused.discard(site)
 
     def reset(self) -> None:
         self.completed.clear()
+        self.no_time.clear()
         self.refused.clear()
 
 
@@ -278,6 +306,14 @@ class RecoveryState(object):
     def note_search_completed(self, site) -> None:
         self.search.note_completed(site)
 
+    def note_no_time_search(self, site) -> None:
+        """Record one zero-time recovery search attempt at *site* (plan §2A)."""
+        self.search.note_no_time(site)
+
+    def no_time_searches(self, site) -> int:
+        """How many zero-time recovery searches this site has spent."""
+        return self.search.no_time_count(site)
+
     def movement_history(self) -> Tuple[Tuple[int, int], ...]:
         """The deduplicated trailing confirmed-movement window."""
         return tuple(self.cycle.history)
@@ -333,6 +369,7 @@ __all__ = [
     "normalize_message", "is_search_refusal", "refusal_in",
     "classify_food_negative", "FoodNegatives",
     "FOOD_NEG_INVENTORY", "FOOD_NEG_LOCATION",
-    "SEARCH_SITE_LIMIT", "SearchBudget", "CycleDetector", "RecoveryState",
+    "SEARCH_SITE_LIMIT", "SEARCH_NO_TIME_LIMIT", "SearchBudget", "CycleDetector",
+    "RecoveryState",
     "chebyshev",
 ]

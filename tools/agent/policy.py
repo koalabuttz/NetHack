@@ -467,13 +467,21 @@ class ScriptedReflex(object):
             self.eat_forced_menu = False
         elif effect in ("refresh-inventory", "refresh-inventory-periodic"):
             self.last_inv_tick = tick
-        elif effect in ("secret-search", "site-search") and not no_time:
-            # a completed search consumes its budget; a no-time outcome is a
-            # refusal/no-progress (recorded by note_observation), never a
-            # completed search (plan 5.1)
-            if effect == "secret-search":
-                mem.searches_since_progress += 1
-            self.recovery.note_search_completed(self._search_site(mem.hero))
+        elif effect in ("secret-search", "site-search") or \
+                "recovery-search" in (payload or ()):
+            # A *completed* search consumes the ordinary per-site budget
+            # (plan 5.1).  A **no-time** search advanced nothing: the hero is
+            # stuck, so it is a matched gameplay attempt that must consume its
+            # own bounded budget (plan §1/§2A) -- otherwise recovery would
+            # nominate `s` forever and never reach the forced-search /
+            # trapped-quit escalation.
+            site = self._search_site(mem.hero)
+            if no_time:
+                self.recovery.note_no_time_search(site)
+            else:
+                if effect == "secret-search":
+                    mem.searches_since_progress += 1
+                self.recovery.note_search_completed(site)
 
     def _commit_noncommand(self, tags, payload, mem) -> None:
         """Apply a frozen non-command effect set (plan 3.1).
@@ -1347,8 +1355,16 @@ class ScriptedReflex(object):
         # 1. low-HP disengagement: escape before any other action
         if hero is not None and self._low_hp(st):
             action, why = self._escape(mem, hero)
+            if action is None:
+                # the bounded no-time search budget is exhausted at this site:
+                # escalate exactly per the stall plan (forced-search nomination
+                # -> controller gates -> trapped graceful quit), never another
+                # unbounded zero-time search
+                return self._search_fallback(mem, hero)
+            payload = (("recovery-search",)
+                       if action.get("key") == KEY.KEY_SEARCH else ())
             return (self._cand(action, "escape", "emergency", 0, why,
-                               "emergency"),)
+                               "emergency", effect_payload=payload),)
         # 2. hunger: schedule a known-safe food intent, unless scoped
         #    evidence already shows there is nothing to eat here
         if self._hungry(st) and \
@@ -2515,7 +2531,13 @@ class ScriptedReflex(object):
                 return {"key": KEY.DIR_KEYS[step]}, "low HP: flee upstairs"
         if self._safe_to_rest(mem, mem.status, hero):
             return {"key": KEY.KEY_WAIT}, "low HP: hold position"
-        return {"key": KEY.KEY_SEARCH}, "low HP: search for an exit"
+        # (6) search -- only while the bounded per-site budget still allows it.
+        # A zero-time (stuck) search is a matched attempt that must not loop:
+        # once the budget is spent the caller escalates exactly per the stall
+        # plan (forced-search nomination -> controller gates -> trapped quit).
+        if self._allows_search(mem, hero):
+            return {"key": KEY.KEY_SEARCH}, "low HP: search for an exit"
+        return None, "low HP: bounded search exhausted at this site"
 
     def _emergency_move(self, mem, terrain, hero, threats):
         """The best legal emergency-class step, or ``None`` (§E fallback 1-3)."""

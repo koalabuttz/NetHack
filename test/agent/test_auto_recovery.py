@@ -683,5 +683,144 @@ class Ep2TrappedQuit(unittest.TestCase):
         self.assertNotIn(cand.semantic_label, ("unblock", "random-move"))
 
 
+class NoTimeRecoverySearchBudget(unittest.TestCase):
+    """Bug A: a zero-time recovery search is bounded and escalates.
+
+    A stuck hero (held/paralysed by a monster) reconciles every search as
+    ``no-time``: no time advances, and the engine emits no search *refusal*, so
+    neither the ordinary completed-search budget nor the refusal flag ever
+    engaged and the ladder nominated ``s`` forever.  The no-time budget bounds
+    it and the ladder then escalates exactly per the stall plan.
+    """
+
+    def setUp(self):
+        self.ref = policy.ScriptedReflex(ProviderConfig(role="Valkyrie"))
+
+    def _stuck_with_monster(self, messages=()):
+        """A held hero: no legal movement, an adjacent monster, unsafe to rest.
+
+        The monster sits on the only floor neighbour (diagonally), so
+        ``_recovery_legal_step`` skips it on occupancy and ``_random_move``
+        finds no legal step and (unsafe to rest) falls back to a *search* --
+        exactly the ep-2 nomination shape.
+        """
+        cells = {(10, 10): FLOOR, (11, 11): FLOOR, (11, 10): WALL,
+                 (10, 11): WALL, (9, 10): WALL, (10, 9): WALL}
+        mem = mem_with(cells, (10, 10), messages=list(messages))
+        mem.grid[(11, 11)] = ("d", "brown", 0, "none")
+        mem.no_progress = 3
+        return mem
+
+    def _step(self, mem, tick=0):
+        return self.ref.prepare(ctx(mem, tick=tick)).table.scripted()
+
+    def _commit_no_time(self, mem, cand, tick=0):
+        self.ref.commit_effect(cand.proposed_effect, cand.semantic_label, tick,
+                               mem, observed_kind="no-time")
+
+    def test_no_time_recovery_search_escalates_to_forced_search_within_budget(
+            self):
+        site = (10, 10)
+        limit = recovery.SEARCH_NO_TIME_LIMIT
+        self.ref.instance_id = 1        # the reflex knows its instance
+        # no refusal evidence yet: the bounded searches must be nominated
+        mem = self._stuck_with_monster()
+        # the first `limit` decisions are bounded ordinary searches, each of
+        # which reconciles zero-time (the hero is held)
+        for i in range(limit):
+            cand = self._step(mem, tick=i)
+            self.assertEqual(cand.semantic_label, "search", i)
+            self.assertEqual(cand.action.to_wire(),
+                             {"key": protocol.KEY_SEARCH})
+            self.assertTrue(self.ref.recovery.allows_search(site), i)
+            self._commit_no_time(mem, cand, tick=i)
+        # the bounded no-time budget is now spent at this site
+        self.assertEqual(self.ref.recovery.no_time_searches(site), limit)
+        self.assertFalse(self.ref.recovery.allows_search(site))
+        # a freshly observed correlated refusal unlocks the forced-search
+        # nomination (stale text must never fail a new site -- plan §4)
+        mem.messages.append("You already found a monster.")
+        cand = self._step(mem, tick=limit)
+        self.assertEqual(cand.semantic_label, "forced-search")
+        self.assertEqual(cand.proposed_effect,
+                         forced_search.FORCED_SEARCH_EFFECT)
+        self.assertEqual(cand.action.to_wire(),
+                         {"key": forced_search.FORCED_SEARCH_PREFIX_CODE})
+        self.assertIsNotNone(self.ref.forced_search_local())
+
+    def test_no_time_recovery_search_without_refusal_quit_gracefully(self):
+        # with no correlated refusal evidence the nomination gate denies, so
+        # the same exhausted budget produces the trapped graceful quit -- never
+        # another search
+        site = (10, 10)
+        self.ref.instance_id = 1
+        mem = self._stuck_with_monster()
+        for i in range(recovery.SEARCH_NO_TIME_LIMIT):
+            cand = self._step(mem, tick=i)
+            self.assertEqual(cand.semantic_label, "search", i)
+            self._commit_no_time(mem, cand, tick=i)
+        self.assertFalse(self.ref.recovery.allows_search(site))
+        cand = self._step(mem, tick=recovery.SEARCH_NO_TIME_LIMIT)
+        self.assertEqual(cand.semantic_label, "trapped")
+        self.assertEqual(cand.action.to_wire(), {"key": protocol.KEY_HASH})
+
+    def test_recovery_search_budget_counts_no_time_attempts_only(self):
+        site = (10, 10)
+        mem = self._stuck_with_monster()
+        # (a) a TIME-ADVANCING search must not consume the no-time budget
+        cand = self._step(mem, tick=0)
+        self.assertEqual(cand.semantic_label, "search")
+        self.ref.commit_effect(cand.proposed_effect, cand.semantic_label, 0,
+                               mem, observed_kind="advanced")
+        self.assertEqual(self.ref.recovery.no_time_searches(site), 0)
+        self.assertTrue(self.ref.recovery.allows_search(site))
+        # it did consume the ordinary completed-search budget
+        self.assertEqual(self.ref.recovery.search.completed.get(site), 1)
+        # (b) a no-time search consumes ONLY the no-time budget
+        for i in range(1, 1 + recovery.SEARCH_NO_TIME_LIMIT):
+            cand = self._step(mem, tick=i)
+            self._commit_no_time(mem, cand, tick=i)
+        self.assertEqual(self.ref.recovery.search.completed.get(site), 1)
+        self.assertEqual(self.ref.recovery.no_time_searches(site),
+                         recovery.SEARCH_NO_TIME_LIMIT)
+        self.assertFalse(self.ref.recovery.allows_search(site))
+
+    def test_ep2_shape_terminates_within_a_bounded_action_count(self):
+        """The ep-2 stuck-hero shape cannot loop zero-time searches.
+
+        Drives the controller's decide -> commit cycle directly: every search
+        reconciles as ``no-time`` (the hero is held), and the episode must
+        escape the search loop within a bounded action count -- never a long
+        run of identical zero-time searches.
+        """
+        self.ref.instance_id = 1
+        mem = self._stuck_with_monster()
+        actions = []
+        zero_time_searches = 0
+        run = 0
+        max_run = 0
+        for tick in range(200):
+            cand = self._step(mem, tick=tick)
+            wire = cand.action.to_wire()
+            actions.append(wire)
+            if wire == {"key": protocol.KEY_SEARCH}:
+                run += 1
+                max_run = max(max_run, run)
+                zero_time_searches += 1
+                # the held hero cannot act: the search reconciles zero-time
+                self._commit_no_time(mem, cand, tick=tick)
+            else:
+                # the loop escaped into the bounded escalation
+                break
+        # escaped well inside the bounded budget (the plan's 100-action bound)
+        self.assertLess(len(actions), 100)
+        self.assertLessEqual(zero_time_searches, recovery.SEARCH_NO_TIME_LIMIT)
+        self.assertLessEqual(max_run, 100)
+        # the escaping action is the bounded escalation, never another search
+        self.assertIn(actions[-1],
+                      ({"key": protocol.KEY_HASH},
+                       {"key": forced_search.FORCED_SEARCH_PREFIX_CODE}))
+
+
 if __name__ == "__main__":
     unittest.main()
