@@ -584,3 +584,33 @@ apply.
 * Strict-budget live-Jev autotuning remains **blocked** without a verified
   external hard provider quota. Do not conceal this with a watchdog or an
   intercepting proxy.
+
+
+## Roadmap: seed control for matched-seed A/B (not implemented)
+
+The single largest measurement limitation is map/RNG variance: episodes are
+unpaired, so outcome A/B tests need ~25+ episodes per arm to detect even a
+50% effect (see the statistical policy above).  Matched-seed pairing would
+cut that roughly an order of magnitude.
+
+Sketch of the work, in dependency order:
+
+1. **Engine**: locate the RNG initialization site(s) (deliberately unverified
+   so far -- `doc/agent-architecture.md` section 6.5 reserves seeds to the
+   trusted evaluator) and confirm a single seeding entry point covers all
+   consumers (level gen, item gen, monster AI).
+2. **Launcher**: plumb an optional seed (or seed file reference) through the
+   trusted launcher handshake -- the agent/worker must never be able to set
+   or observe it; the supervisor owns it (same trust boundary as the data
+   root).
+3. **Bench**: add `seed` / `seed_sequence` to `bench-spec/1`, switch the A/B
+   schedule to *paired* (same seed sequence for both arms, interleaved), and
+   require seed provenance in the provenance manifest.
+4. **Statistics**: paired comparisons (per-seed differences) replace the
+   unpaired bootstrap; expected sample reduction is roughly 5-10x for the
+   same power.
+
+Trust invariant: the seed is evaluator-side only.  The agent-facing wire,
+scorecards, and the gameplay worker never see it; equal agent-visible
+histories under different seeds must still produce equal agent-visible
+payloads (the noninterference contract is unaffected).
