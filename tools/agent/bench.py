@@ -1446,6 +1446,85 @@ def _read_jsonl(path: Optional[str]) -> Optional[List[dict]]:
     return out
 
 
+#: The bench-side judge audit log (one JSONL record per judge call).
+JUDGE_LOG_NAME = "judge.jsonl"
+#: Any of these in a record key marks it as credential-bearing and redactable.
+_SECRET_KEY_MARKERS = ("api_key", "apikey", "secret", "token", "password",
+                       "credential", "authorization")
+
+
+def judge_log_path(out_dir: str) -> str:
+    """The run-root judge audit log path."""
+    return os.path.join(out_dir, JUDGE_LOG_NAME)
+
+
+def append_jsonl(path: str, obj: dict, mode: int = 0o600) -> None:
+    """Append one JSON line to *path* at *mode* (best-effort caller)."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, mode)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(obj, sort_keys=True, default=str) + "\n")
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+def redact_judge_record(obj: Any, depth: int = 0) -> Any:
+    """Recursively drop credential-bearing keys from a judge audit record.
+
+    The judge payload/state is already an allowlisted metric subset with no
+    secrets; this is a defensive backstop so a future field can never leak a
+    credential into the persisted audit log.
+    """
+    if depth > 8:
+        return "<redacted-depth>"
+    if isinstance(obj, dict):
+        out = {}
+        for key, value in obj.items():
+            if any(marker in str(key).lower() for marker in _SECRET_KEY_MARKERS):
+                continue
+            out[key] = redact_judge_record(value, depth + 1)
+        return out
+    if isinstance(obj, list):
+        return [redact_judge_record(v, depth + 1) for v in obj]
+    return obj
+
+
+def judge_audit_record(episode: int, result: dict, index: int = 0) -> dict:
+    """One redacted, typed judge audit record for the persisted log."""
+    record = {
+        "schema_version": "bench-judge-audit/1",
+        "episode": episode,
+        "ordinal": index,
+        "status": result.get("status"),
+        "dispatched": bool(result.get("dispatched", True)),
+        "cache_hit": bool(result.get("cache_hit", False)),
+        "dispatches": result.get("dispatches", 0),
+        "request_shape": result.get("request_shape"),
+        "model": result.get("model"),
+        "model_hash": result.get("model_hash"),
+        "rubric_version": result.get("rubric_version"),
+        "rubric_hash": result.get("rubric_hash"),
+        "scorecard_hash": result.get("scorecard_hash"),
+        "cache_key": result.get("cache_key"),
+        "advisory": bool(result.get("advisory", True)),
+        "flags": list(result.get("flags", []) or []),
+        "answers": result.get("answers"),
+        "usage": result.get("usage"),
+        "validation_error": result.get("validation_error"),
+        "error": result.get("error"),
+        "unknown_exposure_calls": result.get("unknown_exposure_calls"),
+        "unknown_exposure_usd": result.get("unknown_exposure_usd"),
+    }
+    return redact_judge_record(
+        {k: v for k, v in record.items() if v is not None or k == "answers"})
+
+
 def episode_artifact_paths(episode_dir: str, index: int) -> Dict[str, str]:
     """The per-episode artifact paths the recorder writes."""
     base = os.path.join(episode_dir, "ep-%d" % index)
@@ -2240,7 +2319,10 @@ class BenchRunner(object):
 
         A **required** dispatch that cannot even be constructed (a missing
         transport) is a preflight error, not a silent advisory downgrade: it is
-        recorded as such and the run status reflects it.
+        recorded as such and the run status reflects it.  Every judge call is
+        also appended (typed and redacted) to the run-root ``judge.jsonl`` audit
+        log, so the raw request/answer evidence is persisted -- not just the
+        manifest summary.
         """
         from . import bench_judge as J
         if self.judge is None:
@@ -2261,13 +2343,24 @@ class BenchRunner(object):
             result = {"status": "error", "error": str(exc), "advisory": True}
         except Exception as exc:  # noqa: BLE001 - advisory never fatal
             result = {"status": "error", "error": str(exc), "advisory": True}
+        record = dict(result, episode=index)
+        self._append_judge_log(record)
         self.manifest.data["judge_calls"].append(
             {"episode": index, "status": result.get("status"),
              "dispatches": result.get("dispatches", 0),
              "cache_hit": result.get("cache_hit", False),
              "flags": result.get("flags", [])})
         self.manifest.flush()
-        return dict(result, episode=index)
+        return record
+
+    def _append_judge_log(self, record: dict) -> None:
+        """Persist one redacted judge audit record (failures are non-fatal)."""
+        try:
+            append_jsonl(judge_log_path(self.out_dir),
+                         judge_audit_record(record.get("episode"), record))
+        except OSError:
+            self.manifest.data.setdefault("judge_log_errors", []).append(
+                {"episode": record.get("episode"), "error": "write-failed"})
 
     def _baseline_cards(self) -> List[dict]:
         ref = self.spec.get("baseline_ref")
@@ -2425,6 +2518,12 @@ class BenchRunner(object):
                 excerpt_paths["%s.wire" % name] = wire
             if os.path.exists(decisions):
                 excerpt_paths["%s.decisions" % name] = decisions
+        art = {c["episode_id"]: os.path.join(self.out_dir, c["episode_id"])
+               for c in cards}
+        judge_log = judge_log_path(self.out_dir)
+        if os.path.exists(judge_log):
+            # the postmortem package references the raw judge audit log
+            art["judge.jsonl"] = judge_log
         pkg = M.build_postmortem_package(
             out_dir=self.out_dir, failure_kind="bench-gate-or-regression",
             failed_gates=sorted({g for c in cards
@@ -2432,8 +2531,7 @@ class BenchRunner(object):
                                  if v is True and g.endswith("hard_failure")}),
             comparison=comparison, scorecards=cards,
             judge_answers=list(judge_results),
-            artifact_paths={c["episode_id"]: os.path.join(
-                self.out_dir, c["episode_id"]) for c in cards},
+            artifact_paths=art,
             excerpt_paths=excerpt_paths, excerpt_anchors=anchors,
             evidence_selection=selection,
             package_max_bytes=self._package_max_bytes,
@@ -2964,6 +3062,10 @@ def _cmd_package(args) -> int:
                 excerpt_paths[key] = path
                 if anchor is not None and label in ("wire", "decisions"):
                     anchors[key] = anchor
+    judge_log = judge_log_path(run_dir)
+    if os.path.exists(judge_log):
+        # the postmortem package references the raw judge audit log
+        artifact_paths["judge.jsonl"] = judge_log
     pkg = M.build_postmortem_package(
         out_dir=run_dir,
         failure_kind=args.failure_kind or "operator-requested",
@@ -2978,6 +3080,8 @@ def _cmd_package(args) -> int:
     print(json.dumps({"written": pkg.get("written_to"),
                       "excerpts": sorted(pkg["excerpts"]),
                       "evidence": [i["episode_id"] for i in selection],
+                      "judge_log": judge_log if os.path.exists(judge_log)
+                      else None,
                       "omitted": pkg.get("omitted", []),
                       "budget": pkg.get("budget")},
                      indent=2, sort_keys=True))

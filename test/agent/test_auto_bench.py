@@ -1321,6 +1321,127 @@ class FailClosedEvidence(unittest.TestCase):
 # spec validation
 # ==========================================================================
 
+class JudgeAuditLog(unittest.TestCase):
+    """Bug C: each judge call is persisted to judge.jsonl."""
+
+    def _run(self, tmp, episodes=2):
+        from tools.agent import bench_judge as J
+        keyfile = os.path.join(tmp, "jev.key")
+        with open(keyfile, "w") as fh:
+            fh.write("jev-test-key\n")
+        os.chmod(keyfile, 0o600)
+        spec = _valid_spec(tier="live", episodes=episodes, overrides={
+            "reflex": "jev", "jev_accept_terms": True,
+            "jev_key_file": keyfile})
+        spec["judge"] = {"enabled": True, "model": "jev-latest",
+                         "rubric_version": "bench-judge-rubric/1",
+                         "deadline_s": 10.0, "max_state_bytes": 8192,
+                         "max_response_bytes": 65536, "retries": 0}
+        spec["budget"]["judge_calls_total"] = 10
+        spec["budget"]["max_total_episodes"] = 100
+        os.environ[B.BENCH_WORKER_ENV] = sys.executable
+        self.addCleanup(os.environ.pop, B.BENCH_WORKER_ENV, None)
+
+        def transport(payload):
+            return {"model": "jev-1.13.0",
+                    "answers": {
+                        "degenerate_loop": {"type": "noul", "noul": 0.1},
+                        "exploration_productivity": {
+                            "type": "score", "score": 2.5, "confidence": 0.9,
+                            "legend": {str(i): t for i, t in enumerate(
+                                J.PRODUCTIVITY_LEVELS)},
+                            "probabilities": {str(i): (1.0 if i == 2 else 0.0)
+                                              for i in range(len(
+                                                  J.PRODUCTIVITY_LEVELS))}},
+                        "termination_sanity": {"type": "noul", "noul": 0.9}},
+                    "usage": {"input_tokens": 300, "output_tokens": 20}}
+
+        def judge_factory(calls_total, jspec):
+            return J.BenchJudge(model=jspec["model"], calls_total=calls_total,
+                                transport=transport)
+
+        runner = B.BenchRunner(spec, tmp, judge_factory=judge_factory)
+
+        def fake_episode(config, paths, episode_dir, index, timeout):
+            os.makedirs(episode_dir, exist_ok=True)
+            with open(os.path.join(episode_dir,
+                                   "ep-%d.meta.json" % index), "w") as fh:
+                json.dump(_meta(config={"reflex": "jev", "strategy": "off"},
+                                budget={"usage": {"prompt_tokens": 0,
+                                                  "completion_tokens": 0,
+                                                  "estimated_usd": 0.0},
+                                        "providers": {},
+                                        "reflex": {"paid_dispatched": 3,
+                                                   "applied": 2,
+                                                   "successful": 2},
+                                        "strategy": {
+                                            "postmortem_reserve": 0}}), fh)
+            return _meta(), episode_dir
+
+        runner.episode_runner = fake_episode
+        return runner.run(), spec
+
+    def test_judge_enabled_run_writes_one_record_per_dispatch(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        out, spec = self._run(tmp)
+        log = os.path.join(tmp, "judge.jsonl")
+        self.assertTrue(os.path.exists(log), "judge.jsonl not written")
+        records = [json.loads(l) for l in open(log) if l.strip()]
+        dispatches = sum(int(c.get("dispatches", 0))
+                         for c in out["manifest"]["judge_calls"])
+        self.assertEqual(len(records), dispatches)
+        self.assertEqual(len(records), 2)          # one bundled dispatch each
+        for rec in records:
+            self.assertEqual(rec["schema_version"], "bench-judge-audit/1")
+            self.assertEqual(rec["status"], "ok")
+            self.assertTrue(rec["dispatched"])
+            self.assertEqual(rec["dispatches"], 1)
+            self.assertTrue(rec["scorecard_hash"])
+            self.assertTrue(rec["rubric_hash"])
+            # the typed answers are persisted
+            self.assertIn("degenerate_loop", rec["answers"])
+            self.assertIn("exploration_productivity", rec["answers"])
+            self.assertIn("termination_sanity", rec["answers"])
+
+    def test_no_secret_survives_into_the_judge_log(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self._run(tmp)
+        blob = open(os.path.join(tmp, "judge.jsonl")).read()
+        self.assertNotIn("jev-test-key", blob)
+        for marker in ("api_key", "secret", "token", "password",
+                       "authorization"):
+            self.assertNotIn(marker, blob.lower())
+
+    def test_postmortem_package_references_the_judge_log(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        out, spec = self._run(tmp)
+        spec_path = os.path.join(tmp, "spec.json")
+        with open(spec_path, "w") as fh:
+            json.dump(spec, fh)
+        self.assertEqual(B.main(["package", "--run-dir", tmp]), 0)
+        pkg = json.load(open(os.path.join(tmp, "postmortem", "manifest.json")))
+        self.assertIn("judge.jsonl", pkg["artifact_paths"])
+        self.assertTrue(pkg["source_checksums"].get("judge.jsonl"),
+                        pkg["source_checksums"])
+        self.assertEqual(pkg["source_kinds"]["judge.jsonl"], "file")
+        del out
+
+    def test_redaction_drops_credential_bearing_keys(self):
+        raw = {"status": "ok", "api_key": "sk-live-secret",
+               "nested": {"bearer_token": "abc", "keep": 1},
+               "list": [{"secret": "s"}, {"ok": True}]}
+        red = B.redact_judge_record(raw)
+        self.assertNotIn("api_key", red)
+        self.assertNotIn("bearer_token", red["nested"])
+        self.assertEqual(red["nested"]["keep"], 1)
+        self.assertEqual(red["list"][0], {})
+        self.assertEqual(red["list"][1], {"ok": True})
+        self.assertEqual(red["status"], "ok")
+
+
 class WorkflowWiring(unittest.TestCase):
     """Finding #1: the public workflow actually wires the helpers."""
 
